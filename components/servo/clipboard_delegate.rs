@@ -164,7 +164,8 @@ mod clipboard {
     use crate::clipboard_delegate::fallback_clipboard;
 
     pub(super) fn clear() {
-        if ohos_pasteboard::clear().is_err() {
+        if let Err(error) = ohos_pasteboard::clear() {
+            log::warn!("OHOS pasteboard clear failed ({error}); using in-process fallback");
             fallback_clipboard::clear();
         }
     }
@@ -175,12 +176,16 @@ mod clipboard {
             // An empty system clipboard is not a failure; answer with empty text rather than
             // falling back to the (separate) in-process store.
             Err(ohos_pasteboard::Error::NoText) => request.success(String::new()),
-            Err(_) => fallback_clipboard::get_text(request),
+            Err(error) => {
+                log::warn!("OHOS pasteboard get_text failed ({error}); using in-process fallback");
+                fallback_clipboard::get_text(request);
+            },
         }
     }
 
     pub(super) fn set_text(new_contents: String) {
-        if ohos_pasteboard::set_text(&new_contents).is_err() {
+        if let Err(error) = ohos_pasteboard::set_text(&new_contents) {
+            log::warn!("OHOS pasteboard set_text failed ({error}); using in-process fallback");
             fallback_clipboard::set_text(new_contents);
         }
     }
