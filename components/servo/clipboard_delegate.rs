@@ -158,7 +158,38 @@ mod clipboard {
     }
 }
 
-#[cfg(any(not(feature = "clipboard"), target_os = "android", target_env = "ohos"))]
+#[cfg(all(feature = "clipboard", target_env = "ohos"))]
+mod clipboard {
+    use super::StringRequest;
+    use crate::clipboard_delegate::fallback_clipboard;
+
+    pub(super) fn clear() {
+        if ohos_pasteboard::clear().is_err() {
+            fallback_clipboard::clear();
+        }
+    }
+
+    pub(super) fn get_text(request: StringRequest) {
+        match ohos_pasteboard::get_text() {
+            Ok(text) => request.success(text),
+            // An empty system clipboard is not a failure; answer with empty text rather than
+            // falling back to the (separate) in-process store.
+            Err(ohos_pasteboard::Error::NoText) => request.success(String::new()),
+            Err(_) => fallback_clipboard::get_text(request),
+        }
+    }
+
+    pub(super) fn set_text(new_contents: String) {
+        if ohos_pasteboard::set_text(&new_contents).is_err() {
+            fallback_clipboard::set_text(new_contents);
+        }
+    }
+}
+
+#[cfg(any(
+    not(feature = "clipboard"),
+    all(feature = "clipboard", target_os = "android")
+))]
 mod clipboard {
     use super::StringRequest;
     use crate::clipboard_delegate::fallback_clipboard;
