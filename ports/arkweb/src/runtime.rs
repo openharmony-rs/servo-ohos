@@ -665,6 +665,8 @@ impl ServoThread {
                 }
             },
             Action::SetThrottled { id, throttled } => {
+                // Observability marker for the on-device throttle tests (test_throttle.py).
+                info!("[arkweb] set_throttled id={id} {throttled}");
                 self.with_webview(id, |wv| wv.set_throttled(throttled))
             },
             Action::Touch {
