@@ -9,10 +9,6 @@ button invokes one `WebviewController` API and reports the outcome to hilog as
 ``ArkWebTest: <name>=<value>``. Tests tap buttons via the layout dump and assert on the
 markers; navigation effects are additionally verified with pixel checks (ground truth,
 independent of the getters under test). See conftest.py for harness notes.
-
-Known-limitation handling: title/URL getters can be stale after history navigation (load
-events may not fire on a history traversal — tracked in the plan); that check XFAILs
-rather than fails.
 """
 
 from __future__ import annotations
@@ -132,9 +128,9 @@ def test_back_or_forward(controller_page, cap):
     img = wait_for_pixel(cap, center, is_green)
     assert is_green(img.getpixel(center)[:3]), "backOrForward(1) did not land on page-b"
 
-    title = invoke(device, tree, "getTitle")
-    if title != "page-b":
-        pytest.xfail(f"known: title/url getters stale after history navigation (got {title!r})")
+    # Getters must be fresh after history traversal: servo fires notify_url_changed (and title
+    # updates) on back/forward without a fresh load — regression for the c3f4cf6 fix.
+    assert invoke(device, tree, "getTitle") == "page-b"
 
 
 def test_precompile_javascript(controller_page):
