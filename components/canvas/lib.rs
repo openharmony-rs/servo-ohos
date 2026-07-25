@@ -8,6 +8,12 @@
 mod backend;
 pub mod canvas_data;
 pub mod canvas_paint_thread;
+#[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+#[allow(unsafe_code)]
+mod ohdrawing_backend;
+#[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+#[allow(unsafe_code)]
+mod ohdrawing_present;
 mod peniko_conversions;
 #[cfg(feature = "vello")]
 mod vello_backend;
