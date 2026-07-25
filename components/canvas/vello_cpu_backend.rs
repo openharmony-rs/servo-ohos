@@ -22,7 +22,7 @@ use servo_config::pref;
 use vello_cpu::{RenderSettings, kurbo, peniko};
 use webrender_api::{ImageDescriptor, ImageDescriptorFlags};
 
-use crate::backend::{CanvasStoreSizesPerType, Convert, GenericDrawTarget};
+use crate::backend::{CanvasStoreSizesPerType, Convert, GenericDrawTarget, PresentationData};
 use crate::canvas_data::Filter;
 
 thread_local! {
@@ -498,9 +498,7 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
         })
     }
 
-    fn image_descriptor_and_serializable_data(
-        &mut self,
-    ) -> (ImageDescriptor, SerializableImageData) {
+    fn present(&mut self) -> (ImageDescriptor, PresentationData) {
         let image_desc = ImageDescriptor {
             format: webrender_api::ImageFormat::RGBA8,
             size: self.size().cast().cast_unit(),
@@ -509,7 +507,7 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
             flags: ImageDescriptorFlags::empty(),
         };
         let data = SerializableImageData::Raw(GenericSharedMemory::from_bytes(self.pixmap()));
-        (image_desc, data)
+        (image_desc, PresentationData::Raw(data))
     }
 
     fn snapshot(&mut self) -> pixels::Snapshot {

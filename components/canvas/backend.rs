@@ -3,13 +3,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
-use paint_api::SerializableImageData;
+use paint_api::{SerializableImageData, WebRenderExternalImageApi};
 use pixels::Snapshot;
 use profile_traits::mem::ReportKind;
 use servo_canvas_traits::canvas::{
     CompositionOptions, FillOrStrokeStyle, FillRule, LineOptions, Path, ShadowOptions, TextRun,
 };
-use webrender_api::ImageDescriptor;
+use webrender_api::{ImageBufferKind, ImageDescriptor};
 
 use crate::canvas_data::Filter;
 
@@ -17,6 +17,23 @@ pub(crate) struct CanvasStoreSizesPerType {
     pub name: &'static str,
     pub size: usize,
     pub kind: ReportKind,
+}
+
+/// The result of presenting a rendered canvas frame to the compositor. A backend chooses per
+/// present whether to hand over CPU pixels or to present a GPU texture as a WebRender external
+/// image. Backends that read back into a CPU buffer only ever return [`PresentationData::Raw`].
+pub(crate) enum PresentationData {
+    /// CPU pixels that WebRender will own and upload.
+    Raw(SerializableImageData),
+    /// A GPU texture presented to WebRender as an external image. The [`ImageBufferKind`] selects
+    /// the sampler target; the canvas layer assigns the `ExternalImageId`.
+    ///
+    /// Only the `ohdrawing` backend constructs this today, so every other build would warn (and
+    /// fail the `-D warnings` CI jobs) on an unconstructed variant. The variant itself stays
+    /// unconditional: it is part of the backend-agnostic seam, and cfg-ing it would push the same
+    /// cfg into every `match` over `PresentationData`.
+    #[cfg_attr(not(all(feature = "ohdrawing", target_env = "ohos")), allow(dead_code))]
+    External(ImageBufferKind),
 }
 
 // This defines required methods for a DrawTarget. The prototypes are derived from the now-removed
@@ -106,10 +123,23 @@ pub(crate) trait GenericDrawTarget {
         transform: Transform2D<f64>,
     );
     fn surface(&mut self) -> Self::SourceSurface;
-    fn image_descriptor_and_serializable_data(
-        &mut self,
-    ) -> (ImageDescriptor, SerializableImageData);
+    fn present(&mut self) -> (ImageDescriptor, PresentationData);
     fn snapshot(&mut self) -> Snapshot;
+
+    /// The external image handler this backend uses to present frames as WebRender external
+    /// images, or `None` if it presents via CPU readback. Queried once when the canvas paint
+    /// thread starts and registered under the canvas 2D external image slot.
+    fn external_image_handler() -> Option<Box<dyn WebRenderExternalImageApi + Send>> {
+        None
+    }
+
+    /// Inform the backend of the [`ExternalImageId`](webrender_api::ExternalImageId) the canvas
+    /// layer assigned to this draw target, so a backend that presents external images can key its
+    /// per-canvas GPU resources (shared with its [`external_image_handler`](Self::external_image_handler))
+    /// by it. Called once right after the id is first allocated, and again after
+    /// [`create_similar_draw_target`](Self::create_similar_draw_target) re-creates the target on
+    /// resize. Readback backends ignore it.
+    fn set_external_image_id(&mut self, _id: webrender_api::ExternalImageId) {}
 }
 
 /// A version of the `Into<T>` trait from the standard library that can be used

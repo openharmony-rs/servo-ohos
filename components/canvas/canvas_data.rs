@@ -4,14 +4,17 @@
 
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use malloc_size_of::MallocSizeOfOps;
-use paint_api::CrossProcessPaintApi;
+use paint_api::{
+    CrossProcessPaintApi, SerializableImageData, WebRenderExternalImageIdManager,
+    WebRenderImageHandlerType,
+};
 use pixels::Snapshot;
 use profile_traits::mem::Report;
 use servo_base::Epoch;
 use servo_canvas_traits::canvas::*;
-use webrender_api::ImageKey;
+use webrender_api::{ExternalImageData, ExternalImageId, ExternalImageType, ImageKey};
 
-use crate::backend::GenericDrawTarget;
+use crate::backend::{GenericDrawTarget, PresentationData};
 
 // Asserts on WR texture cache update for zero sized image with raw data.
 // https://github.com/servo/webrender/blob/main/webrender/src/texture_cache.rs#L1475
@@ -27,22 +30,55 @@ pub(crate) struct CanvasData<DrawTarget: GenericDrawTarget> {
     draw_target: DrawTarget,
     paint_api: CrossProcessPaintApi,
     image_key: Option<ImageKey>,
+    external_image_id_manager: WebRenderExternalImageIdManager,
+    external_image_id: Option<ExternalImageId>,
 }
 
 impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
     pub(crate) fn new(
         size: Size2D<u64>,
         paint_api: CrossProcessPaintApi,
+        external_image_id_manager: WebRenderExternalImageIdManager,
     ) -> CanvasData<DrawTarget> {
         CanvasData {
             draw_target: DrawTarget::new(size.max(MIN_WR_IMAGE_SIZE).cast()),
             paint_api,
             image_key: None,
+            external_image_id_manager,
+            external_image_id: None,
+        }
+    }
+
+    /// Turn a backend [`PresentationData`] into the data sent to WebRender, allocating an
+    /// `ExternalImageId` from the shared namespace on the first external present.
+    fn serializable_image_data(&mut self, presentation: PresentationData) -> SerializableImageData {
+        match presentation {
+            PresentationData::Raw(data) => data,
+            PresentationData::External(kind) => {
+                let id = match self.external_image_id {
+                    Some(id) => id,
+                    None => {
+                        let id = self
+                            .external_image_id_manager
+                            .next_id(WebRenderImageHandlerType::Canvas2D);
+                        self.external_image_id = Some(id);
+                        self.draw_target.set_external_image_id(id);
+                        id
+                    },
+                };
+                SerializableImageData::External(ExternalImageData {
+                    id,
+                    channel_index: 0,
+                    image_type: ExternalImageType::TextureHandle(kind),
+                    normalized_uvs: false,
+                })
+            },
         }
     }
 
     pub(crate) fn set_image_key(&mut self, image_key: ImageKey) {
-        let (descriptor, data) = self.draw_target.image_descriptor_and_serializable_data();
+        let (descriptor, presentation) = self.draw_target.present();
+        let data = self.serializable_image_data(presentation);
         self.paint_api.add_image(image_key, descriptor, data, false);
 
         if let Some(old_image_key) = self.image_key.replace(image_key) {
@@ -334,6 +370,12 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
             .draw_target
             .create_similar_draw_target(&Size2D::new(size.width, size.height).cast());
 
+        // Re-propagate the assigned external image id to the freshly created draw target so a
+        // backend presenting external images can re-establish its per-canvas GPU resources.
+        if let Some(id) = self.external_image_id {
+            self.draw_target.set_external_image_id(id);
+        }
+
         self.update_image_rendering(None);
     }
 
@@ -343,11 +385,11 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
             return;
         };
 
-        let (descriptor, data) = {
-            let _span =
-                profile_traits::trace_span!("image_descriptor_and_serializable_data").entered();
-            self.draw_target.image_descriptor_and_serializable_data()
+        let (descriptor, presentation) = {
+            let _span = profile_traits::trace_span!("present").entered();
+            self.draw_target.present()
         };
+        let data = self.serializable_image_data(presentation);
 
         self.paint_api
             .update_image(image_key, descriptor, data, canvas_epoch);
@@ -468,6 +510,9 @@ impl<D: GenericDrawTarget> Drop for CanvasData<D> {
     fn drop(&mut self) {
         if let Some(image_key) = self.image_key {
             self.paint_api.delete_image(image_key);
+        }
+        if let Some(external_image_id) = self.external_image_id.take() {
+            self.external_image_id_manager.remove(&external_image_id);
         }
     }
 }

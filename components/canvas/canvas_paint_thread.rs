@@ -8,7 +8,7 @@ use std::{f32, thread};
 use crossbeam_channel::{Sender, select, unbounded};
 use euclid::default::{Rect, Size2D, Transform2D};
 use log::warn;
-use paint_api::CrossProcessPaintApi;
+use paint_api::{CanvasImageHandler, CrossProcessPaintApi, WebRenderExternalImageIdManager};
 use pixels::Snapshot;
 use profile_traits::mem::{
     ProcessReports, ProfilerChan, Report, ReportsChan, perform_memory_report,
@@ -20,20 +20,26 @@ use servo_canvas_traits::ConstellationCanvasMsg;
 use servo_canvas_traits::canvas::*;
 use webrender_api::ImageKey;
 
+use crate::backend::GenericDrawTarget;
 use crate::canvas_data::*;
 
 pub struct CanvasPaintThread {
     canvases: FxHashMap<CanvasId, Canvas>,
     next_canvas_id: CanvasId,
     paint_api: CrossProcessPaintApi,
+    external_image_id_manager: WebRenderExternalImageIdManager,
 }
 
 impl CanvasPaintThread {
-    fn new(paint_api: CrossProcessPaintApi) -> CanvasPaintThread {
+    fn new(
+        paint_api: CrossProcessPaintApi,
+        external_image_id_manager: WebRenderExternalImageIdManager,
+    ) -> CanvasPaintThread {
         CanvasPaintThread {
             canvases: FxHashMap::default(),
             next_canvas_id: CanvasId(0),
             paint_api,
+            external_image_id_manager,
         }
     }
 
@@ -42,6 +48,8 @@ impl CanvasPaintThread {
     pub fn start(
         paint_api: CrossProcessPaintApi,
         mem_profiler_chan: ProfilerChan,
+        external_image_id_manager: WebRenderExternalImageIdManager,
+        canvas_image_handler: CanvasImageHandler,
     ) -> (Sender<ConstellationCanvasMsg>, GenericSender<CanvasMsg>) {
         let (ipc_sender, ipc_receiver) = generic_channel::channel::<CanvasMsg>().unwrap();
         let msg_receiver = ipc_receiver.route_preserving_errors();
@@ -55,8 +63,9 @@ impl CanvasPaintThread {
             .name("Canvas".to_owned())
             .spawn(move || {
                 let _registration = registration;
-                let mut canvas_paint_thread = CanvasPaintThread::new(
-                    paint_api);
+                canvas_image_handler.install(Canvas::external_image_handler());
+                let mut canvas_paint_thread =
+                    CanvasPaintThread::new(paint_api, external_image_id_manager);
                 loop {
                     select! {
                         recv(msg_receiver) -> msg => {
@@ -106,7 +115,11 @@ impl CanvasPaintThread {
         let canvas_id = self.next_canvas_id;
         self.next_canvas_id.0 += 1;
 
-        let canvas = Canvas::new(size, self.paint_api.clone())?;
+        let canvas = Canvas::new(
+            size,
+            self.paint_api.clone(),
+            self.external_image_id_manager.clone(),
+        )?;
         self.canvases.insert(canvas_id, canvas);
 
         Some(canvas_id)
@@ -341,14 +354,39 @@ enum Canvas {
 }
 
 impl Canvas {
-    fn new(size: Size2D<u64>, paint_api: CrossProcessPaintApi) -> Option<Self> {
+    fn new(
+        size: Size2D<u64>,
+        paint_api: CrossProcessPaintApi,
+        external_image_id_manager: WebRenderExternalImageIdManager,
+    ) -> Option<Self> {
         match servo_config::pref!(dom_canvas_backend)
             .to_lowercase()
             .as_str()
         {
             #[cfg(feature = "vello")]
-            "vello" => Some(Self::Vello(CanvasData::new(size, paint_api))),
-            _ => Some(Self::VelloCPU(CanvasData::new(size, paint_api))),
+            "vello" => Some(Self::Vello(CanvasData::new(
+                size,
+                paint_api,
+                external_image_id_manager,
+            ))),
+            _ => Some(Self::VelloCPU(CanvasData::new(
+                size,
+                paint_api,
+                external_image_id_manager,
+            ))),
+        }
+    }
+
+    /// The external image handler for the configured backend, or `None` for a readback backend.
+    /// Queried once at canvas paint thread start-up.
+    fn external_image_handler() -> Option<Box<dyn paint_api::WebRenderExternalImageApi + Send>> {
+        match servo_config::pref!(dom_canvas_backend)
+            .to_lowercase()
+            .as_str()
+        {
+            #[cfg(feature = "vello")]
+            "vello" => crate::vello_backend::VelloDrawTarget::external_image_handler(),
+            _ => crate::vello_cpu_backend::VelloCPUDrawTarget::external_image_handler(),
         }
     }
 

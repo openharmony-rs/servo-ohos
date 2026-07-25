@@ -583,6 +583,49 @@ pub enum WebRenderImageHandlerType {
     WebGl,
     Media,
     WebGpu,
+    Canvas2D,
+}
+
+/// A shared, late-installable slot for the canvas 2D external image handler.
+///
+/// The canvas paint thread is created lazily, after the [`WebRenderExternalImageHandlers`]
+/// have already been handed to WebRender, so a canvas backend cannot be registered at
+/// painter start-up like the other handlers. Instead the painter registers this shared slot
+/// up front and the canvas paint thread installs the backend-provided handler into it once it
+/// starts. Backends that present via CPU readback never install one and this stays inert.
+#[derive(Clone, Default)]
+pub struct CanvasImageHandler(Arc<Mutex<Option<Box<dyn WebRenderExternalImageApi + Send>>>>);
+
+impl CanvasImageHandler {
+    /// Install (or clear) the backend-provided handler. Called by the canvas paint thread at
+    /// start-up.
+    pub fn install(&self, handler: Option<Box<dyn WebRenderExternalImageApi + Send>>) {
+        *self.0.lock().unwrap() = handler;
+    }
+}
+
+impl WebRenderExternalImageApi for CanvasImageHandler {
+    fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, UntypedSize2D<i32>) {
+        let mut handler = self.0.lock().unwrap();
+        let Some(handler) = handler.as_mut() else {
+            return (ExternalImageSource::Invalid, UntypedSize2D::zero());
+        };
+        let (source, size) = handler.lock(id);
+        // Canvas external images are always presented as GPU textures.
+        let source = match source {
+            ExternalImageSource::NativeTexture(texture_id) => {
+                ExternalImageSource::NativeTexture(texture_id)
+            },
+            _ => ExternalImageSource::Invalid,
+        };
+        (source, size)
+    }
+
+    fn unlock(&mut self, id: u64) {
+        if let Some(handler) = self.0.lock().unwrap().as_mut() {
+            handler.unlock(id);
+        }
+    }
 }
 
 /// List of WebRender external images to be shared among all external image
@@ -625,6 +668,8 @@ pub struct WebRenderExternalImageHandlers {
     media_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     /// WebGPU handler.
     webgpu_handler: Option<Box<dyn WebRenderExternalImageApi>>,
+    /// Canvas 2D handler.
+    canvas2d_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     /// A [`WebRenderExternalImageIdManager`] responsible for creating new [`ExternalImageId`]s.
     /// This is shared with the WebGL, WebGPU, and hardware-accelerated media threads and
     /// all other instances of [`WebRenderExternalImageHandlers`] -- one per WebRender instance.
@@ -637,6 +682,7 @@ impl WebRenderExternalImageHandlers {
             webgl_handler: Default::default(),
             media_handler: Default::default(),
             webgpu_handler: Default::default(),
+            canvas2d_handler: Default::default(),
             id_manager,
         }
     }
@@ -654,6 +700,7 @@ impl WebRenderExternalImageHandlers {
             WebRenderImageHandlerType::WebGl => self.webgl_handler = Some(handler),
             WebRenderImageHandlerType::Media => self.media_handler = Some(handler),
             WebRenderImageHandlerType::WebGpu => self.webgpu_handler = Some(handler),
+            WebRenderImageHandlerType::Canvas2D => self.canvas2d_handler = Some(handler),
         }
     }
 }
@@ -703,6 +750,24 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
                     source,
                 }
             },
+            WebRenderImageHandlerType::Canvas2D => {
+                let (source, size) = self.canvas2d_handler.as_mut().unwrap().lock(key.0);
+                match source {
+                    ExternalImageSource::NativeTexture(texture_id) => ExternalImage {
+                        // The buffer-queue backing (OH_NativeImage) presents the frame already
+                        // oriented as the canvas drew it, so sample top-down with an identity uv.
+                        uv: TexelRect::new(0.0, 0.0, size.width as f32, size.height as f32),
+                        source: ExternalImageSource::NativeTexture(texture_id),
+                    },
+                    // A canvas backend may transiently have no frame yet (first-present bootstrap)
+                    // or be tearing down while WR still references the id. Present nothing rather
+                    // than crashing the compositor.
+                    _ => ExternalImage {
+                        uv: TexelRect::new(0.0, 0.0, 0.0, 0.0),
+                        source: ExternalImageSource::Invalid,
+                    },
+                }
+            },
         }
     }
 
@@ -718,6 +783,9 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
             WebRenderImageHandlerType::Media => self.media_handler.as_mut().unwrap().unlock(key.0),
             WebRenderImageHandlerType::WebGpu => {
                 self.webgpu_handler.as_mut().unwrap().unlock(key.0)
+            },
+            WebRenderImageHandlerType::Canvas2D => {
+                self.canvas2d_handler.as_mut().unwrap().unlock(key.0)
             },
         };
     }

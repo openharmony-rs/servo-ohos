@@ -177,6 +177,11 @@ impl Painter {
             WebRenderImageHandlerType::WebGpu,
         );
 
+        external_image_handlers.set_handler(
+            Box::new(paint.canvas_image_handler()),
+            WebRenderImageHandlerType::Canvas2D,
+        );
+
         WindowGLContext::initialize_image_handler(&mut external_image_handlers);
 
         let embedder_to_constellation_sender = paint.embedder_to_constellation_sender.clone();
