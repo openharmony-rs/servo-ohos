@@ -2615,7 +2615,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3185,7 +3185,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6172,13 +6172,21 @@ dependencies = [
 [[package]]
 name = "ohos-pasteboard"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96ec383566f92ce8534521501d66797e7c9dd5cf0bc967a158884c04a5354a50"
 dependencies = [
  "ohos-pasteboard-sys",
+ "udmf",
 ]
 
 [[package]]
 name = "ohos-pasteboard-sys"
-version = "0.1.0"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52a26fed7fe51d995248785dddb53afeb3f862a4094d406e09de7ab36169411c"
+dependencies = [
+ "ohos-sys-opaque-types",
+]
 
 [[package]]
 name = "ohos-sys-opaque-types"
@@ -7439,7 +7447,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7496,7 +7504,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10226,7 +10234,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10773,6 +10781,26 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "udmf"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12c8d635b4210133f8b5b5c2c70475326319ee0692756bbf61248574f48c8c0e"
+dependencies = [
+ "ohos-sys-opaque-types",
+ "thiserror 2.0.18",
+ "udmf-sys",
+]
+
+[[package]]
+name = "udmf-sys"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9df7a0b7922a95eb8b827746d7f2d8f623331ab416aca833edd177e0775f961e"
+dependencies = [
+ "ohos-sys-opaque-types",
+]
 
 [[package]]
 name = "uds_windows"
@@ -11904,7 +11932,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
