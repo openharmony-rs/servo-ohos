@@ -303,13 +303,42 @@ def region_changed(
 # --- fixtures --------------------------------------------------------------------------
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--target",
+        default=None,
+        help="hdc target serial to run against. Required when more than one device is attached; "
+        "may also be given as HDC_TARGET.",
+    )
+
+
 @pytest.fixture(scope="session")
-def device() -> HarmonyDevice:
-    hdc = Hdc()
-    targets = hdc.list_targets()
+def hdc_target(pytestconfig: pytest.Config) -> str:
+    """The hdc serial every fixture drives, mirroring deploy.py's --target semantics.
+
+    A lone attached device is used implicitly, but an ambiguous fleet has to be
+    disambiguated: picking the first listed target silently drives whichever device hdc
+    happened to enumerate first, which on a multi-device bench is somebody else's phone.
+    """
+    explicit = pytestconfig.getoption("--target") or os.environ.get("HDC_TARGET")
+    targets = Hdc().list_targets()
     if not targets:
         pytest.skip("no hdc device connected")
-    dev = hdc.connect(targets[0])
+    if explicit:
+        if explicit not in targets:
+            pytest.fail(f"requested target {explicit!r} is not connected; attached: {', '.join(targets)}")
+        return explicit
+    if len(targets) > 1:
+        pytest.fail(
+            "multiple hdc targets connected; select one with --target=<serial> or HDC_TARGET=<serial>: "
+            + ", ".join(targets)
+        )
+    return targets[0]
+
+
+@pytest.fixture(scope="session")
+def device(hdc_target: str) -> HarmonyDevice:
+    dev = Hdc().connect(hdc_target)
     probe = sh(dev, f"if [ -f {SHIM_PATH} ]; then echo __OK__; else echo __MISSING__; fi", check=False)
     if "__MISSING__" in probe:
         pytest.skip(f"Servo shim not deployed at {SHIM_PATH} -- run deploy.py first")
@@ -382,7 +411,7 @@ class _FixtureHandler(http.server.BaseHTTPRequestHandler):
 
 
 @pytest.fixture(scope="session")
-def http_server(device: HarmonyDevice):
+def http_server(device: HarmonyDevice, hdc_target: str):
     """Base URL of a host-side fixture server, reachable from the device at 127.0.0.1.
 
     An `hdc rport` reverse-forward makes the host server reachable on device loopback.
@@ -395,7 +424,7 @@ def http_server(device: HarmonyDevice):
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    target = Hdc().list_targets()[0]
+    target = hdc_target
     forward = f"tcp:{port}"
     result = subprocess.run(
         ["hdc", "-t", target, "rport", forward, forward],
