@@ -38,6 +38,10 @@ re-run deploy with `--no-reboot --no-enforce`, relaunch. The test app is built, 
 installed by `uv run ports/arkweb/tools/build_test_app.py` (see its docstring for SDK
 prerequisites).
 
+Deploying refuses devices running a vendor distribution of OpenHarmony (HarmonyOS and the
+like), since the shim is only reachable through the SERVO branch of a patched
+`nweb_helper` and those devices ship their own ArkWeb. `--allow-non-openharmony` overrides.
+
 ## On-device tests
 
 The suite in `tools/test_*.py` is pytest-based and drives the test app on a connected
