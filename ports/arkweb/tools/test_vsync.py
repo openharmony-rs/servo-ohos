@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from conftest import data_url, read_log, region_changed
+from conftest import clear_log, data_url, read_log, region_changed
 
 # Position/size in vh/vw so screen coordinates are density-independent.
 ANIM = """<html><head><meta name=viewport content="width=device-width,initial-scale=1"></head>
@@ -43,9 +43,13 @@ def test_frames_are_vsync_driven(launch):
     device = launch(url=data_url(ANIM))
     # The OHOS Vsync framework (tag C01400/Vsync) logs our named connection (NativeVsync
     # "ServoArkWeb-<id>") when it services vsync -- proof the frames are vsync-driven,
-    # observable without any engine-side instrumentation. The "first vsync" line is logged
-    # once and the hilog buffer is busy, so poll a single snapshot rather than reading twice.
-    deadline = time.time() + 15.0
+    # observable without any engine-side instrumentation. It re-logs periodically while the
+    # connection is serviced, but the 256K hilog buffer wraps within seconds on a busy device,
+    # so any line emitted during launch is typically evicted before this runs. Clear the
+    # buffer and wait for the next servicing to land in an empty one; measured at ~10s
+    # between lines, hence the window below.
+    clear_log(device)
+    deadline = time.time() + 40.0
     vsync_lines: list[str] = []
     while time.time() < deadline and not vsync_lines:
         vsync_lines = [line for line in read_log(device).splitlines() if "Vsync" in line and "ServoArkWeb-" in line]
