@@ -8,7 +8,7 @@ use std::{f32, thread};
 use crossbeam_channel::{Sender, select, unbounded};
 use euclid::default::{Rect, Size2D, Transform2D};
 use log::warn;
-use paint_api::CrossProcessPaintApi;
+use paint_api::{CanvasImageHandler, CrossProcessPaintApi, WebRenderExternalImageIdManager};
 use pixels::Snapshot;
 use profile_traits::mem::{
     ProcessReports, ProfilerChan, Report, ReportsChan, perform_memory_report,
@@ -20,20 +20,26 @@ use servo_canvas_traits::ConstellationCanvasMsg;
 use servo_canvas_traits::canvas::*;
 use webrender_api::ImageKey;
 
+use crate::backend::GenericDrawTarget;
 use crate::canvas_data::*;
 
 pub struct CanvasPaintThread {
     canvases: FxHashMap<CanvasId, Canvas>,
     next_canvas_id: CanvasId,
     paint_api: CrossProcessPaintApi,
+    external_image_id_manager: WebRenderExternalImageIdManager,
 }
 
 impl CanvasPaintThread {
-    fn new(paint_api: CrossProcessPaintApi) -> CanvasPaintThread {
+    fn new(
+        paint_api: CrossProcessPaintApi,
+        external_image_id_manager: WebRenderExternalImageIdManager,
+    ) -> CanvasPaintThread {
         CanvasPaintThread {
             canvases: FxHashMap::default(),
             next_canvas_id: CanvasId(0),
             paint_api,
+            external_image_id_manager,
         }
     }
 
@@ -42,6 +48,8 @@ impl CanvasPaintThread {
     pub fn start(
         paint_api: CrossProcessPaintApi,
         mem_profiler_chan: ProfilerChan,
+        external_image_id_manager: WebRenderExternalImageIdManager,
+        canvas_image_handler: CanvasImageHandler,
     ) -> (Sender<ConstellationCanvasMsg>, GenericSender<CanvasMsg>) {
         let (ipc_sender, ipc_receiver) = generic_channel::channel::<CanvasMsg>().unwrap();
         let msg_receiver = ipc_receiver.route_preserving_errors();
@@ -55,8 +63,9 @@ impl CanvasPaintThread {
             .name("Canvas".to_owned())
             .spawn(move || {
                 let _registration = registration;
-                let mut canvas_paint_thread = CanvasPaintThread::new(
-                    paint_api);
+                canvas_image_handler.install(Canvas::external_image_handler());
+                let mut canvas_paint_thread =
+                    CanvasPaintThread::new(paint_api, external_image_id_manager);
                 loop {
                     select! {
                         recv(msg_receiver) -> msg => {
@@ -106,7 +115,11 @@ impl CanvasPaintThread {
         let canvas_id = self.next_canvas_id;
         self.next_canvas_id.0 += 1;
 
-        let canvas = Canvas::new(size, self.paint_api.clone())?;
+        let canvas = Canvas::new(
+            size,
+            self.paint_api.clone(),
+            self.external_image_id_manager.clone(),
+        )?;
         self.canvases.insert(canvas_id, canvas);
 
         Some(canvas_id)
@@ -337,18 +350,77 @@ impl CanvasPaintThread {
 enum Canvas {
     #[cfg(feature = "vello")]
     Vello(CanvasData<crate::vello_backend::VelloDrawTarget>),
+    #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+    OhDrawing(CanvasData<crate::ohdrawing_backend::OhDrawingDrawTarget>),
     VelloCPU(CanvasData<crate::vello_cpu_backend::VelloCPUDrawTarget>),
 }
 
+/// Report the backend the first canvas resolved to.
+///
+/// A backend that was not compiled into this build falls through to `vello_cpu` silently, which
+/// has already invalidated one measurement campaign; say so loudly instead.
+fn report_backend(requested: &str, selected: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if requested.is_empty() || requested == selected {
+            log::info!("canvas: 2D backend is {selected}");
+        } else {
+            log::warn!(
+                "canvas: 2D backend {requested:?} is unavailable in this build, using {selected}"
+            );
+        }
+    });
+}
+
 impl Canvas {
-    fn new(size: Size2D<u64>, paint_api: CrossProcessPaintApi) -> Option<Self> {
+    fn new(
+        size: Size2D<u64>,
+        paint_api: CrossProcessPaintApi,
+        external_image_id_manager: WebRenderExternalImageIdManager,
+    ) -> Option<Self> {
+        let requested = servo_config::pref!(dom_canvas_backend).to_lowercase();
+        match requested.as_str() {
+            #[cfg(feature = "vello")]
+            "vello" => {
+                report_backend(&requested, "vello");
+                Some(Self::Vello(CanvasData::new(
+                    size,
+                    paint_api,
+                    external_image_id_manager,
+                )))
+            },
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            "ohdrawing" => {
+                report_backend(&requested, "ohdrawing");
+                Some(Self::OhDrawing(CanvasData::new(
+                    size,
+                    paint_api,
+                    external_image_id_manager,
+                )))
+            },
+            _ => {
+                report_backend(&requested, "vello_cpu");
+                Some(Self::VelloCPU(CanvasData::new(
+                    size,
+                    paint_api,
+                    external_image_id_manager,
+                )))
+            },
+        }
+    }
+
+    /// The external image handler for the configured backend, or `None` for a readback backend.
+    /// Queried once at canvas paint thread start-up.
+    fn external_image_handler() -> Option<Box<dyn paint_api::WebRenderExternalImageApi + Send>> {
         match servo_config::pref!(dom_canvas_backend)
             .to_lowercase()
             .as_str()
         {
             #[cfg(feature = "vello")]
-            "vello" => Some(Self::Vello(CanvasData::new(size, paint_api))),
-            _ => Some(Self::VelloCPU(CanvasData::new(size, paint_api))),
+            "vello" => crate::vello_backend::VelloDrawTarget::external_image_handler(),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            "ohdrawing" => crate::ohdrawing_backend::OhDrawingDrawTarget::external_image_handler(),
+            _ => crate::vello_cpu_backend::VelloCPUDrawTarget::external_image_handler(),
         }
     }
 
@@ -360,6 +432,8 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.collect_memory_report(canvas_id, ops),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.collect_memory_report(canvas_id, ops),
             Canvas::VelloCPU(canvas_data) => canvas_data.collect_memory_report(canvas_id, ops),
         }
     }
@@ -368,6 +442,8 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.set_image_key(image_key),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.set_image_key(image_key),
             Canvas::VelloCPU(canvas_data) => canvas_data.set_image_key(image_key),
         }
     }
@@ -376,6 +452,8 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.pop_clips(clips),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.pop_clips(clips),
             Canvas::VelloCPU(canvas_data) => canvas_data.pop_clips(clips),
         }
     }
@@ -393,6 +471,16 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.stroke_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.stroke_text(
                 text_bounds,
                 text_runs,
                 fill_or_stroke_style,
@@ -432,6 +520,15 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.fill_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
             Canvas::VelloCPU(canvas_data) => canvas_data.fill_text(
                 text_bounds,
                 text_runs,
@@ -456,6 +553,10 @@ impl Canvas {
             Canvas::Vello(canvas_data) => {
                 canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
             },
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => {
+                canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
+            },
             Canvas::VelloCPU(canvas_data) => {
                 canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
             },
@@ -474,6 +575,15 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.stroke_rect(
+                rect,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.stroke_rect(
                 rect,
                 style,
                 line_options,
@@ -511,6 +621,15 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.fill_path(
+                path,
+                fill_rule,
+                style,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
             Canvas::VelloCPU(canvas_data) => canvas_data.fill_path(
                 path,
                 fill_rule,
@@ -541,6 +660,15 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.stroke_path(
+                path,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
             Canvas::VelloCPU(canvas_data) => canvas_data.stroke_path(
                 path,
                 style,
@@ -556,6 +684,8 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.clear_rect(rect, transform),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.clear_rect(rect, transform),
             Canvas::VelloCPU(canvas_data) => canvas_data.clear_rect(rect, transform),
         }
     }
@@ -582,6 +712,16 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.draw_image(
+                snapshot,
+                dest_rect,
+                source_rect,
+                smoothing_enabled,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
             Canvas::VelloCPU(canvas_data) => canvas_data.draw_image(
                 snapshot,
                 dest_rect,
@@ -598,6 +738,8 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.read_pixels(read_rect),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.read_pixels(read_rect),
             Canvas::VelloCPU(canvas_data) => canvas_data.read_pixels(read_rect),
         }
     }
@@ -606,6 +748,8 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
             Canvas::VelloCPU(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
         }
     }
@@ -614,6 +758,8 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.put_image_data(snapshot, rect),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.put_image_data(snapshot, rect),
             Canvas::VelloCPU(canvas_data) => canvas_data.put_image_data(snapshot, rect),
         }
     }
@@ -622,6 +768,8 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
             Canvas::VelloCPU(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
         }
     }
@@ -630,6 +778,8 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.recreate(size),
+            #[cfg(all(feature = "ohdrawing", target_env = "ohos"))]
+            Canvas::OhDrawing(canvas_data) => canvas_data.recreate(size),
             Canvas::VelloCPU(canvas_data) => canvas_data.recreate(size),
         }
     }

@@ -22,7 +22,7 @@ use image::RgbaImage;
 use log::{debug, warn};
 use paint_api::rendering_context::RenderingContext;
 use paint_api::{
-    PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
+    CanvasImageHandler, PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
     WebRenderExternalImageIdManager, WebViewTrait,
 };
 use profile_traits::mem::{
@@ -140,6 +140,10 @@ pub struct Paint {
     /// An map of external images shared between all `WebGpuExternalImages`.
     #[cfg(feature = "webgpu")]
     webgpu_image_map: std::cell::OnceCell<WebGpuExternalImageMap>,
+
+    /// The shared handler slot for canvas 2D external images. Registered with WebRender at
+    /// painter start-up and installed by the canvas paint thread once it starts.
+    canvas_image_handler: CanvasImageHandler,
 }
 
 /// Why we need to be repainted. This is used for debugging.
@@ -213,6 +217,7 @@ impl Paint {
             webxr_main_thread: RefCell::new(webxr_main_thread),
             #[cfg(feature = "webgpu")]
             webgpu_image_map: Default::default(),
+            canvas_image_handler: Default::default(),
         }))
     }
 
@@ -333,6 +338,10 @@ impl Paint {
     #[cfg(feature = "webgpu")]
     pub fn webgpu_image_map(&self) -> WebGpuExternalImageMap {
         self.webgpu_image_map.get_or_init(Default::default).clone()
+    }
+
+    pub fn canvas_image_handler(&self) -> CanvasImageHandler {
+        self.canvas_image_handler.clone()
     }
 
     pub fn webviews_needing_repaint(&self) -> Vec<WebViewId> {

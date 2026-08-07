@@ -24,7 +24,7 @@ use std::thread;
 use cookie::Cookie;
 use cxx::{CxxString, CxxVector, SharedPtr};
 use dpi::PhysicalSize;
-use log::{LevelFilter, error, info};
+use log::{LevelFilter, error, info, warn};
 use ohos_ime::{AttachOptions, Ime, ImeProxy, RawTextEditorProxy};
 use ohos_ime_sys::types::InputMethod_EnterKeyType;
 use ohos_vsync::NativeVsync;
@@ -37,14 +37,49 @@ use servo::{
     DevicePoint, DeviceVector2D, EmbedderControl, EmbedderControlId, EventLoopWaker, FilePicker,
     ImeEvent, InputEvent, InputMethodControl, InputMethodType, JSValue, Key, KeyState,
     KeyboardEvent, LoadStatus, MediaSessionActionType, MediaSessionEvent, NamedKey, Opts,
-    PermissionFeature, PermissionRequest, Preferences, RefreshDriver, RenderingContext, Scroll,
-    SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog, TouchEvent,
-    TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate,
-    WindowRenderingContext,
+    PermissionFeature, PermissionRequest, PrefValue, Preferences, RefreshDriver, RenderingContext,
+    Scroll, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog,
+    TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
+    WebViewDelegate, WindowRenderingContext,
 };
 use url::Url;
 
 use crate::bridge::ffi::{InitOptions, WebViewClient};
+use crate::convert::parse_pref_args;
+
+/// Apply `--pref name=value` arguments to `preferences`.
+///
+/// `Preferences::set_value` panics on an unknown name or a value of the wrong type. That is fine
+/// for a shell parsing its own command line, but here the arguments arrive from the application
+/// through ACE, and this runs inside a system process, so each setting is checked first and a bad
+/// one is reported and skipped. The value is parsed as the type the preference already holds
+/// rather than guessed from its spelling, so `--pref fonts_default=123` stays the string "123".
+fn apply_pref_args(preferences: &mut Preferences, args: &[String]) {
+    for (name, value) in parse_pref_args(args) {
+        if !Preferences::exists(name) {
+            warn!("[arkweb] ignoring unknown preference {name:?}");
+            continue;
+        }
+        let parsed = match preferences.get_value(name) {
+            PrefValue::Bool(_) => value.parse::<bool>().map(PrefValue::Bool).ok(),
+            PrefValue::Int(_) => value.parse::<i64>().map(PrefValue::Int).ok(),
+            PrefValue::UInt(_) => value.parse::<u64>().map(PrefValue::UInt).ok(),
+            PrefValue::Float(_) => value.parse::<f64>().map(PrefValue::Float).ok(),
+            PrefValue::Str(_) => Some(PrefValue::Str(value.to_owned())),
+            PrefValue::Array(_) => None,
+        };
+        match parsed {
+            Some(parsed) => {
+                info!("[arkweb] preference {name} = {parsed:?}");
+                preferences.set_value(name, parsed);
+            },
+            None => warn!(
+                "[arkweb] ignoring preference {name:?}: {value:?} is not a valid {}",
+                Preferences::type_of(name)
+            ),
+        }
+    }
+}
 
 /// A `SharedPtr` to the C++ embedder callback sink, made `Send` so it can travel to the servo
 /// thread inside an [`Action`].
@@ -547,7 +582,12 @@ impl ServoThread {
     /// Build the Servo engine. This is the expensive step (`Servo::new` spins up the constellation,
     /// networking, JS and GPU machinery), split out of [`Self::run`] so a `lazy` LibraryLoaded can
     /// defer it until a webview is actually needed.
-    fn build(waker_chan: Sender<Action>, config_dir: PathBuf, proxy: String) -> ServoThread {
+    fn build(
+        waker_chan: Sender<Action>,
+        config_dir: PathBuf,
+        proxy: String,
+        pref_args: Vec<String>,
+    ) -> ServoThread {
         // Install the crypto provider Servo's rustls-based networking requires for TLS.
         if rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
@@ -583,6 +623,8 @@ impl ServoThread {
             preferences.network_http_proxy_uri = proxy.clone();
             preferences.network_https_proxy_uri = proxy;
         }
+        // Last, so an explicit `--pref` from the application wins over the defaults set above.
+        apply_pref_args(&mut preferences, &pref_args);
         let servo = ServoBuilder::default()
             .opts(opts)
             .event_loop_waker(waker)
@@ -599,25 +641,27 @@ impl ServoThread {
         waker_chan: Sender<Action>,
         config_dir: PathBuf,
         proxy: String,
+        pref_args: Vec<String>,
         lazy: bool,
     ) {
         // On a `lazy` (preload/prewarm) load, defer `Servo::new` until the first action arrives —
         // i.e. until a webview is actually created or a bridge call needs the engine — so a
         // preload-only process that never uses a webview pays nothing. `WakeUp`/`Vsync` can only be
         // produced once the engine exists, so the first action here is always one that needs it.
-        let mut params = Some((waker_chan, config_dir, proxy));
+        let mut params = Some((waker_chan, config_dir, proxy, pref_args));
         let mut thread: Option<ServoThread> = if lazy {
             info!("[arkweb] lazy load: deferring Servo::new until first use");
             None
         } else {
-            let (waker_chan, config_dir, proxy) = params.take().expect("params present");
-            Some(ServoThread::build(waker_chan, config_dir, proxy))
+            let (waker_chan, config_dir, proxy, pref_args) = params.take().expect("params present");
+            Some(ServoThread::build(waker_chan, config_dir, proxy, pref_args))
         };
         while let Ok(action) = rx.recv() {
             if thread.is_none() {
-                let (waker_chan, config_dir, proxy) = params.take().expect("params present");
+                let (waker_chan, config_dir, proxy, pref_args) =
+                    params.take().expect("params present");
                 info!("[arkweb] building Servo on first use (deferred lazy init)");
-                thread = Some(ServoThread::build(waker_chan, config_dir, proxy));
+                thread = Some(ServoThread::build(waker_chan, config_dir, proxy, pref_args));
             }
             let thread = thread.as_mut().expect("built above");
             thread.handle(action);
@@ -1569,9 +1613,10 @@ pub fn initialize(options: InitOptions, lazy: bool) -> bool {
         let (tx, rx) = mpsc::channel::<Action>();
         let waker_chan = tx.clone();
         let proxy = options.proxy;
+        let pref_args = options.extra_args;
         match thread::Builder::new()
             .name("servo-main".into())
-            .spawn(move || ServoThread::run(rx, waker_chan, config_dir, proxy, lazy))
+            .spawn(move || ServoThread::run(rx, waker_chan, config_dir, proxy, pref_args, lazy))
         {
             Ok(_) => {
                 // Publish the channel only once the draining thread is alive. On a spawn failure the

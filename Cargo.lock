@@ -6147,6 +6147,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee8ebdc19fbffb06eead79d6ab628b05fa8514d5ac881540719d04469c772738"
 
 [[package]]
+name = "ohos-drawing"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b45d5ee575b3ab3c454c785b0627a3a677762d89fefb2280bf4a1578f2fbc71f"
+dependencies = [
+ "ohos-drawing-sys",
+ "ohos-sys-opaque-types",
+ "ohos-window-sys",
+]
+
+[[package]]
 name = "ohos-drawing-sys"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8017,6 +8028,7 @@ dependencies = [
  "futures-intrusive",
  "kurbo",
  "log",
+ "ohos-drawing",
  "peniko",
  "pollster",
  "rustc-hash 2.1.3",

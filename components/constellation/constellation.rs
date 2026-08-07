@@ -127,8 +127,8 @@ use net::image_cache::ImageCacheFactoryImpl;
 use net_traits::pub_domains::registered_domain_name;
 use net_traits::{self, AsyncRuntime, FetchThread, ResourceThreads};
 use paint_api::{
-    PaintMessage, PaintProxy, PinchZoomInfos, PipelineExitSource, SendableFrameTree,
-    WebRenderExternalImageIdManager,
+    CanvasImageHandler, PaintMessage, PaintProxy, PinchZoomInfos, PipelineExitSource,
+    SendableFrameTree, WebRenderExternalImageIdManager,
 };
 use profile_traits::mem::ProfilerMsg;
 use profile_traits::{mem, time};
@@ -403,6 +403,14 @@ pub struct Constellation<STF, SWF> {
     #[cfg(feature = "webgpu")]
     webrender_wgpu: WebRenderWGPU,
 
+    /// A [`WebRenderExternalImageIdManager`] used to allocate [`ExternalImageId`]s for canvases
+    /// that present as WebRender external images.
+    webrender_external_image_id_manager: WebRenderExternalImageIdManager,
+
+    /// The shared handler slot into which the canvas paint thread installs its backend-provided
+    /// external image handler.
+    canvas_image_handler: CanvasImageHandler,
+
     /// A map of message-port Id to info.
     message_ports: FxHashMap<MessagePortId, MessagePortInfo>,
 
@@ -578,6 +586,10 @@ pub struct InitialConstellationState {
     /// A [`WebRenderExternalImageIdManager`] used to lazily start up the WebGPU threads.
     pub webrender_external_image_id_manager: WebRenderExternalImageIdManager,
 
+    /// The shared handler slot into which the canvas paint thread installs its backend-provided
+    /// external image handler once it starts.
+    pub canvas_image_handler: CanvasImageHandler,
+
     /// Entry point to create and get channels to a WebGLThread.
     pub webgl_threads: Option<WebGLThreads>,
 
@@ -672,7 +684,9 @@ where
 
                 #[cfg(feature = "webgpu")]
                 let webrender_wgpu = WebRenderWGPU {
-                    webrender_external_image_id_manager: state.webrender_external_image_id_manager,
+                    webrender_external_image_id_manager: state
+                        .webrender_external_image_id_manager
+                        .clone(),
                     wgpu_image_map: state.wgpu_image_map,
                 };
 
@@ -723,6 +737,8 @@ where
                     document_states: Default::default(),
                     #[cfg(feature = "webgpu")]
                     webrender_wgpu,
+                    webrender_external_image_id_manager: state.webrender_external_image_id_manager,
+                    canvas_image_handler: state.canvas_image_handler,
                     shutting_down: false,
                     handled_warnings: VecDeque::new(),
                     random_pipeline_closure: random_pipeline_closure_probability.map(|probability| {
@@ -6210,6 +6226,8 @@ where
         CanvasPaintThread::start(
             self.paint_proxy.cross_process_paint_api.clone(),
             self.mem_profiler_chan.clone(),
+            self.webrender_external_image_id_manager.clone(),
+            self.canvas_image_handler.clone(),
         )
     }
 

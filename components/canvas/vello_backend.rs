@@ -37,7 +37,7 @@ use vello::wgpu::{
 use vello::{kurbo, peniko};
 use webrender_api::{ImageDescriptor, ImageDescriptorFlags};
 
-use crate::backend::{CanvasStoreSizesPerType, Convert as _, GenericDrawTarget};
+use crate::backend::{CanvasStoreSizesPerType, Convert as _, GenericDrawTarget, PresentationData};
 use crate::canvas_data::Filter;
 
 thread_local! {
@@ -597,9 +597,7 @@ impl GenericDrawTarget for VelloDrawTarget {
         })
     }
 
-    fn image_descriptor_and_serializable_data(
-        &mut self,
-    ) -> (ImageDescriptor, SerializableImageData) {
+    fn present(&mut self) -> (ImageDescriptor, PresentationData) {
         let size = self.size;
         let stride = self.padded_byte_width;
         self.map_read(|data| {
@@ -617,7 +615,7 @@ impl GenericDrawTarget for VelloDrawTarget {
             } else {
                 GenericSharedMemory::from_byte(0, size.area() as usize * 4)
             });
-            (image_desc, data)
+            (image_desc, PresentationData::Raw(data))
         })
     }
 

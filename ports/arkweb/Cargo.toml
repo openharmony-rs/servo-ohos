@@ -13,6 +13,19 @@ description = "Servo as an alternative ArkWeb (OpenHarmony) webview backend."
 name = "servo_arkweb"
 crate-type = ["cdylib"]
 
+[features]
+# Compile in the OH_Drawing-backed canvas 2D backend. Off by default; once built in, select it at
+# runtime with `--pref=dom_canvas_backend=ohdrawing`.
+#
+# KNOWN BROKEN, pending investigation: a continuously animating full-size canvas kills the
+# application process on a rk3568 board (OpenHarmony-7.0.0.25, Mali-G52). The Mali driver requests
+# a graphics buffer during glClear, libsurface's GetOrResetDisplayBuffer() yields null and
+# DisplayBufferHdiImpl::AddDeathRecipient dereferences it. The same page survives here on
+# vello_cpu, and survives on ohdrawing in servoshell, so something about this process is the
+# trigger. Note the on-device suite passes with this backend selected -- none of its pages hold a
+# sustained animating canvas, so a green run is not evidence the backend is usable here.
+ohdrawing = ["servo/ohdrawing"]
+
 # All runtime dependencies are gated on the OpenHarmony target environment. On any
 # other target (e.g. host `./mach check`) this crate compiles to an empty library.
 # Note: freetype is bundled (compiled from source) by default on ohos; there is no

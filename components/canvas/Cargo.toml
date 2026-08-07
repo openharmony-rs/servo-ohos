@@ -14,6 +14,7 @@ name = "servo_canvas"
 path = "lib.rs"
 
 [features]
+ohdrawing = ["dep:ohos-drawing"]
 tracing = ["dep:tracing"]
 vello = ["dep:vello", "dep:pollster", "dep:futures-intrusive"]
 
@@ -41,3 +42,6 @@ tracing = { workspace = true, optional = true }
 vello = { workspace = true, optional = true }
 vello_cpu = { workspace = true }
 webrender_api = { workspace = true }
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+ohos-drawing = { workspace = true, optional = true, features = ["native-image"] }
