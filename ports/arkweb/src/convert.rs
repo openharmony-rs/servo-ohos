@@ -29,6 +29,31 @@ pub(crate) fn printable_char(unicode: i32) -> Option<char> {
         .filter(|c| !c.is_control())
 }
 
+/// Pick the `--pref` settings out of the extra arguments ACE hands the engine, as
+/// `(name, value)` pairs in the order given. Both `--pref name=value` and `--pref=name=value`
+/// are accepted, matching how servoshell spells it; a bare name means `true`, so `--pref
+/// dom_bluetooth_enabled` enables it. Arguments that are not `--pref` are ignored, as is a
+/// trailing `--pref` with nothing after it.
+pub(crate) fn parse_pref_args(args: &[String]) -> Vec<(&str, &str)> {
+    let mut prefs = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let setting = if let Some(setting) = arg.strip_prefix("--pref=") {
+            setting
+        } else if arg == "--pref" {
+            let Some(setting) = args.next() else { break };
+            setting.as_str()
+        } else {
+            continue;
+        };
+        match setting.split_once('=') {
+            Some((name, value)) => prefs.push((name, value)),
+            None => prefs.push((setting, "true")),
+        }
+    }
+    prefs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +104,44 @@ mod tests {
         assert_eq!(printable_char(9), None); // tab (control)
         assert_eq!(printable_char(13), None); // carriage return (control)
         assert_eq!(printable_char(0xD800), None); // lone surrogate, not a scalar value
+    }
+
+    fn args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[test]
+    fn parse_pref_args_accepts_both_spellings() {
+        let both = args(&["--pref=a=1", "--pref", "b=2"]);
+        assert_eq!(parse_pref_args(&both), vec![("a", "1"), ("b", "2")]);
+    }
+
+    #[test]
+    fn parse_pref_args_defaults_bare_name_to_true() {
+        assert_eq!(
+            parse_pref_args(&args(&["--pref=dom_bluetooth_enabled"])),
+            vec![("dom_bluetooth_enabled", "true")]
+        );
+    }
+
+    #[test]
+    fn parse_pref_args_keeps_value_separators() {
+        // Only the first `=` separates name from value, so URLs and other `=`-bearing values survive.
+        assert_eq!(
+            parse_pref_args(&args(&["--pref=network_http_proxy_uri=http://h:1/?a=b"])),
+            vec![("network_http_proxy_uri", "http://h:1/?a=b")]
+        );
+    }
+
+    #[test]
+    fn parse_pref_args_ignores_other_arguments() {
+        let mixed = args(&["--url", "https://servo.org", "--pref=a=1", "-x"]);
+        assert_eq!(parse_pref_args(&mixed), vec![("a", "1")]);
+    }
+
+    #[test]
+    fn parse_pref_args_tolerates_dangling_pref() {
+        assert_eq!(parse_pref_args(&args(&["--pref"])), vec![]);
+        assert_eq!(parse_pref_args(&args(&[])), vec![]);
     }
 }

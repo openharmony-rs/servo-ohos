@@ -48,8 +48,22 @@ servo::embedder::InitOptions ParseInitOptions(const std::shared_ptr<NWebEngineIn
                 options.user_data_dir = arg.substr(kUserDataDir.size());
             } else if (arg.rfind(kLang, 0) == 0) {
                 options.lang = arg.substr(kLang.size());
+            } else {
+                // Anything else is handed to the engine as-is; `--pref name=value` is applied to
+                // Servo's preferences, the rest is ignored there.
+                options.extra_args.push_back(rust::String(arg));
             }
         }
+    }
+    // Dev/testing aid, mirroring the proxy param above: whitespace-separated engine arguments,
+    // set via `param set web.engine.servo.args "--pref=dom_canvas_backend=ohdrawing"`. The ArkWeb
+    // layer builds the init args itself, so without this an app cannot pass anything through.
+    const std::string param_args = ReadSystemParam("web.engine.servo.args");
+    for (size_t begin = param_args.find_first_not_of(" \t"); begin != std::string::npos;) {
+        const size_t end = param_args.find_first_of(" \t", begin);
+        options.extra_args.push_back(rust::String(param_args.substr(
+            begin, end == std::string::npos ? std::string::npos : end - begin)));
+        begin = end == std::string::npos ? end : param_args.find_first_not_of(" \t", end);
     }
     return options;
 }
