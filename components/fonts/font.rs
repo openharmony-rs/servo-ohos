@@ -481,7 +481,7 @@ impl Font {
     #[servo_tracing::instrument(name = "Font::shape_text", skip_all)]
     pub fn shape_text(&self, text: &str, options: &ShapingOptions) -> Arc<ShapedText> {
         let font_features =
-            compute_used_font_features(options, self.template.borrow().font_face_rule.as_ref())
+            compute_used_font_features(options, self.template.borrow().font_face_rule.as_deref())
                 .collect();
         let lookup_key = ShapeCacheEntry {
             text: text.to_owned(),
@@ -692,7 +692,7 @@ impl Font {
         self.template
             .font_face_rule()
             .and_then(|font_face_rule| {
-                AtomicRef::filter_map(font_face_rule, |rule| rule.font_family.as_ref())
+                AtomicRef::filter_map(font_face_rule, |rule| rule.descriptors.font_family.as_ref())
             })
             .map(|font_family| font_family.name.clone())
             .or_else(|| {
