@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 27 Nov 2026 21:10:16 +0000
+Subject: [PATCH] quickjs: Bump servo-quickjs for absent keys in
+ GetWeakMapEntry
+
+servo-quickjs 77b89e6, its main branch, adds to 6ac4a17, which
+`script: Run debugger.js on QuickJS` pins, the GetWeakMapEntry fix
+685f43b ("other keys are absent from holder maps") and the coverage
+tooling for the shim and SpiderMonkey's API layer. The QuickJS runs of
+ohos-v0.6's creation used its code: before the mozjs update as
+servo-quickjs eab2bfbe06f, which is this commit with the version 0.26.3.
+
+Fork note: ohos-v0.6 only; ohos-main moves its pin at its next sync.
+
+Validation: servo-quickjs 77b89e6 passes `just test` and `just test-asan --no-fail-fast` (185 tests), `just lint` and `cargo fmt --all --check`. `./mach build --release --js-engine quickjs` of this stack resolves mozjs 0.26.14 from that commit (no `[[patch.unused]]` in Cargo.lock), and the release build ran the whole WPT suite (57,523 tests): 104 tests had unexpected results, none of them only with QuickJS in three reruns with each engine. The device workflow's QuickJS headless build (`./mach build --ohos --headless-binary --profile checked-release --js-engine quickjs`, -D warnings) passes. On a DAYU200 with OpenHarmony 7.0, the stack's QuickJS headless checked-release executable ran /infrastructure, /css/css-backgrounds and /webstorage through `mach test-wpt --ohos` (1,098 tests in 31 minutes) without a crash in css-backgrounds; one webstorage quota test was reported crashed, as these tests crash under load on the host too.
+AI-assisted: Yes (agent session; 2026-11-27 ohos-v0.6 sync -- written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ support/quickjs/cargo-config.toml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/support/quickjs/cargo-config.toml b/support/quickjs/cargo-config.toml
+index a339f1e8dbf..1c39ea3856d 100644
+--- a/support/quickjs/cargo-config.toml
++++ b/support/quickjs/cargo-config.toml
+@@ -10,4 +10,4 @@
+ SERVO_QUICKJS_DEBUGGER = "1"
+ 
+ [patch.crates-io]
+-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "6ac4a17b197264851600edb124c7ef2b508c8f90" }
++mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "77b89e6853831a85e52aeee558d632ab44cdde4c" }

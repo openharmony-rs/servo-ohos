@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "dependabot[bot]" <49699333+dependabot[bot]@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 05:10:09 +0000
+Subject: [PATCH] backport: build: bump encoding_rs from 0.8.35 to 0.8.40
+ (#47974)
+
+Bumps [encoding_rs](https://github.com/hsivonen/encoding_rs) from 0.8.35
+to 0.8.40.
+<details>
+<summary>Commits</summary>
+<ul>
+<li><a
+href="https://github.com/hsivonen/encoding_rs/commit/662cb427013c13eb4444e7e51e8579c9457f5e6b"><code>662cb42</code></a>
+Allow split_u16_stride_mut as dead code</li>
+<li><a
+href="https://github.com/hsivonen/encoding_rs/commit/55f2530369fdf3be74e5588cf9fc1cec100914a5"><code>55f2530</code></a>
+Increment version number to 0.8.40</li>
+<li><a
+href="https://github.com/hsivonen/encoding_rs/commit/71ae1c093693f104eb182c37be5c8710cc46a594"><code>71ae1c0</code></a>
+Mention defense in depth when writing to &amp;mut str</li>
+<li><a
+href="https://github.com/hsivonen/encoding_rs/commit/12790ab29353db724eb805cdeba1a4b3dbff8dab"><code>12790ab</code></a>
+Remove remarks about a standard library bug that has been worked
+around</li>
+<li><a
+href="https://github.com/hsivonen/encoding_rs/commit/d477c2a526cbe835a1b99e9e997ae56f2e78177c"><code>d477c2a</code></a>
+Inline asm not stable on powerpc/powerpc64 at MSRV</li>
+<li><a
+href="https://github.com/hsivonen/encoding_rs/commit/6c2fb496e4e987abe7965f669b268ae9c4f3e7f2"><code>6c2fb49</code></a>
+Work around slow _mm_packus_epi16 in Rust 1.96 through 1.98,
+inclusive</li>
+<li><a
+href="https://github.com/hsivonen/encoding_rs/commit/945117503ea6b67aefce20363dcddb4b2bad7a98"><code>9451175</code></a>
+Zero the output slice upon panic in functions that write to &amp;mut
+str</li>
+<li><a
+href="https://github.com/hsivonen/encoding_rs/commit/4cdc020b767ef5ba3841eba258d2c0ed73fabdf4"><code>4cdc020</code></a>
+Anticipate complaints about the dependencies in the README</li>
+<li><a
+href="https://github.com/hsivonen/encoding_rs/commit/debb436ac5480fcd328b01c9ab0802d490d99d2b"><code>debb436</code></a>
+Add thanks to the related release notes</li>
+<li><a
+href="https://github.com/hsivonen/encoding_rs/commit/5b05f10888703596e9e53dee1920694b069b77e7"><code>5b05f10</code></a>
+Mention <a
+href="https://redirect.github.com/rust-lang/stdarch/issues/2208">rust-lang/stdarch#2208</a>
+in the README</li>
+<li>Additional commits viewable in <a
+href="https://github.com/hsivonen/encoding_rs/compare/v0.8.35...v0.8.40">compare
+view</a></li>
+</ul>
+</details>
+<br />
+
+
+[![Dependabot compatibility
+score](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=encoding_rs&package-manager=cargo&previous-version=0.8.35&new-version=0.8.40)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)
+
+Dependabot will resolve any conflicts with this PR as long as you don't
+alter it yourself. You can also trigger a rebase manually by commenting
+`@dependabot rebase`.
+
+[//]: # (dependabot-automerge-start)
+[//]: # (dependabot-automerge-end)
+
+---
+
+<details>
+<summary>Dependabot commands and options</summary>
+<br />
+
+You can trigger Dependabot actions by commenting on this PR:
+- `@dependabot rebase` will rebase this PR
+- `@dependabot recreate` will recreate this PR, overwriting any edits
+that have been made to it
+- `@dependabot show <dependency name> ignore conditions` will show all
+of the ignore conditions of the specified dependency
+- `@dependabot ignore this major version` will close this PR and stop
+Dependabot creating any more for this major version (unless you reopen
+the PR or upgrade to it yourself)
+- `@dependabot ignore this minor version` will close this PR and stop
+Dependabot creating any more for this minor version (unless you reopen
+the PR or upgrade to it yourself)
+- `@dependabot ignore this dependency` will close this PR and stop
+Dependabot creating any more for this dependency (unless you reopen the
+PR or upgrade to it yourself)
+
+
+</details>
+
+Signed-off-by: dependabot[bot] <support@github.com>
+Co-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+(cherry picked from commit 00a278f26a9042f84f0b87f75c3c9d0d10298bac)
+
+----
+
+Fork note: backported onto Servo v0.6.0 for the ohos-v0.6 branch without its Cargo.lock change, as the mozjs update before it already takes encoding_rs from 0.8.35 to 0.8.44. What is left is the expectation file it deletes: encoding_rs 0.8.40 fixed buffer boundaries in streaming two-byte legacy decoders, so the big5, euc-kr and shift_jis stream subtests of textdecoder-mistakes pass now.
+
+Validation: On the final stack, at its tip: `./mach test-tidy` (including cargo-deny), `./mach test-scripts`, `./mach clippy --locked -- -- --deny warnings`, the crown build (checked-release, -D warnings, crown built for Rust 1.97.1), `./mach test-unit --profile checked-release` with and without `--doc`, and the OpenHarmony checked-release builds of both flavors with -D warnings, which make signed HAPs, pass; release builds of it with both engines ran the whole WPT suite. textdecoder-mistakes.any.html and .any.worker.html run as expected with both engines in the stack's full runs. On this branch's first version, which also carried the ArkWeb port and the other patches it leaves out now, the three stream subtests passed in all 27 runs after the mozjs update (17 with SpiderMonkey, 10 with QuickJS), and plain v0.6.0 failed them in all of its 8.
+AI-assisted: Yes (agent session; the agent took upstream commit 00a278f26a9 without its Cargo.lock change and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../encoding/textdecoder-mistakes.any.js.ini  | 20 -------------------
+ 1 file changed, 20 deletions(-)
+ delete mode 100644 tests/wpt/meta/encoding/textdecoder-mistakes.any.js.ini
+
+diff --git a/tests/wpt/meta/encoding/textdecoder-mistakes.any.js.ini b/tests/wpt/meta/encoding/textdecoder-mistakes.any.js.ini
+deleted file mode 100644
+index 336c2248746..00000000000
+--- a/tests/wpt/meta/encoding/textdecoder-mistakes.any.js.ini
++++ /dev/null
+@@ -1,20 +0,0 @@
+-[textdecoder-mistakes.any.worker.html]
+-  [stream: big5]
+-    expected: FAIL
+-
+-  [stream: shift_jis]
+-    expected: FAIL
+-
+-  [stream: euc-kr]
+-    expected: FAIL
+-
+-
+-[textdecoder-mistakes.any.html]
+-  [stream: big5]
+-    expected: FAIL
+-
+-  [stream: shift_jis]
+-    expected: FAIL
+-
+-  [stream: euc-kr]
+-    expected: FAIL

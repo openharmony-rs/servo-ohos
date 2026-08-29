@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 27 Nov 2026 21:16:27 +0000
+Subject: [PATCH] ci: Store the WPT runs of ohos-v0.6 apart from ohos-main's
+
+ohos-v0.6 is the patch stack of ohos-main on Servo's v0.6 releases. Its
+WPT runs go to servo-ohos-wpt under configurations of their own, which
+its dashboard shows on a page apart from ohos-main's runs on newer
+releases: `ohos-v06-linux-spidermonkey` and `ohos-v06-linux-quickjs` for
+every push to ohos-v0.6, `ohos-v06-upstream-linux-spidermonkey` for the
+results of servo/servo's CI for the upstream base, and
+`ohos-v06-dayu200-quickjs` for the device runs. servo-ohos-wpt's
+configuration names have no dots. The upstream base needs a
+configuration of its own, as servo-ohos-wpt takes the latest run of an
+upstream configuration for the base of the latest run; store.yml's
+`upstream-config` input names it, so servo-ohos-wpt's main needs that
+input before this workflow runs.
+
+GitHub starts scheduled workflows only on the default branch, so the
+nightly device run doesn't start for ohos-v0.6; it is dispatched with
+`store` instead. The results jobs need the `servo-ohos-wpt` environment
+to allow ohos-v0.6, which is a setting of the repository.
+
+Validation: actionlint 1.7 (uvx actionlint-py) on both workflows reports only the missing descriptions of the local actions' metadata and the self-hosted runner label, as on ohos-main; both files parse as YAML. servo-ohos-wpt's wpt_store.py accepts the configuration names and builds a separate ohos-v0.6 page from synthetic runs under them. Not run: store.yml itself (no run is stored before the push).
+AI-assisted: Yes (agent session; 2026-11-27 ohos-v0.6 sync -- written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/ohos-device-wpt.yml | 15 ++++++++-------
+ .github/workflows/ohos-main-wpt.yml   | 18 ++++++++++++------
+ 2 files changed, 20 insertions(+), 13 deletions(-)
+
+diff --git a/.github/workflows/ohos-device-wpt.yml b/.github/workflows/ohos-device-wpt.yml
+index 428b193af60..bb91e73b517 100644
+--- a/.github/workflows/ohos-device-wpt.yml
++++ b/.github/workflows/ohos-device-wpt.yml
+@@ -4,9 +4,10 @@
+ # expectations for OpenHarmony yet, so the tests never fail the run.
+ #
+ # Every night, unless servo-ohos-wpt has a run of the ohos-main commit already, it runs the
+-# nightly subset of WPT and stores the results in openharmony-rs/servo-ohos-wpt as
+-# `ohos-dayu200-quickjs`. All of WPT would take a board about 14 hours. Otherwise it runs on
+-# request only: pull requests must not reach the boards.
++# nightly subset of WPT on ohos-main. GitHub runs schedules only on the default branch, so on
++# ohos-v0.6 the nightly subset runs when dispatched with `store`, and is stored in
++# openharmony-rs/servo-ohos-wpt as `ohos-v06-dayu200-quickjs`. All of WPT would take a board about
++# 14 hours. Otherwise it runs on request only: pull requests must not reach the boards.
+ name: OpenHarmony device WPT
+ on:
+   schedule:
+@@ -23,7 +24,7 @@ on:
+         options: ["checked-release", "release"]
+         default: "checked-release"
+       store:
+-        description: "Store the results in servo-ohos-wpt (only the nightly subset with checked-release, on ohos-main)"
++        description: "Store the results in servo-ohos-wpt (only the nightly subset with checked-release, on ohos-v0.6)"
+         type: boolean
+         default: false
+ 
+@@ -37,7 +38,7 @@ env:
+   SHELL: /bin/bash
+   CARGO_INCREMENTAL: 0
+   # The configuration of the stored runs, as in the results job.
+-  RESULTS_CONFIG: ohos-dayu200-quickjs
++  RESULTS_CONFIG: ohos-v06-dayu200-quickjs
+   # About 36,000 tests of what generated UI uses: layout, text and fonts, rendering, SVG and canvas
+   # (for charts), animations, images, forms, touch input, storage, markup parsing, scripts and
+   # timers, and the network with streamed responses. They take one board about six hours. The
+@@ -240,7 +241,7 @@ jobs:
+           pattern: wpt-full-logs-ohos-dayu200-*
+ 
+   # The called workflow takes its token from the `servo-ohos-wpt` environment, which only ohos-main
+-  # can use.
++  # and ohos-v0.6 can use.
+   results:
+     name: Results
+     needs: [setup, wpt, merge]
+@@ -253,7 +254,7 @@ jobs:
+       SERVO_OHOS_WPT_TOKEN: ${{ secrets.SERVO_OHOS_WPT_TOKEN }}
+     with:
+       # RESULTS_CONFIG; `with` can't read env.
+-      artifacts: '{"ohos-dayu200-quickjs": "wpt-full-logs-ohos-dayu200"}'
++      artifacts: '{"ohos-v06-dayu200-quickjs": "wpt-full-logs-ohos-dayu200"}'
+       chunks: 2
+       upstream: false
+     permissions: {}
+diff --git a/.github/workflows/ohos-main-wpt.yml b/.github/workflows/ohos-main-wpt.yml
+index 6a4d49a393d..3f16c94664b 100644
+--- a/.github/workflows/ohos-main-wpt.yml
++++ b/.github/workflows/ohos-main-wpt.yml
+@@ -1,13 +1,16 @@
+-# Runs the whole WPT suite with SpiderMonkey and with QuickJS on every ohos-main commit, and stores
++# Runs the whole WPT suite with SpiderMonkey and with QuickJS on every ohos-v0.6 commit, and stores
+ # the results in openharmony-rs/servo-ohos-wpt, which shows them with the results of the upstream
+-# commit that ohos-main is based on: https://openharmony-rs.github.io/servo-ohos-wpt/
++# commit that the branch is based on: https://openharmony-rs.github.io/servo-ohos-wpt/
++# ohos-v0.6 stores them as the configurations `ohos-v06-linux-spidermonkey` and
++# `ohos-v06-linux-quickjs`, and those of the upstream commit as
++# `ohos-v06-upstream-linux-spidermonkey`, apart from ohos-main's.
+ #
+-# The results job takes its token from the `servo-ohos-wpt` environment, which only ohos-main can
+-# use.
+-name: ohos-main WPT
++# The results job takes its token from the `servo-ohos-wpt` environment, which only ohos-main and
++# ohos-v0.6 can use.
++name: ohos-v0.6 WPT
+ on:
+   push:
+-    branches: ["ohos-main"]
++    branches: ["ohos-v0.6"]
+   workflow_dispatch:
+ 
+ # One run at a time, so that the results job stores the runs in order. A push waits for the running
+@@ -43,4 +46,7 @@ jobs:
+     # The called workflow reads the secret from its job's environment, but only if it is passed.
+     secrets:
+       SERVO_OHOS_WPT_TOKEN: ${{ secrets.SERVO_OHOS_WPT_TOKEN }}
++    with:
++      artifacts: '{"ohos-v06-linux-spidermonkey": "wpt-full-logs-linux", "ohos-v06-linux-quickjs": "wpt-full-logs-quickjs"}'
++      upstream-config: ohos-v06-upstream-linux-spidermonkey
+     permissions: {}

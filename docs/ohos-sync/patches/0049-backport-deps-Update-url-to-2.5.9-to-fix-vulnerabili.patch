@@ -1,0 +1,409 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Euclid Ye <yezhizhenjiakang@gmail.com>
+Date: Sun, 22 Nov 2026 12:58:00 +0000
+Subject: [PATCH] backport: deps: Update url to 2.5.9 to fix vulnerability
+ (#50138)
+
+Stack overflow in `Url::origin()` on nested `blob:` URLs. See
+[RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html)
+This is patched in 2.5.9.
+
+Testing: It builds.
+
+---------
+
+Signed-off-by: Euclid Ye <yezhizhenjiakang@gmail.com>
+(cherry picked from commit d22050dbbf0d5d7544df2f2a77bea18c4038a027)
+
+----
+
+Fork note: backported onto Servo v0.6.0 for the ohos-v0.6 branch. cargo-deny in test-tidy reports RUSTSEC-2026-0592 (url 2.5.8, stack overflow in Url::origin on nested blob: URLs) for v0.6.0's lock file. Cargo.lock takes only the url and form_urlencoded crates: the change of one crate's syn dependency to 3.0.4 that came along upstream is left out, because v0.6.0 resolves that crate with syn 2.
+
+Validation: On the final stack, at its tip: `./mach test-tidy` (including cargo-deny), `./mach test-scripts`, `./mach clippy --locked -- -- --deny warnings`, the crown build (checked-release, -D warnings, crown built for Rust 1.97.1), `./mach test-unit --profile checked-release` with and without `--doc`, and the OpenHarmony checked-release builds of both flavors with -D warnings, which make signed HAPs, pass; release builds of it with both engines ran the whole WPT suite. The 77 url tests run as expected with both engines with the expectations this commit removes; cargo-deny no longer reports RUSTSEC-2026-0592.
+AI-assisted: Yes (agent session; the agent cherry-picked upstream commit d22050dbbf0, left its syn change out of Cargo.lock and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock                                    |  8 +--
+ tests/wpt/meta/url/a-element-xhtml.xhtml.ini  | 23 --------
+ tests/wpt/meta/url/a-element.html.ini         | 22 -------
+ tests/wpt/meta/url/url-constructor.any.js.ini | 57 -------------------
+ tests/wpt/meta/url/url-origin.any.js.ini      | 24 --------
+ .../meta/url/url-setters-a-area.window.js.ini | 11 ----
+ tests/wpt/meta/url/url-setters.any.js.ini     | 15 -----
+ 7 files changed, 4 insertions(+), 156 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 313aa234b81..112eab26121 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2877,9 +2877,9 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
+ 
+ [[package]]
+ name = "form_urlencoded"
+-version = "1.2.2"
++version = "1.2.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
++checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
+ dependencies = [
+  "percent-encoding",
+ ]
+@@ -11198,9 +11198,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+ 
+ [[package]]
+ name = "url"
+-version = "2.5.8"
++version = "2.5.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
++checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
+ dependencies = [
+  "form_urlencoded",
+  "idna",
+diff --git a/tests/wpt/meta/url/a-element-xhtml.xhtml.ini b/tests/wpt/meta/url/a-element-xhtml.xhtml.ini
+index 325a77b91da..1d158c8a5f5 100644
+--- a/tests/wpt/meta/url/a-element-xhtml.xhtml.ini
++++ b/tests/wpt/meta/url/a-element-xhtml.xhtml.ini
+@@ -429,8 +429,6 @@
+     expected: FAIL
+ 
+ 
+-[a-element-xhtml.xhtml?include=javascript]
+-
+ [a-element-xhtml.xhtml?include=file]
+   [Parsing: </> against <file://h/C:/a/b>]
+     expected: FAIL
+@@ -495,15 +493,6 @@
+   [Parsing: </c:/foo/bar> against <file://host/path>]
+     expected: FAIL
+ 
+-  [Parsing: <file://example.net/C:/> against <about:blank>]
+-    expected: FAIL
+-
+-  [Parsing: <file://1.2.3.4/C:/> against <about:blank>]
+-    expected: FAIL
+-
+-  [Parsing: <file://[1::8\]/C:/> against <about:blank>]
+-    expected: FAIL
+-
+   [Parsing: <C|/> against <file://host/>]
+     expected: FAIL
+ 
+@@ -546,9 +535,6 @@
+   [Parsing: <file:///w|/m> against <about:blank>]
+     expected: FAIL
+ 
+-  [Parsing: <..> against <file://x/C:/>]
+-    expected: FAIL
+-
+   [Parsing: <file://xn--/p> against <about:blank>]
+     expected: FAIL
+ 
+@@ -575,12 +561,6 @@
+   [Parsing: <///example.org/../path/../../path> against <http://example.org/>]
+     expected: FAIL
+ 
+-  [Parsing: <foo://host/ !"$%&'()*+,-./:;<=>@[\\\]^_`{|}~> against <about:blank>]
+-    expected: FAIL
+-
+-  [Parsing: <wss://host/ !"$%&'()*+,-./:;<=>@[\\\]^_`{|}~> against <about:blank>]
+-    expected: FAIL
+-
+   [Parsing: <non-special:opaque  ?hi> against <about:blank>]
+     expected: FAIL
+ 
+@@ -628,6 +608,3 @@
+ 
+   [Parsing: <https://xn--/> against <about:blank>]
+     expected: FAIL
+-
+-
+-[a-element-xhtml.xhtml?include=mailto]
+diff --git a/tests/wpt/meta/url/a-element.html.ini b/tests/wpt/meta/url/a-element.html.ini
+index 75066439e8f..960f7ef859d 100644
+--- a/tests/wpt/meta/url/a-element.html.ini
++++ b/tests/wpt/meta/url/a-element.html.ini
+@@ -429,8 +429,6 @@
+     expected: FAIL
+ 
+ 
+-[a-element.html?include=mailto]
+-
+ [a-element.html?include=file]
+   [Parsing: </> against <file://h/C:/a/b>]
+     expected: FAIL
+@@ -495,15 +493,6 @@
+   [Parsing: </c:/foo/bar> against <file://host/path>]
+     expected: FAIL
+ 
+-  [Parsing: <file://example.net/C:/> against <about:blank>]
+-    expected: FAIL
+-
+-  [Parsing: <file://1.2.3.4/C:/> against <about:blank>]
+-    expected: FAIL
+-
+-  [Parsing: <file://[1::8\]/C:/> against <about:blank>]
+-    expected: FAIL
+-
+   [Parsing: <C|/> against <file://host/>]
+     expected: FAIL
+ 
+@@ -546,15 +535,10 @@
+   [Parsing: <file:///w|/m> against <about:blank>]
+     expected: FAIL
+ 
+-  [Parsing: <..> against <file://x/C:/>]
+-    expected: FAIL
+-
+   [Parsing: <file://xn--/p> against <about:blank>]
+     expected: FAIL
+ 
+ 
+-[a-element.html?include=javascript]
+-
+ [a-element.html?exclude=(file|javascript|mailto)]
+   [Parsing: <///test> against <http://example.org/>]
+     expected: FAIL
+@@ -577,12 +561,6 @@
+   [Parsing: <///example.org/../path/../../path> against <http://example.org/>]
+     expected: FAIL
+ 
+-  [Parsing: <foo://host/ !"$%&'()*+,-./:;<=>@[\\\]^_`{|}~> against <about:blank>]
+-    expected: FAIL
+-
+-  [Parsing: <wss://host/ !"$%&'()*+,-./:;<=>@[\\\]^_`{|}~> against <about:blank>]
+-    expected: FAIL
+-
+   [Parsing: <non-special:opaque  ?hi> against <about:blank>]
+     expected: FAIL
+ 
+diff --git a/tests/wpt/meta/url/url-constructor.any.js.ini b/tests/wpt/meta/url/url-constructor.any.js.ini
+index dc6c32f6253..3688fb08f52 100644
+--- a/tests/wpt/meta/url/url-constructor.any.js.ini
++++ b/tests/wpt/meta/url/url-constructor.any.js.ini
+@@ -860,8 +860,6 @@
+     expected: FAIL
+ 
+ 
+-[url-constructor.any.worker.html?include=javascript]
+-
+ [url-constructor.any.html?exclude=(file|javascript|mailto)]
+   [Parsing: <///test> against <http://example.org/>]
+     expected: FAIL
+@@ -884,12 +882,6 @@
+   [Parsing: <///example.org/../path/../../path> against <http://example.org/>]
+     expected: FAIL
+ 
+-  [Parsing: <foo://host/ !"$%&'()*+,-./:;<=>@[\\\]^_`{|}~> without base]
+-    expected: FAIL
+-
+-  [Parsing: <wss://host/ !"$%&'()*+,-./:;<=>@[\\\]^_`{|}~> without base]
+-    expected: FAIL
+-
+   [Parsing: <non-special:opaque  ?hi> without base]
+     expected: FAIL
+ 
+@@ -1024,15 +1016,6 @@
+   [Parsing: <file://localhost//a//../..//> without base]
+     expected: FAIL
+ 
+-  [Parsing: <file://example.net/C:/> without base]
+-    expected: FAIL
+-
+-  [Parsing: <file://1.2.3.4/C:/> without base]
+-    expected: FAIL
+-
+-  [Parsing: <file://[1::8\]/C:/> without base]
+-    expected: FAIL
+-
+   [Parsing: <file://localhost//a//../..//foo> without base]
+     expected: FAIL
+ 
+@@ -1054,9 +1037,6 @@
+   [Parsing: <file:///w|/m> without base]
+     expected: FAIL
+ 
+-  [Parsing: <..> against <file://x/C:/>]
+-    expected: FAIL
+-
+   [Parsing: <file://xn--/p> without base]
+     expected: FAIL
+ 
+@@ -1146,15 +1126,6 @@
+   [Parsing: <file://localhost//a//../..//> without base]
+     expected: FAIL
+ 
+-  [Parsing: <file://example.net/C:/> without base]
+-    expected: FAIL
+-
+-  [Parsing: <file://1.2.3.4/C:/> without base]
+-    expected: FAIL
+-
+-  [Parsing: <file://[1::8\]/C:/> without base]
+-    expected: FAIL
+-
+   [Parsing: <file://localhost//a//../..//foo> without base]
+     expected: FAIL
+ 
+@@ -1197,12 +1168,6 @@
+   [Parsing: <file:///w|/m> without base]
+     expected: FAIL
+ 
+-  [Parsing: <foo://host/ !"$%&'()*+,-./:;<=>@[\\\]^_`{|}~> without base]
+-    expected: FAIL
+-
+-  [Parsing: <wss://host/ !"$%&'()*+,-./:;<=>@[\\\]^_`{|}~> without base]
+-    expected: FAIL
+-
+   [Parsing: <non-special:opaque  ?hi> without base]
+     expected: FAIL
+ 
+@@ -1221,9 +1186,6 @@
+   [Parsing: <..> against <abc://x/y/z/C:/>]
+     expected: FAIL
+ 
+-  [Parsing: <..> against <file://x/C:/>]
+-    expected: FAIL
+-
+   [Parsing: <\\a> against <foo://foo/a>]
+     expected: FAIL
+ 
+@@ -1343,15 +1305,6 @@
+   [Parsing: <file://localhost//a//../..//> without base]
+     expected: FAIL
+ 
+-  [Parsing: <file://example.net/C:/> without base]
+-    expected: FAIL
+-
+-  [Parsing: <file://1.2.3.4/C:/> without base]
+-    expected: FAIL
+-
+-  [Parsing: <file://[1::8\]/C:/> without base]
+-    expected: FAIL
+-
+   [Parsing: <file://localhost//a//../..//foo> without base]
+     expected: FAIL
+ 
+@@ -1373,15 +1326,5 @@
+   [Parsing: <file:///w|/m> without base]
+     expected: FAIL
+ 
+-  [Parsing: <..> against <file://x/C:/>]
+-    expected: FAIL
+-
+   [Parsing: <file://xn--/p> without base]
+     expected: FAIL
+-
+-
+-[url-constructor.any.html?include=javascript]
+-
+-[url-constructor.any.html?include=mailto]
+-
+-[url-constructor.any.worker.html?include=mailto]
+diff --git a/tests/wpt/meta/url/url-origin.any.js.ini b/tests/wpt/meta/url/url-origin.any.js.ini
+index 15ecdc8259c..793cbe7f9a6 100644
+--- a/tests/wpt/meta/url/url-origin.any.js.ini
++++ b/tests/wpt/meta/url/url-origin.any.js.ini
+@@ -1,16 +1,4 @@
+ [url-origin.any.html]
+-  [Origin parsing: <blob:blob:https://example.org/> without base]
+-    expected: FAIL
+-
+-  [Origin parsing: <blob:ftp://host/path> without base]
+-    expected: FAIL
+-
+-  [Origin parsing: <blob:ws://example.org/> without base]
+-    expected: FAIL
+-
+-  [Origin parsing: <blob:wss://example.org/> without base]
+-    expected: FAIL
+-
+   [Origin parsing: <http://a.b.c.Xn--pokxncvks> without base]
+     expected: FAIL
+ 
+@@ -34,18 +22,6 @@
+ 
+ 
+ [url-origin.any.worker.html]
+-  [Origin parsing: <blob:blob:https://example.org/> without base]
+-    expected: FAIL
+-
+-  [Origin parsing: <blob:ftp://host/path> without base]
+-    expected: FAIL
+-
+-  [Origin parsing: <blob:ws://example.org/> without base]
+-    expected: FAIL
+-
+-  [Origin parsing: <blob:wss://example.org/> without base]
+-    expected: FAIL
+-
+   [Origin parsing: <http://a.b.c.Xn--pokxncvks> without base]
+     expected: FAIL
+ 
+diff --git a/tests/wpt/meta/url/url-setters-a-area.window.js.ini b/tests/wpt/meta/url/url-setters-a-area.window.js.ini
+index e48246d7e01..46aff281b82 100644
+--- a/tests/wpt/meta/url/url-setters-a-area.window.js.ini
++++ b/tests/wpt/meta/url/url-setters-a-area.window.js.ini
+@@ -1,5 +1,3 @@
+-[url-setters-a-area.window.html?include=mailto]
+-
+ [url-setters-a-area.window.html?include=file]
+   [<a>: Setting <file://monkey/>.pathname = '\\\\' File URLs and (back)slashes]
+     expected: FAIL
+@@ -27,12 +25,6 @@
+   [<area>: Setting <foo:///some/path>.pathname = '' Non-special URLs with an empty host can have their paths erased]
+     expected: FAIL
+ 
+-  [<a>: Setting <a:/>.pathname = '\x00\x01\t\n\r\x1f !"#$%&'()*+,-./09:;<=>?@AZ[\\\]^_`az{|}~Éé' UTF-8 percent encoding with the default encode set. Tabs and newlines are removed.]
+-    expected: FAIL
+-
+-  [<area>: Setting <a:/>.pathname = '\x00\x01\t\n\r\x1f !"#$%&'()*+,-./09:;<=>?@AZ[\\\]^_`az{|}~Éé' UTF-8 percent encoding with the default encode set. Tabs and newlines are removed.]
+-    expected: FAIL
+-
+   [<a>: Setting <data:space ?query>.search = '' Trailing spaces and opaque paths]
+     expected: FAIL
+ 
+@@ -116,6 +108,3 @@
+ 
+   [<a>: Setting <https://example.com/>.host = 'xn--']
+     expected: FAIL
+-
+-
+-[url-setters-a-area.window.html?include=javascript]
+diff --git a/tests/wpt/meta/url/url-setters.any.js.ini b/tests/wpt/meta/url/url-setters.any.js.ini
+index 2d94a0c5d90..4d15372c87c 100644
+--- a/tests/wpt/meta/url/url-setters.any.js.ini
++++ b/tests/wpt/meta/url/url-setters.any.js.ini
+@@ -14,9 +14,6 @@
+   [URL: Setting <non-spec:/.//p>.hostname = '']
+     expected: FAIL
+ 
+-  [URL: Setting <a:/>.pathname = '\x00\x01\t\n\r\x1f !"#$%&'()*+,-./09:;<=>?@AZ[\\\]^_`az{|}~Éé' UTF-8 percent encoding with the default encode set. Tabs and newlines are removed.]
+-    expected: FAIL
+-
+   [URL: Setting <data:space ?query>.search = '' Trailing spaces and opaque paths]
+     expected: FAIL
+ 
+@@ -93,9 +90,6 @@
+   [URL: Setting <non-spec:/.//p>.hostname = '']
+     expected: FAIL
+ 
+-  [URL: Setting <a:/>.pathname = '\x00\x01\t\n\r\x1f !"#$%&'()*+,-./09:;<=>?@AZ[\\\]^_`az{|}~Éé' UTF-8 percent encoding with the default encode set. Tabs and newlines are removed.]
+-    expected: FAIL
+-
+   [URL: Setting <data:space ?query>.search = '' Trailing spaces and opaque paths]
+     expected: FAIL
+ 
+@@ -151,12 +145,3 @@
+ 
+   [URL: Setting <file:///unicorn>.pathname = '//monkey/..//' File URLs and (back)slashes]
+     expected: FAIL
+-
+-
+-[url-setters.any.worker.html?include=mailto]
+-
+-[url-setters.any.html?include=javascript]
+-
+-[url-setters.any.worker.html?include=javascript]
+-
+-[url-setters.any.html?include=mailto]

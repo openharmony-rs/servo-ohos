@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 29 Oct 2026 13:50:20 +0000
+Subject: [PATCH] backport: deps: Upgrade webrender to 0.70.1 (#49329)
+
+The updated WebRender backports fixes for a regression, where on high
+DPI displays servo would draw color bitmap emoji at 1/DPR of the
+intended size. The same could also be observed when applying `transform:
+scale()` to emoji.
+
+The issue manifested slightly differently in Gecko, since Gecko
+apparently builds display lists in device pixels. Servo however applies
+a scale transform to get to device pixels
+(https://github.com/servo/servo/blob/6d3c9c30951d019d997e364fee133669ba234679/components/paint/painter.rs#L674)
+
+Testing: Testing DPR is not possible with the current servo testrunner.
+Adding a reftest that uses scale might be possible, but since the
+regression was covered by a wrench test in WebRender, I didn't try to
+add one.
+
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+(cherry picked from commit 988d63c306a3688229c4df45ea926f4ea57808cc)
+
+----
+
+Fork note: backported onto Servo v0.6.0 for the ohos-v0.6 branch. wr_glyph_rasterizer 0.70.1 also links the FreeType variation functions on OpenHarmony as on Android. With 0.70.0, ohos-main's OpenHarmony builds crashed on the `succeeded(res)` assertion in 113 of the 875 css-backgrounds tests on a DAYU200; the 2026-10-29 sync fixed that with a WebRender git pin first and then with this commit. Cargo.lock takes only the two WebRender versions: the change of one crate's syn dependency to 3.0.4 that came along upstream is left out, because v0.6.0 resolves that crate with syn 2 (`cargo metadata --locked` fails otherwise).
+
+Validation: On the final stack, at its tip: `./mach test-tidy` (including cargo-deny), `./mach test-scripts`, `./mach clippy --locked -- -- --deny warnings`, the crown build (checked-release, -D warnings, crown built for Rust 1.97.1), `./mach test-unit --profile checked-release` with and without `--doc`, and the OpenHarmony checked-release builds of both flavors with -D warnings, which make signed HAPs, pass; release builds of it with both engines ran the whole WPT suite. On a DAYU200 with OpenHarmony 7.0, the stack's QuickJS headless checked-release executable ran /infrastructure, /css/css-backgrounds and /webstorage through `mach test-wpt --ohos` (1,098 tests in 31 minutes) without a crash in css-backgrounds; one webstorage quota test was reported crashed, as these tests crash under load on the host too. Before this fix, ohos-main's checked-release build crashed on FreeType's `succeeded(res)` assertion in 113 of 875 css-backgrounds tests.
+AI-assisted: Yes (agent session; the agent cherry-picked upstream commit 988d63c306a, left its syn change out of Cargo.lock and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock | 8 ++++----
+ Cargo.toml | 2 +-
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 57db67e7366..82d140daf7d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -11734,9 +11734,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "webrender"
+-version = "0.70.0"
++version = "0.70.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ede9dbc3cfb3e2c073a68e20f8fd54d9f6be8587be1c7c948e1ac51112421ef6"
++checksum = "b90e7e9f5be8b8e81a292dc5617bcb06661f5b110891499ff793ca55e364e0ca"
+ dependencies = [
+  "allocator-api2",
+  "bincode",
+@@ -12631,9 +12631,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "wr_glyph_rasterizer"
+-version = "0.70.0"
++version = "0.70.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "bcda26d8788ba57a04cd75ae4a2c6da3aa8e5ab16ed1cfd5db09d0fbc04df2fb"
++checksum = "ab2dca02e2202d7472f6aa3ea67ef55bacd1aabdb71e2b0cd642b053a99545a9"
+ dependencies = [
+  "core-foundation 0.9.4",
+  "core-graphics",
+diff --git a/Cargo.toml b/Cargo.toml
+index 65bfdf3e41f..ab614c54489 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -277,7 +277,7 @@ warp = "0.4.2"
+ web_atoms = "0.2.6"
+ webdriver = { version = "0.54.0", default-features = false }
+ webpki-roots = "1.0"
+-webrender = { version = "0.70", features = ["serde"] }
++webrender = { version = "0.70.1", features = ["serde"] }
+ webrender_api = "0.70"
+ wgpu-core = "30"
+ wgpu-types = "30"

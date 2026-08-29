@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Narfinger <Narfinger@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 04:34:07 +0000
+Subject: [PATCH] backport: support: Update OpenHarmony and HarmonyOS sdk
+ versions (#48505)
+
+This updates the SDK version for OpenHarmony and HarmonyOS to API level
+23.
+
+Testing: Test for HarmonyOS
+https://github.com/Narfinger/servo/actions/runs/36574391883/job/109426155955
+and OpenHarmony Run
+https://github.com/Narfinger/servo/actions/runs/36576710022/job/109434096228
+Fixes: https://github.com/servo/servo/issues/48472
+
+---------
+
+Signed-off-by: Narfinger <Narfinger@users.noreply.github.com>
+(cherry picked from commit fef77e189b880bafa456ec150d9db05948b33c1e)
+
+----
+
+Fork note: backported onto Servo v0.6.0 for the ohos-v0.6 branch. v0.6.0 targets OpenHarmony API 20. The fork's OpenHarmony code, its CI and the SDKs it is built with use API 23, as ohos-main does since its 2026-10-08 sync. Drop this at the first v0.6.x release that carries it.
+
+Validation: On the final stack, at its tip: `./mach test-tidy` (including cargo-deny), `./mach test-scripts`, `./mach clippy --locked -- -- --deny warnings`, the crown build (checked-release, -D warnings, crown built for Rust 1.97.1), `./mach test-unit --profile checked-release` with and without `--doc`, and the OpenHarmony checked-release builds of both flavors with -D warnings, which make signed HAPs, pass; release builds of it with both engines ran the whole WPT suite. The default HAP of this stack, built against the API 23 SDK, installs on a DAYU200 with OpenHarmony 7.0 and renders a page with text.
+AI-assisted: Yes (agent session; the agent cherry-picked upstream commit fef77e189b8 without code changes and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/ohos.yml              |  4 ++--
+ support/openharmony/build-profile.json5 | 10 +++++-----
+ 2 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/.github/workflows/ohos.yml b/.github/workflows/ohos.yml
+index 7be4cd49be6..b93b3982981 100644
+--- a/.github/workflows/ohos.yml
++++ b/.github/workflows/ohos.yml
+@@ -77,10 +77,10 @@ jobs:
+         id: setup_sdk
+         uses: openharmony-rs/setup-ohos-sdk@v1.0.0
+         with:
+-          version: "6.0.0.1" # api 20 in openharmony
++          version: "6.1" # api 23 in openharmony
+           fixup-path: true
+       - name: Install node for hvigor
+-        uses: actions/setup-node@v6
++        uses: actions/setup-node@v7
+         with:
+           node-version: 24
+       - name: Install hvigor modules
+diff --git a/support/openharmony/build-profile.json5 b/support/openharmony/build-profile.json5
+index 848dcedb3a3..2a62de5385a 100644
+--- a/support/openharmony/build-profile.json5
++++ b/support/openharmony/build-profile.json5
+@@ -4,16 +4,16 @@
+       {
+         "name": "default",
+         "signingConfig": "default",
+-        "compileSdkVersion": 20,
+-        "compatibleSdkVersion": 20,
+-        "targetSdkVersion": 20,
++        "compileSdkVersion": 23,
++        "compatibleSdkVersion": 23,
++        "targetSdkVersion": 23,
+         "runtimeOS": "OpenHarmony"
+       },
+       {
+         "name": "harmonyos",
+         "signingConfig": "hos",
+-        "compatibleSdkVersion": "6.0.0(20)",
+-        "targetSdkVersion": "6.0.0(20)",
++        "compatibleSdkVersion": "6.1.0(23)",
++        "targetSdkVersion": "6.1.0(23)",
+         "runtimeOS": "HarmonyOS"
+       }
+     ],

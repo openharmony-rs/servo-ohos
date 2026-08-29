@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Euclid Ye <yezhizhenjiakang@gmail.com>
+Date: Mon, 23 Nov 2026 12:04:04 +0000
+Subject: [PATCH] backport: deps: Upgrade cookie to 0.18.3 (#50151)
+
+This essentially patches
+[RUSTSEC-2026-0594](https://rustsec.org/advisories/RUSTSEC-2026-0594.html),
+by upgrading cookie to 0.18.3.
+
+We are stuck with 0.16 which is used by webdriver crate still,
+but seems we never enable the feature related to the vulnerability
+ so it is probably fine.
+
+Testing: test-tidy
+
+Signed-off-by: Euclid Ye <yezhizhenjiakang@gmail.com>
+(cherry picked from commit 889914bd6e62c1b17a572dc5e921003276b3e9b5)
+
+----
+
+Fork note: backported onto Servo v0.6.0 for the ohos-v0.6 branch. cargo-deny in test-tidy reports RUSTSEC-2026-0594 (cookie 0.16.2 and 0.18.2) for v0.6.0's lock file; webdriver 0.54.0 holds cookie 0.16 on v0.6.0 too. Cargo.lock conflicted, so it is v0.6.0's with `cargo update -p cookie@0.18.2 --precise 0.18.3`, which changes 20 of upstream's 22 lines: all but upstream's unrelated change to the syn dependency of cssparser-macros.
+
+Validation: On the final stack, at its tip: `./mach test-tidy` (including cargo-deny), `./mach test-scripts`, `./mach clippy --locked -- -- --deny warnings`, the crown build (checked-release, -D warnings, crown built for Rust 1.97.1), `./mach test-unit --profile checked-release` with and without `--doc`, and the OpenHarmony checked-release builds of both flavors with -D warnings, which make signed HAPs, pass; release builds of it with both engines ran the whole WPT suite. cargo-deny passes: the lock file has cookie 0.18.3, and RUSTSEC-2026-0594 stays ignored for webdriver's cookie 0.16, as upstream does.
+AI-assisted: Yes (agent session; the agent cherry-picked upstream commit 889914bd6e6, regenerated its Cargo.lock change with cargo update instead of merging it, and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock | 20 ++++++++++----------
+ deny.toml  |  3 +++
+ 2 files changed, 13 insertions(+), 10 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 112eab26121..f3583d11d4a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1570,9 +1570,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "cookie"
+-version = "0.18.2"
++version = "0.18.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
++checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
+ dependencies = [
+  "time",
+  "version_check",
+@@ -7997,7 +7997,7 @@ dependencies = [
+  "arboard",
+  "bitflags 2.13.1",
+  "content-security-policy",
+- "cookie 0.18.2",
++ "cookie 0.18.3",
+  "crossbeam-channel",
+  "dpi",
+  "env_logger",
+@@ -8412,7 +8412,7 @@ dependencies = [
+  "accesskit",
+  "bitflags 2.13.1",
+  "content-security-policy",
+- "cookie 0.18.2",
++ "cookie 0.18.3",
+  "crossbeam-channel",
+  "euclid",
+  "http",
+@@ -8537,7 +8537,7 @@ dependencies = [
+ name = "servo-hyper-serde"
+ version = "0.6.0"
+ dependencies = [
+- "cookie 0.18.2",
++ "cookie 0.18.3",
+  "headers",
+  "http",
+  "hyper",
+@@ -8661,7 +8661,7 @@ dependencies = [
+  "atomic_refcell",
+  "bytes",
+  "content-security-policy",
+- "cookie 0.18.2",
++ "cookie 0.18.3",
+  "crossbeam-channel",
+  "data-url",
+  "encoding_rs",
+@@ -8948,7 +8948,7 @@ dependencies = [
+  "bytes",
+  "chrono",
+  "content-security-policy",
+- "cookie 0.18.2",
++ "cookie 0.18.3",
+  "crossbeam-channel",
+  "data-url",
+  "flate2",
+@@ -9022,7 +9022,7 @@ version = "0.6.0"
+ dependencies = [
+  "bytes",
+  "content-security-policy",
+- "cookie 0.18.2",
++ "cookie 0.18.3",
+  "crossbeam-channel",
+  "data-url",
+  "headers",
+@@ -9205,7 +9205,7 @@ dependencies = [
+  "chardetng",
+  "chrono",
+  "content-security-policy",
+- "cookie 0.18.2",
++ "cookie 0.18.3",
+  "crossbeam-channel",
+  "crypto-bigint",
+  "cshake",
+@@ -9518,7 +9518,7 @@ version = "0.6.0"
+ dependencies = [
+  "base64 0.23.1",
+  "bytes",
+- "cookie 0.18.2",
++ "cookie 0.18.3",
+  "crossbeam-channel",
+  "euclid",
+  "http",
+diff --git a/deny.toml b/deny.toml
+index 70b1c1cf18e..5220290ba0f 100644
+--- a/deny.toml
++++ b/deny.toml
+@@ -55,6 +55,9 @@ ignore = [
+ 
+     # chrono is unmaintained and will be replaced by probably jiff.
+     "RUSTSEC-2026-0543",
++    # The crate `cookie` 0.16 is used by `webdriver` 0.54.0,
++    # which still requires `cookie` 0.16 and has no patched version.
++    "RUSTSEC-2026-0594",
+ ]
+ 
+ # This section is considered when running `cargo deny check licenses`
