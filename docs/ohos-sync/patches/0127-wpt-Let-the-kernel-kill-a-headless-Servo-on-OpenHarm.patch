@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 29 Oct 2026 09:07:07 +0000
+Subject: [PATCH] wpt: Let the kernel kill a headless Servo on OpenHarmony that
+ runs out of memory
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+servoshell inherited the oom_score_adj of -1000 of the hdc shell that
+starts it, so the kernel could not kill it when it used up the memory.
+On a DAYU200 (2 GB), html/canvas/element/manual/shadows/
+shadowBlur_gaussian_tolerance.1.html made servoshell take 1.4 GB; the
+kernel killed the launcher, systemui and other system services and then
+panicked ("System is deadlocked on memory"), which rebooted the board
+and ended the nightly WPT run after a third of its tests. The shell now
+raises its oom_score_adj to 1000 before it starts servoshell, which
+inherits it, so Servo is the first process to go.
+
+Validation: on a DAYU200 (OpenHarmony 7.0.0.38), a running headless servoshell has oom_score_adj 1000; with --timeout-multiplier 4, so that the test can't time out first, shadowBlur_gaussian_tolerance.1.html now ends as CRASH with the kernel killing only servoshell ("Killed process … (servoshell) … anon-rss:1420804kB … oom_score_adj:1000"), the board keeps running (uptime unchanged), and the next test runs; MANIFEST.json gets the new hash of servo_ohos.py, and test-tidy passes.
+AI-assisted: Yes (agent session; the agent found the cause in the board's kernel log and the measurements, and wrote and tested the change)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ tests/wpt/meta/MANIFEST.json                                | 2 +-
+ .../tests/tools/wptrunner/wptrunner/browsers/servo_ohos.py  | 6 +++++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/tests/wpt/meta/MANIFEST.json b/tests/wpt/meta/MANIFEST.json
+index 744dbd98fe0..7573e9a2911 100644
+--- a/tests/wpt/meta/MANIFEST.json
++++ b/tests/wpt/meta/MANIFEST.json
+@@ -610292,7 +610292,7 @@
+         []
+        ],
+        "servo_ohos.py": [
+-        "7364ef31a5fffdc6cb024548b24c6e89d12b5f98",
++        "98b673eff55cdb6758616f9d159e4ded8a46603d",
+         []
+        ],
+        "webkit.py": [
+diff --git a/tests/wpt/tests/tools/wptrunner/wptrunner/browsers/servo_ohos.py b/tests/wpt/tests/tools/wptrunner/wptrunner/browsers/servo_ohos.py
+index 7364ef31a5f..98b673eff55 100644
+--- a/tests/wpt/tests/tools/wptrunner/wptrunner/browsers/servo_ohos.py
++++ b/tests/wpt/tests/tools/wptrunner/wptrunner/browsers/servo_ohos.py
+@@ -408,7 +408,11 @@ class ServoOhosBrowser(WebDriverBrowser):
+         args = self.servo_args()
+         if self.headless:
+             executable = f"{self.executable_dir}/servoshell"
+-            script = (f"cd {self.files_dir}; "
++            # The shells of hdcd have its oom_score_adj of -1000, which would keep the kernel from
++            # killing Servo when it runs out of memory: it kills the system services instead and
++            # then panics. Make Servo the first process to go instead.
++            script = ("echo 1000 > /proc/self/oom_score_adj 2>/dev/null; "
++                      f"cd {self.files_dir}; "
+                       f"LD_LIBRARY_PATH={self.executable_dir} RUST_BACKTRACE=1 "
+                       f"{executable} {shlex.join(args)} about:blank 2>&1 & "
+                       f"echo {PID_MARKER}$!; wait $!; echo {EXIT_MARKER}$?")

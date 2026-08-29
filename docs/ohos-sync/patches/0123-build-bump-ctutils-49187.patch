@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Asset Malik <5373400+janeoa@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 09:05:11 +0000
+Subject: [PATCH] build: bump ctutils (#49187)
+
+Dropped in favour of upstream 7615ccf8186 (#49187), which this commit
+backported and which every base from base/2026-10-29 on contains.
+Equivalence: `git show <commit> | git patch-id --stable` gives the same
+patch-id for this commit and 7615ccf8186. On base/2026-10-29 it
+conflicts in Cargo.lock only because upstream has since moved ctutils
+on to 0.4.5; with upstream's side it applies empty. Verified by the sync
+of 2026-10-29.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: 7615ccf8186
+Validation: patch-id identity with 7615ccf8186 (`git patch-id --stable`); applies empty on base/2026-10-29 with upstream's Cargo.lock, which has ctutils 0.4.5.
+AI-assisted: Yes (agent session; 2026-10-29 sync -- upstream 7615ccf8186 is the identical patch and upstream moved ctutils further since; kept as an empty placeholder)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

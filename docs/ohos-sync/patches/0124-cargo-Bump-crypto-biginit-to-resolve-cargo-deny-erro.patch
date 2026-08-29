@@ -1,0 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tim van der Lippe <TimvdLippe@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 08:47:18 +0000
+Subject: [PATCH] cargo: Bump crypto-biginit to resolve cargo-deny error
+ (#49218)
+
+Dropped in favour of upstream e78fc913f26 (#49218), which this commit
+backported and which every base from base/2026-10-29 on contains.
+Equivalence: `git show <commit> | git patch-id --stable` gives the same
+patch-id for this commit and e78fc913f26, and it applies empty on
+base/2026-10-29. Verified by the sync of 2026-10-29.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: e78fc913f26
+Validation: applies empty on base/2026-10-29; patch-id identity with e78fc913f26 (`git patch-id --stable`).
+AI-assisted: Yes (agent session; 2026-10-29 sync -- applied empty, since upstream e78fc913f26 is the identical patch; kept as a placeholder)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

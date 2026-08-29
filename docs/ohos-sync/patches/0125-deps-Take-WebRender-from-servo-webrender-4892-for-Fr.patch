@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 28 Oct 2026 14:35:36 +0000
+Subject: [PATCH] deps: Take WebRender from servo/webrender#4892, for FreeType
+ on OpenHarmony
+
+Dropped in favour of upstream 988d63c306a (#49329), which upgrades
+WebRender to 0.70.1. wr_glyph_rasterizer 0.70.1 contains the change of
+servo/webrender#4892 that this commit pinned: its
+src/platform/unix/font.rs links the FreeType variation functions on
+OpenHarmony as on Android, with the same cfgs as the pinned commit
+02d1ddd4d36 (only a comment differs in case); 0.70.1 also has the color
+emoji fixes. Upstream doing more is fine (runbook decision 3).
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: 988d63c306a
+Validation: the `font.rs` of wr_glyph_rasterizer 0.70.1 has the cfgs of the pinned commit 02d1ddd4d36 (diffed; only a comment differs). With this sync's stack and plain 0.70.1, an OpenHarmony checked-release build with `-D warnings` has no FT_ symbols in the dynamic symbol table of its headless executable or of libservoshell.so, and on a DAYU200 (OpenHarmony 7.0) `./mach test-wpt --ohos --profile checked-release css/css-backgrounds` (875 tests, 113 of which crashed on the assertion before this commit) ran without a crash and without the `succeeded(res)` assertion; background-clip-002.html passes.
+AI-assisted: Yes (agent session; 2026-10-29 sync -- dropped the git pin in favour of upstream's WebRender 0.70.1, checked the diff of font.rs against the pinned commit; kept as an empty placeholder)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
