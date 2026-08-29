@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 18 Oct 2026 09:12:31 +0000
+Subject: [PATCH] servoshell: Drop an unmet lint expectation of the embedded
+ app
+
+Dropped in favour of upstream 7b7e3a54f98 (#48941), which removes the
+same expectation as part of building Android with `RUSTFLAGS=-D
+warnings`, and which every base from base/2026-10-22 on contains.
+Equivalence: the patch-id of this commit equals that of 7b7e3a54f98's
+`ports/servoshell/egl/app.rs` hunk, and this commit applies empty on
+base/2026-10-22. Verified by the sync of 2026-10-22.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: 7b7e3a54f98
+Validation: applies empty on base/2026-10-22; patch-id identity with the `ports/servoshell/egl/app.rs` part of 7b7e3a54f98 (`git show 7b7e3a54f98 -- ports/servoshell/egl/app.rs | git patch-id --stable`). The `RUSTFLAGS="-D warnings" ./mach build --locked --ohos --profile checked-release` of the original Validation runs with the CI checks of this sync.
+AI-assisted: Yes (agent session; 2026-10-22 sync -- applied empty, since upstream 7b7e3a54f98 contains the identical change; kept as a placeholder)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

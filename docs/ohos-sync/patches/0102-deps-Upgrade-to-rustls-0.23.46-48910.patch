@@ -1,0 +1,17 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Narfinger <Narfinger@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 15:06:20 +0000
+Subject: [PATCH] deps: Upgrade to rustls@0.23.46 (#48910)
+
+Dropped in favour of upstream 5abd89f8ca3 (#48910), which this commit
+backported and which every base from base/2026-10-22 on contains.
+Equivalence: `git show <commit> | git patch-id --stable` gives the same
+patch-id for this commit and 5abd89f8ca3, and it applies empty on
+base/2026-10-22. Verified by the sync of 2026-10-22.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: 5abd89f8ca3
+Validation: applies empty on base/2026-10-22; patch-id identity with 5abd89f8ca3 (`git patch-id --stable`).
+AI-assisted: Yes (agent session; 2026-10-22 sync -- applied empty, since upstream 5abd89f8ca3 is the identical patch; kept as a placeholder)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

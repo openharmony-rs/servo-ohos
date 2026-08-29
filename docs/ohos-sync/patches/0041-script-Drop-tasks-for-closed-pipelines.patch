@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 8 Oct 2026 13:43:00 +0200
+Subject: [PATCH] script: Drop tasks for closed pipelines
+
+Dropped in favour of upstream 98817dbcff5 (#48747), the landed version
+of the pull request this commit backported, which every base from
+base/2026-10-22 on contains. Equivalence: the two commits add and remove
+the same lines (their patch-ids differ only by context, since upstream
+fb2540e8161 removed the `throttled` field next to the hunks), and this
+commit applies empty on base/2026-10-22. Verified by the sync of
+2026-10-22.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: 98817dbcff5
+Validation: applies empty on base/2026-10-22; the added and removed lines are identical to 98817dbcff5's (`diff` of the `^[-+]` lines of both commits). The leak check of the original Validation was not re-run on plain upstream; equivalence rests on the identical change.
+AI-assisted: Yes (agent session; 2026-10-22 sync -- applied empty, since upstream 98817dbcff5 is the landed version of the same change; kept as a placeholder)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

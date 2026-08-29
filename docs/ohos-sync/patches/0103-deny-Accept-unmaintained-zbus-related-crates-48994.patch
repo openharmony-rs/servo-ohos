@@ -1,0 +1,17 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Martin Robinson <mrobinson@igalia.com>
+Date: Sat, 17 Oct 2026 19:36:39 +0000
+Subject: [PATCH] deny: Accept unmaintained zbus-related crates (#48994)
+
+Dropped in favour of upstream 493d293e194 (#48994), which this commit
+backported and which every base from base/2026-10-22 on contains.
+Equivalence: `git show <commit> | git patch-id --stable` gives the same
+patch-id for this commit and 493d293e194, and it applies empty on
+base/2026-10-22. Verified by the sync of 2026-10-22.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: 493d293e194
+Validation: applies empty on base/2026-10-22; patch-id identity with 493d293e194 (`git patch-id --stable`).
+AI-assisted: Yes (agent session; 2026-10-22 sync -- applied empty, since upstream 493d293e194 is the identical patch; kept as a placeholder)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
