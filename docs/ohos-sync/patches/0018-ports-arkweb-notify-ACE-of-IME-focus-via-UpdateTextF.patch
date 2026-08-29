@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 9 Jul 2026 15:58:03 +0000
+Subject: [PATCH] ports/arkweb: notify ACE of IME focus via
+ UpdateTextFieldStatus
+
+Fire the NWebHandler::UpdateTextFieldStatus callback when Servo focuses
+(true, true) / blurs (false, false) an editable, so ACE tracks the focus
+text field and its back button closes the soft keyboard instead of
+navigating. The keyboard itself remains driven by the engine's own IME
+connection; this only updates ACE's focus state.
+
+Verified on rk3568: with the keyboard up, pressing back closes it
+(OnBackPressed -> "Request close soft keyboard" -> web restored to full
+height) and stays on the page, no crash.
+
+Validation: Test by running uv run ports/arkweb/tools/test_ime.py on a device (soft keyboard must show/hide on focus changes).
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <jschwender@posteo.net>
+---
+ ports/arkweb/cpp/servo_client.h          | 3 +++
+ ports/arkweb/cpp/servo_handler_proxy.cpp | 6 ++++++
+ ports/arkweb/cpp/servo_handler_proxy.h   | 1 +
+ ports/arkweb/src/bridge.rs               | 4 ++++
+ ports/arkweb/src/runtime.rs              | 7 +++++++
+ 5 files changed, 21 insertions(+)
+
+diff --git a/ports/arkweb/cpp/servo_client.h b/ports/arkweb/cpp/servo_client.h
+index 34173f2f1a8..958de38317a 100644
+--- a/ports/arkweb/cpp/servo_client.h
++++ b/ports/arkweb/cpp/servo_client.h
+@@ -27,6 +27,9 @@ public:
+     virtual void on_console_message(std::int32_t level, const std::string& msg, std::int32_t line,
+                                     const std::string& source) const = 0;
+     virtual void on_frame_ready() const = 0;
++    // Notifies ACE that an editable is focused / blurred so it tracks the focus text field and its
++    // back button closes the soft keyboard (the keyboard itself is driven by the engine's own IME).
++    virtual void update_text_field_status(bool show_keyboard, bool attach_ime) const = 0;
+ };
+ 
+ }  // namespace servo::embedder
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.cpp b/ports/arkweb/cpp/servo_handler_proxy.cpp
+index f5e3ce13d9f..6f3338fcb04 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.cpp
++++ b/ports/arkweb/cpp/servo_handler_proxy.cpp
+@@ -83,4 +83,10 @@ void NWebHandlerProxy::on_console_message(std::int32_t level, const std::string&
+ // Presentation is driven directly on the servo side (EGL swap); nothing to forward.
+ void NWebHandlerProxy::on_frame_ready() const {}
+ 
++void NWebHandlerProxy::update_text_field_status(bool show_keyboard, bool attach_ime) const {
++    if (auto h = handler()) {
++        h->UpdateTextFieldStatus(show_keyboard, attach_ime);
++    }
++}
++
+ }  // namespace servo::arkweb
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.h b/ports/arkweb/cpp/servo_handler_proxy.h
+index 46897f7f88e..4e93a113e31 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.h
++++ b/ports/arkweb/cpp/servo_handler_proxy.h
+@@ -28,6 +28,7 @@ public:
+     void on_console_message(std::int32_t level, const std::string& msg, std::int32_t line,
+                             const std::string& source) const override;
+     void on_frame_ready() const override;
++    void update_text_field_status(bool show_keyboard, bool attach_ime) const override;
+ 
+ private:
+     std::shared_ptr<OHOS::NWeb::NWebHandler> handler() const;
+diff --git a/ports/arkweb/src/bridge.rs b/ports/arkweb/src/bridge.rs
+index c20aa0fb9d5..4750904f1e8 100644
+--- a/ports/arkweb/src/bridge.rs
++++ b/ports/arkweb/src/bridge.rs
+@@ -82,6 +82,10 @@ pub mod ffi {
+             source: &CxxString,
+         );
+         fn on_frame_ready(self: &WebViewClient);
++        /// Tell ACE an editable is focused (`true, true`) or blurred (`false, false`) so its back
++        /// button closes the soft keyboard and it tracks the focus text field. The keyboard itself
++        /// is driven by the engine's own IME connection, not by this.
++        fn update_text_field_status(self: &WebViewClient, show_keyboard: bool, attach_ime: bool);
+     }
+ }
+ 
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index 3cf44801fbb..ab28f7d65b2 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -896,6 +896,10 @@ impl ArkWebViewDelegate {
+             }
+         }
+         self.sync.ime_active.store(true, Ordering::Relaxed);
++        // Let ACE track the focus text field so its back button closes the keyboard.
++        if let Some(client) = self.client.as_ref() {
++            client.update_text_field_status(true, true);
++        }
+     }
+ 
+     /// Detach the OHOS IME (hides the soft keyboard) when the editable is blurred.
+@@ -907,6 +911,9 @@ impl ArkWebViewDelegate {
+             }
+             // Dropping the proxy detaches the InputMethodController.
+         }
++        if let Some(client) = self.client.as_ref() {
++            client.update_text_field_status(false, false);
++        }
+     }
+ }
+ 

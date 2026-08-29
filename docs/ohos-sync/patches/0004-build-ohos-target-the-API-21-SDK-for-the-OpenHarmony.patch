@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <jschwender@posteo.net>
+Date: Wed, 15 Jul 2026 14:14:06 +0000
+Subject: [PATCH] build(ohos): target the API-21 SDK for the OpenHarmony
+ product
+
+hvigor resolves compileSdkVersion against the SDK components actually
+installed. With an API-21 OpenHarmony SDK (6.0.1.112) the previous value
+of 20 fails packaging with "The SDK management mode has changed" /
+"Unable to find the following components", since no API-20 components are
+present.
+
+Bump compileSdkVersion/targetSdkVersion to 21 and keep
+compatibleSdkVersion at 20 so the minimum supported device API is
+unchanged. Note HarmonyOS numbers its 6.0 SDK as API 26, so the
+harmonyos product's values are left alone.
+
+Validation: Test by packaging servoshell for the openharmony product against an API-21 OpenHarmony SDK (./mach package --ohos; hvigor must resolve the SDK components).
+Signed-off-by: Jonathan Schwender <jschwender@posteo.net>
+---
+ support/openharmony/build-profile.json5 | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/support/openharmony/build-profile.json5 b/support/openharmony/build-profile.json5
+index 848dcedb3a3..5fc8af8f9e2 100644
+--- a/support/openharmony/build-profile.json5
++++ b/support/openharmony/build-profile.json5
+@@ -4,9 +4,9 @@
+       {
+         "name": "default",
+         "signingConfig": "default",
+-        "compileSdkVersion": 20,
++        "compileSdkVersion": 21,
+         "compatibleSdkVersion": 20,
+-        "targetSdkVersion": 20,
++        "targetSdkVersion": 21,
+         "runtimeOS": "OpenHarmony"
+       },
+       {

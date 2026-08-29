@@ -1,0 +1,1069 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 8 Jul 2026 19:54:33 +0000
+Subject: [PATCH] ports/arkweb: on-device render fixes, deploy.py, OHOS patches
+
+Fixes found bringing the shim up on an rk3568 (M1 render):
+- start the servo thread in LibraryLoaded (CreateNWeb can precede
+  InitializeWebEngine)
+- set opts.config_dir from --user-data-dir (the OHOS font cache unwraps it)
+- buffer the initial load until the browsing context is registered
+- defer WebView creation until the first real Resize, and set the OHNativeWindow
+  buffer geometry before creating the surfman surface (otherwise WebRender OOMs
+  into ACE's 1x1/producer surface)
+- let WebView::resize own the rendering-context resize. Resizing the context
+  directly first makes Painter::resize_rendering_context early-return (it is
+  already at the target size), which skips the WebRender document-view update,
+  the display-list resend and set_needs_repaint -- no new frame is scheduled and
+  the old one persists until an unrelated event (a tap) forces a repaint. Most
+  visible as a half-height page after the soft keyboard closes, once the IME is
+  wired. Buffer geometry is still set first, before the surfman resize that
+  resize() performs. With the context no longer held for that direct resize,
+  BuiltWebView does not keep one: the painter and the delegate hold their own.
+
+Add tools/deploy.py (hdc-py based) and ohos-patches/ (the OpenHarmony webview
+diff plus apply/build instructions) for reproducibility.
+
+Validation: Test by deploying with ports/arkweb/tools/deploy.py and running uv run ports/arkweb/tools/test_render.py on a device; a webview resize must repaint immediately rather than leaving the previous frame.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <jschwender@posteo.net>
+---
+ ports/arkweb/build.rs                         |   1 +
+ ports/arkweb/cpp/servo_native_window.cpp      |  36 +++
+ ports/arkweb/cpp/servo_native_window.h        |  14 +
+ ports/arkweb/cpp/servo_nweb_engine.cpp        |  49 +++-
+ .../0001-webview-servo-engine-backend.patch   | 159 +++++++++++
+ ports/arkweb/ohos-patches/README.md           |  50 ++++
+ ports/arkweb/src/bridge.rs                    |   7 +
+ ports/arkweb/src/runtime.rs                   | 213 +++++++++++---
+ ports/arkweb/tools/deploy.py                  | 270 ++++++++++++++++++
+ 9 files changed, 760 insertions(+), 39 deletions(-)
+ create mode 100644 ports/arkweb/cpp/servo_native_window.cpp
+ create mode 100644 ports/arkweb/cpp/servo_native_window.h
+ create mode 100644 ports/arkweb/ohos-patches/0001-webview-servo-engine-backend.patch
+ create mode 100644 ports/arkweb/ohos-patches/README.md
+ create mode 100644 ports/arkweb/tools/deploy.py
+
+diff --git a/ports/arkweb/build.rs b/ports/arkweb/build.rs
+index 56a24e9179d..3f9fcf89ede 100644
+--- a/ports/arkweb/build.rs
++++ b/ports/arkweb/build.rs
+@@ -15,6 +15,7 @@ fn main() {
+         "cpp/servo_nweb.cpp",
+         "cpp/servo_handler_proxy.cpp",
+         "cpp/servo_stub_managers.cpp",
++        "cpp/servo_native_window.cpp",
+     ];
+ 
+     cxx_build::bridge("src/bridge.rs")
+diff --git a/ports/arkweb/cpp/servo_native_window.cpp b/ports/arkweb/cpp/servo_native_window.cpp
+new file mode 100644
+index 00000000000..17ca832a071
+--- /dev/null
++++ b/ports/arkweb/cpp/servo_native_window.cpp
+@@ -0,0 +1,36 @@
++#include "servo_native_window.h"
++
++#include <dlfcn.h>
++#include <hilog/log.h>
++#include <native_window/external_window.h>
++
++#include <cstdint>
++
++namespace servo::arkweb {
++
++namespace {
++#define SERVO_LOGI(...) OH_LOG_Print(LOG_APP, LOG_INFO, 0xE0C3, "ServoArkWeb", __VA_ARGS__)
++#define SERVO_LOGE(...) OH_LOG_Print(LOG_APP, LOG_ERROR, 0xE0C3, "ServoArkWeb", __VA_ARGS__)
++
++// Variadic, matching the public NDK declaration. Resolved at runtime from libnative_window.so
++// (already loaded in the app process), consistent with how CreateNativeWindowFromSurface is used.
++using HandleOptFn = int32_t (*)(OHNativeWindow*, int, ...);
++}  // namespace
++
++void set_native_window_buffer_geometry(std::size_t window, std::uint32_t width, std::uint32_t height) {
++    auto* native_window = reinterpret_cast<OHNativeWindow*>(window);
++    if (native_window == nullptr || width == 0 || height == 0) {
++        return;
++    }
++    auto handle_opt =
++        reinterpret_cast<HandleOptFn>(dlsym(RTLD_DEFAULT, "OH_NativeWindow_NativeWindowHandleOpt"));
++    if (handle_opt == nullptr) {
++        SERVO_LOGE("OH_NativeWindow_NativeWindowHandleOpt not found: %{public}s", dlerror());
++        return;
++    }
++    int32_t ret = handle_opt(native_window, SET_BUFFER_GEOMETRY, static_cast<int32_t>(width),
++                             static_cast<int32_t>(height));
++    SERVO_LOGI("SET_BUFFER_GEOMETRY %{public}ux%{public}u ret=%{public}d", width, height, ret);
++}
++
++}  // namespace servo::arkweb
+diff --git a/ports/arkweb/cpp/servo_native_window.h b/ports/arkweb/cpp/servo_native_window.h
+new file mode 100644
+index 00000000000..54ecd2a6673
+--- /dev/null
++++ b/ports/arkweb/cpp/servo_native_window.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace servo::arkweb {
++
++// Set the buffer geometry of an OHNativeWindow (passed as its address). surfman creates the EGL
++// window surface with `CreatePlatformWindowSurface` and trusts the native window's existing buffer
++// geometry; ACE's producer surface has no geometry set, so this must be called before the surface
++// is created (and on resize) or WebRender renders into degenerate buffers and reports OutOfMemory.
++void set_native_window_buffer_geometry(std::size_t window, std::uint32_t width, std::uint32_t height);
++
++}  // namespace servo::arkweb
+diff --git a/ports/arkweb/cpp/servo_nweb_engine.cpp b/ports/arkweb/cpp/servo_nweb_engine.cpp
+index d6ead95dd21..fb4cf2328f5 100644
+--- a/ports/arkweb/cpp/servo_nweb_engine.cpp
++++ b/ports/arkweb/cpp/servo_nweb_engine.cpp
+@@ -1,8 +1,12 @@
+ #include "servo_nweb_engine.h"
+ 
+ #include <dlfcn.h>
++#include <hilog/log.h>
+ 
++#include <cstdint>
+ #include <memory>
++#include <string>
++#include <string_view>
+ #include <utility>
+ 
+ #include "arkweb/src/bridge.rs.h"
+@@ -15,10 +19,29 @@ namespace {
+ // not exposed by the NDK stub lib, so it is resolved at runtime from the real
+ // libnative_window.so already loaded in the app process.
+ using CreateNativeWindowFromSurfaceFn = void* (*)(void*);
++
++#define SERVO_LOGI(...) OH_LOG_Print(LOG_APP, LOG_INFO, 0xE0C3, "ServoArkWeb", __VA_ARGS__)
++
++servo::embedder::InitOptions ParseInitOptions(const std::shared_ptr<NWebEngineInitArgs>& init_args) {
++    servo::embedder::InitOptions options{};
++    if (init_args) {
++        constexpr std::string_view kUserDataDir = "--user-data-dir=";
++        constexpr std::string_view kLang = "--lang=";
++        for (const std::string& arg : init_args->GetArgsToAdd()) {
++            if (arg.rfind(kUserDataDir, 0) == 0) {
++                options.user_data_dir = arg.substr(kUserDataDir.size());
++            } else if (arg.rfind(kLang, 0) == 0) {
++                options.lang = arg.substr(kLang.size());
++            }
++        }
++    }
++    return options;
++}
+ }  // namespace
+ 
+ std::shared_ptr<NWeb> ServoNWebEngine::CreateNWeb(std::shared_ptr<NWebCreateInfo> create_info) {
+     if (!create_info) {
++        SERVO_LOGI("CreateNWeb: null create_info");
+         return nullptr;
+     }
+ 
+@@ -26,8 +49,14 @@ std::shared_ptr<NWeb> ServoNWebEngine::CreateNWeb(std::shared_ptr<NWebCreateInfo
+     // NWebSurfaceAdapter::GetCreateInfo and dangles once CreateNWeb returns, so it must be
+     // consumed here, before anything else.
+     void* producer_surface = create_info->GetProducerSurface();
+-    if (create_info->GetEnhanceSurfaceInfo() != nullptr) {
++    void* enhance_surface = create_info->GetEnhanceSurfaceInfo();
++    SERVO_LOGI("CreateNWeb: enter w=%{public}u h=%{public}u producer=%{public}llx enhance=%{public}llx",
++        create_info->GetWidth(), create_info->GetHeight(),
++        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(producer_surface)),
++        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(enhance_surface)));
++    if (enhance_surface != nullptr) {
+         // Enhance-surface mode is unsupported in the MVP.
++        SERVO_LOGI("CreateNWeb: enhance-surface mode unsupported (MVP), returning null");
+         return nullptr;
+     }
+ 
+@@ -43,9 +72,12 @@ std::shared_ptr<NWeb> ServoNWebEngine::CreateNWeb(std::shared_ptr<NWebCreateInfo
+     uint32_t width = create_info->GetWidth();
+     uint32_t height = create_info->GetHeight();
+ 
++    SERVO_LOGI("CreateNWeb: native_window=%{public}llx, calling create_webview %{public}ux%{public}u",
++        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(native_window)), width, height);
+     auto proxy = std::make_shared<servo::arkweb::NWebHandlerProxy>();
+     uint32_t id = servo::embedder::create_webview(reinterpret_cast<size_t>(native_window), width,
+                                                   height, proxy);
++    SERVO_LOGI("CreateNWeb: create_webview returned id=%{public}u", id);
+ 
+     auto nweb = std::make_shared<ServoNWeb>(id, proxy);
+     {
+@@ -61,13 +93,18 @@ std::shared_ptr<NWeb> ServoNWebEngine::GetNWeb(int32_t nweb_id) {
+     return it == nwebs_.end() ? nullptr : it->second;
+ }
+ 
+-void ServoNWebEngine::InitializeWebEngine(std::shared_ptr<NWebEngineInitArgs> /*init_args*/) {
+-    servo::embedder::InitOptions options{};
+-    // TODO(arkweb): parse --user-data-dir / --lang from init_args->GetArgsToAdd().
+-    servo::embedder::initialize(std::move(options));
++// The Servo thread is started here rather than only in InitializeWebEngine: the OHOS lifecycle
++// does not guarantee InitializeWebEngine runs before CreateNWeb (NWebHelper::CreateNWeb only
++// checks that the engine object exists), but LibraryLoaded is always called from GetWebEngine,
++// before any web component creates an NWeb. `initialize` is idempotent, so a later
++// InitializeWebEngine call is a no-op.
++void ServoNWebEngine::LibraryLoaded(std::shared_ptr<NWebEngineInitArgs> init_args, bool /*lazy*/) {
++    servo::embedder::initialize(ParseInitOptions(init_args));
+ }
+ 
+-void ServoNWebEngine::LibraryLoaded(std::shared_ptr<NWebEngineInitArgs> /*init_args*/, bool /*lazy*/) {}
++void ServoNWebEngine::InitializeWebEngine(std::shared_ptr<NWebEngineInitArgs> init_args) {
++    servo::embedder::initialize(ParseInitOptions(init_args));
++}
+ 
+ void ServoNWebEngine::SetWebTag(int32_t /*nweb_id*/, const char* /*web_tag*/) {}
+ 
+diff --git a/ports/arkweb/ohos-patches/0001-webview-servo-engine-backend.patch b/ports/arkweb/ohos-patches/0001-webview-servo-engine-backend.patch
+new file mode 100644
+index 00000000000..7bda72a16bb
+--- /dev/null
++++ b/ports/arkweb/ohos-patches/0001-webview-servo-engine-backend.patch
+@@ -0,0 +1,159 @@
++diff --git a/arkweb_utils/arkweb_utils.cpp b/arkweb_utils/arkweb_utils.cpp
++index dcda11e2c..0fa2abc83 100644
++--- a/arkweb_utils/arkweb_utils.cpp
+++++ b/arkweb_utils/arkweb_utils.cpp
++@@ -476,6 +476,8 @@ ArkWebEngineVersionMetrics MapToMetricsVersion(ArkWebEngineVersion version)
++             return ArkWebEngineVersionMetrics::M132;
++         case ArkWebEngineVersion::M144:
++             return ArkWebEngineVersionMetrics::M144;
+++        case ArkWebEngineVersion::SERVO:
+++            return ArkWebEngineVersionMetrics::UNKNOWN_METRICS;
++     }
++     WVLOG_W("Unexpected ArkWebEngineVersion: %{public}d", static_cast<int32_t>(version));
++     return ArkWebEngineVersionMetrics::UNKNOWN_METRICS;
++@@ -508,7 +510,8 @@ ArkWebEngineVersion CalculateActiveWebEngineVersion()
++ {
++     int webEngineEnforce = OHOS::system::GetIntParameter("web.engine.enforce", 0);
++     if (webEngineEnforce == static_cast<int>(ArkWebEngineType::EVERGREEN) ||
++-        webEngineEnforce == static_cast<int>(ArkWebEngineType::LEGACY)) {
+++        webEngineEnforce == static_cast<int>(ArkWebEngineType::LEGACY) ||
+++        webEngineEnforce == static_cast<int>(ArkWebEngineType::SERVO)) {
++         WVLOG_I("CalculateActiveWebEngineVersion, enforce %{public}d", webEngineEnforce);
++         return static_cast<ArkWebEngineVersion>(webEngineEnforce);
++     }
++@@ -550,6 +553,11 @@ bool IsActiveWebEngineEvergreen()
++     return false;
++ }
++ 
+++bool IsActiveWebEngineServo()
+++{
+++    return getActiveWebEngineType() == ArkWebEngineType::SERVO;
+++}
+++
++ void LogForUnsupportedFunc(ArkWebEngineVersion version, const char* msg)
++ {
++     WVLOG_W("%{public}s unsupported engine version: %{public}d",
++diff --git a/arkweb_utils/arkweb_utils.h b/arkweb_utils/arkweb_utils.h
++index b04016097..bc53eb4a2 100644
++--- a/arkweb_utils/arkweb_utils.h
+++++ b/arkweb_utils/arkweb_utils.h
++@@ -89,6 +89,7 @@ enum class ArkWebEngineVersion {
++     M114 = 1,
++     M132 = 2,
++     M144 = 3,
+++    SERVO = 100,
++     PLAYGROUND = 99998,
++     SYSTEM_EVERGREEN = 99999
++ };
++@@ -96,6 +97,7 @@ enum class ArkWebEngineVersion {
++ enum class ArkWebEngineType {
++     LEGACY = static_cast<int>(ArkWebEngineVersion::M132),
++     EVERGREEN = static_cast<int>(ArkWebEngineVersion::M144),
+++    SERVO = static_cast<int>(ArkWebEngineVersion::SERVO),
++     PLAYGROUND = static_cast<int>(ArkWebEngineVersion::PLAYGROUND),
++ };
++ 
++@@ -127,6 +129,7 @@ ARKWEB_EXPORT void SetAppVersionInner(const std::string& appVersion);
++ ARKWEB_EXPORT std::string ExtractAndRemoveParam(std::string& renderCmd, const std::string& prefix);
++ ARKWEB_EXPORT void UpdateAppInfoFromCmdline(std::string& renderCmd);
++ ARKWEB_EXPORT bool IsActiveWebEngineEvergreen();
+++ARKWEB_EXPORT bool IsActiveWebEngineServo();
++ ARKWEB_EXPORT void SelectWebcoreBeforeProcessRun(const std::string& appBundleName);
++ 
++ ARKWEB_EXPORT std::string GetArkwebLibPath();
++diff --git a/ohos_nweb/src/nweb_helper.cpp b/ohos_nweb/src/nweb_helper.cpp
++index 21180fecf..40c9c550e 100644
++--- a/ohos_nweb/src/nweb_helper.cpp
+++++ b/ohos_nweb/src/nweb_helper.cpp
++@@ -16,6 +16,7 @@
++ #include "nweb_helper.h"
++ 
++ #include <cstdint>
+++#include <dlfcn.h>
++ #include <refbase.h>
++ #include <surface.h>
++ #include <thread>
++@@ -706,12 +707,83 @@ bool NWebHelper::RegisterCustomSchemes()
++     return true;
++ }
++ 
+++namespace {
+++constexpr int SERVO_ARKWEB_EXPECTED_ABI_VERSION = 1;
+++constexpr char SERVO_ARKWEB_DEFAULT_LIB[] = "/system/lib64/libservo_arkweb.so";
+++
+++using ServoAbiVersionFn = int (*)();
+++using ServoCreateEngineFn = OHOS::NWeb::NWebEngine* (*)();
+++
+++// dlopen the Servo shim and hand back its NWebEngine, or nullptr on any failure (with a logged
+++// reason). On success the library handle is intentionally leaked: the engine is a process-wide
+++// singleton that lives for the lifetime of the process, so the shim must never be unloaded.
+++OHOS::NWeb::NWebEngine* LoadServoWebEngine()
+++{
+++    std::string libPath = OHOS::system::GetParameter("web.engine.servo.path", SERVO_ARKWEB_DEFAULT_LIB);
+++
+++    dlerror();
+++    void* handle = dlopen(libPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
+++    if (handle == nullptr) {
+++        WVLOG_E("servo: dlopen('%{public}s') failed: %{public}s", libPath.c_str(), dlerror());
+++        return nullptr;
+++    }
+++
+++    dlerror();
+++    auto abiVersionFn = reinterpret_cast<ServoAbiVersionFn>(dlsym(handle, "servo_arkweb_abi_version"));
+++    if (abiVersionFn == nullptr) {
+++        WVLOG_E("servo: symbol 'servo_arkweb_abi_version' not found: %{public}s", dlerror());
+++        dlclose(handle);
+++        return nullptr;
+++    }
+++
+++    int abiVersion = abiVersionFn();
+++    if (abiVersion != SERVO_ARKWEB_EXPECTED_ABI_VERSION) {
+++        WVLOG_E("servo: ABI version mismatch, shim reports %{public}d, host expects %{public}d",
+++            abiVersion, SERVO_ARKWEB_EXPECTED_ABI_VERSION);
+++        dlclose(handle);
+++        return nullptr;
+++    }
+++
+++    dlerror();
+++    auto createEngineFn =
+++        reinterpret_cast<ServoCreateEngineFn>(dlsym(handle, "servo_arkweb_create_nweb_engine"));
+++    if (createEngineFn == nullptr) {
+++        WVLOG_E("servo: symbol 'servo_arkweb_create_nweb_engine' not found: %{public}s", dlerror());
+++        dlclose(handle);
+++        return nullptr;
+++    }
+++
+++    OHOS::NWeb::NWebEngine* engine = createEngineFn();
+++    if (engine == nullptr) {
+++        WVLOG_E("servo: factory 'servo_arkweb_create_nweb_engine' returned nullptr");
+++        dlclose(handle);
+++        return nullptr;
+++    }
+++
+++    WVLOG_I("servo: loaded web engine from %{public}s (abi %{public}d)", libPath.c_str(), abiVersion);
+++    return engine;
+++}
+++}  // namespace
+++
++ bool NWebHelper::GetWebEngine(bool fromArk)
++ {
++     if (nwebEngine_) {
++         return true;
++     }
++ 
+++    if (OHOS::ArkWeb::IsActiveWebEngineServo()) {
+++        NWebEngine* servoEngine = LoadServoWebEngine();
+++        if (servoEngine == nullptr) {
+++            WVLOG_E("failed to load servo web engine");
+++            return false;
+++        }
+++        // No-op deleter: LoadServoWebEngine hands back a leaked process singleton.
+++        nwebEngine_ = std::shared_ptr<NWebEngine>(servoEngine, [](NWebEngine*) {});
+++        nwebEngine_->LibraryLoaded(GetInitArgs(), lazyInitializeWebEngine_);
+++        WVLOG_I("servo web engine loaded");
+++        return true;
+++    }
+++
++     if (bundlePath_.empty()) {
++         auto ctx = AbilityRuntime::ApplicationContext::GetApplicationContext();
++         if (!ctx) {
+diff --git a/ports/arkweb/ohos-patches/README.md b/ports/arkweb/ohos-patches/README.md
+new file mode 100644
+index 00000000000..e65345570dd
+--- /dev/null
++++ b/ports/arkweb/ohos-patches/README.md
+@@ -0,0 +1,50 @@
++# OpenHarmony webview patches
++
++These patches modify the OpenHarmony `web/webview` component so that Servo can be selected at
++runtime as an alternative ArkWeb engine, loaded from `libservo_arkweb.so` (built by this crate).
++They are the *only* changes required on the OpenHarmony side — the ACE (`web_delegate.cpp`) and
++NAPI layers are untouched.
++
++## Source
++
++- Repo: `https://gitcode.com/openharmony/web_webview` (component `base/web/webview`)
++- Branch/tag: `OpenHarmony-7.0-Beta1`
++- Base commit: `f0d95626a5fbd99b5d4106cbdd3785c2934a8152`
++
++This matches the commit the NWeb headers in `../vendor/ohos_nweb/` were synced from, so the shim's
++vtable layout agrees with the patched libraries. Always build and deploy the shim and the patched
++`.z.so` libraries from matching checkouts.
++
++## Applying
++
++From the root of an OpenHarmony `web/webview` checkout at the base commit above:
++
++```sh
++cd base/web/webview
++git apply /path/to/ports/arkweb/ohos-patches/0001-webview-servo-engine-backend.patch
++```
++
++Then build the webview component (arm64) — see `../../../Servo-arkweb-plan.md` §7:
++
++```sh
++./build.sh --product-name rk3568 --target-cpu arm64 --build-target webview --ccache
++# → out/rk3568/web/webview/{libarkweb_utils.z.so, libarkweb_core_loader.z.so}
++```
++
++## What the patch does
++
++- `arkweb_utils/arkweb_utils.h` — adds `SERVO = 100` to `ArkWebEngineVersion` / `ArkWebEngineType`
++  and declares `IsActiveWebEngineServo()`.
++- `arkweb_utils/arkweb_utils.cpp` — accepts `web.engine.enforce == SERVO` in
++  `CalculateActiveWebEngineVersion()`, implements `IsActiveWebEngineServo()`, and adds the `SERVO`
++  case to `MapToMetricsVersion()` (so the new enumerator does not trip `-Wswitch -Werror`).
++- `ohos_nweb/src/nweb_helper.cpp` — a `LoadServoWebEngine()` helper (dlopen
++  `web.engine.servo.path`, default `/system/lib64/libservo_arkweb.so`; ABI-version check; factory
++  symbol) and a `SERVO` branch at the top of `NWebHelper::GetWebEngine` that uses it instead of the
++  Chromium bridge-helper path.
++
++## Toggle at runtime
++
++```sh
++hdc shell param set web.engine.enforce 100   # resets on reboot; re-set before launching the app
++```
+diff --git a/ports/arkweb/src/bridge.rs b/ports/arkweb/src/bridge.rs
+index 0429285f960..0692ab2b2ac 100644
+--- a/ports/arkweb/src/bridge.rs
++++ b/ports/arkweb/src/bridge.rs
+@@ -81,6 +81,13 @@ pub mod ffi_arkweb {
+         fn send_key_event(id: u32, oh_keycode: i32, oh_action: i32) -> bool;
+         fn init_logging(min_level: i32);
+     }
++
++    unsafe extern "C++" {
++        include!("servo_native_window.h");
++
++        /// Set the OHNativeWindow buffer geometry before surfman creates/resizes its EGL surface.
++        fn set_native_window_buffer_geometry(window: usize, width: u32, height: u32);
++    }
+ }
+ 
+ // ---- `extern "Rust"` implementations (resolved by cxx as `super::<name>`). ----
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index b1eea16f4cf..cdc95326fd2 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -12,6 +12,7 @@
+ use std::collections::HashMap;
+ use std::ffi::c_void;
+ use std::panic::{self, AssertUnwindSafe};
++use std::path::PathBuf;
+ use std::ptr::NonNull;
+ use std::rc::Rc;
+ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+@@ -27,8 +28,8 @@ use raw_window_handle::{
+     WindowHandle,
+ };
+ use servo::{
+-    EventLoopWaker, LoadStatus, RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder,
+-    WebViewDelegate, WindowRenderingContext,
++    EventLoopWaker, LoadStatus, Opts, RenderingContext, Servo, ServoBuilder, WebView,
++    WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+ };
+ use url::Url;
+ 
+@@ -145,9 +146,27 @@ impl EventLoopWaker for ArkWaker {
+     }
+ }
+ 
+-struct WebViewEntry {
++/// The Servo `WebView`, built lazily once a real size is known. The rendering context is held by
++/// the painter and the delegate (which paints through it), so it is not kept here separately.
++struct BuiltWebView {
+     webview: WebView,
+-    rendering_context: Rc<WindowRenderingContext>,
++}
++
++struct WebViewEntry {
++    window_handle: usize,
++    client: SharedPtr<WebViewClient>,
++    sync: Arc<SyncState>,
++    /// The most recent size ACE reported. ACE creates the NWeb at a 1x1 placeholder before layout
++    /// and issues one real `Resize` afterwards; surfman must create its EGL surface at the real
++    /// size (creating at 1x1 then resizing the producer surface makes WebRender OOM), so the
++    /// WebView is not built until this is non-degenerate — mirroring how servoshell only creates a
++    /// WebView once a real window size is available.
++    size: PhysicalSize<u32>,
++    /// A URL requested before the WebView existed / its browsing context was registered. Held here
++    /// and flushed by [`ServoThread::flush_pending_loads`] once the WebView is built and ready.
++    pending_url: Option<Url>,
++    /// `None` until the first real-sized `Resize` builds the WebView.
++    built: Option<BuiltWebView>,
+ }
+ 
+ struct ServoThread {
+@@ -156,7 +175,7 @@ struct ServoThread {
+ }
+ 
+ impl ServoThread {
+-    fn run(rx: Receiver<Action>, waker_chan: Sender<Action>) {
++    fn run(rx: Receiver<Action>, waker_chan: Sender<Action>, config_dir: PathBuf) {
+         // Install the crypto provider Servo's rustls-based networking requires for TLS.
+         if rustls::crypto::aws_lc_rs::default_provider()
+             .install_default()
+@@ -165,7 +184,16 @@ impl ServoThread {
+             info!("[arkweb] rustls crypto provider already installed");
+         }
+         let waker = Box::new(ArkWaker { chan: waker_chan });
+-        let servo = ServoBuilder::default().event_loop_waker(waker).build();
++        // `config_dir` must be set: the OHOS font cache unwraps `opts::get().config_dir`
++        // (fonts/platform/freetype/ohos/font_cache.rs) when Servo initializes.
++        let opts = Opts {
++            config_dir: Some(config_dir),
++            ..Default::default()
++        };
++        let servo = ServoBuilder::default()
++            .opts(opts)
++            .event_loop_waker(waker)
++            .build();
+         let mut thread = ServoThread {
+             servo,
+             webviews: HashMap::new(),
+@@ -173,6 +201,7 @@ impl ServoThread {
+         while let Ok(action) = rx.recv() {
+             thread.handle(action);
+             thread.servo.spin_event_loop();
++            thread.flush_pending_loads();
+         }
+         info!("[arkweb] servo-main thread exiting");
+     }
+@@ -197,10 +226,14 @@ impl ServoThread {
+                 SYNC_STATES.lock().unwrap().remove(&id);
+                 let _ = ack.send(());
+             },
+-            Action::LoadUrl { id, url } => {
+-                if let (Some(entry), Ok(url)) = (self.webviews.get(&id), Url::parse(&url)) {
+-                    entry.webview.load(url);
+-                }
++            Action::LoadUrl { id, url } => match Url::parse(&url) {
++                Ok(url) => {
++                    if let Some(entry) = self.webviews.get_mut(&id) {
++                        // Defer the actual load until the WebView is registered (see below).
++                        entry.pending_url = Some(url);
++                    }
++                },
++                Err(error) => error!("[arkweb] load_url id={id}: invalid url {url:?}: {error}"),
+             },
+             Action::Reload(id) => self.with_webview(id, |wv| wv.reload()),
+             Action::GoBack(id) => self.with_webview(id, |wv| {
+@@ -210,10 +243,37 @@ impl ServoThread {
+                 wv.go_forward(1);
+             }),
+             Action::Resize { id, width, height } => {
+-                if let Some(entry) = self.webviews.get(&id) {
+-                    let size = PhysicalSize::new(width.max(1), height.max(1));
+-                    entry.rendering_context.resize(size);
+-                    entry.webview.resize(size);
++                info!("[arkweb] resize id={id} {width}x{height}");
++                let size = PhysicalSize::new(width.max(1), height.max(1));
++                let already_built = match self.webviews.get_mut(&id) {
++                    Some(entry) => {
++                        entry.size = size;
++                        match &entry.built {
++                            Some(built) => {
++                                crate::bridge::ffi_arkweb::set_native_window_buffer_geometry(
++                                    entry.window_handle,
++                                    size.width,
++                                    size.height,
++                                );
++                                // `WebView::resize` resizes the shared rendering context itself (via
++                                // the painter) *and* issues the WebRender document-view + display-list
++                                // update that schedules the repaint. Do not resize the context
++                                // directly first: the painter early-returns when the context is
++                                // already at the target size, which skips that repaint and leaves the
++                                // stale frame until the next unrelated event (e.g. a tap) — most
++                                // visibly a half-height page after the soft keyboard closes. Buffer
++                                // geometry is still set above, before the surfman resize `resize()`
++                                // performs.
++                                built.webview.resize(size);
++                                true
++                            },
++                            None => false,
++                        }
++                    },
++                    None => true,
++                };
++                if !already_built {
++                    self.ensure_built(id);
+                 }
+             },
+             Action::SetThrottled { id, throttled } => {
+@@ -229,22 +289,54 @@ impl ServoThread {
+     }
+ 
+     fn with_webview(&self, id: u32, f: impl FnOnce(&WebView)) {
+-        if let Some(entry) = self.webviews.get(&id) {
+-            f(&entry.webview);
++        if let Some(built) = self
++            .webviews
++            .get(&id)
++            .and_then(|entry| entry.built.as_ref())
++        {
++            f(&built.webview);
+         }
+     }
+ 
+-    fn create_webview(
+-        &mut self,
+-        id: u32,
+-        window_handle: usize,
+-        width: u32,
+-        height: u32,
+-        client: SendClient,
+-        sync: Arc<SyncState>,
+-    ) {
++    /// Load any URL that was requested before its WebView existed or its browsing context was
++    /// registered. A WebView is ready once the constellation has registered it, observable as
++    /// `url()` becoming `Some`. Retried after every event-loop turn, so the constellation's own
++    /// wakeups drive it.
++    fn flush_pending_loads(&mut self) {
++        for entry in self.webviews.values_mut() {
++            let ready = entry
++                .built
++                .as_ref()
++                .is_some_and(|built| built.webview.url().is_some());
++            if ready && entry.pending_url.is_some() {
++                let url = entry.pending_url.take().expect("checked is_some");
++                info!("[arkweb] flushing pending load: {url}");
++                if let Some(built) = &entry.built {
++                    built.webview.load(url);
++                }
++            }
++        }
++    }
++
++    /// Build the WebView + surfman rendering context once a real (non-1x1) size is known. No-op if
++    /// already built or still at the 1x1 placeholder. See [`WebViewEntry::size`].
++    fn ensure_built(&mut self, id: u32) {
++        let (window_handle, size, client, sync) = match self.webviews.get(&id) {
++            Some(entry)
++                if entry.built.is_none() && entry.size.width > 1 && entry.size.height > 1 =>
++            {
++                (
++                    entry.window_handle,
++                    entry.size,
++                    entry.client.clone(),
++                    entry.sync.clone(),
++                )
++            },
++            _ => return,
++        };
++
+         let Some(native_window) = NonNull::new(window_handle as *mut c_void) else {
+-            error!("[arkweb] create_webview id={id}: null OHNativeWindow");
++            error!("[arkweb] build webview id={id}: null OHNativeWindow");
+             return;
+         };
+         let raw_window = RawWindowHandle::OhosNdk(OhosNdkWindowHandle::new(native_window));
+@@ -253,18 +345,24 @@ impl ServoThread {
+         let window = unsafe { WindowHandle::borrow_raw(raw_window) };
+         let display = unsafe { DisplayHandle::borrow_raw(raw_display) };
+ 
+-        let size = PhysicalSize::new(width.max(1), height.max(1));
++        // surfman does not set the native window's buffer geometry; ACE's producer surface has
++        // none, so set it before creating the EGL surface or WebRender OOMs on the mismatch.
++        crate::bridge::ffi_arkweb::set_native_window_buffer_geometry(
++            window_handle,
++            size.width,
++            size.height,
++        );
+         let rendering_context = match WindowRenderingContext::new(display, window, size) {
+             Ok(context) => Rc::new(context),
+             Err(error) => {
+-                error!("[arkweb] create_webview id={id}: rendering context: {error:?}");
++                error!("[arkweb] build webview id={id}: rendering context: {error:?}");
+                 return;
+             },
+         };
+ 
+         let delegate = Rc::new(ArkWebViewDelegate {
+             sync,
+-            client: client.0,
++            client,
+             rendering_context: rendering_context.clone(),
+         });
+         let webview = WebViewBuilder::new(&self.servo, rendering_context.clone())
+@@ -273,14 +371,44 @@ impl ServoThread {
+         webview.focus();
+         webview.show();
+ 
++        if let Some(entry) = self.webviews.get_mut(&id) {
++            entry.built = Some(BuiltWebView { webview });
++        }
++        info!(
++            "[arkweb] built webview id={id} at {}x{}",
++            size.width, size.height
++        );
++    }
++
++    fn create_webview(
++        &mut self,
++        id: u32,
++        window_handle: usize,
++        width: u32,
++        height: u32,
++        client: SendClient,
++        sync: Arc<SyncState>,
++    ) {
++        // Register the WebView's parameters but defer building it: ACE creates the NWeb at a 1x1
++        // placeholder before layout, and surfman must create its EGL surface at the real size.
++        // The build happens in `ensure_built` on the first non-degenerate `Resize`.
++        let size = PhysicalSize::new(width.max(1), height.max(1));
+         self.webviews.insert(
+             id,
+             WebViewEntry {
+-                webview,
+-                rendering_context,
++                window_handle,
++                client: client.0,
++                sync,
++                size,
++                pending_url: None,
++                built: None,
+             },
+         );
+-        info!("[arkweb] create_webview id={id} window={window_handle:#x} {width}x{height}");
++        info!(
++            "[arkweb] register webview id={id} window={window_handle:#x} {width}x{height} (build deferred)"
++        );
++        // Build immediately if ACE already gave a real size (otherwise wait for the first Resize).
++        self.ensure_built(id);
+     }
+ }
+ 
+@@ -334,6 +462,13 @@ impl WebViewDelegate for ArkWebViewDelegate {
+     }
+ 
+     fn notify_new_frame_ready(&self, webview: WebView) {
++        // ACE creates the NWeb at a 1x1 placeholder and resizes to the real size once laid out.
++        // Presenting into a 1x1 surface makes WebRender report OutOfMemory every frame and panic
++        // after five, so skip painting until a real size has arrived.
++        let size = self.rendering_context.size();
++        if size.width <= 1 || size.height <= 1 {
++            return;
++        }
+         if self.rendering_context.make_current().is_ok() {
+             webview.paint();
+             self.rendering_context.present();
+@@ -370,6 +505,18 @@ pub fn initialize(options: InitOptions) -> bool {
+             options.user_data_dir, options.lang, options.extra_args
+         );
+ 
++        // Servo needs a writable `config_dir` (used for the OHOS font cache and prefs). The OHOS
++        // side passes the app's data dir as `--user-data-dir`; fall back to the sandbox-relative
++        // app cache dir if it is absent.
++        let config_dir = if options.user_data_dir.is_empty() {
++            PathBuf::from("/data/storage/el2/base/cache/servo")
++        } else {
++            PathBuf::from(&options.user_data_dir).join("servo")
++        };
++        if let Err(error) = std::fs::create_dir_all(&config_dir) {
++            error!("[arkweb] failed to create config dir {config_dir:?}: {error}");
++        }
++
+         if SERVO_CHANNEL.get().is_some() {
+             info!("[arkweb] already initialized");
+             return true;
+@@ -378,7 +525,7 @@ pub fn initialize(options: InitOptions) -> bool {
+         let waker_chan = tx.clone();
+         match thread::Builder::new()
+             .name("servo-main".into())
+-            .spawn(move || ServoThread::run(rx, waker_chan))
++            .spawn(move || ServoThread::run(rx, waker_chan, config_dir))
+         {
+             Ok(_) => {
+                 // Publish the channel only once the draining thread is alive. On a spawn failure the
+diff --git a/ports/arkweb/tools/deploy.py b/ports/arkweb/tools/deploy.py
+new file mode 100644
+index 00000000000..252d0ed31ad
+--- /dev/null
++++ b/ports/arkweb/tools/deploy.py
+@@ -0,0 +1,270 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["hdc-py>=0.2.0"]
++# ///
++"""Deploy the Servo ArkWeb backend to an OpenHarmony device.
++
++Pushes the Servo shim (``libservo_arkweb.so``) plus the patched OHOS webview libraries
++(``libarkweb_utils.z.so`` and ``libarkweb_core_loader.z.so``, which carry the SERVO branch in
++``arkweb_utils`` / ``nweb_helper.cpp``) into the system image, then sets
++``web.engine.enforce=100`` so the next boot selects Servo as the active ArkWeb engine.
++
++Every transfer is sha256-verified host-vs-device by hdc-py's ``send_file`` (a mismatch aborts the
++deploy loudly), which guards against the silent truncation ``hdc file send`` can produce when the
++device disk is full. Free space on the target partition is checked up front.
++
++Run with uv (installs hdc-py into an ephemeral environment)::
++
++    uv run ports/arkweb/tools/deploy.py \\
++        --servo-lib target/aarch64-unknown-linux-ohos/release/libservo_arkweb.so \\
++        --ohos-out /home/ubuntu/openharmony/out/rk3568
++
++The OHOS libs may be packaged inside a signed HAP rather than loose on the filesystem; in that
++case discovery fails with a clear message and those libs must be replaced by other means.
++"""
++
++from __future__ import annotations
++
++import argparse
++import shlex
++import sys
++from dataclasses import dataclass
++from pathlib import Path
++
++from hdc_py import Hdc, HarmonyDevice, HdcDisconnectedError
++
++# The two OHOS webview libraries built from the ~3-file diff, by output filename.
++OHOS_LIB_NAMES = ("libarkweb_utils.z.so", "libarkweb_core_loader.z.so")
++
++# Servo engine type in arkweb_utils (ArkWebEngineType::SERVO); the value the enforce param takes.
++SERVO_ENGINE_TYPE = 100
++
++DEFAULT_SERVO_DEST = "/system/lib64/libservo_arkweb.so"
++
++# Space margin required on the target partition beyond the pushed payload (temp/inode slack).
++FREE_SPACE_MARGIN_BYTES = 16 * 1024 * 1024
++
++
++@dataclass
++class Transfer:
++    """A single host file to push to a resolved device path."""
++
++    label: str
++    host_path: Path
++    device_path: str
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Deploy the Servo ArkWeb backend to an OpenHarmony device.",
++    )
++    parser.add_argument(
++        "--servo-lib",
++        type=Path,
++        required=True,
++        help="Host path to libservo_arkweb.so (the cross-built Servo shim).",
++    )
++    parser.add_argument(
++        "--servo-dest",
++        default=DEFAULT_SERVO_DEST,
++        help=f"Device path for the Servo shim (default: {DEFAULT_SERVO_DEST}). "
++        "Must match the web.engine.servo.path param if that param is overridden.",
++    )
++    parser.add_argument(
++        "--ohos-out",
++        type=Path,
++        help="OHOS build output dir (e.g. out/rk3568) to locate the patched webview .z.so libs. "
++        "Omit to deploy only the Servo shim.",
++    )
++    parser.add_argument(
++        "--ohos-lib",
++        action="append",
++        default=[],
++        metavar="HOST_PATH",
++        help="Explicit host path to an OHOS webview .z.so to push (repeatable). Overrides the "
++        "automatic search under --ohos-out for that filename.",
++    )
++    parser.add_argument(
++        "--search-root",
++        default="/system",
++        help="Device root under which to discover existing OHOS lib paths (default: /system).",
++    )
++    parser.add_argument("--target", help="hdc target serial (auto-detected if exactly one).")
++    parser.add_argument("--hdc", type=Path, help="Path to the hdc binary (default: from PATH).")
++    parser.add_argument(
++        "--no-enforce",
++        action="store_true",
++        help="Do not set web.engine.enforce (only push libraries).",
++    )
++    parser.add_argument(
++        "--setenforce-permissive",
++        action="store_true",
++        help="Run 'setenforce 0' so SELinux does not block dlopen of the shim (dev devices only).",
++    )
++    parser.add_argument(
++        "--no-reboot",
++        action="store_true",
++        help="Do not reboot after deploying (the engine switch takes effect on next boot).",
++    )
++    parser.add_argument(
++        "--dry-run",
++        action="store_true",
++        help="Print the planned actions without touching the device.",
++    )
++    return parser.parse_args()
++
++
++def resolve_device(hdc: Hdc, target: str | None) -> HarmonyDevice:
++    if target:
++        return hdc.connect(target)
++    targets = hdc.list_targets()
++    if not targets:
++        sys.exit("error: no hdc targets connected")
++    if len(targets) > 1:
++        sys.exit(f"error: multiple targets connected, pass --target: {', '.join(targets)}")
++    return hdc.connect(targets[0])
++
++
++def device_shell(device: HarmonyDevice, command: str, check: bool = True) -> str:
++    """Run a shell command on the device and return its stdout as text."""
++    result = device.cmd(command, capture_output=True, text=True, check=check)
++    return (result.stdout or "").strip()
++
++
++def discover_device_path(device: HarmonyDevice, lib_name: str, search_root: str) -> str:
++    """Locate an existing library on the device by filename, returning its absolute path."""
++    quoted_root = shlex.quote(search_root)
++    quoted_name = shlex.quote(lib_name)
++    output = device_shell(
++        device,
++        f"find {quoted_root} -name {quoted_name} -type f 2>/dev/null",
++        check=False,
++    )
++    matches = [line.strip() for line in output.splitlines() if line.strip()]
++    if not matches:
++        sys.exit(
++            f"error: could not locate {lib_name} under {search_root} on the device. "
++            "It may be packaged inside a HAP rather than a loose file; replace it by other means."
++        )
++    if len(matches) > 1:
++        print(f"warning: multiple matches for {lib_name}, using the first:", file=sys.stderr)
++        for match in matches:
++            print(f"    {match}", file=sys.stderr)
++    return matches[0]
++
++
++def build_transfers(args: argparse.Namespace, device: HarmonyDevice) -> list[Transfer]:
++    transfers: list[Transfer] = []
++
++    if not args.servo_lib.is_file():
++        sys.exit(f"error: --servo-lib not found: {args.servo_lib}")
++    transfers.append(Transfer("servo shim", args.servo_lib, args.servo_dest))
++
++    # Map each OHOS lib name to a host path: an explicit --ohos-lib override, else search --ohos-out.
++    explicit = {Path(p).name: Path(p) for p in args.ohos_lib}
++    if args.ohos_out or explicit:
++        for lib_name in OHOS_LIB_NAMES:
++            host_path = explicit.get(lib_name)
++            if host_path is None and args.ohos_out:
++                host_path = find_ohos_lib(args.ohos_out, lib_name)
++            if host_path is None:
++                print(
++                    f"warning: {lib_name} not provided or found; skipping (needed for the SERVO branch to take effect)",
++                    file=sys.stderr,
++                )
++                continue
++            if not host_path.is_file():
++                sys.exit(f"error: OHOS lib not found: {host_path}")
++            device_path = discover_device_path(device, lib_name, args.search_root)
++            transfers.append(Transfer(lib_name, host_path, device_path))
++
++    return transfers
++
++
++def find_ohos_lib(ohos_out: Path, lib_name: str) -> Path | None:
++    matches = sorted(ohos_out.rglob(lib_name), key=lambda p: p.stat().st_mtime, reverse=True)
++    if not matches:
++        return None
++    if len(matches) > 1:
++        print(f"warning: multiple {lib_name} under {ohos_out}, using newest: {matches[0]}", file=sys.stderr)
++    return matches[0]
++
++
++def check_free_space(device: HarmonyDevice, device_dir: str, needed_bytes: int) -> None:
++    quoted_dir = shlex.quote(device_dir)
++    output = device_shell(device, f"df -k {quoted_dir}", check=False)
++    lines = [line for line in output.splitlines() if line.strip()]
++    if len(lines) < 2:
++        print(f"warning: could not read free space for {device_dir}", file=sys.stderr)
++        return
++    fields = lines[-1].split()
++    # Toybox df: Filesystem 1K-blocks Used Available Use% Mounted-on
++    try:
++        available_bytes = int(fields[3]) * 1024
++    except (IndexError, ValueError):
++        print(f"warning: could not parse df output for {device_dir}: {lines[-1]}", file=sys.stderr)
++        return
++    if available_bytes < needed_bytes:
++        sys.exit(
++            f"error: insufficient free space on {device_dir}: "
++            f"{available_bytes // 1024} KiB available, {needed_bytes // 1024} KiB required"
++        )
++    print(f"free space on {device_dir}: {available_bytes // (1024 * 1024)} MiB available")
++
++
++def main() -> None:
++    args = parse_args()
++
++    hdc = Hdc(hdc_path=args.hdc)
++    device = resolve_device(hdc, args.target)
++    print(f"target: {device.target}")
++
++    transfers = build_transfers(args, device)
++    print("planned transfers:")
++    for transfer in transfers:
++        size = transfer.host_path.stat().st_size
++        print(f"  {transfer.label}: {transfer.host_path} -> {transfer.device_path} ({size} bytes)")
++
++    if args.dry_run:
++        print("dry run: no changes made")
++        return
++
++    device.mount_system_as_rw()
++
++    # Group required free space by target partition top-level dir (crude but adequate).
++    needed = sum(t.host_path.stat().st_size for t in transfers) + FREE_SPACE_MARGIN_BYTES
++    check_free_space(device, "/system", needed)
++
++    for transfer in transfers:
++        print(f"pushing {transfer.label} -> {transfer.device_path}")
++        # send_file sha256-verifies the transfer and raises on mismatch (skips if already equal).
++        device.send_file(str(transfer.host_path), transfer.device_path)
++        print(f"  verified {transfer.device_path}")
++
++    if args.setenforce_permissive:
++        print("setting SELinux permissive")
++        device_shell(device, "setenforce 0", check=False)
++
++    if not args.no_enforce:
++        print(f"setting web.engine.enforce={SERVO_ENGINE_TYPE}")
++        device_shell(device, f"param set web.engine.enforce {SERVO_ENGINE_TYPE}")
++        if args.servo_dest != DEFAULT_SERVO_DEST:
++            print(f"setting web.engine.servo.path={args.servo_dest}")
++            device_shell(device, f"param set web.engine.servo.path {shlex.quote(args.servo_dest)}")
++        current = device_shell(device, "param get web.engine.enforce", check=False)
++        print(f"  web.engine.enforce is now: {current}")
++
++    if not args.no_reboot:
++        print("rebooting device")
++        # The connection drops as the device reboots. hdc_py's cmd() still tries to read the
++        # device-side exit code afterwards and raises once the target disconnects, so swallow it.
++        try:
++            device.cmd("reboot", check=False)
++        except HdcDisconnectedError:
++            pass
++
++    print("done")
++
++
++if __name__ == "__main__":
++    main()
