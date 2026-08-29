@@ -1,0 +1,335 @@
+# ohos-main patch stack
+
+Ordered list of the patches on `ohos-main`, first patch first. Kept in sync
+with `git log base/<date>..ohos-main` by `check_stack.py` (subjects must
+match exactly). Per entry:
+
+- tier per the fork policy: A = additive, B = seam in shared code,
+  C = invasive;
+- coverage: what proves the patch after a rebase — `CI` (host build/tests),
+  `device` (the arkweb on-device suite), `manual` (only its `Validation:`
+  recipe), `tooling` (self-checking scripts), `none` (docs);
+- watch: upstream paths the patch depends on but does not modify. `drift.py`
+  reports upstream commits touching them, so semantic drift is reviewed
+  even when the patch applies cleanly. Keep the list file-level and short.
+
+The checked-in `patches/` directory is generated from the stack by
+`gen_patches.py` and verified by `check_stack.py`; never edit it by hand.
+Its diff between syncs is the GitHub-viewable form of the range-diff.
+
+Vendored third-party code under `third_party/<name>` is left out of the patch
+files, which would otherwise carry megabytes of generated sources. Each
+`third_party/patches/<name>/update.sh` regenerates its directory from upstream
+plus the patches next to it, so after applying the stack to a fresh base, run
+those scripts (they need network access). `check_stack.py` runs each with
+`--check` to verify the committed copy.
+
+1. `docs: add the ohos-main sync runbook and stack manifest` — A · tooling · watch: -
+2. `docs: Mark this repo as an experimental OHOS downstream fork` — B · none · watch: -
+3. `Allow clearly marked AI assisted contributions` — B · none · watch: -
+4. `build(ohos): target the API-21 SDK for the OpenHarmony product` — B · none · watch: -
+5. `ports/arkweb: Servo as an alternative ArkWeb webview backend` — B · device · watch: components/servo/servo.rs components/servo/webview.rs components/servo/webview_delegate.rs components/shared/embedder ports/servoshell/egl/ohos
+6. `ports/arkweb: on-device render fixes, deploy.py, OHOS patches` — A · device · watch: components/servo/webview.rs
+7. `ports/arkweb: Wire touch, scroll and key input; fix open/close leaks` — A · device · watch: components/shared/embedder/input_events.rs components/servo/webview.rs
+8. `ports/arkweb: Drive console, progress and crash handler callbacks` — A · device · watch: components/servo/webview_delegate.rs
+9. `ports/arkweb: Back the cookie manager with Servo's site-data manager` — B · device · watch: components/net/cookie_storage.rs components/servo/site_data_manager.rs
+10. `ports/arkweb: Return ExecuteJavaScript results to ACE` — A · device · watch: components/servo/webview.rs components/servo/javascript_evaluator.rs
+11. `ports/arkweb: Optional network proxy for on-device testing` — A · device · watch: components/config/prefs.rs
+12. `ports/arkweb: restrict libservo_arkweb.so exported symbols` — A · device · watch: -
+13. `ports/arkweb: dlopen the shim with RTLD_LOCAL in the OHOS loader` — A · device · watch: -
+14. `ports/arkweb: drive presentation from the OHOS display vsync` — A · device · watch: components/servo/servo.rs components/servo/webview.rs
+15. `ports/arkweb: honor LibraryLoaded lazy flag, defer Servo::new` — A · device · watch: components/servo/servo.rs
+16. `ports/arkweb: split pure conversion helpers into a host-tested module` — B · CI · watch: components/shared/embedder
+17. `ports/arkweb: IME / soft-keyboard integration` — B · device · watch: components/shared/embedder/input_events.rs components/servo/webview_delegate.rs ports/servoshell/egl/ohos components/script/dom/html/form_controls/htmlinputelement.rs components/script/dom/html/form_controls/htmltextareaelement.rs components/script/dom/document/editing.rs
+18. `ports/arkweb: notify ACE of IME focus via UpdateTextFieldStatus` — A · device · watch: components/servo/webview_delegate.rs components/script/dom/html/form_controls/htmlinputelement.rs components/script/dom/html/form_controls/htmltextareaelement.rs
+19. `ports/arkweb: add on-device regression tests (scroll, nav, render, multi-webview, vsync)` — B · device · watch: -
+20. `ports/arkweb: JS dialogs (alert/confirm/prompt)` — A · device · watch: components/servo/webview_delegate.rs
+21. `ports/arkweb: vendor the arkweb-test app + a HAP build script` — A · device · watch: -
+22. `ports/arkweb: <select> dropdowns` — A · device · watch: components/servo/webview_delegate.rs
+23. `ports/arkweb: <input type=file> pickers` — A · device · watch: components/servo/webview_delegate.rs
+24. `ports/arkweb: resolve <input type=color> (no ACE hook)` — A · device · watch: components/servo/webview_delegate.rs
+25. `ports/arkweb: wire the OHOS system clipboard via ohos-pasteboard` — B · device · watch: components/servo/clipboard_delegate.rs components/servo/Cargo.toml components/script/dom/clipboard
+26. `ports/arkweb: sync URL bar on history navigation` — A · device · watch: components/servo/webview_delegate.rs
+27. `ports/arkweb: add port README with build/deploy/test docs` — A · none · watch: -
+28. `ports/arkweb: wire Tier-1 NWeb methods` — A · device · watch: components/servo/webview.rs components/servo/webview_delegate.rs
+29. `ports/arkweb: wire HTTP-auth and permission request delegates` — A · device · watch: components/servo/webview_delegate.rs components/script/dom/geolocation components/script/dom/permission
+30. `storage: add an OHOS RDB backend for webstorage, client_storage and indexeddb` — C · CI+device · watch: components/storage components/config/prefs.rs components/net/Cargo.toml
+
+31. `docs: document how to update local branches after a sync` — B · none · watch: -
+
+32. `docs: stack ordering and feature-guard conventions` — B · none · watch: -
+
+33. `ohos: add a chrome-less mode to the servoshell app` — B · manual · watch: ports/servoshell/prefs.rs
+
+34. `layout: emit a trace marker when a reflow actually laid out` — B · manual · watch: components/shared/layout/lib.rs
+
+35. `script: Return list of matching fonts from FontFaceSet.load (backport of #47564)` — B · none · watch: -
+
+36. `fonts: Report the load state of @font-face rules in FontFace.status` — B · CI · watch: -
+
+37. `fonts: Only load @font-face fonts that the page uses` — C · CI · watch: components/shared/fonts/font_template.rs components/script/dom/document/document.rs
+
+38. `fonts: Only relayout for web font changes that can affect laid-out text` — B · CI · watch: -
+
+39. `script: Lay out once for web fonts that finish loading together` — B · CI · watch: components/script/dom/globalscope/globalscope.rs
+
+40. `Update rustls to unbreak CI. (#48079)` — B · none · watch: -
+
+41. `ci: add an integrity job checking that base + patches reproduce the PR head` — A · tooling · watch: -
+
+42. `fonts: Compute FreeType glyph advances without the autohinter` — B · CI+device · watch: -
+
+43. `docs/ohos-sync: keep vendored third-party code out of the patch files` — A · tooling · watch: -
+
+44. `third_party: vendor freetype-sys with the openharmony-rs patches` — B · CI · watch: components/fonts/platform/freetype
+
+45. `fonts: Do not create fonts for web font faces that are not loaded yet` — B · CI · watch: -
+
+46. `script: Delay the load event while web fonts are loading` — B · CI · watch: -
+
+47. `fonts: Load the first available web font of elements without text` — B · CI · watch: -
+
+48. `tests: Expect the two responsive-iframe allow-origins failures of the base` — B · none · watch: -
+
+49. `script: Render SVG text again once the web font it uses has loaded` — B · CI · watch: components/net/image_cache.rs
+
+50. `docs/ohos-sync: find vendoring scripts under third_party/patches too` — A · tooling · watch: -
+
+51. `third_party: vendor Stylo with the eager pseudo-element cascade skip` — B · CI · watch: Cargo.toml deny.toml components/layout/query.rs components/script/layout_dom/servo_layout_element.rs
+
+52. `third_party: move freetype-sys to the third_party/patches layout` — B · CI · watch: -
+
+53. `ohos: Insert committed IME text through a composition update` — B · manual · watch: components/script/dom/document/editing.rs components/shared/embedder/input_events.rs
+
+## Sync log
+
+One entry per sync, newest first. Records the upstream range and every
+patch that was dropped, superseded, squashed or split, with the reason.
+
+### 2026-10-08
+
+- base: `base/2026-08-29` (bc6153bb1bb) → `base/2026-10-08` (ab7e8fb1358);
+  pre-sync tip `pre-sync/2026-10-08` = 57bef201228.
+- upstream: 701 commits; stack 61 → 53: the seven `docs: record patches …`
+  commits and the two `squash!` commits folded, one new patch (53).
+- rebase: `git -c rerere.enabled=false rebase --signoff --empty=ask` (the
+  rr-cache held 85 recorded resolutions of unknown origin).
+- conflicts:
+  - 2 (fork notice): `main.yml` push preset vs #48530 (intel macOS jobs
+    removed); kept the fork's reduced presets.
+  - 4 (API-21 SDK): upstream fef77e189b8 (#48505) moved both products to
+    API 23 → placeholder, see dropped.
+  - 30 (RDB storage): workspace versions 0.7.0 (#48535) with the fork's
+    `default-features = false` re-added; `multiprocess` (new upstream default,
+    22c646903a0) kept in servo's `default` and servoshell's `base` group,
+    whose stated contract is "the default set minus the storage backend";
+    arkweb stays without it (single-process). The fork's `[lints.rust]` table
+    dropped: upstream added `[lints] workspace = true` (a40515c3b0f), cargo
+    rejects both, and `build.rs` already emits the check-cfg. `Cargo.lock`
+    regenerated from upstream's (`ohos-rdb-sys` kept at 0.1.0).
+  - 33 (chrome-less): upstream #48684 replaced `Tabs` with a `List` tab bar,
+    a `Stack` of XComponents and `@Entry({ useSharedStorage: true })`;
+    re-applied as `if (this.showChrome)` around the toolbar and the tab list.
+  - 34 (RanLayout marker): upstream's accessibility work reshaped the
+    `restyle_and_build_trees` call; marker re-added unchanged.
+  - 35 (FontFaceSet.load backport) → placeholder, see dropped.
+  - 36, 37 (web fonts): upstream converted `Rc<Promise>` to
+    `RootedPromise`/`TracedPromise` (#47935, #48333) and `icu_locid` to
+    `icu_locale_core`; resolved to the upstream-bound `lazy-webfonts` code
+    (460f417f242, 3a1db33e3cc), which the code files of 36–39 now match
+    line for line; 37's MANIFEST.json entry re-inserted.
+  - 42 (FreeType advances): upstream d15ed10a8a8 (#48455) loads glyphs
+    unhinted on Android and OpenHarmony. The fast path assumed light hinting
+    and would have rounded advances that upstream now leaves fractional, so it
+    is gated on light-hinted loads (desktop); the unit test asserts that and
+    embeds its fonts so it also runs on devices. On OpenHarmony the patch now
+    only skips decoding colour bitmaps; its OHOS measurements predate #48455.
+  - 46 (load event): imports only. 51 (Stylo): upstream moved the pin
+    b3e6425 → 7b2f078 (+368 Stylo commits); the patch rebased with identical
+    `+`/`-` lines (context only: `clone_display()` → `*get_display()`),
+    re-exported, `third_party/stylo` re-vendored, `update.sh --check` ok.
+- applied cleanly, did not compile or did not work (fixed in the owning
+  patch):
+  - 5 (arkweb): `WebView::set_throttled` removed (c974e3c7c79) → `OnPause` /
+    `OnOccluded` hide the WebView, which also stops painting; `WebView::focus`
+    removed (15aa067b33e) → `set_focused`, focusing one WebView unfocuses the
+    others as servoshell does with windows; blur stays a logged no-op.
+    Applied to every arkweb commit, so each prefix builds.
+  - 17 (arkweb IME): d2abb3339dd (#48690, landed the day of the base) made
+    a composition end stop inserting text; the device suite caught it (typing,
+    backspace and blur failed). Commits are now sent as update + end. The same
+    bug hit servoshell's OpenHarmony port → new patch 53 (meant for upstream).
+  - 30: index names unique per object store (#47936) mirrored into the RDB
+    schema copy; `GenericCallback::new` lost its `ProfilerChan` (#48037).
+  - 49 (SVG text): `traverse_preorder_non_rooting` →
+    `traverse_preorder_unrooted` (#48555).
+- fold: `squash!` commits into 30 (clippy `duplicate_mod` fix) and 36 (emoji
+  expectations restored), this sync's fixups into their patches, the
+  `docs: record patches …` commits into this manifest. Patches 49 (old 56),
+  45–47 and 52 kept separate. Every commit now passes
+  `cargo metadata --locked` (5–29 had auto-merged lockfiles cargo rejected).
+  Each commit this sync resolved, adapted or regenerated carries an
+  `AI-assisted:` line saying what (decision 5).
+- dropped (decision 3, empty placeholders, removed next sync):
+  - 4 → fef77e189b8 (#48505): the OpenHarmony product packages against an
+    API-23 SDK and runs on a DAYU200; compatibleSdkVersion 20 → 23 is within
+    the fork's minimum-API policy.
+  - 35 → a8d5fdaa915 (#47564): identical patch-id (`--cherry-mark`).
+  - 40 → 866d0957e4f (#48079): applied empty, base pins rustls 0.23.45.
+  - 48 → f9b43a6f0b9 (WPT sync #47639): the edited `allowed=` variants no
+    longer exist; base carries the `allow=` expectations.
+- new tests: `components/storage/tests/schema_parity.rs` (30; fails on the
+  pre-sync RDB schema), `test_focus.py`, repaint/tap after foregrounding in
+  `test_throttle.py`, `test_cookies.py` with ControllerPage cookie buttons
+  (28; first automated coverage of the cookie manager, 9),
+  `test_clipboard.py` (25; replaces its manual round-trip recipe: a token
+  written with `writeText` is read back after a force-stop, so only the
+  system pasteboard can hold it, and without READ_PASTEBOARD the read falls
+  back to the empty in-process clipboard).
+- expectations: 37 drops its six `generic-family-keywords-003` canvas FAILs
+  (they pass on the new base, as on upstream) and the two
+  `layer-font-face-override` FAILs (passed with the lazy web-font patches
+  already before this sync; upstream still fails them).
+- drift (`drift.py`; hits not listed are churn in the large shared files
+  covered by the compile and test gates):
+  - 15aa067b33e system focus, c974e3c7c79 hidden WebViews, 07777aaa24a
+    WebView borrows → 5 (above). fd4d5d0e377 key events, d2abb3339dd
+    composition, 53f2a80314b touch compat mouse events → 7, 17: arkweb suite
+    (IME fixed, touch/scroll/select/dialog pass).
+  - 47def473014 `WebView::clear_session_history` → opportunity for 28's
+    `DeleteNavigateHistory`, no drift. 12beb73b689 embedder JS in CSP
+    documents → 10 gains it, no change needed.
+  - c0e5583323a, 7256c05b108, 7130363bbf4 cookie host/domain/date → 9
+    (manual): `test_cookies.py` added and passing.
+  - 3eca066448f, d0162990069 clipboard promises/events → 25:
+    `test_clipboard.py` added and passing.
+  - e6aacc15323, b8fd8dbf768, 1462d866b8c, 2a8c5fab976, 84b5b2563a7 storage →
+    30: only #47936 needed mirroring (done, schema test added); cache storage
+    is in-memory and backend independent.
+  - d15ed10a8a8, b724f6f80e1, b9ed512231f, 694133bbcf5 FreeType/metrics →
+    42 (above); 31e3c3501e1, 29b00233c2c FontData → 45, 47: font WPT clean.
+  - 31f660d20c5 layout image loads block `load` → 46: its WPT list
+    (css-flexbox, css-grid, cssom-view) plus css-images and css-text clean.
+  - cc0c73e197c, Rc<Promise> conversions → 36, 37, 49 (above).
+  - Stylo upgrades fdb829e98c2, baa77ece393, cb086ca56ec, 5190fc46c70,
+    614cd411f84 → 51 re-vendored; pseudo-element changes upstream do not
+    touch the skip (`style_resolver.rs` hunk unchanged).
+  - 64c4855e7dd, df3525edc0d ArkUI → 33 (above). a4fe23d8085 CMake step,
+    da4d69a8af3 cargo-ohos → packaging works.
+- validation (all on the final stack unless noted): fmt, test-tidy (incl.
+  cargo-deny, WPT manifest), `./mach check` and `./mach check --ohos`,
+  arkweb and servo-storage in the plain, twin and RDB-only configurations
+  (warning-free); host unit tests servo-storage 53/53, servo-fonts 7/7,
+  arkweb 6/6; device unit tests on the DAYU200 servo-storage 53/53 (sqlite),
+  64/64 (twin) and 43/43 (RDB only), one documented skip each, servo-fonts
+  2/3 (upstream's `ohos::font_list::test_get_system_font_families` fails on
+  this board, as before the sync). WPT, host release build, against plain
+  `base/2026-10-08`: css-font-loading, css-fonts, html canvas text,
+  css-cascade 1115/1115; css-flexbox, css-grid, cssom-view, css-images,
+  css-text 6564 with one unexpected (`cssom-view/resizeTo-negative.html`
+  TIMEOUT, same on the base); the Stylo set (css-pseudo, css-content, cssom,
+  transitions, animations, nesting, lists, selectors, css-cascade,
+  css-variables) 2571, only the two layer-override passes above; SVG
+  reftests, responsive-iframe and webstorage as expected; IndexedDB has a
+  varying set of 1–5 worker/sharedworker timeouts per full-directory run on
+  both builds (19 on the stack, 13 on the base over five runs each, the same
+  tests, each passing in isolation). DAYU200
+  arkweb suite 33 passed / 1 xfailed (geolocation, known) on the final
+  shim; before the IME fix typing, backspace and blur failed while the
+  2026-09-13 shim passed them. PLR-AL00, production
+  HAP with `tracing-hitrace ohos-rdb-backend`: soft-keyboard text reaches a
+  page input (empty without patch 53), `--chrome=none` drops toolbar and tab
+  bar, localStorage persists across a force-stop, IndexedDB accepts the same
+  index name in two stores with either backend, the `RanLayout` marker
+  appears in hitrace. OpenHarmony-flavor HAP packaged against an API-23 SDK
+  runs on the DAYU200. `test_clipboard.py` 2/2 on the DAYU200. Patch 30's
+  RDB-vs-sqlite WPT A/B on the PLR-AL00 (release HAP with
+  `ohos-rdb-backend`, the `wpt-ohos` runner branch cherry-picked): 78 tests,
+  1577 subtests, no subtest differs; the one test-level difference,
+  `storage_local_setitem_quotaexceedederr.window.html` TIMEOUT on sqlite,
+  passes on both in isolation (sqlite 8.3–9.0 s against the 10 s timeout,
+  RDB 1.2–1.4 s); store proof holds on both legs. The sqlite leg leaves
+  60–70 IndexedDB databases registered whose `deleteDatabase` from test
+  cleanup never completes, the RDB leg 3; plain upstream on the host leaves
+  66 after the same tests, so this is upstream sqlite behaviour, not a
+  stack regression. Patch 42, PLR-AL00, production HAPs of the stack
+  without and with it, `servoperf page --only load`, two rounds of 5 loads
+  in alternating order, `Layout>::reflow` M instructions/load: chuxing
+  122.8 -> 89.9 (-27%), shibashiji 101.8 -> 94.3 (-7%), biyadi and
+  keai-pruned unchanged within noise; the difference is colour-emoji PNG
+  decoding (`Load_SBit_Png` 40.6 -> 7.3 M/load on chuxing).
+- not run: the GenUI FCP A/B for 46 after 31f660d20c5.
+- open: keep 42 (its colour-bitmap skip is still worth up to 27% of layout
+  on emoji-heavy pages, see validation); patch 53 and the arkweb IME fix
+  should go upstream with the next IME work; `lazy-webfonts` should drop the
+  `layer-font-face-override` FAILs too.
+
+### 2026-08-29
+
+- base: `base/2026-08-07` (79e2c7a8827) → `base/2026-08-29` (bc6153bb1bb)
+- upstream: 297 commits; stack 29 → 30 (new first patch: this runbook + manifest)
+- conflicts: `ports/arkweb: wire the OHOS system clipboard via ohos-pasteboard`
+  (servo-crate half now upstream 5c2a3839525 / #47177, patch shrunk to the
+  arkweb glue, `clipboard` feature, READ_PASTEBOARD test-app permission;
+  not a full supersede since upstream declined clipboard read);
+  `storage: add an OHOS RDB backend …` (Cargo.toml vs #47198/#43819,
+  `ascii_serialization` → `Cow` from #47264 mirrored in the twins).
+- fold: nothing to do (no fixups pending; the clipboard shrink's empty-
+  placeholder rule did not trigger — the patch shrank, it did not empty)
+- dropped: none
+- known stale: the RDB commit's 1.91 MiB RDB-only size saving no longer
+  holds (#43819 makes rusqlite unconditional in components/net); remeasure.
+- hygiene items: pre-sync `Cargo.lock` had a dangling `cookie 0.18.1` in the
+  arkweb entry (`--locked` broken mid-stack); duplicated proxy comment in
+  `ports/arkweb/src/runtime.rs`; three squashed commits keep an old
+  `Validation:`/`AI-assisted:` pair mid-body.
+- drift (from `drift.py`; hits not listed had no verdict-worthy content):
+  - `b780274a164` clang-19, `058c55ed4a1` cargo-ohos build env → patch 4
+    (API-21) unaffected textually; the rewritten packaging path is proven
+    by the servoshell OHOS release builds. `./mach package --ohos` signing
+    fails in the container (hvigor 00303116) — container config, not drift.
+  - `c1517a950cc` ohos keyboard support → servoshell + xcomponent-sys only,
+    no code shared with the arkweb IME patches (17, 18); device IME tests
+    pass.
+  - `27775d1d904` queued session-history traversals → potential behaviour
+    change for patches 26 (URL bar follows history) and 28 (back/forward
+    Tier-1 methods); `test_urlbar.py`, `test_controller.py` pass.
+  - `6ee336ce836` MouseButton(s), `1728d63f488` a11y bounds,
+    `522fa371e41` webgl guard, `a40c8f29010` threadboost, `e2bcea2a0f6`
+    DPR override → embedder-API surface of patches 5, 7, 14–16 changed
+    shape; `./mach check --ohos -p arkweb` warning-free and the device suite
+    (render, scroll, vsync) passes. No behaviour drift observed.
+  - `7a27057feec` cookie/auth memory reporting → patch 9 (cookie manager)
+    compiles against unchanged `cookie_storage.rs` API; its manual
+    Validation was NOT run this sync (no automated coverage) — open.
+  - `cb680edc199` removed prefs, `8067519db8c`/`76f48dc9e3a`/`fb04f8f1613`
+    pref additions → patches 11 and 30 set prefs by field name; compile
+    proves none of the removed prefs were used.
+  - `723dd93c61e`/`22b7b75ba42`/`522fa371e41` feature-flag reshuffle in
+    `components/servo/Cargo.toml` → resolved in patches 25 and 30.
+  - `5c2a3839525` clipboard backend → patch 25 partially superseded (see
+    conflicts). `7bea9ed91f2` `Cow` origins → mirrored in patch 30.
+    `fb04f8f1613` disk cache → patch 30 size rationale stale (see above).
+  - `b8819327242` quick_cache, `e0b630fe3e0` aws-lc-rs SRI, `27a317dd69c`
+    disk-cache temporary storage → `components/net/Cargo.toml` churn with
+    no storage interaction.
+  - keyword scan: `cb9b0804bda`/`748bf81026f` keyCode changes and
+    `f9b4d1e6094` insertLineBreak are script-side (page-visible, not port);
+    `c65518f8960`/`2a5f73586c3` CookieStoreManager is the DOM layer, not
+    the NWeb cookie manager; `b3ee31d291c` media ohos dummy backend,
+    `eff9ff0bfa4` OHOS font fallback, `e8ffe8e88ce` image decoder trait,
+    `ba14b47a9a6` arboard wayland → not on the stack's surface.
+- validation: check --ohos, tidy, fmt, test-unit servo-storage 53/53,
+  arkweb release build + deploy, DAYU200 arkweb suite 30 passed / 1 xfailed,
+  device nextest servo-storage sqlite 53/53 and RDB 43/43 (+1 documented
+  skip), clipboard round-trip with/without READ_PASTEBOARD, servoshell
+  release with and without `ohos-rdb-backend`, RDB-vs-sqlite same-HAP pref
+  A/B on localhost origin, and the full WPT subset A/B via
+  `./mach test-wpt --ohos` (runner from `wip-wpt-ohos` + device fixes on
+  scratch branch `ohos-sync-2026-08-29-wpt`): 78 tests, 0 differing
+  subtests, store proof both legs. `--flavor=harmonyos` does not install on
+  the DAYU200 (profile UDID); default flavor, hap-sign-tool signing.
+- found during validation: servoshell race `webdriver.rs:171 Expected at
+  least one window to be open` when WebDriver answers before
+  `on_surface_created`; `hdc file send -b` fails on the DAYU200 (hdc
+  3.2.0b) — worked around in the runner, servoshell fix pending.

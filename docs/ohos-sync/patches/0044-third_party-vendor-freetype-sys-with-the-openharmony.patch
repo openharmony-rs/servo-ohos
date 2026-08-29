@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 20 Sep 2026 14:34:20 +0000
+Subject: [PATCH] third_party: vendor freetype-sys with the openharmony-rs
+ patches
+
+Build freetype-sys from third_party/freetype-sys/freetype-sys through
+`[patch.crates-io]` instead of the crates.io release. update.sh
+reproduces that directory: it fetches upstream PistonDevelopers/
+freetype-sys at a pinned commit, applies the patches in patches/ (the
+commits of openharmony-rs/freetype-sys on top of it), fetches the
+FreeType submodule, vendors libpng from upstream libpng with the
+crate's own script, and keeps only the files the build uses.
+`update.sh --export-patches` regenerates patches/ from a checkout of the
+fork, and `update.sh --check` verifies the committed copy.
+
+Compared with freetype-sys 0.23.0 from crates.io, this brings:
+- FreeType 2.14.3 instead of a snapshot after 2.13.2, and libpng 1.6.58
+  instead of 1.6.44.
+- The memory-mapping unix ftsystem.c (and the Windows one) instead of
+  stdio, so faces opened from a path no longer fread on every access.
+- ABI fixes for FT_Get_Sfnt_LangTag and the FT_Bitmap and FT_Span
+  field types, and bindings for FT_Get_Advance and FT_Get_Advances.
+
+Validation: `third_party/freetype-sys/update.sh --check` reproduces the committed copy, which is also file-identical to openharmony-rs/freetype-sys at cf04f4e. `./mach check --ohos` passes. `cargo nextest run -p servo-fonts --features bundled_freetype` passes 7/7, including `autohinted_advances_match_loaded_advances` against the vendored FreeType 2.14.3, and the test binary links `ft_close_stream_by_munmap`, so the memory-mapping ftsystem.c is the one in use. `./mach test-tidy` passes. Not run on device; the same FreeType and mmap combination was measured on the PLR-AL00 earlier (layout -6..-12% on the GenUI pages).
+AI-assisted: Yes (agent session; written and tested by the agent)
+AI-assisted: Yes (agent session; 2026-10-08 sync -- Cargo.lock regenerated from upstream's so that `cargo metadata --locked` passes at this commit; no other change)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock | 2 --
+ Cargo.toml | 6 +++++-
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index fe776e6a4f8..c09f930574e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3021,8 +3021,6 @@ dependencies = [
+ [[package]]
+ name = "freetype-sys"
+ version = "0.23.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "eab537ce43cab850c64b4cdc390ce7e4f47f877485ddc323208e268280c308ae"
+ dependencies = [
+  "cc",
+  "libz-sys",
+diff --git a/Cargo.toml b/Cargo.toml
+index e53ca6f4bc4..acbcaa72a1c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -11,7 +11,7 @@ members = [
+     "tests/unit/*",
+ ]
+ default-members = ["ports/servoshell"]
+-exclude = [".cargo", "support/crown"]
++exclude = [".cargo", "support/crown", "third_party/freetype-sys"]
+ 
+ [workspace.package]
+ version = "0.7.0"
+@@ -450,6 +450,10 @@ lto = "thin"
+ codegen-units = 1
+ 
+ [patch.crates-io]
++# OpenHarmony fork with FreeType 2.14.3, mmap-backed streams and ABI fixes; see
++# third_party/freetype-sys/update.sh.
++freetype-sys = { path = "third_party/freetype-sys/freetype-sys" }
++
+ # If you need to temporarily test Servo with a local fork of some upstream
+ # crate, add that here. Use the form:
+ #

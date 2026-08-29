@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Simon=20W=C3=BClker?= <simon.wuelker@arcor.de>
+Date: Sat, 29 Aug 2026 18:19:11 +0000
+Subject: [PATCH] script: Return list of matching fonts from FontFaceSet.load
+ (backport of #47564)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dropped in favour of upstream a8d5fdaa915 (#47564), which this commit
+backported and which every base from base/2026-10-08 on contains.
+Equivalence: `git log --cherry-mark base/2026-10-08...pre-sync/2026-10-08`
+marks this commit `=` (identical patch-id to a8d5fdaa915); the rebase
+stopped only because later upstream commits rewrote the same lines
+(Rc<Promise> → RootedPromise/TracedPromise). Verified by the sync of
+2026-10-08.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: a8d5fdaa915
+Validation: patch-id identity with a8d5fdaa915 (`git log --cherry-mark`); the stack's font WPT set (css/css-font-loading, css/css-fonts) is run on the rebased stack by the 2026-10-08 sync.
+AI-assisted: Yes (agent session; 2026-10-08 sync -- emptied in favor of upstream a8d5fdaa915, which has the identical patch (`git log --cherry-mark`))
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

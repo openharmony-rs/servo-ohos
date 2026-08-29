@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 23 Sep 2026 06:52:57 +0000
+Subject: [PATCH] tests: Expect the two responsive-iframe allow-origins
+ failures of the base
+
+Dropped in favour of upstream f9b43a6f0b9 (Sync WPT with upstream
+(30-08-2026), #47639), which renamed the test's `allowed=` variants to
+`allow=` and carries expectations for both `container=subdomain` variants
+(servo/servo#47268). The sections this commit edited belong to variants that
+no longer exist on base/2026-10-08, so it only kept dead metadata alive.
+Verified by the sync of 2026-10-08 (variant list of the test and
+`tests/wpt/meta/.../responsive-iframe-allow-origins.html.ini` on the base).
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: f9b43a6f0b9
+Validation: on base/2026-10-08 the test declares only `allow=` variants, and the base metadata lists `[FAIL]` expectations for `container=subdomain,origin=cross,allow=wildcard` and `container=subdomain,origin=same,allow=wildcard`.
+AI-assisted: Yes (agent session; 2026-10-08 sync -- emptied in favor of upstream's WPT sync f9b43a6f0b9, after which the edited `allowed=` variants no longer exist)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

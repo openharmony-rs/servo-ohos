@@ -1,0 +1,17 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Josh Bowman-Matthews <josh@joshmatthews.net>
+Date: Mon, 14 Sep 2026 17:27:47 +0000
+Subject: [PATCH] Update rustls to unbreak CI. (#48079)
+
+Dropped in favour of upstream 866d0957e4f (#48079), which this commit
+backported (rustls hunk only) and which every base from base/2026-10-08
+on contains. The commit applies empty: base/2026-10-08 already pins rustls
+0.23.45, the exact version this backport selected. Verified by the sync of
+2026-10-08.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: 866d0957e4f
+Validation: applies empty on base/2026-10-08; its Cargo.lock has rustls 0.23.45; `./mach test-tidy` (cargo-deny) is run on the rebased stack by the 2026-10-08 sync.
+AI-assisted: Yes (agent session; 2026-10-08 sync -- applied empty, since the base already pins rustls 0.23.45; kept as a placeholder)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

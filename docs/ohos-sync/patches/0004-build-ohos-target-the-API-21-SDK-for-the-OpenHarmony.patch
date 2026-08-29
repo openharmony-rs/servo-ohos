@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 15 Jul 2026 14:14:06 +0000
+Subject: [PATCH] build(ohos): target the API-21 SDK for the OpenHarmony
+ product
+
+Dropped in favour of upstream fef77e189b8 (#48505), which moves the
+openharmony product to compileSdkVersion/targetSdkVersion 23 and the
+harmonyos product to 6.1.0(23). The SDK mirrors provide API 23 but no
+API 21, so the fork's API-21 pin has no remaining purpose. Upstream also
+raises compatibleSdkVersion from 20 to 23, which is within the fork's
+minimum-API policy (the test devices run API 26).
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: fef77e189b8
+Validation: (sync 2026-10-08) `./mach package --ohos --profile production --flavor default` with a full OpenHarmony 6.1 (API 23) SDK as OHOS_BASE_SDK_HOME resolves the SDK components and packages the HAP (signing then fails on the container's known hvigor 00303116); signed with hap-sign-tool it installs and renders on a DAYU200 (OpenHarmony 7.0).
+AI-assisted: Yes (agent session; 2026-10-08 sync -- emptied in favor of upstream fef77e189b8 (#48505), which moved both products to API 23; equivalence checked by packaging the OpenHarmony product against an API-23 SDK and running it on a DAYU200)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
