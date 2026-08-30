@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html class="test-wait">
+<meta charset="utf-8">
+<title>Module load: a fast-failing sibling must not free load state still used by a slow parse-error sibling</title>
+<link rel="help" href="https://html.spec.whatwg.org/multipage/webappapis.html#fetch-the-descendants-of-and-link-a-module-script">
+<link rel="help" href="https://github.com/servo/servo/issues/47489">
+<!--
+  Regression crashtest for a use-after-free in the module loader.
+
+  The top-level module requests two descendants:
+    1. a *slow* module whose body has a syntax error (fetched with 200 OK, so it
+       fails only at parse time) -- the "straggler"; and
+    2. a module that *fails fast* (a 404), rejecting the LoadRequestedModules
+       promise while the slow descendant is still being fetched.
+
+  If the implementation frees the per-load "state" record when the loading
+  promise settles (on the fast failure), the still-outstanding slow module's
+  completion handler later dereferences that freed state when it records its
+  parse error -- a use-after-free. A correct UA keeps the state alive until
+  every outstanding descendant fetch has completed. This test must not crash.
+
+  The ~1s delay on the syntax-error module guarantees the fast 404 rejects
+  (and frees) first; the straggler then arrives and touches the freed state.
+
+  The write into freed memory is silent in an ordinary build. To turn it into
+  an observable crash, run under AddressSanitizer, or with the allocator set to
+  fill freed memory (e.g. jemalloc _RJEM_MALLOC_CONF=junk:true); Servo's WPT
+  harness already passes --hard-fail, which escalates the resulting panic to a
+  process crash.
+-->
+<script type="module">
+import "./resources/delayed-syntaxerror-modulescript.py?ms=1000";
+import "./resources/this-module-does-not-exist.js";
+</script>
+<script type="module">
+// End the test once a module load that outlasts the ~1s straggler above has
+// settled (a longer delayed module, used as a timer without setTimeout, which
+// the WPT lint disallows in tests).
+import("./resources/delayed-modulescript.py?ms=2000")
+  .catch(() => {})
+  .finally(() => document.documentElement.classList.remove("test-wait"));
+</script>
+</html>
