@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 10 Jul 2026 06:57:53 +0000
+Subject: [PATCH] ports/arkweb: wire the OHOS system clipboard via
+ ohos-pasteboard
+
+On the ohos target the clipboard delegate used only an in-process fallback
+that does not cross processes. Add an ohos branch to clipboard_delegate.rs
+that uses the ohos-pasteboard crate (the OHOS analogue of arboard), keeping
+the in-process fallback on error, and enable the `clipboard` feature for the
+arkweb servo dependency so both arkweb and servoshell-ohos get it.
+
+ohos-pasteboard is taken from crates.io, as are its own dependencies
+(ohos-pasteboard-sys and udmf, both from openharmony-rs); the lockfile is
+updated accordingly, which `mach build --locked` needs. It is only pulled in
+under cfg(target_env = "ohos").
+
+Enable the dom_async_clipboard_enabled pref for arkweb so web content can
+reach the clipboard via navigator.clipboard (off by default in Servo). Log
+a warning when the OHOS pasteboard path errors and falls back to the
+in-process store.
+
+Reading the OHOS pasteboard needs ohos.permission.READ_PASTEBOARD, which is
+grantMode user_grant / availableLevel system_basic -- a normal-APL app can't
+hold it. Declare it in the test app (module.json5 + reason string) and
+re-provision the debug signing profile at system_basic APL with the
+permission in its ACL, so it can be granted via atm on the (developer-mode)
+test device.
+
+Verified on device: navigator.clipboard writeText->readText round-trips
+'SERVOCLIP42' through the real system pasteboard, no in-process fallback;
+without READ_PASTEBOARD, get_text returns status 201 and falls back.
+
+Validation: Test by running ./mach build --locked --ohos, then on device: navigator.clipboard.writeText/readText must round-trip through the system pasteboard (grant READ_PASTEBOARD via atm first); no automated test yet.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+---
+ Cargo.lock                                    |  40 ++++++++++++++++++
+ Cargo.toml                                    |   1 +
+ components/servo/Cargo.toml                   |   4 +-
+ components/servo/clipboard_delegate.rs        |  38 ++++++++++++++++-
+ ports/arkweb/Cargo.toml                       |   2 +-
+ ports/arkweb/src/runtime.rs                   |  24 ++++++++---
+ .../test-app/entry/src/main/module.json5      |  10 +++++
+ .../main/resources/base/element/string.json   |   4 ++
+ .../test-app/signing/profile-debug.json       |   4 +-
+ .../arkweb/test-app/signing/profile-debug.p7b | Bin 3544 -> 3581 bytes
+ 10 files changed, 115 insertions(+), 12 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index c3f9592634c..95b8101d753 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -6183,6 +6183,25 @@ dependencies = [
+  "ohos-sys-opaque-types",
+ ]
+ 
++[[package]]
++name = "ohos-pasteboard"
++version = "0.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "96ec383566f92ce8534521501d66797e7c9dd5cf0bc967a158884c04a5354a50"
++dependencies = [
++ "ohos-pasteboard-sys",
++ "udmf",
++]
++
++[[package]]
++name = "ohos-pasteboard-sys"
++version = "0.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "52a26fed7fe51d995248785dddb53afeb3f862a4094d406e09de7ab36169411c"
++dependencies = [
++ "ohos-sys-opaque-types",
++]
++
+ [[package]]
+ name = "ohos-sys-opaque-types"
+ version = "0.1.10"
+@@ -7843,6 +7862,7 @@ dependencies = [
+  "keyboard-types",
+  "log",
+  "mozangle",
++ "ohos-pasteboard",
+  "parking_lot",
+  "rustc-hash 2.1.3",
+  "rustls",
+@@ -10799,6 +10819,26 @@ version = "1.20.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+ 
++[[package]]
++name = "udmf"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "12c8d635b4210133f8b5b5c2c70475326319ee0692756bbf61248574f48c8c0e"
++dependencies = [
++ "ohos-sys-opaque-types",
++ "thiserror 2.0.18",
++ "udmf-sys",
++]
++
++[[package]]
++name = "udmf-sys"
++version = "0.1.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9df7a0b7922a95eb8b827746d7f2d8f623331ab416aca833edd177e0775f961e"
++dependencies = [
++ "ohos-sys-opaque-types",
++]
++
+ [[package]]
+ name = "uds_windows"
+ version = "1.2.1"
+diff --git a/Cargo.toml b/Cargo.toml
+index 34d06738625..0f47a2e8d52 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -182,6 +182,7 @@ ohos-deviceinfo-sys = "0.1.7"
+ ohos-ime = "0.4.2"
+ ohos-ime-sys = "0.2.4"
+ ohos-media-sys = "0.1.1"
++ohos-pasteboard = "0.1.0"
+ ohos-sys-opaque-types = "0.1.7"
+ ohos-vsync = "0.1.3"
+ ohos-window-manager-sys = "0.1"
+diff --git a/components/servo/Cargo.toml b/components/servo/Cargo.toml
+index c48f7a2fe30..a71e0b64390 100644
+--- a/components/servo/Cargo.toml
++++ b/components/servo/Cargo.toml
+@@ -41,7 +41,7 @@ bluetooth = [
+     "script_traits/bluetooth",
+ ]
+ bundled_freetype = ["fonts/bundled_freetype"]
+-clipboard = ["dep:arboard"]
++clipboard = ["dep:arboard", "dep:ohos-pasteboard"]
+ crown = ["script/crown"]
+ debugmozjs = ["script/debugmozjs"]
+ dynamic_freetype = ["webrender/dynamic_freetype"]
+@@ -173,6 +173,8 @@ webxr = { workspace = true, optional = true, features = ["glwindow", "headless",
+ 
+ [target.'cfg(target_env = "ohos")'.dependencies]
+ servo-media-ohos = { workspace = true }
++# Real system clipboard on OpenHarmony (the OHOS analogue of `arboard`), enabled by `clipboard`.
++ohos-pasteboard = { workspace = true, optional = true }
+ 
+ [dev-dependencies]
+ accesskit_consumer = { workspace = true }
+diff --git a/components/servo/clipboard_delegate.rs b/components/servo/clipboard_delegate.rs
+index ec7953a148c..7d49c57674f 100644
+--- a/components/servo/clipboard_delegate.rs
++++ b/components/servo/clipboard_delegate.rs
+@@ -158,7 +158,43 @@ mod clipboard {
+     }
+ }
+ 
+-#[cfg(any(not(feature = "clipboard"), target_os = "android", target_env = "ohos"))]
++#[cfg(all(feature = "clipboard", target_env = "ohos"))]
++mod clipboard {
++    use super::StringRequest;
++    use crate::clipboard_delegate::fallback_clipboard;
++
++    pub(super) fn clear() {
++        if let Err(error) = ohos_pasteboard::clear() {
++            log::warn!("OHOS pasteboard clear failed ({error}); using in-process fallback");
++            fallback_clipboard::clear();
++        }
++    }
++
++    pub(super) fn get_text(request: StringRequest) {
++        match ohos_pasteboard::get_text() {
++            Ok(text) => request.success(text),
++            // An empty system clipboard is not a failure; answer with empty text rather than
++            // falling back to the (separate) in-process store.
++            Err(ohos_pasteboard::Error::NoText) => request.success(String::new()),
++            Err(error) => {
++                log::warn!("OHOS pasteboard get_text failed ({error}); using in-process fallback");
++                fallback_clipboard::get_text(request);
++            },
++        }
++    }
++
++    pub(super) fn set_text(new_contents: String) {
++        if let Err(error) = ohos_pasteboard::set_text(&new_contents) {
++            log::warn!("OHOS pasteboard set_text failed ({error}); using in-process fallback");
++            fallback_clipboard::set_text(new_contents);
++        }
++    }
++}
++
++#[cfg(any(
++    not(feature = "clipboard"),
++    all(feature = "clipboard", target_os = "android")
++))]
+ mod clipboard {
+     use super::StringRequest;
+     use crate::clipboard_delegate::fallback_clipboard;
+diff --git a/ports/arkweb/Cargo.toml b/ports/arkweb/Cargo.toml
+index 5f9093e8492..a791611327f 100644
+--- a/ports/arkweb/Cargo.toml
++++ b/ports/arkweb/Cargo.toml
+@@ -18,7 +18,7 @@ crate-type = ["cdylib"]
+ # Note: freetype is bundled (compiled from source) by default on ohos; there is no
+ # `bundled_freetype` servo feature. `dynamic_freetype` would opt into dynamic linking.
+ [target.'cfg(target_env = "ohos")'.dependencies]
+-servo = { workspace = true, default-features = false, features = ["js_jit"] }
++servo = { workspace = true, default-features = false, features = ["js_jit", "clipboard"] }
+ cookie = { workspace = true }
+ cxx = { workspace = true }
+ dpi = { workspace = true }
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index 29b5a6f8193..15344697821 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -492,16 +492,26 @@ impl ServoThread {
+         // Route networking through an HTTP(S) proxy when one is configured (dev/testing aid; the
+         // device typically has no direct route, so an `hdc rport` reverse-forward to a host proxy
+         // is used). Both schemes go through the same CONNECT-capable proxy.
+-        let mut builder = ServoBuilder::default().opts(opts).event_loop_waker(waker);
++        let mut preferences = Preferences {
++            // Expose the async Clipboard API (`navigator.clipboard`) to web content; it is
++            // off by default in Servo. Backed by the OHOS system pasteboard via the clipboard
++            // delegate. (`ClipboardEvent`/`execCommand` copy-paste is already enabled by default.)
++            dom_async_clipboard_enabled: true,
++            ..Default::default()
++        };
++        // Route networking through an HTTP(S) proxy when one is configured (dev/testing aid; the
++        // device typically has no direct route, so an `hdc rport` reverse-forward to a host proxy
++        // is used). Both schemes go through the same CONNECT-capable proxy.
+         if !proxy.is_empty() {
+             info!("[arkweb] using network proxy {proxy}");
+-            builder = builder.preferences(Preferences {
+-                network_http_proxy_uri: proxy.clone(),
+-                network_https_proxy_uri: proxy,
+-                ..Default::default()
+-            });
++            preferences.network_http_proxy_uri = proxy.clone();
++            preferences.network_https_proxy_uri = proxy;
+         }
+-        let servo = builder.build();
++        let servo = ServoBuilder::default()
++            .opts(opts)
++            .event_loop_waker(waker)
++            .preferences(preferences)
++            .build();
+         ServoThread {
+             servo,
+             webviews: HashMap::new(),
+diff --git a/ports/arkweb/test-app/entry/src/main/module.json5 b/ports/arkweb/test-app/entry/src/main/module.json5
+index a6365c4c7b8..77e1390f675 100644
+--- a/ports/arkweb/test-app/entry/src/main/module.json5
++++ b/ports/arkweb/test-app/entry/src/main/module.json5
+@@ -13,6 +13,16 @@
+     "requestPermissions": [
+       {
+         "name": "ohos.permission.INTERNET"
++      },
++      {
++        "name": "ohos.permission.READ_PASTEBOARD",
++        "reason": "$string:pasteboard_reason",
++        "usedScene": {
++          "abilities": [
++            "EntryAbility"
++          ],
++          "when": "inuse"
++        }
+       }
+     ],
+     "abilities": [
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/base/element/string.json b/ports/arkweb/test-app/entry/src/main/resources/base/element/string.json
+index c702cb80ecf..3f4f818be65 100644
+--- a/ports/arkweb/test-app/entry/src/main/resources/base/element/string.json
++++ b/ports/arkweb/test-app/entry/src/main/resources/base/element/string.json
+@@ -11,6 +11,10 @@
+     {
+       "name": "EntryAbility_label",
+       "value": "arkweb-test"
++    },
++    {
++      "name": "pasteboard_reason",
++      "value": "Read the clipboard to paste into web content"
+     }
+   ]
+ }
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/signing/profile-debug.json b/ports/arkweb/test-app/signing/profile-debug.json
+index 08d07777237..03279cf1119 100644
+--- a/ports/arkweb/test-app/signing/profile-debug.json
++++ b/ports/arkweb/test-app/signing/profile-debug.json
+@@ -11,12 +11,12 @@
+         "developer-id": "OpenHarmony",
+         "development-certificate": "-----BEGIN CERTIFICATE-----\nMIICMzCCAbegAwIBAgIEaOC/zDAMBggqhkjOPQQDAwUAMGMxCzAJBgNVBAYTAkNO\nMRQwEgYDVQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVh\nbTEjMCEGA1UEAxMaT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gQ0EwHhcNMjEwMjAy\nMTIxOTMxWhcNNDkxMjMxMTIxOTMxWjBoMQswCQYDVQQGEwJDTjEUMBIGA1UEChML\nT3Blbkhhcm1vbnkxGTAXBgNVBAsTEE9wZW5IYXJtb255IFRlYW0xKDAmBgNVBAMT\nH09wZW5IYXJtb255IEFwcGxpY2F0aW9uIFJlbGVhc2UwWTATBgcqhkjOPQIBBggq\nhkjOPQMBBwNCAATbYOCQQpW5fdkYHN45v0X3AHax12jPBdEDosFRIZ1eXmxOYzSG\nJwMfsHhUU90E8lI0TXYZnNmgM1sovubeQqATo1IwUDAfBgNVHSMEGDAWgBTbhrci\nFtULoUu33SV7ufEFfaItRzAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0OBBYEFPtxruhl\ncRBQsJdwcZqLu9oNUVgaMAwGCCqGSM49BAMDBQADaAAwZQIxAJta0PQ2p4DIu/ps\nLMdLCDgQ5UH1l0B4PGhBlMgdi2zf8nk9spazEQI/0XNwpft8QAIwHSuA2WelVi/o\nzAlF08DnbJrOOtOnQq5wHOPlDYB4OtUzOYJk9scotrEnJxJzGsh/\n-----END CERTIFICATE-----\n",
+         "bundle-name": "org.openharmonyrs.arkwebtest",
+-        "apl": "normal",
++        "apl": "system_basic",
+         "app-feature": "hos_normal_app"
+     },
+     "acls": {
+         "allowed-acls": [
+-            ""
++            "ohos.permission.READ_PASTEBOARD"
+         ]
+     },
+     "permissions": {
+diff --git a/ports/arkweb/test-app/signing/profile-debug.p7b b/ports/arkweb/test-app/signing/profile-debug.p7b
+index cd5c5a5a8a339cc01cd1f82a72cdd067000108d7..d56ee0e51661967c0d7d390729e7fcbb6d248934 100644
+GIT binary patch
+delta 271
+zcmca1{a4z-po#Y<8>d#AN85K^Ms}tJO}wvwLeH2O84Y<2xY;-p+B_IjnOT?^4VqZz
+zBNQ?&Xkwkf(!|=c(IJ_Ir?|4XBsDiaDX};+dGbmYYx(?){9?U=)S}$X;^NHwJiQ=S
+zN0;~j$KViGCx6Evm(5RD(m3i34GhdpOpOhr4D{g!bFvsJu_$nO#YUF!A5y%@r^F=o
+z%H2PjcdE|y6vw_PKC5H?6m60>;9}zdI{BO}3o{don}G|H0@rD)!q;UdN^kv=Uh{jU
+zX<+QZ?$8G(PK4+)&T-vbYq_6Eq10!xPvz&*raVy>_A5zENpJWczuB-^_f^05pFO|w
+ILQkCm0FJ_7qW}N^
+
+delta 233
+zcmew>eM8#8po#Yi8>d#AN85K^Ms}tJO}s~eLI;@`84Y<2xY;-p+B_IjnOT?^4VqZ1
+z5DFO=G_hv0G_j^{bVz1l%gZmyP0X3Rp2d1ICu<r<y@7?Hg^`(|d6a=ZTni_Qp%RP2
+zKcB6fGb}VC8S2=U=rqL42w%46UHG}OH`fy0F&>^@C}+UM#sPH9Ia?NHCKfjX7bXS1
+zFOQxd_gUVN_%VNiP2bC2epZRg{y*DZU(k_dc<p}0kx79|UG;{msbij;rSUn|t5KS7
+V`O`R;az5^E42##_aw93j3joT;PWJ!+
+
