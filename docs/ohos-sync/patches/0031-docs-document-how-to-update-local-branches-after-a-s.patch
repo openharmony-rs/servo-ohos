@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <jschwender@posteo.net>
+Date: Mon, 31 Aug 2026 11:01:27 +0000
+Subject: [PATCH] docs: document how to update local branches after a sync
+
+The runbook gains an "After a sync: updating your branches" section: the
+routine pull --rebase path (fork-point + patch-id), the cases where it
+trips, and the deterministic
+`git rebase --onto sync/<date> pre-sync/<date> <branch>` form the tags
+guarantee. CONTRIBUTING.md points at it.
+
+Lands as an ordinary commit between syncs; the next sync's fold step
+merges it into the runbook patch.
+
+Validation: not required (documentation-only); uv run docs/ohos-sync/check_stack.py base/2026-08-29 passes.
+AI-assisted: Yes (agent session; drafted from the maintainer's review question)
+Signed-off-by: Jonathan Schwender <jschwender@posteo.net>
+---
+ CONTRIBUTING.md         |  4 ++++
+ docs/ohos-sync.md       | 24 ++++++++++++++++++++++++
+ docs/ohos-sync/STACK.md |  2 ++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index e083c329d04..66df66ff346 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -8,6 +8,10 @@ Patches that are blocked upstream, and improve the experience on ohos can be mer
+ The `main` branch follows `upstream/main` and carries no patches. 
+ The `ohos-main` contains `main` + our patches and will be rebased regularly (via force-push).
+ Previous states will be preserved by tagging commits before / after syncing.
++After a sync, update local branches with `git pull --rebase` / `git rebase ohos-main`
++(set `pull.rebase = true`), or deterministically with
++`git rebase --onto sync/<date> pre-sync/<date> <branch>` — see
++[docs/ohos-sync.md](docs/ohos-sync.md), "After a sync: updating your branches".
+ `base/<date>` tags mark the base state of `main` on a given date of a sync.
+ `pre-sync/<date>` tags mark the last commit on `ohos-main` before a rebase onto main.
+ `sync/<date>` marks the last commit on `ohos-main` after a rebase onto main.
+diff --git a/docs/ohos-sync.md b/docs/ohos-sync.md
+index 9ba7e6b5b66..574489e16c0 100644
+--- a/docs/ohos-sync.md
++++ b/docs/ohos-sync.md
+@@ -249,6 +249,30 @@ git push ohos pre-sync/<date> base/<date>
+ git tag sync/<date> ohos-sync-<date> && git push ohos sync/<date>
+ ```
+ 
++## After a sync: updating your branches
++
++`ohos-main` is force-pushed by the sync, so local branches need a rebase —
++the same routine one as after any upstream move:
++
++- Set `git config pull.rebase true` once. After a sync, `git pull --rebase`
++  on `ohos-main` and `git rebase ohos-main` on feature branches replay only
++  your own commits: fork-point detection (your reflog of the remote branch
++  knows the old published tip) excludes the old stack copies, and patch-id
++  matching drops anything content-identical to the new stack.
++- That covers the common case, not every case. It can trip when your clone
++  has no reflog of the old tip (fresh clone, long-unfetched machine), or
++  when you built directly on a patch the sync reshaped (conflict-resolved,
++  shrunk, folded, superseded).
++- The deterministic form needs neither reflog nor patch-id and is always
++  correct about which commits are yours:
++
++  ```sh
++  git rebase --onto sync/<date> pre-sync/<date> my-branch
++  ```
++
++  Only genuine content conflicts between your work and the new base remain
++  — those exist under any sync model.
++
+ ## Device-test gotchas
+ 
+ - `ohos-test-runner` selects the device via `OHOS_TEST_RUNNER_HDC_TARGET`,
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 3e4aaee644a..7b0af9131b5 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -48,6 +48,8 @@ Its diff between syncs is the GitHub-viewable form of the range-diff.
+ 29. `ports/arkweb: wire HTTP-auth and permission request delegates` — A · device · watch: components/servo/webview_delegate.rs
+ 30. `storage: add an OHOS RDB backend for webstorage, client_storage and indexeddb` — C · CI+device · watch: components/storage components/config/prefs.rs components/net/Cargo.toml
+ 
++31. `docs: document how to update local branches after a sync` — B · none · watch: -
++
+ ## Sync log
+ 
+ One entry per sync, newest first. Records the upstream range and every

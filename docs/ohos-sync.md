@@ -249,6 +249,30 @@ git push ohos pre-sync/<date> base/<date>
 git tag sync/<date> ohos-sync-<date> && git push ohos sync/<date>
 ```
 
+## After a sync: updating your branches
+
+`ohos-main` is force-pushed by the sync, so local branches need a rebase —
+the same routine one as after any upstream move:
+
+- Set `git config pull.rebase true` once. After a sync, `git pull --rebase`
+  on `ohos-main` and `git rebase ohos-main` on feature branches replay only
+  your own commits: fork-point detection (your reflog of the remote branch
+  knows the old published tip) excludes the old stack copies, and patch-id
+  matching drops anything content-identical to the new stack.
+- That covers the common case, not every case. It can trip when your clone
+  has no reflog of the old tip (fresh clone, long-unfetched machine), or
+  when you built directly on a patch the sync reshaped (conflict-resolved,
+  shrunk, folded, superseded).
+- The deterministic form needs neither reflog nor patch-id and is always
+  correct about which commits are yours:
+
+  ```sh
+  git rebase --onto sync/<date> pre-sync/<date> my-branch
+  ```
+
+  Only genuine content conflicts between your work and the new base remain
+  — those exist under any sync model.
+
 ## Device-test gotchas
 
 - `ohos-test-runner` selects the device via `OHOS_TEST_RUNNER_HDC_TARGET`,

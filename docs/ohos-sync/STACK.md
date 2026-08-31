@@ -48,6 +48,8 @@ Its diff between syncs is the GitHub-viewable form of the range-diff.
 29. `ports/arkweb: wire HTTP-auth and permission request delegates` — A · device · watch: components/servo/webview_delegate.rs
 30. `storage: add an OHOS RDB backend for webstorage, client_storage and indexeddb` — C · CI+device · watch: components/storage components/config/prefs.rs components/net/Cargo.toml
 
+31. `docs: document how to update local branches after a sync` — B · none · watch: -
+
 ## Sync log
 
 One entry per sync, newest first. Records the upstream range and every
