@@ -168,6 +168,11 @@ Rules:
 - Bookkeeping: update `STACK.md` (entries removed/renamed) and list every
   fold in the sync-log entry — what was folded into what, and why. The
   manifest history is the record of when patches disappeared.
+- Reordering is also a fold-step operation, under the same tree-identity
+  rule. Target order: docs/policy/CI first, then as additive-early as
+  dependencies allow, invasive (tier C) last — conflicts then arrive with
+  the rest of the stack already applied, and every prefix stays buildable.
+  Batch reorders: patch-file renumbering makes each one a noisy review.
 
 If there is nothing to fold, say so in the sync report ("fold: nothing to
 do") rather than skipping silently.
@@ -293,3 +298,11 @@ the same routine one as after any upstream move:
 - Keep the docs/policy/CI commits first on the stack so they rebase first.
 - A patch that conflicts on consecutive syncs is a refactor-to-additive
   work item; note it in the manifest log.
+- Feature guards grow with the stack: code shared by several fork features
+  starts under the first feature's `cfg` in the patch that adds it, and a
+  later patch widens the guard to `cfg(any(...))` when it starts relying on
+  the code — never a pre-emptive grab-bag "common" patch. At every stack
+  position the guard then equals exactly the features introduced so far, so
+  dropping a patch leaves no stale `any()` arms, and every prefix of the
+  stack builds with its own features (spot-check with
+  `cargo hack check --each-feature`).

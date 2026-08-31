@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <jschwender@posteo.net>
+Date: Mon, 31 Aug 2026 11:50:49 +0000
+Subject: [PATCH] docs: stack ordering and feature-guard conventions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fold step: reordering is allowed under the same tree-identity rule, with
+the target order docs/CI first, additive as early as dependencies allow,
+invasive last. Stack hygiene: cfg guards shared by several fork features
+grow with the stack — each any() arm is added by the patch that starts
+relying on the code, so guards always equal the features introduced so
+far and every prefix builds with its own features.
+
+Validation: not required (documentation-only); uv run docs/ohos-sync/check_stack.py base/2026-08-29 passes.
+AI-assisted: Yes (agent session; drafted from the maintainer's ordering and guard-widening proposal)
+Signed-off-by: Jonathan Schwender <jschwender@posteo.net>
+---
+ docs/ohos-sync.md       | 13 +++++++++++++
+ docs/ohos-sync/STACK.md |  2 ++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/docs/ohos-sync.md b/docs/ohos-sync.md
+index 574489e16c0..bb82f84b233 100644
+--- a/docs/ohos-sync.md
++++ b/docs/ohos-sync.md
+@@ -168,6 +168,11 @@ Rules:
+ - Bookkeeping: update `STACK.md` (entries removed/renamed) and list every
+   fold in the sync-log entry — what was folded into what, and why. The
+   manifest history is the record of when patches disappeared.
++- Reordering is also a fold-step operation, under the same tree-identity
++  rule. Target order: docs/policy/CI first, then as additive-early as
++  dependencies allow, invasive (tier C) last — conflicts then arrive with
++  the rest of the stack already applied, and every prefix stays buildable.
++  Batch reorders: patch-file renumbering makes each one a noisy review.
+ 
+ If there is nothing to fold, say so in the sync report ("fold: nothing to
+ do") rather than skipping silently.
+@@ -293,3 +298,11 @@ the same routine one as after any upstream move:
+ - Keep the docs/policy/CI commits first on the stack so they rebase first.
+ - A patch that conflicts on consecutive syncs is a refactor-to-additive
+   work item; note it in the manifest log.
++- Feature guards grow with the stack: code shared by several fork features
++  starts under the first feature's `cfg` in the patch that adds it, and a
++  later patch widens the guard to `cfg(any(...))` when it starts relying on
++  the code — never a pre-emptive grab-bag "common" patch. At every stack
++  position the guard then equals exactly the features introduced so far, so
++  dropping a patch leaves no stale `any()` arms, and every prefix of the
++  stack builds with its own features (spot-check with
++  `cargo hack check --each-feature`).
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 7b0af9131b5..a40c87d14bb 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -50,6 +50,8 @@ Its diff between syncs is the GitHub-viewable form of the range-diff.
+ 
+ 31. `docs: document how to update local branches after a sync` — B · none · watch: -
+ 
++32. `docs: stack ordering and feature-guard conventions` — B · none · watch: -
++
+ ## Sync log
+ 
+ One entry per sync, newest first. Records the upstream range and every

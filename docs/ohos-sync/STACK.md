@@ -50,6 +50,8 @@ Its diff between syncs is the GitHub-viewable form of the range-diff.
 
 31. `docs: document how to update local branches after a sync` — B · none · watch: -
 
+32. `docs: stack ordering and feature-guard conventions` — B · none · watch: -
+
 ## Sync log
 
 One entry per sync, newest first. Records the upstream range and every
