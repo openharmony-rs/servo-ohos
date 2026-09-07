@@ -16,6 +16,7 @@ from concurrent.futures import Future
 
 import pytest
 from geckordp.actors.events import Events
+from geckordp.actors.resources import Resources
 from geckordp.actors.web_console import WebConsoleActor
 
 from .utils import (
@@ -131,6 +132,56 @@ class TestDebuggerTab:
 
             # Clean up by resuming from the original pause
             devtools.client.send_receive({"to": thread_actor, "type": "resume"})
+
+    def test_microtask_enqueued_while_paused_in_microtask_runs(self, run_servoshell, web_server_urls):
+        run_servoshell(url=f"{web_server_urls[0]}/debugger/microtask_pause.html")
+        with Devtools.connect() as devtools:
+            thread_actor = attach_thread(devtools)
+            console_actor = devtools.targets[0]["consoleActor"]
+            source_actor = wait_for_source(devtools, "debugger/microtask_pause.html")
+
+            devtools.watcher.watch_resources([Resources.CONSOLE_MESSAGE])
+            marker = Future()
+
+            def on_resource_available(data):
+                for resource in data["array"]:
+                    if resource[0] != "console-message":
+                        continue
+                    for message in resource[1]:
+                        if message.get("arguments", [None])[0] == "drained" and not marker.done():
+                            marker.set_result(message)
+
+            devtools.client.add_event_listener(
+                devtools.targets[0]["actor"], Events.Watcher.RESOURCES_AVAILABLE_ARRAY, on_resource_available
+            )
+
+            # Pause inside a promise reaction, i.e. while a microtask checkpoint is in progress.
+            positions = devtools.client.send_receive(
+                {"to": source_actor, "type": "getBreakpointPositionsCompressed"}
+            ).get("positions", {})
+            line, column = 4, positions["4"][0]
+
+            def trigger():
+                set_breakpoint(devtools, f"{web_server_urls[0]}/debugger/microtask_pause.html", line, column)
+
+            paused_data = wait_for_pause(devtools.client, thread_actor, trigger)
+            assert paused_data.get("why", {}).get("type") == "breakpoint"
+
+            # Microtasks enqueued while paused go to the debugger's own queue, which must be
+            # drained before the page resumes. A bound native as reaction avoids running
+            # debuggee script while paused.
+            devtools.client.send_receive(
+                {
+                    "to": console_actor,
+                    "type": "evaluateJSAsync",
+                    "text": 'Promise.resolve().then(console.log.bind(console, "drained"))',
+                    "frameActor": paused_data["frame"]["actor"],
+                }
+            )
+            # Console messages logged while paused are only delivered once the thread resumes.
+            # If the microtask was dropped instead of drained, the message never arrives.
+            devtools.client.send_receive({"to": thread_actor, "type": "resume"})
+            assert marker.result(3)["arguments"][0] == "drained"
 
     def test_frame_scoped_eval(self, run_servoshell, web_server_urls):
         run_servoshell(url=f"{web_server_urls[0]}/debugger/frame_scoped.html")
