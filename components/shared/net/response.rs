@@ -50,12 +50,15 @@ pub enum ResponseBody {
     Receiving(Vec<u8>),
     #[serde(with = "serde_bytes")]
     Done(Vec<u8>),
+    /// The body is delivered to the consumer chunk by chunk and is not retained
+    /// anywhere in the net process.
+    Streamed,
 }
 
 impl ResponseBody {
     pub fn is_done(&self) -> bool {
         match *self {
-            ResponseBody::Done(..) => true,
+            ResponseBody::Done(..) | ResponseBody::Streamed => true,
             ResponseBody::Empty | ResponseBody::Receiving(..) => false,
         }
     }

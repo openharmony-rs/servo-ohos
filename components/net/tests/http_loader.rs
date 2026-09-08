@@ -158,17 +158,26 @@ pub fn expect_devtools_http_response(
     }
 }
 
+/// Bodies are streamed rather than accumulated by the net process, so the devtools
+/// notification carrying the whole body is the one sent once the last chunk has been
+/// delivered. Several body-less notifications precede it.
 pub fn devtools_response_with_body(
     devtools_port: &Receiver<DevtoolsControlMsg>,
 ) -> DevtoolsHttpResponse {
-    let devhttpresponses = vec![
-        expect_devtools_http_response(devtools_port),
-        expect_devtools_http_response(devtools_port),
-    ];
-    return devhttpresponses
-        .into_iter()
-        .find(|resp| resp.body.is_some())
-        .expect("One of the responses should have a body");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while let Ok(message) = devtools_port.recv_deadline(deadline) {
+        let DevtoolsControlMsg::FromChrome(ChromeToDevtoolsControlMsg::NetworkEvent(
+            _,
+            NetworkEvent::HttpResponse(response),
+        )) = message
+        else {
+            continue;
+        };
+        if response.body.is_some() {
+            return response;
+        }
+    }
+    panic!("One of the responses should have a body");
 }
 
 #[test]

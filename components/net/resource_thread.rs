@@ -50,7 +50,7 @@ use servo_base::id::CookieStoreId;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::async_runtime::{init_async_runtime, spawn_task};
+use crate::async_runtime::{init_async_runtime, spawn_blocking_task, spawn_task};
 use crate::connector::{
     CACertificates, CertificateErrorOverrideManager, create_http_client, create_tls_config,
 };
@@ -641,7 +641,7 @@ impl ResourceChannelManager {
                 sender.send_or_ignore(http_state.http_cache.cache_entry_descriptors());
             },
             CoreResourceMsg::ClearCache(sender) => {
-                http_state.http_cache.clear();
+                spawn_blocking_task::<_, ()>(http_state.http_cache.clear());
                 if let Some(sender) = sender {
                     sender.send_or_ignore(());
                 }
@@ -671,6 +671,7 @@ impl ResourceChannelManager {
                     let hsts = http_state.hsts_list.read();
                     servo_base::write_json_to_file(&*hsts, config_dir, "hsts_list.json");
                 }
+                spawn_blocking_task::<_, ()>(http_state.http_cache.shutdown());
                 self.resource_manager.exit();
 
                 let _ = sender.send(());
