@@ -261,7 +261,8 @@ impl MallocSizeOf for EntryPolicy {
 }
 
 impl EntryPolicy {
-    pub(crate) fn new(
+    /// The policy for a response as it was received.
+    pub fn new(
         request: &Request,
         status: StatusCode,
         headers: &HeaderMap,

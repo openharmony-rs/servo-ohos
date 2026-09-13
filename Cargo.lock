@@ -8816,6 +8816,7 @@ dependencies = [
  "imsz",
  "ipc-channel",
  "itertools 0.15.0",
+ "libc",
  "log",
  "malloc_size_of_derive",
  "mime",

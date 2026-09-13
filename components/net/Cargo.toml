@@ -52,6 +52,7 @@ sha1 = { workspace = true }
 imsz = { workspace = true }
 ipc-channel = { workspace = true }
 itertools = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }
 malloc_size_of = { workspace = true }
 malloc_size_of_derive = { workspace = true }
@@ -80,7 +81,7 @@ servo-url = { workspace = true }
 servo_arc = { workspace = true }
 smallvec = { workspace = true }
 time = { workspace = true }
-tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true, features = ["codec", "io"] }

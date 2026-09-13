@@ -312,6 +312,7 @@ pub trait CacheStore: MallocSizeOf + Send + Sync + 'static {
     fn open(
         &self,
         id: EntryId,
+        meta: &EntryMeta,
         range: Option<BodyRange>,
     ) -> BoxFuture<'_, Result<BodyReader, StoreError>>;
 
@@ -335,17 +336,30 @@ pub trait CacheStore: MallocSizeOf + Send + Sync + 'static {
     fn touch(&self, id: EntryId);
 
     /// The entries devtools lists.
-    fn descriptors(&self) -> Vec<CacheEntryDescriptor>;
+    fn descriptors(&self) -> BoxFuture<'_, Vec<CacheEntryDescriptor>>;
 
-    /// Bytes of storage in use, for `about:memory`. Zero for stores that do not
-    /// hold bodies in the process.
+    /// Bytes held in this process, for `about:memory`. Zero for a store whose
+    /// bodies live in files.
     fn stored_bytes(&self) -> usize {
+        0
+    }
+
+    /// Bytes held on disk, reported as non-heap so device measurements can see it.
+    fn disk_bytes(&self) -> u64 {
         0
     }
 
     /// The largest response this store will take. Chromium's rule is an eighth of
     /// the budget, never below 5 MiB.
     fn max_entry_bytes(&self) -> u64;
+
+    /// Persist anything that only lives in memory, and return once it is on disk.
+    ///
+    /// Called when the embedding application is backgrounded, because a
+    /// backgrounded application may be killed without any further notice.
+    fn flush(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
 
     /// Flush anything that only lives in memory. Called when the resource thread exits.
     fn shutdown(&self) -> BoxFuture<'_, ()>;

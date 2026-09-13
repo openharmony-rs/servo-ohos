@@ -159,6 +159,7 @@ impl CacheStore for MemoryStore {
     fn open(
         &self,
         id: EntryId,
+        _meta: &EntryMeta,
         range: Option<BodyRange>,
     ) -> BoxFuture<'_, Result<BodyReader, StoreError>> {
         let inner = self.inner.clone();
@@ -309,15 +310,17 @@ impl CacheStore for MemoryStore {
         }
     }
 
-    fn descriptors(&self) -> Vec<CacheEntryDescriptor> {
-        self.inner
+    fn descriptors(&self) -> BoxFuture<'_, Vec<CacheEntryDescriptor>> {
+        let descriptors = self
+            .inner
             .lock()
             .unwrap()
             .entries
             .values()
             .flat_map(|variants| variants.iter())
             .map(|variant| CacheEntryDescriptor::new(variant.meta.key.url().to_string()))
-            .collect()
+            .collect();
+        Box::pin(async move { descriptors })
     }
 
     fn stored_bytes(&self) -> usize {
