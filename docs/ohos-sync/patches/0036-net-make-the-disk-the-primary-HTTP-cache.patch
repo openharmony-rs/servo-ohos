@@ -1,0 +1,2977 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <jschwender@posteo.net>
+Date: Sun, 13 Sep 2026 14:05:29 +0000
+Subject: [PATCH] net: make the disk the primary HTTP cache
+
+Add `DiskStore`, a file-per-entry backend behind `CacheStore`, and turn it on by
+default wherever the embedder gives Servo a cache directory. Cached bodies then
+live only on disk, the OS page cache is the memory tier, and the net process
+holds nothing but an index.
+
+Layout, following Chromium's Simple Cache: a version stamp whose mismatch
+discards the directory, an index written through a temporary file and a rename,
+and one file per variant under `entries/`. There is no fsync anywhere -- neither
+Chromium nor Firefox does one, and `fdatasync` costs 8 ms on eMMC.
+
+The entry format puts the metadata *after* the body:
+
+    magic u64 | format u32 | flags u32
+    body, exactly as received
+    meta, postcard(EntryMeta)
+    meta_len u32 | meta_crc u32 | body_crc u32 | body_len u64 | eof magic u64
+
+That is the one deliberate departure from a header-first layout: freshening an
+entry after a 304 replaces metadata whose length changes, and with the metadata
+at the end that is a truncate and an append instead of rewriting the body. A
+file without a valid trailer was never committed and is ignored, so a crash
+mid-write costs nothing. The body checksum is verified only on a read that runs
+to EOF, as in Chromium; a ranged read skips it.
+
+The index holds `{key_hash, slot, size, last_used}` and nothing else, so the RAM
+per entry stays at Chromium's scale; headers and policy are read from the entry
+file on lookup, one tail read that the page cache serves after the first time.
+It is a derived artifact throughout: a bad checksum, a missing file or a
+directory that changed underneath the cache all repair by scanning, which is
+what makes the store survive OpenHarmony emptying `cacheDir` at any instant. An
+entry whose body does not read back is unlinked rather than left in place, so a
+file the page cache happens to have lost cannot keep failing the same URL.
+
+All blocking I/O goes to one dedicated thread per store, QoS-boosted onto the
+larger cores. The unit of hand-off is a batch of up to 256 KiB rather than a
+64 KiB chunk, because the measured cross-thread hand-off is 28 to 45 us on the
+DAYU200 and the PLR -- several times the 64 KiB read it would dispatch -- so an
+entry under 256 KiB, which is most of the web, costs exactly one hand-off.
+Reads keep one batch in flight while the previous one is decoded. `tokio::fs`
+was rejected for costing a hand-off per operation, inline I/O on a tokio worker
+for stalling it on a 375 us cold read, and mmap because a fault over a 64 KiB
+span costs 28 to 36 percent of a read that also copies the data.
+
+Sizing follows the plan: 100 MiB on OpenHarmony and Android, Chromium's
+free-space ladder elsewhere (`statvfs`, no new dependency), both overridable
+through `network_http_disk_cache_size`. Entries are capped at an eighth of the
+budget and at 20 000 files, since inodes are metered per uid on OpenHarmony.
+`Opts::http_cache_dir` carries the location; servoshell defaults it to
+`<cacheDir>/servo/http-cache` on Android and OpenHarmony and to
+`dirs::cache_dir()/servo/http-cache` elsewhere. `--temporary-storage` and
+private browsing stay on the memory store, so WPT runs are unaffected.
+
+`about:memory` gains `http-cache/index` for the in-process index and a non-heap
+`http-cache/disk` for the bytes on disk.
+
+Persisting the index is part of being disk-primary, because on a phone the
+process is almost never shut down cleanly -- it is frozen and then killed -- so
+an index that is only written on a timer is rarely written at all, and every
+cold start pays a directory scan (74 ms at 20 000 entries on the PLR). Measured
+on device: after `aa force-stop`, `shutdown()` never runs. Chromium solves this
+the same way and this follows it: `SimpleIndex` uses
+`kWriteToDiskDelayMSecs = 20000` in the foreground and
+`kWriteToDiskOnBackgroundDelayMSecs = 100` in the background, and
+`OnApplicationStateChange()` -- registered through `ApplicationStatusListener` --
+writes the index immediately on `APPLICATION_STATE_HAS_STOPPED_ACTIVITIES`.
+
+  * The index flush is a real debounce: 20 s after the *last* change, not "at
+    most every 20 s while active", matching Chromium's `PostponeWritingToDisk`.
+    A generation counter means a burst of commits costs one index write, and an
+    application that goes quiet still persists.
+
+  * `NetworkManager::notify_application_backgrounded()` is a new embedder API
+    that flushes immediately, wired on OpenHarmony from
+    `EntryAbility.onBackground()` through a new `onApplicationBackground` napi
+    export. It is deliberately a general embedder API rather than an
+    OpenHarmony detail: Android's `onTrimMemory` / `ApplicationStatusListener`
+    is the same signal, and an embedded webview can forward its host's
+    equivalent.
+
+    The call *waits* for the flush, bounded by `BACKGROUND_FLUSH_TIMEOUT`
+    (500 ms), rather than enqueuing it: the application can be frozen once the
+    callback returns, so firing and forgetting would race the freeze. The bound
+    exists only so a busy Servo thread cannot stall the ability's main thread;
+    hitting it is logged and means something else is wrong, since the work is a
+    few kilobytes with no `fsync`.
+
+    No background permission is needed, and deliberately so.
+    `ohos.permission.KEEP_BACKGROUND_RUNNING` covers *continuous* tasks, which
+    this is not. The other option is a `backgroundTaskManager` transient task
+    via `requestSuspendDelay`, which needs no permission and may be requested
+    during `onBackground` -- its documented use case is exactly "saving state on
+    app exit". It is still the wrong tool: transient tasks are quota'd (at most
+    3 per time segment and 10 minutes a day) and sized for work measured in
+    seconds, so spending one on a sub-millisecond index write would burn a
+    budget a real background job may need. If this API ever grows a heavier
+    user -- a cache trim driven by a memory-pressure signal, say -- a transient
+    task becomes the right wrapper, and that is when to add it.
+
+  * Index staleness is decided by a dirty flag in the version stamp, which is
+    Firefox's approach ("set as soon as the index is read and cleared only when
+    the shutdown journal has been written successfully"). A directory mtime
+    cannot tell an unclean exit from a clean one. The mtime check stays
+    *alongside* the flag, because the flag only covers our own exit while the
+    mtime catches the system emptying the cache directory while Servo is not
+    running -- both have to hold before the index is trusted.
+
+`index::load()` also gained `http-cache: index loaded from disk` /
+`index rebuilt by scanning` markers. The two are indistinguishable from
+behaviour alone -- a rebuild finds the same entries, so the cache answers either
+way -- so without them nothing can assert that a flush actually saved a scan.
+
+mmap for the index was considered and rejected: it would survive SIGKILL, but it
+offers no atomicity, so a kill mid-update leaves a torn record, which is harder
+to detect than the current single CRC over the whole payload and would need a
+fixed-slot format plus per-record validation. The lifecycle hook covers the case
+that actually happens for a fraction of the risk.
+
+Validation: (1) `./mach test-unit -p servo-net` -- 437 tests, all passing.
+`tests/cache_store.rs` runs one suite against both stores through a macro
+(commit/read, abort, multi-batch bodies, variants, ranges, `update_meta`,
+byte-budget eviction, remove/clear, concurrent writers, descriptors), so a
+behaviour only one backend gets right fails there. Three tests pin the index
+semantics: an unclean exit still finds its entries, a flush makes the index
+reusable, and entries removed while Servo was closed are *not* served from an
+otherwise-clean index.
+(2) The disk-specific half of that file is the hostile suite the design asks
+for: entries survive a restart, a corrupt index is rebuilt from the files, a
+temporary file left by a killed writer is cleaned up, an entry file removed
+behind the store's back reads as a miss, the whole directory can be deleted
+while the store runs and it recreates it, a foreign version stamp discards the
+directory, a flipped body byte surfaces as an error rather than silent
+corruption, a forged hash collision does not serve the wrong URL, and an
+outsized entry is declined. A corrupt body is also checked to be *dropped*, not
+just reported, and no credential from the request reaches the entry file.
+(3) On PLR-AL00, release, `--flavor=harmonyos`: after loading a page no
+`index-data` exists at 12 s (the debounce has not fired); pressing Home produces
+it within 2 s; the stamp's clean byte reads 1; no "background timeout" warning
+appears in hilog, so the flush finished well inside the bound; and the next
+start serves the whole page with zero server requests, from the trusted index
+rather than a scan. With a page that keeps fetching, the clean byte correctly
+reverts to 0 and the next start rescans -- the safe direction. Process PSS over
+three alternating pairs: 234.9 -> 181.8 MB, -53.0 MB (-22.6%), all of it
+anonymous.
+(4) `./mach check`, `./mach check --ohos` warning-free; `./mach test-tidy` clean.
+(5) After a rebase, re-check `Opts` and the servoshell argument plumbing; re-run
+the hostile suite, which is the only thing pinning the "no store error ever
+fails a fetch" invariant; and re-check that `EntryAbility.onBackground()` still
+calls in and still *waits*. That last one is a one-line call site a conflict can
+silently drop, and making it fire-and-forget again restores the race -- nothing
+in the Rust build notices either.
+AI-assisted: Yes (agent session; implementation and testing)
+---
+ Cargo.lock                                    |   1 +
+ components/config/opts.rs                     |   5 +
+ components/net/Cargo.toml                     |   3 +-
+ components/net/http_cache/disk/entry.rs       | 182 ++++
+ components/net/http_cache/disk/index.rs       | 479 ++++++++++
+ components/net/http_cache/disk/io_thread.rs   |  96 +++
+ components/net/http_cache/disk/mod.rs         | 816 +++++++++++++++++-
+ components/net/http_cache/memory_store.rs     |   9 +-
+ components/net/http_cache/mod.rs              |  23 +-
+ components/net/http_cache/policy.rs           |   3 +-
+ components/net/http_cache/store.rs            |  20 +-
+ components/net/http_loader.rs                 |   9 +-
+ components/net/resource_thread.rs             |  13 +-
+ components/net/tests/cache_store.rs           | 681 +++++++++++++++
+ components/net/tests/main.rs                  |   1 +
+ components/servo/network_manager.rs           |  25 +-
+ components/shared/net/lib.rs                  |  17 +
+ ports/servoshell/egl/app.rs                   |  12 +
+ ports/servoshell/egl/ohos/mod.rs              |  32 +
+ ports/servoshell/prefs.rs                     |  17 +
+ .../main/ets/entryability/EntryAbility.ets    |   8 +
+ 21 files changed, 2429 insertions(+), 23 deletions(-)
+ create mode 100644 components/net/http_cache/disk/entry.rs
+ create mode 100644 components/net/http_cache/disk/index.rs
+ create mode 100644 components/net/http_cache/disk/io_thread.rs
+ create mode 100644 components/net/tests/cache_store.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index fe794754b8e..c2c90dc7722 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -8816,6 +8816,7 @@ dependencies = [
+  "imsz",
+  "ipc-channel",
+  "itertools 0.15.0",
++ "libc",
+  "log",
+  "malloc_size_of_derive",
+  "mime",
+diff --git a/components/config/opts.rs b/components/config/opts.rs
+index f9a04dc7728..a005f742c20 100644
+--- a/components/config/opts.rs
++++ b/components/config/opts.rs
+@@ -65,6 +65,10 @@ pub struct Opts {
+     /// Directory for a default config directory
+     pub config_dir: Option<PathBuf>,
+ 
++    /// Where the HTTP cache may keep its files. `None` keeps the cache in memory,
++    /// which is also what `temporary_storage` forces.
++    pub http_cache_dir: Option<PathBuf>,
++
+     /// Use temporary storage (data on disk will not persist across restarts).
+     pub temporary_storage: bool,
+ 
+@@ -254,6 +258,7 @@ impl Default for Opts {
+             sandbox: false,
+             debug: Default::default(),
+             config_dir: None,
++            http_cache_dir: None,
+             temporary_storage: false,
+             shaders_path: None,
+             certificate_path: None,
+diff --git a/components/net/Cargo.toml b/components/net/Cargo.toml
+index b6b2956fa0c..b754d2aea62 100644
+--- a/components/net/Cargo.toml
++++ b/components/net/Cargo.toml
+@@ -52,6 +52,7 @@ sha1 = { workspace = true }
+ imsz = { workspace = true }
+ ipc-channel = { workspace = true }
+ itertools = { workspace = true }
++libc = { workspace = true }
+ log = { workspace = true }
+ malloc_size_of = { workspace = true }
+ malloc_size_of_derive = { workspace = true }
+@@ -80,7 +81,7 @@ servo-url = { workspace = true }
+ servo_arc = { workspace = true }
+ smallvec = { workspace = true }
+ time = { workspace = true }
+-tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync"] }
++tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+ tokio-rustls = { workspace = true }
+ tokio-stream = { workspace = true }
+ tokio-util = { workspace = true, features = ["codec", "io"] }
+diff --git a/components/net/http_cache/disk/entry.rs b/components/net/http_cache/disk/entry.rs
+new file mode 100644
+index 00000000000..90306359212
+--- /dev/null
++++ b/components/net/http_cache/disk/entry.rs
+@@ -0,0 +1,182 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! The on-disk format of one cache entry.
++//!
++//! ```text
++//! 0                magic u64 | format u32 | flags u32
++//! HEADER_LEN       body, exactly as it was received
++//! + body_len       meta, postcard(EntryMeta)
++//! + meta_len       meta_len u32 | meta_crc u32 | body_crc u32 | body_len u64 | eof magic u64
++//! ```
++//!
++//! The metadata sits *after* the body, unlike the header-first layout other
++//! caches use, so that a 304 can replace it by truncating and appending rather
++//! than rewriting the body. A file without a valid trailer was never committed
++//! and is ignored.
++
++use std::fs::File;
++use std::io::{self, Read, Seek, SeekFrom, Write};
++
++use crc32fast::Hasher;
++
++use crate::http_cache::store::{CACHE_FORMAT, EntryMeta};
++
++const ENTRY_MAGIC: u64 = 0x5345_5256_4f43_4143;
++const EOF_MAGIC: u64 = 0x4341_434f_5652_4553;
++
++pub(crate) const HEADER_LEN: u64 = 16;
++pub(crate) const TRAILER_LEN: u64 = 28;
++
++/// How much of the tail is read in one go when opening an entry. Large enough
++/// that a typical entry's metadata comes back with the trailer.
++const TAIL_READ_LEN: u64 = 8 * 1024;
++
++fn invalid(reason: &'static str) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, reason)
++}
++
++pub(crate) fn header_bytes() -> [u8; HEADER_LEN as usize] {
++    let mut header = [0u8; HEADER_LEN as usize];
++    header[..8].copy_from_slice(&ENTRY_MAGIC.to_le_bytes());
++    header[8..12].copy_from_slice(&(CACHE_FORMAT as u32).to_le_bytes());
++    header
++}
++
++pub(crate) fn write_header(file: &mut File) -> io::Result<()> {
++    file.write_all(&header_bytes())
++}
++
++/// Append the metadata and the trailer that makes the entry complete.
++pub(crate) fn write_tail(
++    file: &mut File,
++    meta: &EntryMeta,
++    body_len: u64,
++    body_crc: u32,
++) -> io::Result<()> {
++    let meta_bytes =
++        postcard::to_stdvec(meta).map_err(|_| invalid("cache metadata is not serializable"))?;
++    let meta_len =
++        u32::try_from(meta_bytes.len()).map_err(|_| invalid("cache metadata too big"))?;
++    let mut meta_hasher = Hasher::new();
++    meta_hasher.update(&meta_bytes);
++
++    let mut trailer = [0u8; TRAILER_LEN as usize];
++    trailer[..4].copy_from_slice(&meta_len.to_le_bytes());
++    trailer[4..8].copy_from_slice(&meta_hasher.finalize().to_le_bytes());
++    trailer[8..12].copy_from_slice(&body_crc.to_le_bytes());
++    trailer[12..20].copy_from_slice(&body_len.to_le_bytes());
++    trailer[20..].copy_from_slice(&EOF_MAGIC.to_le_bytes());
++
++    file.write_all(&meta_bytes)?;
++    file.write_all(&trailer)
++}
++
++/// What the tail of a committed entry says about it.
++pub(crate) struct EntryTail {
++    pub meta: EntryMeta,
++    pub body_len: u64,
++    pub body_crc: u32,
++}
++
++/// Read an entry's metadata. Fails for a file that was never committed, whose
++/// format does not match, or whose metadata does not check out.
++pub(crate) fn read_tail(file: &mut File) -> io::Result<EntryTail> {
++    let file_len = file.seek(SeekFrom::End(0))?;
++    if file_len < HEADER_LEN + TRAILER_LEN {
++        return Err(invalid("cache entry is too short to be complete"));
++    }
++
++    let mut header = [0u8; HEADER_LEN as usize];
++    file.seek(SeekFrom::Start(0))?;
++    file.read_exact(&mut header)?;
++    if u64::from_le_bytes(header[..8].try_into().unwrap()) != ENTRY_MAGIC {
++        return Err(invalid("not a cache entry"));
++    }
++    if u32::from_le_bytes(header[8..12].try_into().unwrap()) != CACHE_FORMAT as u32 {
++        return Err(invalid("cache entry has another format"));
++    }
++
++    let tail_len = (file_len - HEADER_LEN).min(TAIL_READ_LEN + TRAILER_LEN);
++    let tail_start = file_len - tail_len;
++    let mut tail = vec![0u8; tail_len as usize];
++    file.seek(SeekFrom::Start(tail_start))?;
++    file.read_exact(&mut tail)?;
++
++    let trailer = &tail[tail.len() - TRAILER_LEN as usize..];
++    if u64::from_le_bytes(trailer[20..].try_into().unwrap()) != EOF_MAGIC {
++        return Err(invalid("cache entry was never committed"));
++    }
++    let meta_len = u32::from_le_bytes(trailer[..4].try_into().unwrap()) as u64;
++    let meta_crc = u32::from_le_bytes(trailer[4..8].try_into().unwrap());
++    let body_crc = u32::from_le_bytes(trailer[8..12].try_into().unwrap());
++    let body_len = u64::from_le_bytes(trailer[12..20].try_into().unwrap());
++
++    if HEADER_LEN
++        .checked_add(body_len)
++        .and_then(|offset| offset.checked_add(meta_len))
++        .and_then(|offset| offset.checked_add(TRAILER_LEN)) !=
++        Some(file_len)
++    {
++        return Err(invalid("cache entry lengths do not add up"));
++    }
++
++    let meta_offset = HEADER_LEN + body_len;
++    let meta_bytes = if meta_offset >= tail_start {
++        let start = (meta_offset - tail_start) as usize;
++        tail[start..start + meta_len as usize].to_vec()
++    } else {
++        let mut meta_bytes = vec![0u8; meta_len as usize];
++        file.seek(SeekFrom::Start(meta_offset))?;
++        file.read_exact(&mut meta_bytes)?;
++        meta_bytes
++    };
++
++    let mut hasher = Hasher::new();
++    hasher.update(&meta_bytes);
++    if hasher.finalize() != meta_crc {
++        return Err(invalid("cache metadata is corrupt"));
++    }
++
++    let mut meta: EntryMeta =
++        postcard::from_bytes(&meta_bytes).map_err(|_| invalid("cache metadata is unreadable"))?;
++    if meta.format != CACHE_FORMAT {
++        return Err(invalid("cache metadata has another format"));
++    }
++    meta.body_len = body_len;
++
++    Ok(EntryTail {
++        meta,
++        body_len,
++        body_crc,
++    })
++}
++
++/// Read only the length and checksum of an entry's body, without parsing its
++/// metadata. Used when opening a body whose metadata the caller already has.
++pub(crate) fn read_trailer(file: &mut File) -> io::Result<(u64, u32)> {
++    let file_len = file.seek(SeekFrom::End(0))?;
++    if file_len < HEADER_LEN + TRAILER_LEN {
++        return Err(invalid("cache entry is too short to be complete"));
++    }
++    let mut trailer = [0u8; TRAILER_LEN as usize];
++    file.seek(SeekFrom::Start(file_len - TRAILER_LEN))?;
++    file.read_exact(&mut trailer)?;
++    if u64::from_le_bytes(trailer[20..].try_into().unwrap()) != EOF_MAGIC {
++        return Err(invalid("cache entry was never committed"));
++    }
++    Ok((
++        u64::from_le_bytes(trailer[12..20].try_into().unwrap()),
++        u32::from_le_bytes(trailer[8..12].try_into().unwrap()),
++    ))
++}
++
++/// Replace an entry's metadata, keeping its body. Used to freshen an entry after
++/// a 304, which is why the metadata lives at the end of the file.
++pub(crate) fn rewrite_tail(file: &mut File, meta: &EntryMeta) -> io::Result<()> {
++    let existing = read_tail(file)?;
++    file.set_len(HEADER_LEN + existing.body_len)?;
++    file.seek(SeekFrom::Start(HEADER_LEN + existing.body_len))?;
++    write_tail(file, meta, existing.body_len, existing.body_crc)
++}
+diff --git a/components/net/http_cache/disk/index.rs b/components/net/http_cache/disk/index.rs
+new file mode 100644
+index 00000000000..b13deb259f9
+--- /dev/null
++++ b/components/net/http_cache/disk/index.rs
+@@ -0,0 +1,479 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! The in-memory index of a disk store, and the file it is persisted to.
++//!
++//! The index is a derived artifact: losing it costs a directory scan, never an
++//! entry. It holds no metadata beyond what eviction needs, so the RAM per entry
++//! stays at Chromium's scale; the response headers and policy are read from the
++//! entry file on lookup.
++
++use std::path::{Path, PathBuf};
++use std::time::{SystemTime, UNIX_EPOCH};
++use std::{fs, io};
++
++use crc32fast::Hasher;
++use log::{debug, info};
++use rustc_hash::FxHashMap;
++use serde::{Deserialize, Serialize};
++use smallvec::SmallVec;
++
++use crate::http_cache::key::{EntryId, MAX_SLOTS, entry_id, entry_key_hash, entry_slot};
++use crate::http_cache::store::CACHE_FORMAT;
++
++const INDEX_MAGIC: u64 = 0x5845_444e_495f_4341;
++/// Length of the header of `index-data`: magic, format, count, dir mtime, crc.
++const INDEX_HEADER_LEN: usize = 8 + 4 + 4 + 8 + 4;
++
++/// The version stamp. A mismatch means the whole directory is discarded.
++pub(crate) const STAMP_FILE: &str = "index";
++/// The index itself.
++pub(crate) const INDEX_FILE: &str = "index-data";
++/// Where entry files live.
++pub(crate) const ENTRIES_DIR: &str = "entries";
++
++/// Seconds since the epoch, which is all the resolution eviction needs.
++pub(crate) fn now_secs() -> u32 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|since| since.as_secs() as u32)
++        .unwrap_or_default()
++}
++
++#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
++struct IndexRecord {
++    key_hash: u64,
++    slot: u8,
++    size: u32,
++    last_used: u32,
++}
++
++/// One stored variant, as the index knows it.
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct Variant {
++    pub slot: u8,
++    pub size: u32,
++    pub last_used: u32,
++}
++
++/// The index of a disk store.
++#[derive(Default)]
++pub(crate) struct Index {
++    entries: FxHashMap<u64, SmallVec<[Variant; 1]>>,
++    /// Slots handed to writers that have not committed or aborted yet.
++    reserved: FxHashMap<u64, SmallVec<[u8; 1]>>,
++    bytes: u64,
++    count: usize,
++    dirty: bool,
++}
++
++impl Index {
++    pub(crate) fn bytes(&self) -> u64 {
++        self.bytes
++    }
++
++    pub(crate) fn count(&self) -> usize {
++        self.count
++    }
++
++    pub(crate) fn is_dirty(&self) -> bool {
++        self.dirty
++    }
++
++    pub(crate) fn variants(&self, key_hash: u64) -> impl Iterator<Item = Variant> + '_ {
++        self.entries
++            .get(&key_hash)
++            .into_iter()
++            .flat_map(|variants| variants.iter().copied())
++    }
++
++    pub(crate) fn get(&self, id: EntryId) -> Option<Variant> {
++        self.entries
++            .get(&entry_key_hash(id))?
++            .iter()
++            .find(|variant| variant.slot == entry_slot(id))
++            .copied()
++    }
++
++    pub(crate) fn all(&self) -> Vec<EntryId> {
++        self.entries
++            .iter()
++            .flat_map(|(hash, variants)| {
++                variants
++                    .iter()
++                    .map(move |variant| entry_id(*hash, variant.slot))
++            })
++            .collect()
++    }
++
++    /// Reserve a slot for a writer, or `None` when this key already has as many
++    /// variants as it may have.
++    pub(crate) fn reserve_slot(&mut self, key_hash: u64) -> Option<u8> {
++        let used = self.entries.get(&key_hash);
++        let reserved = self.reserved.get(&key_hash);
++        let slot = (0..MAX_SLOTS).find(|slot| {
++            !used.is_some_and(|variants| variants.iter().any(|variant| variant.slot == *slot)) &&
++                !reserved.is_some_and(|slots| slots.contains(slot))
++        })?;
++        self.reserved.entry(key_hash).or_default().push(slot);
++        Some(slot)
++    }
++
++    pub(crate) fn release_slot(&mut self, key_hash: u64, slot: u8) {
++        if let Some(slots) = self.reserved.get_mut(&key_hash) {
++            slots.retain(|reserved| *reserved != slot);
++            if slots.is_empty() {
++                self.reserved.remove(&key_hash);
++            }
++        }
++    }
++
++    pub(crate) fn insert(&mut self, key_hash: u64, variant: Variant) {
++        self.remove(entry_id(key_hash, variant.slot));
++        self.bytes += variant.size as u64;
++        self.count += 1;
++        self.entries.entry(key_hash).or_default().push(variant);
++        self.dirty = true;
++    }
++
++    pub(crate) fn remove(&mut self, id: EntryId) -> bool {
++        let key_hash = entry_key_hash(id);
++        let Some(variants) = self.entries.get_mut(&key_hash) else {
++            return false;
++        };
++        let Some(position) = variants
++            .iter()
++            .position(|variant| variant.slot == entry_slot(id))
++        else {
++            return false;
++        };
++        self.bytes -= variants[position].size as u64;
++        self.count -= 1;
++        variants.remove(position);
++        if variants.is_empty() {
++            self.entries.remove(&key_hash);
++        }
++        self.dirty = true;
++        true
++    }
++
++    pub(crate) fn remove_key(&mut self, key_hash: u64) -> Vec<EntryId> {
++        let Some(variants) = self.entries.remove(&key_hash) else {
++            return Vec::new();
++        };
++        for variant in &variants {
++            self.bytes -= variant.size as u64;
++            self.count -= 1;
++        }
++        self.dirty = true;
++        variants
++            .iter()
++            .map(|variant| entry_id(key_hash, variant.slot))
++            .collect()
++    }
++
++    pub(crate) fn clear(&mut self) -> Vec<EntryId> {
++        let ids = self.all();
++        self.entries.clear();
++        self.bytes = 0;
++        self.count = 0;
++        self.dirty = true;
++        ids
++    }
++
++    pub(crate) fn touch(&mut self, id: EntryId) {
++        let slot = entry_slot(id);
++        if let Some(variants) = self.entries.get_mut(&entry_key_hash(id)) &&
++            let Some(variant) = variants.iter_mut().find(|variant| variant.slot == slot)
++        {
++            variant.last_used = now_secs();
++            self.dirty = true;
++        }
++    }
++
++    /// The least recently used entries to drop so that the store fits in its
++    /// budgets again, with headroom so eviction does not run on every commit.
++    pub(crate) fn evict_to(&mut self, max_bytes: u64, max_entries: usize) -> Vec<EntryId> {
++        if self.bytes <= max_bytes && self.count <= max_entries {
++            return Vec::new();
++        }
++        let target_bytes = max_bytes / 10 * 9;
++        let target_entries = max_entries / 10 * 9;
++
++        let mut candidates: Vec<(u32, EntryId, u32)> = self
++            .entries
++            .iter()
++            .flat_map(|(hash, variants)| {
++                variants.iter().map(move |variant| {
++                    (
++                        variant.last_used,
++                        entry_id(*hash, variant.slot),
++                        variant.size,
++                    )
++                })
++            })
++            .collect();
++        candidates.sort_unstable_by_key(|(last_used, id, _)| (*last_used, *id));
++
++        let mut evicted = Vec::new();
++        for (_, id, _) in candidates {
++            if self.bytes <= target_bytes && self.count <= target_entries {
++                break;
++            }
++            if self.remove(id) {
++                evicted.push(id);
++            }
++        }
++        evicted
++    }
++
++    pub(crate) fn serialize(&self, dir_mtime: u64) -> Option<Vec<u8>> {
++        let records: Vec<IndexRecord> = self
++            .entries
++            .iter()
++            .flat_map(|(hash, variants)| {
++                variants.iter().map(move |variant| IndexRecord {
++                    key_hash: *hash,
++                    slot: variant.slot,
++                    size: variant.size,
++                    last_used: variant.last_used,
++                })
++            })
++            .collect();
++        let payload = postcard::to_stdvec(&records).ok()?;
++        let mut hasher = Hasher::new();
++        hasher.update(&payload);
++
++        let mut bytes = Vec::with_capacity(INDEX_HEADER_LEN + payload.len());
++        bytes.extend_from_slice(&INDEX_MAGIC.to_le_bytes());
++        bytes.extend_from_slice(&(CACHE_FORMAT as u32).to_le_bytes());
++        bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
++        bytes.extend_from_slice(&dir_mtime.to_le_bytes());
++        bytes.extend_from_slice(&hasher.finalize().to_le_bytes());
++        bytes.extend_from_slice(&payload);
++        Some(bytes)
++    }
++
++    fn deserialize(bytes: &[u8]) -> Option<(Index, u64)> {
++        if bytes.len() < INDEX_HEADER_LEN {
++            return None;
++        }
++        if u64::from_le_bytes(bytes[..8].try_into().ok()?) != INDEX_MAGIC {
++            return None;
++        }
++        if u32::from_le_bytes(bytes[8..12].try_into().ok()?) != CACHE_FORMAT as u32 {
++            return None;
++        }
++        let dir_mtime = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
++        let crc = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
++        let payload = &bytes[INDEX_HEADER_LEN..];
++        let mut hasher = Hasher::new();
++        hasher.update(payload);
++        if hasher.finalize() != crc {
++            return None;
++        }
++
++        let records: Vec<IndexRecord> = postcard::from_bytes(payload).ok()?;
++        let mut index = Index::default();
++        for record in records {
++            index.insert(
++                record.key_hash,
++                Variant {
++                    slot: record.slot,
++                    size: record.size,
++                    last_used: record.last_used,
++                },
++            );
++        }
++        index.dirty = false;
++        Some((index, dir_mtime))
++    }
++
++    pub(crate) fn mark_clean(&mut self) {
++        self.dirty = false;
++    }
++}
++
++/// Parse an entry file name back into the key hash and slot it stands for.
++pub(crate) fn parse_entry_name(name: &str) -> Option<(u64, u8)> {
++    let (hash, slot) = name.split_once('_')?;
++    Some((
++        u64::from_str_radix(hash, 16).ok()?,
++        slot.parse::<u8>().ok()?,
++    ))
++}
++
++pub(crate) fn entry_file_name(key_hash: u64, slot: u8) -> String {
++    format!("{key_hash:014x}_{slot}")
++}
++
++/// Nanoseconds, not seconds: two changes within the same second must still be
++/// distinguishable, or a directory that changed after the index was written can
++/// look like one that did not.
++pub(crate) fn dir_mtime(dir: &Path) -> u64 {
++    fs::metadata(dir)
++        .and_then(|metadata| metadata.modified())
++        .ok()
++        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
++        .map(|since| since.as_nanos() as u64)
++        .unwrap_or_default()
++}
++
++/// Load the index, repairing or rebuilding it as needed. Blocking; only run at
++/// store construction.
++pub(crate) fn load(dir: &Path, entries_dir: &Path, was_clean: bool) -> Index {
++    let mut index = match fs::read(dir.join(INDEX_FILE)).ok().and_then(|bytes| {
++        let bytes = Index::deserialize(&bytes)?;
++        Some(bytes)
++    }) {
++        // Trust the index only if the previous run said it was up to date *and*
++        // nothing changed the directory since: the flag catches our own unclean
++        // exit, the mtime catches the system emptying `cacheDir` behind our back.
++        Some((index, stamped_mtime)) if was_clean && stamped_mtime == dir_mtime(entries_dir) => {
++            // Marker asserted by ports/arkweb/tools/test_http_cache_index.py.
++            info!(
++                "http-cache: index loaded from disk, {} entries",
++                index.count()
++            );
++            return index;
++        },
++        Some((index, _)) => index,
++        None => {
++            debug!("HTTP cache index is missing or unreadable, rebuilding it");
++            Index::default()
++        },
++    };
++    reconcile(&mut index, entries_dir);
++    info!(
++        "http-cache: index rebuilt by scanning, {} entries",
++        index.count()
++    );
++    index
++}
++
++/// Bring an index back in line with what is actually on disk, which the system
++/// is allowed to change behind the cache's back.
++fn reconcile(index: &mut Index, entries_dir: &Path) {
++    let Ok(dir) = fs::read_dir(entries_dir) else {
++        // The whole directory is gone; every record is stale.
++        index.clear();
++        index.mark_clean();
++        return;
++    };
++
++    let mut present: FxHashMap<u64, SmallVec<[u8; 1]>> = FxHashMap::default();
++    let mut unknown: Vec<(u64, u8, PathBuf)> = Vec::new();
++    for entry in dir.flatten() {
++        let name = entry.file_name();
++        let Some(name) = name.to_str() else { continue };
++        if name.ends_with(".tmp") {
++            // A writer that never committed, from this run or a previous one.
++            let _ = fs::remove_file(entry.path());
++            continue;
++        }
++        let Some((key_hash, slot)) = parse_entry_name(name) else {
++            continue;
++        };
++        present.entry(key_hash).or_default().push(slot);
++        if index.get(entry_id(key_hash, slot)).is_none() {
++            unknown.push((key_hash, slot, entry.path()));
++        }
++    }
++
++    for id in index.all() {
++        let known = present
++            .get(&entry_key_hash(id))
++            .is_some_and(|slots| slots.contains(&entry_slot(id)));
++        if !known {
++            index.remove(id);
++        }
++    }
++
++    // Only files the index did not know about are stat'ed; the routine path never
++    // touches the file system for sizes or recency.
++    for (key_hash, slot, path) in unknown {
++        let Ok(metadata) = fs::metadata(&path) else {
++            continue;
++        };
++        index.insert(
++            key_hash,
++            Variant {
++                slot,
++                size: metadata.len().min(u32::MAX as u64) as u32,
++                last_used: metadata
++                    .modified()
++                    .ok()
++                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
++                    .map(|since| since.as_secs() as u32)
++                    .unwrap_or_else(now_secs),
++            },
++        );
++    }
++}
++
++/// The version stamp: magic, format, and one byte saying whether the previous run
++/// closed the store cleanly.
++fn stamp_bytes(clean: bool) -> Vec<u8> {
++    let mut stamp = Vec::with_capacity(13);
++    stamp.extend_from_slice(&INDEX_MAGIC.to_le_bytes());
++    stamp.extend_from_slice(&(CACHE_FORMAT as u32).to_le_bytes());
++    stamp.push(clean as u8);
++    stamp
++}
++
++/// Record whether the index on disk currently describes the directory exactly.
++/// Cleared as soon as anything changes, set again once a write has caught up.
++pub(crate) fn write_stamp(dir: &Path, clean: bool) {
++    let _ = fs::write(dir.join(STAMP_FILE), stamp_bytes(clean));
++}
++
++/// Check the version stamp, discarding the directory when it does not match, and
++/// make sure the layout exists.
++///
++/// Returns whether the previous run left the index describing the directory. This
++/// is Firefox's dirty-flag trick: a directory mtime cannot tell an unclean exit
++/// from a clean one, because a writer may have been in flight when the index was
++/// last written.
++pub(crate) fn prepare_directory(dir: &Path) -> io::Result<bool> {
++    let stamp_path = dir.join(STAMP_FILE);
++    let version = &stamp_bytes(false)[..12];
++    let was_clean = match fs::read(&stamp_path) {
++        Ok(stamp) if stamp.len() >= 12 && &stamp[..12] == version => {
++            stamp.get(12).copied() == Some(1)
++        },
++        Ok(_) => {
++            // Another format wrote this directory. There is no migration.
++            debug!("HTTP cache directory has another format, discarding it");
++            let _ = fs::remove_dir_all(dir);
++            false
++        },
++        // No stamp at all: either a fresh directory, or one the system emptied
++        // while Servo was not running. Neither can be trusted.
++        Err(_) => false,
++    };
++    fs::create_dir_all(dir.join(ENTRIES_DIR))?;
++    // We are about to start changing the directory.
++    write_stamp(dir, false);
++    Ok(was_clean)
++}
++
++/// Write the index through a temporary file and a rename, so a crash leaves
++/// either the old index or the new one. Blocking; runs on the I/O thread.
++///
++/// `bytes_of` serializes the index and, while it holds the index lock, records the
++/// directory's modification time. Reading the two together is what keeps the
++/// recorded time from describing a directory the index does not: a commit either
++/// renames its file before the time is read, and the index is written again, or
++/// after it, and the time no longer matches -- both make the next start rescan.
++pub(crate) fn save(dir: &Path, bytes_of: impl FnOnce() -> Option<Vec<u8>>) -> bool {
++    let Some(bytes) = bytes_of() else {
++        return false;
++    };
++    let temporary = dir.join(format!("{INDEX_FILE}.tmp"));
++    // No fsync: the index is a derived artifact, and fdatasync costs 8 ms on eMMC.
++    if fs::write(&temporary, &bytes).is_err() {
++        return false;
++    }
++    fs::rename(&temporary, dir.join(INDEX_FILE)).is_ok()
++}
+diff --git a/components/net/http_cache/disk/io_thread.rs b/components/net/http_cache/disk/io_thread.rs
+new file mode 100644
+index 00000000000..22adb0e8bcb
+--- /dev/null
++++ b/components/net/http_cache/disk/io_thread.rs
+@@ -0,0 +1,96 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! One dedicated thread per disk store, doing all of its blocking I/O.
++//!
++//! A dedicated thread rather than `tokio::fs` because a cross-thread hand-off
++//! costs 28 to 45 us on the OHOS devices, several times a 64 KiB read: with one
++//! thread and one hand-off per *batch* of syscalls the cost is amortised, file
++//! descriptors stay warm, and operations on one file keep their order. Doing the
++//! I/O inline on a tokio worker is not an option either, since a cold 64 KiB read
++//! on eMMC takes 375 us and writeback throttling can stall a write for
++//! milliseconds.
++
++use std::thread;
++
++use log::debug;
++use servo_base::threadboost::{BoostAffinity, ThreadPriority, boost_thread};
++use tokio::sync::{mpsc, oneshot};
++
++/// How many operations may be queued before a caller waits. Deep enough that
++/// several concurrent fetches do not serialise on handing work over.
++const QUEUE_DEPTH: usize = 64;
++
++type Job = Box<dyn FnOnce() + Send>;
++
++/// A handle to a store's I/O thread.
++pub(crate) struct IoThread {
++    jobs: mpsc::Sender<Job>,
++}
++
++impl IoThread {
++    pub(crate) fn spawn(name: String) -> IoThread {
++        let (jobs, mut receiver) = mpsc::channel::<Job>(QUEUE_DEPTH);
++        let spawned = thread::Builder::new().name(name).spawn(move || {
++            // Default core placement made the hand-off four times more expensive
++            // than the big cores on the PLR, and the hand-off is what this thread
++            // exists to amortise.
++            boost_thread(ThreadPriority::Default, BoostAffinity::Boost);
++            while let Some(job) = receiver.blocking_recv() {
++                job();
++            }
++        });
++        if let Err(error) = spawned {
++            debug!("could not start the HTTP cache I/O thread: {error}");
++        }
++        IoThread { jobs }
++    }
++
++    /// Run `job` on the I/O thread. `None` means the thread is gone, which every
++    /// caller must treat as a cache miss rather than an error.
++    pub(crate) async fn run<R, F>(&self, job: F) -> Option<R>
++    where
++        F: FnOnce() -> R + Send + 'static,
++        R: Send + 'static,
++    {
++        let (reply, result) = oneshot::channel();
++        let job: Job = Box::new(move || {
++            let _ = reply.send(job());
++        });
++        self.jobs.send(job).await.ok()?;
++        result.await.ok()
++    }
++
++    /// Queue `job` without waiting for it. Used for work whose result nothing
++    /// needs, such as unlinking evicted entries and writing the index.
++    ///
++    /// A full queue must not cost the job: an unlink that is dropped leaves a file
++    /// the next rescan believes in, which would resurrect an entry the cache has
++    /// already decided to forget.
++    pub(crate) fn detach<F>(&self, job: F)
++    where
++        F: FnOnce() + Send + 'static,
++    {
++        let job: Job = Box::new(job);
++        let Err(full) = self.jobs.try_send(job) else {
++            return;
++        };
++        let mpsc::error::TrySendError::Full(job) = full else {
++            debug!("the HTTP cache I/O thread is gone, dropping background work");
++            return;
++        };
++        let jobs = self.jobs.clone();
++        match tokio::runtime::Handle::try_current() {
++            Ok(handle) => {
++                handle.spawn(async move {
++                    let _ = jobs.send(job).await;
++                });
++            },
++            // Off a runtime there is nothing to yield to, so wait for room here.
++            Err(_) => {
++                let _ = jobs.blocking_send(job);
++            },
++        }
++    }
++}
+diff --git a/components/net/http_cache/disk/mod.rs b/components/net/http_cache/disk/mod.rs
+index 178fdc59f86..ea01c6d7787 100644
+--- a/components/net/http_cache/disk/mod.rs
++++ b/components/net/http_cache/disk/mod.rs
+@@ -4,13 +4,823 @@
+ 
+ //! A disk-primary store: one file per entry, an index in memory, and a dedicated
+ //! I/O thread.
++//!
++//! Bodies live only on disk, so the page cache is the memory tier and the net
++//! process never holds a complete cached body. Nothing here is ever allowed to
++//! fail a fetch: a missing, truncated or unreadable entry is reported as a miss.
++//!
++//! The store must survive its directory being emptied at any instant, which is
++//! what OpenHarmony does to `cacheDir` under storage pressure and on the user's
++//! "Clear cache". The index is therefore a derived artifact, rebuilt by scanning,
++//! and every read path treats `ENOENT` as a miss.
+ 
+-use std::sync::Arc;
++use std::collections::VecDeque;
++use std::fs::{self, File, OpenOptions};
++use std::io::{self, Seek, SeekFrom, Write};
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
+ 
+-use crate::http_cache::store::CacheStore;
++use bytes::Bytes;
++use crc32fast::Hasher;
++use futures::future::BoxFuture;
++use log::debug;
++use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
++use net_traits::CacheEntryDescriptor;
++use servo_config::pref;
++
++use crate::http_cache::disk::index::{Index, Variant, entry_file_name, now_secs};
++use crate::http_cache::disk::io_thread::IoThread;
++use crate::http_cache::key::{CacheKey, EntryId, entry_id, entry_key_hash, entry_slot};
++use crate::http_cache::store::{
++    BATCH_BYTES, BodyRange, BodyReader, CacheStore, EntryMeta, EntryWriter, StoreError, WriteOp,
++    clamp_range, entry_cap_for, split_into_chunks,
++};
++
++mod entry;
++mod index;
++mod io_thread;
++
++/// How long the index may stay dirty in memory before it is written out. A crash
++/// inside the window costs a directory scan on the next start, never an entry.
++const INDEX_SAVE_INTERVAL: Duration = Duration::from_secs(20);
++
++/// Entries are metered per uid on OpenHarmony, so the entry count is capped as
++/// well as the byte budget.
++const MAX_ENTRIES: usize = 20_000;
++
++/// Chromium's `PreferredCacheSize` constants, used for the desktop default.
++const DEFAULT_CACHE_SIZE: u64 = 80 * 1024 * 1024;
++const MAX_CACHE_SIZE: u64 = 320 * 1024 * 1024;
++/// Chromium scales its default up by this much outside Windows.
++const CACHE_SIZE_SCALE: u64 = 4;
++/// What Android WebView and ArkWeb document per app.
++const MOBILE_CACHE_SIZE: u64 = 100 * 1024 * 1024;
+ 
+ /// Open the store for the public cache from the embedder's configuration, or
+-/// `None` when no cache directory was supplied.
++/// `None` when there is no cache directory to use.
+ pub fn open_default_store() -> Option<Arc<dyn CacheStore>> {
++    let opts = servo_config::opts::get();
++    if opts.temporary_storage || pref!(network_http_cache_disabled) {
++        return None;
++    }
++    let dir = opts.http_cache_dir.clone()?;
++    // The free-space ladder measures the volume the cache is on, so the directory
++    // has to exist before it is asked.
++    if let Err(error) = fs::create_dir_all(&dir) {
++        debug!("could not create the HTTP cache directory: {error}");
++        return None;
++    }
++    let max_bytes = match pref!(network_http_disk_cache_size) {
++        0 => automatic_cache_size(&dir),
++        configured => configured,
++    };
++    match DiskStore::open(dir, max_bytes) {
++        Ok(store) => Some(Arc::new(store) as Arc<dyn CacheStore>),
++        Err(error) => {
++            debug!("could not open the HTTP disk cache, falling back to memory: {error}");
++            None
++        },
++    }
++}
++
++/// How big the cache may grow when the embedder did not say. Mobile gets a fixed
++/// budget; elsewhere the size follows the free space of the volume the cache is
++/// on, using Chromium's ladder.
++fn automatic_cache_size(dir: &Path) -> u64 {
++    if cfg!(any(target_env = "ohos", target_os = "android")) {
++        return MOBILE_CACHE_SIZE;
++    }
++    let Some(available) = available_bytes(dir) else {
++        return DEFAULT_CACHE_SIZE * CACHE_SIZE_SCALE;
++    };
++    let preferred = if available < DEFAULT_CACHE_SIZE * 10 {
++        available / 10 * 8
++    } else if available < DEFAULT_CACHE_SIZE * 100 {
++        DEFAULT_CACHE_SIZE
++    } else {
++        (available / 100).min(MAX_CACHE_SIZE)
++    };
++    (preferred * CACHE_SIZE_SCALE).min(MAX_CACHE_SIZE * CACHE_SIZE_SCALE)
++}
++
++#[cfg(unix)]
++#[allow(unsafe_code)]
++fn available_bytes(dir: &Path) -> Option<u64> {
++    use std::ffi::CString;
++    use std::os::unix::ffi::OsStrExt;
++
++    let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
++    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
++    // SAFETY: `path` is a valid NUL-terminated string and `stats` is a valid,
++    // writable `statvfs` for the duration of the call.
++    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
++        return None;
++    }
++    (stats.f_bavail as u64).checked_mul(stats.f_frsize as u64)
++}
++
++#[cfg(not(unix))]
++fn available_bytes(_dir: &Path) -> Option<u64> {
+     None
+ }
++
++/// A body being written to a temporary file.
++struct EntryFile {
++    file: File,
++    body_len: u64,
++    crc: Hasher,
++}
++
++impl EntryFile {
++    fn append(&mut self, chunks: &[Bytes]) -> io::Result<()> {
++        for chunk in chunks {
++            self.file.write_all(chunk)?;
++            self.crc.update(chunk);
++            self.body_len += chunk.len() as u64;
++        }
++        Ok(())
++    }
++}
++
++/// Everything a store and its in-flight writers share.
++struct StoreCore {
++    dir: PathBuf,
++    entries_dir: PathBuf,
++    io: IoThread,
++    index: Mutex<Index>,
++    /// Bumped on every index change. A scheduled flush only fires once this stops
++    /// moving, which makes the delay "20 s after the last change" rather than
++    /// "at most every 20 s", matching Chromium's `PostponeWritingToDisk`.
++    dirty_generation: AtomicU64,
++    /// Whether a debounced flush task is already waiting.
++    flush_scheduled: AtomicBool,
++    /// Whether the on-disk stamp currently says the index is up to date.
++    stamp_clean: AtomicBool,
++    /// Kept alongside the index so `disk_bytes` needs no lock.
++    disk_bytes: AtomicU64,
++    max_bytes: u64,
++    max_entries: usize,
++    /// The largest response that may be stored at all.
++    max_entry_bytes: u64,
++}
++
++/// A file-per-entry [`CacheStore`].
++pub struct DiskStore {
++    core: Arc<StoreCore>,
++}
++
++impl DiskStore {
++    /// Open, and if necessary create or repair, a store at `dir`.
++    pub fn open(dir: PathBuf, max_bytes: u64) -> io::Result<DiskStore> {
++        let was_clean = index::prepare_directory(&dir)?;
++        let entries_dir = dir.join(index::ENTRIES_DIR);
++        let loaded = index::load(&dir, &entries_dir, was_clean);
++        let disk_bytes = AtomicU64::new(loaded.bytes());
++        let max_entry_bytes = entry_cap_for(max_bytes);
++        Ok(DiskStore {
++            core: Arc::new(StoreCore {
++                io: IoThread::spawn("HttpCacheIO".to_owned()),
++                index: Mutex::new(loaded),
++                dirty_generation: AtomicU64::new(0),
++                flush_scheduled: AtomicBool::new(false),
++                stamp_clean: AtomicBool::new(false),
++                dir,
++                entries_dir,
++                max_bytes,
++                max_entries: MAX_ENTRIES,
++                max_entry_bytes,
++                disk_bytes,
++            }),
++        })
++    }
++}
++
++impl StoreCore {
++    fn path_for(&self, key_hash: u64, slot: u8) -> PathBuf {
++        self.entries_dir.join(entry_file_name(key_hash, slot))
++    }
++
++    fn temp_path_for(&self, key_hash: u64, slot: u8) -> PathBuf {
++        self.entries_dir
++            .join(format!("{}.tmp", entry_file_name(key_hash, slot)))
++    }
++
++    fn path_of(&self, id: EntryId) -> PathBuf {
++        self.path_for(entry_key_hash(id), entry_slot(id))
++    }
++
++    /// Drop an entry the index believed in but the file system does not have.
++    fn forget(&self, id: EntryId) {
++        let mut index = self.index.lock().unwrap();
++        index.remove(id);
++        self.disk_bytes.store(index.bytes(), Ordering::Relaxed);
++    }
++
++    fn unlink_all(&self, ids: Vec<EntryId>) {
++        if ids.is_empty() {
++            return;
++        }
++        let paths: Vec<PathBuf> = ids.into_iter().map(|id| self.path_of(id)).collect();
++        // Unlinking costs 16 to 66 us per file on device, so a large eviction must
++        // never happen on the fetch path.
++        self.io.detach(move || {
++            for path in paths {
++                let _ = fs::remove_file(path);
++            }
++        });
++    }
++
++    /// Note that the index no longer matches the directory, and arrange for it to
++    /// be written once things go quiet.
++    fn mark_index_dirty(self: &Arc<Self>) {
++        self.dirty_generation.fetch_add(1, Ordering::AcqRel);
++        // The index on disk is now stale; say so, so that a kill before the flush
++        // makes the next start reconcile instead of trusting it.
++        if self.stamp_clean.swap(false, Ordering::AcqRel) {
++            let dir = self.dir.clone();
++            self.io.detach(move || index::write_stamp(&dir, false));
++        }
++        if self.flush_scheduled.swap(true, Ordering::AcqRel) {
++            return;
++        }
++        let core = self.clone();
++        tokio::spawn(async move {
++            // Wait for the changes to stop before writing, so a burst of commits
++            // costs one index write rather than one per 20 s window.
++            loop {
++                let generation = core.dirty_generation.load(Ordering::Acquire);
++                tokio::time::sleep(INDEX_SAVE_INTERVAL).await;
++                if core.dirty_generation.load(Ordering::Acquire) == generation {
++                    break;
++                }
++            }
++            core.flush_scheduled.store(false, Ordering::Release);
++            let writer = core.clone();
++            core.io.detach(move || writer.write_index());
++        });
++    }
++
++    /// Write the index and, if nothing changed while it was being written, record
++    /// that it now describes the directory exactly.
++    fn write_index(&self) {
++        let generation = self.dirty_generation.load(Ordering::Acquire);
++        let wrote = index::save(&self.dir, || {
++            let mut index = self.index.lock().unwrap();
++            let bytes = index.serialize(index::dir_mtime(&self.entries_dir));
++            if bytes.is_some() {
++                index.mark_clean();
++            }
++            bytes
++        });
++        if wrote && self.dirty_generation.load(Ordering::Acquire) == generation {
++            index::write_stamp(&self.dir, true);
++            self.stamp_clean.store(true, Ordering::Release);
++        }
++    }
++
++    /// Apply the byte and entry budgets. Runs after a commit, off the fetch path.
++    fn evict(&self) {
++        let evicted = {
++            let mut index = self.index.lock().unwrap();
++            let evicted = index.evict_to(self.max_bytes, self.max_entries);
++            self.disk_bytes.store(index.bytes(), Ordering::Relaxed);
++            evicted
++        };
++        if !evicted.is_empty() {
++            debug!("evicting {} HTTP cache entries", evicted.len());
++        }
++        self.unlink_all(evicted);
++    }
++}
++
++impl MallocSizeOf for DiskStore {
++    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
++        // Only the index is in memory; the bodies are files. The per-entry cost is
++        // the record plus its share of the map and the per-key `SmallVec`.
++        self.core.index.lock().unwrap().count() * (std::mem::size_of::<Variant>() + 24)
++    }
++}
++
++impl CacheStore for DiskStore {
++    fn lookup<'a>(&'a self, key: &'a CacheKey) -> BoxFuture<'a, Vec<(EntryId, EntryMeta)>> {
++        let core = self.core.clone();
++        Box::pin(async move {
++            let key_hash = key.hash();
++            let slots: Vec<u8> = core
++                .index
++                .lock()
++                .unwrap()
++                .variants(key_hash)
++                .map(|variant| variant.slot)
++                .collect();
++
++            let mut found = Vec::with_capacity(slots.len());
++            for slot in slots {
++                let id = entry_id(key_hash, slot);
++                let path = core.path_for(key_hash, slot);
++                let tail = core
++                    .io
++                    .run(move || {
++                        let mut file = File::open(&path)?;
++                        entry::read_tail(&mut file)
++                    })
++                    .await;
++                match tail {
++                    Some(Ok(tail)) if tail.meta.key == *key => found.push((id, tail.meta)),
++                    // A hash collision: the file belongs to another URL.
++                    Some(Ok(_)) => {},
++                    Some(Err(error)) => {
++                        debug!("dropping unreadable cache entry: {error}");
++                        core.forget(id);
++                        core.unlink_all(vec![id]);
++                    },
++                    None => {},
++                }
++            }
++            found
++        })
++    }
++
++    fn open(
++        &self,
++        id: EntryId,
++        meta: &EntryMeta,
++        range: Option<BodyRange>,
++    ) -> BoxFuture<'_, Result<BodyReader, StoreError>> {
++        let core = self.core.clone();
++        let path = core.path_of(id);
++        let encoding = meta.content_encoding;
++        let body_len = meta.body_len;
++        let range = range.map(|range| clamp_range(range, body_len).ok_or(StoreError::Missing));
++        Box::pin(async move {
++            let range = range.transpose()?;
++            let start = entry::HEADER_LEN + range.map(|range| range.start).unwrap_or(0);
++            let len = range
++                .map(|range| range.end - range.start + 1)
++                .unwrap_or(body_len);
++
++            let opened = core
++                .io
++                .run(move || -> io::Result<(File, u32)> {
++                    let mut file = File::open(&path)?;
++                    let (stored_len, body_crc) = entry::read_trailer(&mut file)?;
++                    if stored_len != body_len {
++                        return Err(io::Error::new(
++                            io::ErrorKind::InvalidData,
++                            "cache entry changed underneath us",
++                        ));
++                    }
++                    file.seek(SeekFrom::Start(start))?;
++                    Ok((file, body_crc))
++                })
++                .await
++                .ok_or(StoreError::Missing)?;
++
++            let (file, body_crc) = match opened {
++                Ok(opened) => opened,
++                Err(error) => {
++                    debug!("could not open a cache entry: {error}");
++                    core.forget(id);
++                    return Err(StoreError::Missing);
++                },
++            };
++            // A checksum only means anything for a read that covers the whole body.
++            let expected_crc = range.is_none().then_some(body_crc);
++            Ok(BodyReader::new(
++                len,
++                encoding,
++                read_stream(core, id, file, len, expected_crc),
++            ))
++        })
++    }
++
++    fn create(&self, meta: EntryMeta) -> BoxFuture<'_, Result<EntryWriter, StoreError>> {
++        let core = self.core.clone();
++        Box::pin(async move {
++            let key_hash = meta.key.hash();
++            let slot = core
++                .index
++                .lock()
++                .unwrap()
++                .reserve_slot(key_hash)
++                .ok_or(StoreError::Rejected)?;
++
++            let temporary = core.temp_path_for(key_hash, slot);
++            let entries_dir = core.entries_dir.clone();
++            let created = core
++                .io
++                .run({
++                    let temporary = temporary.clone();
++                    move || -> io::Result<File> {
++                        let mut file = match File::create(&temporary) {
++                            Ok(file) => file,
++                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
++                                // The directory was removed underneath us, which is
++                                // routine on OpenHarmony.
++                                fs::create_dir_all(&entries_dir)?;
++                                File::create(&temporary)?
++                            },
++                            Err(error) => return Err(error),
++                        };
++                        entry::write_header(&mut file)?;
++                        Ok(file)
++                    }
++                })
++                .await;
++
++            let file = match created {
++                Some(Ok(file)) => file,
++                other => {
++                    if let Some(Err(error)) = other {
++                        debug!("could not create a cache entry: {error}");
++                    }
++                    core.index.lock().unwrap().release_slot(key_hash, slot);
++                    return Err(StoreError::Rejected);
++                },
++            };
++
++            let (writer, ops) = EntryWriter::channel();
++            tokio::spawn(write_entry(
++                core.clone(),
++                Slot {
++                    key_hash,
++                    slot,
++                    temporary,
++                },
++                EntryFile {
++                    file,
++                    body_len: 0,
++                    crc: Hasher::new(),
++                },
++                meta,
++                ops,
++            ));
++            Ok(writer)
++        })
++    }
++
++    fn update_meta(&self, id: EntryId, meta: EntryMeta) -> BoxFuture<'_, Result<(), StoreError>> {
++        let core = self.core.clone();
++        let path = core.path_of(id);
++        Box::pin(async move {
++            let size = core
++                .io
++                .run(move || -> io::Result<u64> {
++                    let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
++                    entry::rewrite_tail(&mut file, &meta)?;
++                    file.seek(SeekFrom::End(0))
++                })
++                .await
++                .ok_or(StoreError::Missing)?;
++
++            match size {
++                Ok(size) => {
++                    {
++                        let mut index = core.index.lock().unwrap();
++                        if index.get(id).is_some() {
++                            index.insert(
++                                entry_key_hash(id),
++                                Variant {
++                                    slot: entry_slot(id),
++                                    size: size.min(u32::MAX as u64) as u32,
++                                    last_used: now_secs(),
++                                },
++                            );
++                        }
++                        core.disk_bytes.store(index.bytes(), Ordering::Relaxed);
++                    }
++                    core.mark_index_dirty();
++                    Ok(())
++                },
++                Err(error) => {
++                    debug!("could not freshen a cache entry: {error}");
++                    core.forget(id);
++                    // The tail was being rewritten, so the file may no longer parse.
++                    core.unlink_all(vec![id]);
++                    Err(StoreError::Missing)
++                },
++            }
++        })
++    }
++
++    fn remove(&self, id: EntryId) -> BoxFuture<'_, ()> {
++        let core = self.core.clone();
++        Box::pin(async move {
++            core.forget(id);
++            core.unlink_all(vec![id]);
++        })
++    }
++
++    fn remove_key<'a>(&'a self, key: &'a CacheKey) -> BoxFuture<'a, ()> {
++        let core = self.core.clone();
++        Box::pin(async move {
++            let removed = {
++                let mut index = core.index.lock().unwrap();
++                let removed = index.remove_key(key.hash());
++                core.disk_bytes.store(index.bytes(), Ordering::Relaxed);
++                removed
++            };
++            core.unlink_all(removed);
++        })
++    }
++
++    fn clear(&self) -> BoxFuture<'_, ()> {
++        let core = self.core.clone();
++        Box::pin(async move {
++            {
++                let mut index = core.index.lock().unwrap();
++                index.clear();
++                core.disk_bytes.store(0, Ordering::Relaxed);
++            }
++            let entries_dir = core.entries_dir.clone();
++            let writer = core.clone();
++            core.io
++                .run(move || {
++                    let _ = fs::remove_dir_all(&entries_dir);
++                    let _ = fs::create_dir_all(&entries_dir);
++                    // On the I/O thread, so that it cannot race the index write the
++                    // debounce may already have queued there.
++                    writer.write_index();
++                })
++                .await;
++        })
++    }
++
++    fn touch(&self, id: EntryId) {
++        self.core.index.lock().unwrap().touch(id);
++    }
++
++    fn descriptors(&self) -> BoxFuture<'_, Vec<CacheEntryDescriptor>> {
++        let core = self.core.clone();
++        Box::pin(async move {
++            let paths: Vec<PathBuf> = core
++                .index
++                .lock()
++                .unwrap()
++                .all()
++                .into_iter()
++                .map(|id| core.path_of(id))
++                .collect();
++            // One hand-off for the whole listing: this reads every entry's
++            // metadata, and it is only ever asked for by devtools.
++            core.io
++                .run(move || {
++                    paths
++                        .into_iter()
++                        .filter_map(|path| {
++                            let mut file = File::open(&path).ok()?;
++                            let tail = entry::read_tail(&mut file).ok()?;
++                            Some(CacheEntryDescriptor::new(tail.meta.key.url().to_string()))
++                        })
++                        .collect()
++                })
++                .await
++                .unwrap_or_default()
++        })
++    }
++
++    fn disk_bytes(&self) -> u64 {
++        self.core.disk_bytes.load(Ordering::Relaxed)
++    }
++
++    fn max_entry_bytes(&self) -> u64 {
++        self.core.max_entry_bytes
++    }
++
++    fn flush(&self) -> BoxFuture<'_, ()> {
++        let core = self.core.clone();
++        Box::pin(async move {
++            if !core.index.lock().unwrap().is_dirty() {
++                return;
++            }
++            let writer = core.clone();
++            core.io.run(move || writer.write_index()).await;
++        })
++    }
++
++    fn shutdown(&self) -> BoxFuture<'_, ()> {
++        self.flush()
++    }
++}
++
++/// Which entry a writer is filling.
++struct Slot {
++    key_hash: u64,
++    slot: u8,
++    temporary: PathBuf,
++}
++
++/// Drive one entry's body from the writer's queue onto disk, and publish it if it
++/// is committed. Dropping the queue without committing throws the entry away.
++async fn write_entry(
++    core: Arc<StoreCore>,
++    slot: Slot,
++    mut entry_file: EntryFile,
++    meta: EntryMeta,
++    mut ops: tokio::sync::mpsc::Receiver<WriteOp>,
++) {
++    let mut failed = false;
++    let mut committed = false;
++
++    while let Some(op) = ops.recv().await {
++        match op {
++            WriteOp::Append(chunks) => {
++                if failed {
++                    continue;
++                }
++                let added: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
++                if entry_file.body_len + added > core.max_entry_bytes {
++                    debug!("cache entry outgrew the per-entry cap, dropping it");
++                    failed = true;
++                    continue;
++                }
++                match core
++                    .io
++                    .run(move || {
++                        let outcome = entry_file.append(&chunks);
++                        (entry_file, outcome)
++                    })
++                    .await
++                {
++                    Some((file, Ok(()))) => entry_file = file,
++                    Some((file, Err(error))) => {
++                        debug!("could not write a cache entry: {error}");
++                        entry_file = file;
++                        failed = true;
++                    },
++                    None => break,
++                }
++            },
++            WriteOp::Commit(reply) => {
++                if failed {
++                    let _ = reply.send(Err(StoreError::Rejected));
++                    break;
++                }
++                let mut meta = meta.clone();
++                meta.body_len = entry_file.body_len;
++                let final_path = core.path_for(slot.key_hash, slot.slot);
++                let temporary = slot.temporary.clone();
++                let size = core
++                    .io
++                    .run(move || -> io::Result<u64> {
++                        let body_len = entry_file.body_len;
++                        let body_crc = entry_file.crc.finalize();
++                        entry::write_tail(&mut entry_file.file, &meta, body_len, body_crc)?;
++                        let size = entry_file.file.seek(SeekFrom::End(0))?;
++                        // Renaming an open file fails on Windows.
++                        drop(entry_file.file);
++                        fs::rename(&temporary, &final_path)?;
++                        Ok(size)
++                    })
++                    .await;
++
++                let result = match size {
++                    Some(Ok(size)) => {
++                        {
++                            let mut index = core.index.lock().unwrap();
++                            index.insert(
++                                slot.key_hash,
++                                Variant {
++                                    slot: slot.slot,
++                                    size: size.min(u32::MAX as u64) as u32,
++                                    last_used: now_secs(),
++                                },
++                            );
++                            core.disk_bytes.store(index.bytes(), Ordering::Relaxed);
++                        }
++                        Ok(entry_id(slot.key_hash, slot.slot))
++                    },
++                    other => {
++                        if let Some(Err(error)) = other {
++                            debug!("could not commit a cache entry: {error}");
++                        }
++                        Err(StoreError::Rejected)
++                    },
++                };
++                committed = result.is_ok();
++                let _ = reply.send(result);
++                break;
++            },
++        }
++    }
++
++    core.index
++        .lock()
++        .unwrap()
++        .release_slot(slot.key_hash, slot.slot);
++    if committed {
++        core.evict();
++        core.mark_index_dirty();
++    } else {
++        let temporary = slot.temporary;
++        core.io.detach(move || {
++            let _ = fs::remove_file(temporary);
++        });
++    }
++}
++
++/// Stream a body off disk, keeping one batch read in flight while the previous one
++/// is consumed, so a cold read overlaps decoding.
++fn read_stream(
++    core: Arc<StoreCore>,
++    id: EntryId,
++    file: File,
++    len: u64,
++    expected_crc: Option<u32>,
++) -> futures::stream::BoxStream<'static, io::Result<Bytes>> {
++    struct State {
++        core: Arc<StoreCore>,
++        id: EntryId,
++        file: Option<File>,
++        queue: VecDeque<Bytes>,
++        remaining: u64,
++        hasher: Option<Hasher>,
++        expected_crc: Option<u32>,
++        failed: bool,
++    }
++
++    impl State {
++        /// A body that could not be read is not a body: the entry is dropped so the
++        /// next fetch of this URL goes to the network instead of failing again.
++        fn discard_entry(&mut self) {
++            self.failed = true;
++            self.core.forget(self.id);
++            self.core.unlink_all(vec![self.id]);
++        }
++    }
++
++    let state = State {
++        core,
++        id,
++        file: Some(file),
++        queue: VecDeque::new(),
++        remaining: len,
++        hasher: expected_crc.map(|_| Hasher::new()),
++        expected_crc,
++        failed: false,
++    };
++
++    Box::pin(futures::stream::unfold(state, |mut state| async move {
++        loop {
++            if let Some(chunk) = state.queue.pop_front() {
++                return Some((Ok(chunk), state));
++            }
++            if state.failed {
++                return None;
++            }
++            if state.remaining == 0 {
++                if let (Some(hasher), Some(expected)) =
++                    (state.hasher.take(), state.expected_crc.take()) &&
++                    hasher.finalize() != expected
++                {
++                    state.discard_entry();
++                    return Some((
++                        Err(io::Error::new(
++                            io::ErrorKind::InvalidData,
++                            "cached body failed its checksum",
++                        )),
++                        state,
++                    ));
++                }
++                return None;
++            }
++
++            let Some(mut file) = state.file.take() else {
++                return None;
++            };
++            let want = state.remaining.min(BATCH_BYTES as u64) as usize;
++            let read = state
++                .core
++                .io
++                .run(move || {
++                    let mut buffer = vec![0u8; want];
++                    let outcome = io::Read::read_exact(&mut file, &mut buffer).map(|()| buffer);
++                    (file, outcome)
++                })
++                .await;
++
++            match read {
++                Some((file, Ok(buffer))) => {
++                    state.file = Some(file);
++                    state.remaining -= buffer.len() as u64;
++                    if let Some(hasher) = state.hasher.as_mut() {
++                        hasher.update(&buffer);
++                    }
++                    state.queue.extend(split_into_chunks(Bytes::from(buffer)));
++                },
++                Some((_, Err(error))) => {
++                    state.discard_entry();
++                    return Some((Err(error), state));
++                },
++                None => {
++                    // The I/O thread is gone, so the body would be truncated.
++                    // Report it rather than handing on a short body.
++                    state.failed = true;
++                    return Some((Err(io::Error::other("the cache I/O thread stopped")), state));
++                },
++            }
++        }
++    }))
++}
+diff --git a/components/net/http_cache/memory_store.rs b/components/net/http_cache/memory_store.rs
+index 4874035d842..e8b995f164a 100644
+--- a/components/net/http_cache/memory_store.rs
++++ b/components/net/http_cache/memory_store.rs
+@@ -159,6 +159,7 @@ impl CacheStore for MemoryStore {
+     fn open(
+         &self,
+         id: EntryId,
++        _meta: &EntryMeta,
+         range: Option<BodyRange>,
+     ) -> BoxFuture<'_, Result<BodyReader, StoreError>> {
+         let inner = self.inner.clone();
+@@ -309,15 +310,17 @@ impl CacheStore for MemoryStore {
+         }
+     }
+ 
+-    fn descriptors(&self) -> Vec<CacheEntryDescriptor> {
+-        self.inner
++    fn descriptors(&self) -> BoxFuture<'_, Vec<CacheEntryDescriptor>> {
++        let descriptors = self
++            .inner
+             .lock()
+             .unwrap()
+             .entries
+             .values()
+             .flat_map(|variants| variants.iter())
+             .map(|variant| CacheEntryDescriptor::new(variant.meta.key.url().to_string()))
+-            .collect()
++            .collect();
++        Box::pin(async move { descriptors })
+     }
+ 
+     fn stored_bytes(&self) -> usize {
+diff --git a/components/net/http_cache/mod.rs b/components/net/http_cache/mod.rs
+index 41e4558b79e..c629badb414 100644
+--- a/components/net/http_cache/mod.rs
++++ b/components/net/http_cache/mod.rs
+@@ -49,7 +49,7 @@ pub mod disk;
+ mod inflight;
+ mod key;
+ pub mod memory_store;
+-mod policy;
++pub mod policy;
+ mod range;
+ pub mod store;
+ mod tee;
+@@ -119,14 +119,19 @@ impl HttpCache {
+         self.store.stored_bytes()
+     }
+ 
++    /// The bytes this cache holds on disk, for `about:memory`.
++    pub fn disk_bytes(&self) -> u64 {
++        self.store.disk_bytes()
++    }
++
+     /// Whether this is the public cache.
+     pub fn assignment(&self) -> HttpCacheAssignment {
+         self.assignment
+     }
+ 
+     /// Descriptors for the entries devtools lists.
+-    pub(crate) fn cache_entry_descriptors(&self) -> Vec<CacheEntryDescriptor> {
+-        self.store.descriptors()
++    pub(crate) async fn cache_entry_descriptors(&self) -> Vec<CacheEntryDescriptor> {
++        self.store.descriptors().await
+     }
+ 
+     /// Drop everything this cache holds.
+@@ -134,6 +139,12 @@ impl HttpCache {
+         self.store.clear().await;
+     }
+ 
++    /// Persist anything that only lives in memory. Called when the embedding
++    /// application is backgrounded, since it may be killed without further notice.
++    pub(crate) async fn flush(&self) {
++        self.store.flush().await;
++    }
++
+     /// Flush anything that only lives in memory. Called when the resource thread exits.
+     pub(crate) async fn shutdown(&self) {
+         self.store.shutdown().await;
+@@ -326,7 +337,7 @@ impl HttpCache {
+             },
+         };
+ 
+-        let reader = match self.store.open(id, body_range).await {
++        let reader = match self.store.open(id, meta, body_range).await {
+             Ok(reader) => reader,
+             Err(error) => {
+                 debug!("could not open cache entry for {}: {error}", meta.key.url());
+@@ -560,8 +571,8 @@ impl HttpCache {
+     /// Read a stored response back as one buffer. Only for tests.
+     pub async fn read_body_for_test(&self, request: &Request) -> Option<Vec<u8>> {
+         let mut transaction = self.new_transaction(request);
+-        let (id, _, _) = self.select_variant(&mut transaction, request).await?;
+-        let reader = self.store.open(id, None).await.ok()?;
++        let (id, meta, _) = self.select_variant(&mut transaction, request).await?;
++        let reader = self.store.open(id, &meta, None).await.ok()?;
+         let mut stream = reader.into_stream();
+         let mut body = Vec::new();
+         while let Some(chunk) = stream.next().await {
+diff --git a/components/net/http_cache/policy.rs b/components/net/http_cache/policy.rs
+index 724e3536518..5b580a07078 100644
+--- a/components/net/http_cache/policy.rs
++++ b/components/net/http_cache/policy.rs
+@@ -261,7 +261,8 @@ impl MallocSizeOf for EntryPolicy {
+ }
+ 
+ impl EntryPolicy {
+-    pub(crate) fn new(
++    /// The policy for a response as it was received.
++    pub fn new(
+         request: &Request,
+         status: StatusCode,
+         headers: &HeaderMap,
+diff --git a/components/net/http_cache/store.rs b/components/net/http_cache/store.rs
+index 37aa1359084..e52d5db3071 100644
+--- a/components/net/http_cache/store.rs
++++ b/components/net/http_cache/store.rs
+@@ -312,6 +312,7 @@ pub trait CacheStore: MallocSizeOf + Send + Sync + 'static {
+     fn open(
+         &self,
+         id: EntryId,
++        meta: &EntryMeta,
+         range: Option<BodyRange>,
+     ) -> BoxFuture<'_, Result<BodyReader, StoreError>>;
+ 
+@@ -335,18 +336,31 @@ pub trait CacheStore: MallocSizeOf + Send + Sync + 'static {
+     fn touch(&self, id: EntryId);
+ 
+     /// The entries devtools lists.
+-    fn descriptors(&self) -> Vec<CacheEntryDescriptor>;
++    fn descriptors(&self) -> BoxFuture<'_, Vec<CacheEntryDescriptor>>;
+ 
+-    /// Bytes of storage in use, for `about:memory`. Zero for stores that do not
+-    /// hold bodies in the process.
++    /// Bytes held in this process, for `about:memory`. Zero for a store whose
++    /// bodies live in files.
+     fn stored_bytes(&self) -> usize {
+         0
+     }
+ 
++    /// Bytes held on disk, reported as non-heap so device measurements can see it.
++    fn disk_bytes(&self) -> u64 {
++        0
++    }
++
+     /// The largest response this store will take. Chromium's rule is an eighth of
+     /// the budget, never below 5 MiB.
+     fn max_entry_bytes(&self) -> u64;
+ 
++    /// Persist anything that only lives in memory, and return once it is on disk.
++    ///
++    /// Called when the embedding application is backgrounded, because a
++    /// backgrounded application may be killed without any further notice.
++    fn flush(&self) -> BoxFuture<'_, ()> {
++        Box::pin(async {})
++    }
++
+     /// Flush anything that only lives in memory. Called when the resource thread exits.
+     fn shutdown(&self) -> BoxFuture<'_, ()>;
+ }
+diff --git a/components/net/http_loader.rs b/components/net/http_loader.rs
+index 3341a2c3c8c..7c60d55797d 100644
+--- a/components/net/http_loader.rs
++++ b/components/net/http_loader.rs
+@@ -121,10 +121,17 @@ impl HttpState {
+     pub(crate) fn memory_reports(&self, suffix: &str, ops: &mut MallocSizeOfOps) -> Vec<Report> {
+         vec![
+             Report {
+-                path: path!["http-cache", suffix],
++                path: path!["http-cache", "index", suffix],
+                 kind: ReportKind::ExplicitJemallocHeapSize,
+                 size: self.http_cache.size_of(ops),
+             },
++            // Bodies of a disk-backed cache are files, not process memory. Reported
++            // so that device measurements can see how much the cache is using.
++            Report {
++                path: path!["http-cache", "disk", suffix],
++                kind: ReportKind::ExplicitNonHeapSize,
++                size: self.http_cache.disk_bytes() as usize,
++            },
+             Report {
+                 path: path!["hsts-list", suffix],
+                 kind: ReportKind::ExplicitJemallocHeapSize,
+diff --git a/components/net/resource_thread.rs b/components/net/resource_thread.rs
+index 9c23dc0de35..c3ffe4e52c4 100644
+--- a/components/net/resource_thread.rs
++++ b/components/net/resource_thread.rs
+@@ -638,7 +638,18 @@ impl ResourceChannelManager {
+                 }
+             },
+             CoreResourceMsg::GetCacheEntries(sender) => {
+-                sender.send_or_ignore(http_state.http_cache.cache_entry_descriptors());
++                sender.send_or_ignore(spawn_blocking_task::<
++                    _,
++                    Vec<net_traits::CacheEntryDescriptor>,
++                >(
++                    http_state.http_cache.cache_entry_descriptors()
++                ));
++            },
++            CoreResourceMsg::ApplicationBackgrounded(sender) => {
++                spawn_blocking_task::<_, ()>(http_state.http_cache.flush());
++                if let Some(sender) = sender {
++                    sender.send_or_ignore(());
++                }
+             },
+             CoreResourceMsg::ClearCache(sender) => {
+                 spawn_blocking_task::<_, ()>(http_state.http_cache.clear());
+diff --git a/components/net/tests/cache_store.rs b/components/net/tests/cache_store.rs
+new file mode 100644
+index 00000000000..bd3b8dc2b0d
+--- /dev/null
++++ b/components/net/tests/cache_store.rs
+@@ -0,0 +1,681 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! The [`CacheStore`] contract, exercised against every backend.
++//!
++//! `store_suite!` instantiates the whole suite once per store, so a behaviour
++//! that only the memory store or only the disk store gets right fails here.
++
++use std::fs;
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::time::SystemTime;
++
++use bytes::Bytes;
++use futures::StreamExt;
++use http::{HeaderMap, HeaderValue, StatusCode, header};
++use net::http_cache::CacheKey;
++use net::http_cache::disk::DiskStore;
++use net::http_cache::memory_store::MemoryStore;
++use net::http_cache::policy::EntryPolicy;
++use net::http_cache::store::{
++    BodyRange, CACHE_FORMAT, CacheStore, EntryMeta, EntryWriter, StoreError,
++};
++use net_traits::blob_url_store::UrlWithBlobClaim;
++use net_traits::request::{Referrer, Request, RequestBuilder};
++use servo_base::id::TEST_PIPELINE_ID;
++use servo_url::ServoUrl;
++use tempfile::TempDir;
++
++const BUDGET: u64 = 4 * 1024 * 1024;
++
++fn request_for(url: &ServoUrl) -> Request {
++    RequestBuilder::new(
++        None,
++        UrlWithBlobClaim::new(url.clone(), None),
++        Referrer::NoReferrer,
++    )
++    .pipeline_id(Some(TEST_PIPELINE_ID))
++    .origin(url.origin())
++    .build()
++}
++
++fn request_with_headers(url: &ServoUrl, headers: HeaderMap) -> Request {
++    RequestBuilder::new(
++        None,
++        UrlWithBlobClaim::new(url.clone(), None),
++        Referrer::NoReferrer,
++    )
++    .pipeline_id(Some(TEST_PIPELINE_ID))
++    .origin(url.origin())
++    .headers(headers)
++    .build()
++}
++
++fn meta_for(url: &str, headers: &[(header::HeaderName, &str)]) -> EntryMeta {
++    let url = ServoUrl::parse(url).unwrap();
++    let request = request_for(&url);
++    let mut header_map = HeaderMap::new();
++    header_map.insert(
++        header::CACHE_CONTROL,
++        HeaderValue::from_static("max-age=1000"),
++    );
++    for (name, value) in headers {
++        header_map.insert(name.clone(), HeaderValue::from_str(value).unwrap());
++    }
++    EntryMeta {
++        format: CACHE_FORMAT,
++        key: CacheKey::from_url(url.clone()),
++        policy: EntryPolicy::new(&request, StatusCode::OK, &header_map, SystemTime::now()),
++        headers: header_map.into(),
++        status: StatusCode::OK.into(),
++        final_url: url,
++        content_encoding: None,
++        body_len: 0,
++    }
++}
++
++/// Wait until the writer can take another chunk, which is how `TeeBody` paces the
++/// network onto the store.
++async fn ready(writer: &mut EntryWriter) {
++    futures::future::poll_fn(|cx| writer.poll_ready(cx)).await;
++}
++
++/// Store a body under `url` and return the entry it was committed as.
++async fn put(store: &dyn CacheStore, url: &str, body: &[u8]) -> u64 {
++    let mut writer = store.create(meta_for(url, &[])).await.expect("create");
++    writer.push(Bytes::copy_from_slice(body));
++    writer.commit().await.expect("commit")
++}
++
++async fn read_all(store: &dyn CacheStore, id: u64, meta: &EntryMeta) -> Vec<u8> {
++    let mut stream = store
++        .open(id, meta, None)
++        .await
++        .expect("open")
++        .into_stream();
++    let mut body = Vec::new();
++    while let Some(chunk) = stream.next().await {
++        body.extend_from_slice(&chunk.expect("read"));
++    }
++    body
++}
++
++async fn lookup_one(store: &dyn CacheStore, url: &str) -> Option<(u64, EntryMeta)> {
++    let key = CacheKey::from_url(ServoUrl::parse(url).unwrap());
++    store.lookup(&key).await.into_iter().next()
++}
++
++/// The tests below run against each of these; the disk store keeps its directory
++/// alive for as long as the store.
++struct StoreUnderTest {
++    store: Arc<dyn CacheStore>,
++    _dir: Option<TempDir>,
++}
++
++fn memory_store() -> StoreUnderTest {
++    StoreUnderTest {
++        store: Arc::new(MemoryStore::new(BUDGET as usize)),
++        _dir: None,
++    }
++}
++
++fn disk_store() -> StoreUnderTest {
++    let dir = TempDir::new().expect("temporary directory");
++    let store = DiskStore::open(dir.path().to_path_buf(), BUDGET).expect("open disk store");
++    StoreUnderTest {
++        store: Arc::new(store),
++        _dir: Some(dir),
++    }
++}
++
++macro_rules! store_suite {
++    ($name:ident, $make:expr) => {
++        mod $name {
++            use super::*;
++
++            #[tokio::test]
++            async fn commit_then_read() {
++                let under_test = $make;
++                let store = under_test.store.as_ref();
++                let id = put(store, "https://servo.org/a", b"hello").await;
++                let (found_id, meta) = lookup_one(store, "https://servo.org/a")
++                    .await
++                    .expect("the committed entry should be found");
++                assert_eq!(found_id, id);
++                assert_eq!(meta.body_len, 5);
++                assert_eq!(read_all(store, id, &meta).await, b"hello");
++            }
++
++            #[tokio::test]
++            async fn an_uncommitted_entry_is_invisible() {
++                let under_test = $make;
++                let store = under_test.store.as_ref();
++                {
++                    let mut writer = store
++                        .create(meta_for("https://servo.org/a", &[]))
++                        .await
++                        .expect("create");
++                    writer.push(Bytes::from_static(b"partial"));
++                    writer.abort();
++                }
++                assert!(
++                    lookup_one(store, "https://servo.org/a").await.is_none(),
++                    "an aborted writer must leave nothing behind"
++                );
++            }
++
++            #[tokio::test]
++            async fn a_body_larger_than_one_batch_round_trips() {
++                let under_test = $make;
++                let store = under_test.store.as_ref();
++                let body: Vec<u8> = (0..700_000u32).map(|index| index as u8).collect();
++                let mut writer = store
++                    .create(meta_for("https://servo.org/big", &[]))
++                    .await
++                    .expect("create");
++                for chunk in body.chunks(64 * 1024) {
++                    ready(&mut writer).await;
++                    writer.push(Bytes::copy_from_slice(chunk));
++                }
++                let id = writer.commit().await.expect("commit");
++                let (_, meta) = lookup_one(store, "https://servo.org/big").await.unwrap();
++                assert_eq!(meta.body_len as usize, body.len());
++                assert_eq!(read_all(store, id, &meta).await, body);
++            }
++
++            #[tokio::test]
++            async fn several_variants_live_under_one_key() {
++                let under_test = $make;
++                let store = under_test.store.as_ref();
++                put(store, "https://servo.org/v", b"one").await;
++                put(store, "https://servo.org/v", b"two").await;
++                let key = CacheKey::from_url(ServoUrl::parse("https://servo.org/v").unwrap());
++                assert_eq!(store.lookup(&key).await.len(), 2);
++            }
++
++            #[tokio::test]
++            async fn ranges_read_a_slice_of_the_body() {
++                let under_test = $make;
++                let store = under_test.store.as_ref();
++                let id = put(store, "https://servo.org/r", b"0123456789").await;
++                let (_, meta) = lookup_one(store, "https://servo.org/r").await.unwrap();
++                let mut stream = store
++                    .open(id, &meta, Some(BodyRange { start: 2, end: 5 }))
++                    .await
++                    .expect("open a range")
++                    .into_stream();
++                let mut body = Vec::new();
++                while let Some(chunk) = stream.next().await {
++                    body.extend_from_slice(&chunk.expect("read"));
++                }
++                assert_eq!(body, b"2345");
++            }
++
++            #[tokio::test]
++            async fn update_meta_keeps_the_body() {
++                let under_test = $make;
++                let store = under_test.store.as_ref();
++                let id = put(store, "https://servo.org/m", b"body").await;
++                let (_, mut meta) = lookup_one(store, "https://servo.org/m").await.unwrap();
++                let mut headers = meta.headers.0.clone();
++                headers.insert(header::ETAG, HeaderValue::from_static("\"fresh\""));
++                meta.headers = headers.into();
++                store.update_meta(id, meta).await.expect("update_meta");
++
++                let (_, meta) = lookup_one(store, "https://servo.org/m").await.unwrap();
++                assert_eq!(
++                    meta.headers.get(header::ETAG).map(|value| value.as_bytes()),
++                    Some(&b"\"fresh\""[..])
++                );
++                assert_eq!(read_all(store, id, &meta).await, b"body");
++            }
++
++            #[tokio::test]
++            async fn remove_and_clear() {
++                let under_test = $make;
++                let store = under_test.store.as_ref();
++                let id = put(store, "https://servo.org/x", b"x").await;
++                put(store, "https://servo.org/y", b"y").await;
++
++                store.remove(id).await;
++                assert!(lookup_one(store, "https://servo.org/x").await.is_none());
++                assert!(lookup_one(store, "https://servo.org/y").await.is_some());
++
++                store.clear().await;
++                assert!(lookup_one(store, "https://servo.org/y").await.is_none());
++                assert!(store.descriptors().await.is_empty());
++            }
++
++            #[tokio::test]
++            async fn remove_key_drops_every_variant() {
++                let under_test = $make;
++                let store = under_test.store.as_ref();
++                put(store, "https://servo.org/k", b"one").await;
++                put(store, "https://servo.org/k", b"two").await;
++                let key = CacheKey::from_url(ServoUrl::parse("https://servo.org/k").unwrap());
++                store.remove_key(&key).await;
++                assert!(store.lookup(&key).await.is_empty());
++            }
++
++            #[tokio::test]
++            async fn the_byte_budget_evicts_the_least_recently_used() {
++                let under_test = $make;
++                let store = under_test.store.as_ref();
++                let chunk = vec![0u8; 512 * 1024];
++                for index in 0..12 {
++                    put(store, &format!("https://servo.org/e{index}"), &chunk).await;
++                }
++                let mut kept = 0;
++                for index in 0..12 {
++                    if lookup_one(store, &format!("https://servo.org/e{index}"))
++                        .await
++                        .is_some()
++                    {
++                        kept += 1;
++                    }
++                }
++                assert!(
++                    kept < 12,
++                    "6 MiB of entries must not all fit in a 4 MiB budget"
++                );
++                assert!(kept > 0, "eviction must not empty the store");
++                assert!(
++                    lookup_one(store, "https://servo.org/e11").await.is_some(),
++                    "the most recently written entry must survive"
++                );
++            }
++
++            #[tokio::test]
++            async fn concurrent_writers_of_one_key_get_separate_slots() {
++                let under_test = $make;
++                let store = under_test.store.clone();
++                let first = store
++                    .create(meta_for("https://servo.org/c", &[]))
++                    .await
++                    .expect("first create");
++                let second = store
++                    .create(meta_for("https://servo.org/c", &[]))
++                    .await
++                    .expect("second create");
++                let first = tokio::spawn(async move { first.commit().await });
++                let second = tokio::spawn(async move { second.commit().await });
++                let first = first.await.unwrap().expect("first commit");
++                let second = second.await.unwrap().expect("second commit");
++                assert_ne!(first, second, "concurrent writers must not share a slot");
++            }
++
++            #[tokio::test]
++            async fn descriptors_name_the_stored_urls() {
++                let under_test = $make;
++                let store = under_test.store.as_ref();
++                put(store, "https://servo.org/d", b"d").await;
++                let descriptors = store.descriptors().await;
++                assert_eq!(descriptors.len(), 1);
++            }
++        }
++    };
++}
++
++store_suite!(memory, memory_store());
++store_suite!(disk, disk_store());
++
++// The tests below are about the disk store's own failure modes: the file system
++// is shared with the rest of the system, which is allowed to remove files and
++// whole directories underneath a running cache.
++
++fn open_disk_store(dir: &PathBuf) -> Arc<dyn CacheStore> {
++    Arc::new(DiskStore::open(dir.clone(), BUDGET).expect("open disk store"))
++}
++
++#[tokio::test]
++async fn disk_entries_survive_reopening() {
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    {
++        let store = open_disk_store(&path);
++        put(store.as_ref(), "https://servo.org/p", b"persisted").await;
++        store.shutdown().await;
++    }
++    let store = open_disk_store(&path);
++    let (id, meta) = lookup_one(store.as_ref(), "https://servo.org/p")
++        .await
++        .expect("the entry should still be there after a restart");
++    assert_eq!(read_all(store.as_ref(), id, &meta).await, b"persisted");
++}
++
++#[tokio::test]
++async fn disk_entries_are_found_again_after_the_index_is_lost() {
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    {
++        let store = open_disk_store(&path);
++        put(store.as_ref(), "https://servo.org/rebuild", b"body").await;
++        store.shutdown().await;
++    }
++    // A crash before the index was written, or a corrupt index, both look like this.
++    fs::write(path.join("index-data"), b"not an index").unwrap();
++
++    let store = open_disk_store(&path);
++    let (id, meta) = lookup_one(store.as_ref(), "https://servo.org/rebuild")
++        .await
++        .expect("a lost index must be rebuilt from the entry files");
++    assert_eq!(read_all(store.as_ref(), id, &meta).await, b"body");
++}
++
++#[tokio::test]
++async fn an_unclean_exit_still_finds_the_entries() {
++    // No `shutdown()`, so the version stamp still says "in use" on the next open
++    // and the index cannot be trusted -- the entries must come back by scanning.
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    {
++        let store = open_disk_store(&path);
++        put(store.as_ref(), "https://servo.org/unclean", b"body").await;
++        // deliberately no shutdown/flush
++    }
++    let store = open_disk_store(&path);
++    let (id, meta) = lookup_one(store.as_ref(), "https://servo.org/unclean")
++        .await
++        .expect("an unclean exit must not lose entries");
++    assert_eq!(read_all(store.as_ref(), id, &meta).await, b"body");
++}
++
++#[tokio::test]
++async fn entries_removed_while_closed_are_not_served_from_a_clean_index() {
++    // The dirty flag says the index was up to date, but the system emptied the
++    // directory while Servo was not running -- which is exactly what OpenHarmony
++    // does to `cacheDir`. The directory mtime has to catch that.
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    {
++        let store = open_disk_store(&path);
++        put(store.as_ref(), "https://servo.org/a", b"a").await;
++        put(store.as_ref(), "https://servo.org/b", b"b").await;
++        store.flush().await;
++    }
++    for entry in fs::read_dir(path.join("entries")).unwrap().flatten() {
++        fs::remove_file(entry.path()).unwrap();
++    }
++
++    let store = open_disk_store(&path);
++    assert!(
++        lookup_one(store.as_ref(), "https://servo.org/a")
++            .await
++            .is_none(),
++        "an index that predates an external wipe must not claim the entries exist"
++    );
++    assert!(
++        lookup_one(store.as_ref(), "https://servo.org/b")
++            .await
++            .is_none()
++    );
++}
++
++#[tokio::test]
++async fn a_flush_makes_the_index_reusable() {
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    {
++        let store = open_disk_store(&path);
++        put(store.as_ref(), "https://servo.org/flushed", b"flushed").await;
++        store.flush().await;
++    }
++    assert!(
++        path.join("index-data").exists(),
++        "flush must write the index out"
++    );
++    let store = open_disk_store(&path);
++    let (id, meta) = lookup_one(store.as_ref(), "https://servo.org/flushed")
++        .await
++        .expect("a flushed index must still describe the entry");
++    assert_eq!(read_all(store.as_ref(), id, &meta).await, b"flushed");
++}
++
++#[tokio::test]
++async fn a_temporary_file_left_by_a_killed_writer_is_cleaned_up() {
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    let entries = path.join("entries");
++    {
++        let store = open_disk_store(&path);
++        let mut writer = store
++            .create(meta_for("https://servo.org/killed", &[]))
++            .await
++            .expect("create");
++        writer.push(Bytes::from_static(b"never committed"));
++        // Dropping the writer without committing is what a killed fetch does.
++        drop(writer);
++        store.shutdown().await;
++    }
++    // Leave a stray temporary file behind, as a killed *process* would.
++    fs::write(entries.join("deadbeefdeadbe_0.tmp"), b"partial").unwrap();
++
++    let store = open_disk_store(&path);
++    assert!(
++        lookup_one(store.as_ref(), "https://servo.org/killed")
++            .await
++            .is_none(),
++        "an entry that was never committed must not be visible"
++    );
++    assert!(
++        !entries.join("deadbeefdeadbe_0.tmp").exists(),
++        "stray temporary files must be removed when the store is opened"
++    );
++}
++
++#[tokio::test]
++async fn an_entry_file_removed_behind_our_back_reads_as_a_miss() {
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    let store = open_disk_store(&path);
++    put(store.as_ref(), "https://servo.org/gone", b"body").await;
++
++    for entry in fs::read_dir(path.join("entries")).unwrap().flatten() {
++        fs::remove_file(entry.path()).unwrap();
++    }
++    assert!(
++        lookup_one(store.as_ref(), "https://servo.org/gone")
++            .await
++            .is_none(),
++        "a removed entry file must be reported as a miss, not an error"
++    );
++}
++
++#[tokio::test]
++async fn the_whole_directory_can_be_removed_while_the_store_runs() {
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    let store = open_disk_store(&path);
++    put(store.as_ref(), "https://servo.org/before", b"before").await;
++
++    // This is what OpenHarmony does to `cacheDir` under storage pressure, and what
++    // the user's "Clear cache" does even while the app is running.
++    fs::remove_dir_all(&path).unwrap();
++
++    assert!(
++        lookup_one(store.as_ref(), "https://servo.org/before")
++            .await
++            .is_none()
++    );
++    let id = put(store.as_ref(), "https://servo.org/after", b"after").await;
++    let (_, meta) = lookup_one(store.as_ref(), "https://servo.org/after")
++        .await
++        .expect("the store must recreate its directory and keep working");
++    assert_eq!(read_all(store.as_ref(), id, &meta).await, b"after");
++}
++
++#[tokio::test]
++async fn a_directory_written_by_another_format_is_discarded() {
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    {
++        let store = open_disk_store(&path);
++        put(store.as_ref(), "https://servo.org/old", b"old").await;
++        store.shutdown().await;
++    }
++    // A version stamp from another format. There is no migration; the whole
++    // directory goes.
++    fs::write(path.join("index"), b"some other format").unwrap();
++
++    let store = open_disk_store(&path);
++    assert!(
++        lookup_one(store.as_ref(), "https://servo.org/old")
++            .await
++            .is_none(),
++        "a format bump must discard the directory rather than read it"
++    );
++    assert!(
++        fs::read_dir(path.join("entries")).unwrap().next().is_none(),
++        "the entry files of the old format must be gone"
++    );
++}
++
++#[tokio::test]
++async fn a_corrupt_body_is_reported_rather_than_served() {
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    let store = open_disk_store(&path);
++    let id = put(store.as_ref(), "https://servo.org/corrupt", b"0123456789").await;
++    let (_, meta) = lookup_one(store.as_ref(), "https://servo.org/corrupt")
++        .await
++        .unwrap();
++
++    // Flip a byte in the body, leaving the metadata and lengths intact.
++    let entry = fs::read_dir(path.join("entries"))
++        .unwrap()
++        .flatten()
++        .next()
++        .unwrap()
++        .path();
++    let mut bytes = fs::read(&entry).unwrap();
++    bytes[20] ^= 0xff;
++    fs::write(&entry, &bytes).unwrap();
++
++    let mut stream = store
++        .open(id, &meta, None)
++        .await
++        .expect("open")
++        .into_stream();
++    let mut failed = false;
++    while let Some(chunk) = stream.next().await {
++        failed |= chunk.is_err();
++    }
++    assert!(
++        failed,
++        "a body that fails its checksum must surface as an error, not as silent corruption"
++    );
++    assert!(
++        lookup_one(store.as_ref(), "https://servo.org/corrupt")
++            .await
++            .is_none(),
++        "a body that could not be read must be dropped, or every later fetch of that \
++         URL fails the same way"
++    );
++}
++
++#[tokio::test]
++async fn credentials_are_never_written_to_an_entry() {
++    // `http-cache-semantics` keeps the request headers inside the policy, and the
++    // policy is serialized into the entry, so this is what stops a session cookie
++    // from living on disk for as long as the cache does.
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    let store = open_disk_store(&path);
++
++    let url = ServoUrl::parse("https://servo.org/private").unwrap();
++    let mut request_headers = HeaderMap::new();
++    request_headers.insert(header::COOKIE, HeaderValue::from_static("sid=SECRETCOOKIE"));
++    request_headers.insert(
++        header::AUTHORIZATION,
++        HeaderValue::from_static("Basic SECRETAUTH"),
++    );
++    let request = request_with_headers(&url, request_headers);
++
++    let mut headers = HeaderMap::new();
++    headers.insert(
++        header::CACHE_CONTROL,
++        HeaderValue::from_static("max-age=1000"),
++    );
++    let meta = EntryMeta {
++        format: CACHE_FORMAT,
++        key: CacheKey::from_url(url.clone()),
++        policy: EntryPolicy::new(&request, StatusCode::OK, &headers, SystemTime::now()),
++        headers: headers.into(),
++        status: StatusCode::OK.into(),
++        final_url: url,
++        content_encoding: None,
++        body_len: 0,
++    };
++    let mut writer = store.create(meta).await.expect("create");
++    writer.push(Bytes::from_static(b"body"));
++    writer.commit().await.expect("commit");
++
++    let entry = fs::read_dir(path.join("entries"))
++        .unwrap()
++        .flatten()
++        .next()
++        .unwrap()
++        .path();
++    let bytes = fs::read(&entry).unwrap();
++    for secret in [&b"SECRETCOOKIE"[..], &b"SECRETAUTH"[..]] {
++        assert!(
++            !bytes.windows(secret.len()).any(|window| window == secret),
++            "a credential reached the entry file: {}",
++            String::from_utf8_lossy(secret)
++        );
++    }
++}
++
++#[tokio::test]
++async fn a_hash_collision_does_not_serve_the_wrong_url() {
++    // Entry files are named by a 56-bit hash of the key, and the full key is
++    // compared on open. Renaming one entry's file onto another's name is exactly
++    // what a collision looks like.
++    let dir = TempDir::new().unwrap();
++    let path = dir.path().to_path_buf();
++    let store = open_disk_store(&path);
++    put(store.as_ref(), "https://servo.org/one", b"one").await;
++
++    let key = CacheKey::from_url(ServoUrl::parse("https://servo.org/two").unwrap());
++    let entry = fs::read_dir(path.join("entries"))
++        .unwrap()
++        .flatten()
++        .next()
++        .unwrap()
++        .path();
++    let colliding = path.join("entries").join(format!("{:014x}_0", key.hash()));
++    fs::rename(&entry, &colliding).unwrap();
++
++    // Reopen so the index picks the renamed file up.
++    let store = open_disk_store(&path);
++    assert!(
++        store.lookup(&key).await.is_empty(),
++        "an entry whose stored key differs must not answer for this key"
++    );
++}
++
++#[tokio::test]
++async fn an_entry_larger_than_the_per_entry_cap_is_declined() {
++    let dir = TempDir::new().unwrap();
++    let store = open_disk_store(&dir.path().to_path_buf());
++    let mut writer = store
++        .create(meta_for("https://servo.org/huge", &[]))
++        .await
++        .expect("create");
++    // The cap is max(budget / 8, 5 MiB), so 6 MiB is over it.
++    let chunk = vec![0u8; 1024 * 1024];
++    for _ in 0..6 {
++        writer.push(Bytes::from(chunk.clone()));
++    }
++    assert!(
++        matches!(writer.commit().await, Err(StoreError::Rejected)),
++        "an outsized entry must be declined rather than written"
++    );
++    assert!(
++        lookup_one(store.as_ref(), "https://servo.org/huge")
++            .await
++            .is_none()
++    );
++}
+diff --git a/components/net/tests/main.rs b/components/net/tests/main.rs
+index 723c359a419..3c5e5c1ad07 100644
+--- a/components/net/tests/main.rs
++++ b/components/net/tests/main.rs
+@@ -5,6 +5,7 @@
+ #![cfg(test)]
+ #![expect(dead_code)]
+ 
++mod cache_store;
+ mod cookie;
+ mod cookie_http_state;
+ mod data_loader;
+diff --git a/components/servo/network_manager.rs b/components/servo/network_manager.rs
+index 4f28a865a52..29fa7b662a1 100644
+--- a/components/servo/network_manager.rs
++++ b/components/servo/network_manager.rs
+@@ -50,8 +50,8 @@ impl NetworkManager {
+     ///
+     /// Both public and private browsing contexts are included in the result.
+     ///
+-    /// Note: The networking layer currently only implements an in-memory HTTP
+-    /// cache. Support for an on-disk cache is under development.
++    /// Note: Entries may be held in memory or on disk depending on how the
++    /// embedder configured the cache directory.
+     pub fn cache_entries(&self) -> Vec<CacheEntry> {
+         let public_entries = self.public_resource_threads.cache_entries();
+         let private_entries = self.private_resource_threads.cache_entries();
+@@ -65,13 +65,30 @@ impl NetworkManager {
+         unique_keys.into_iter().map(CacheEntry::new).collect()
+     }
+ 
++    /// Tell the networking layer the embedding application moved to the background.
++    ///
++    /// The HTTP cache keeps an index in memory that is otherwise only written out
++    /// once changes stop, so an application that is killed while backgrounded
++    /// would lose it and pay a directory scan on the next start. Embedders should
++    /// call this from whatever "app is no longer in the foreground" signal their
++    /// platform provides -- `onBackground` on OpenHarmony, `onTrimMemory` /
++    /// `ApplicationStatusListener` on Android. Chromium hooks the same signal for
++    /// the same reason.
++    ///
++    /// Blocks until the networking layer is done persisting.
++    pub fn notify_application_backgrounded(&self) {
++        self.public_resource_threads
++            .notify_application_backgrounded();
++        self.private_resource_threads
++            .notify_application_backgrounded();
++    }
++
+     /// Clears the network (HTTP) cache.
+     ///
+     /// This removes all cached network responses maintained by the networking
+     /// layer for both public and private browsing contexts.
+     ///
+-    /// Note: The networking layer currently only implements an in-memory HTTP
+-    /// cache. Support for an on-disk cache is under development.
++    /// Note: This clears both the in-memory and the on-disk cache.
+     pub fn clear_cache(&self) {
+         self.public_resource_threads.clear_cache();
+         self.private_resource_threads.clear_cache();
+diff --git a/components/shared/net/lib.rs b/components/shared/net/lib.rs
+index 3c7d18017fd..cad99f29512 100644
+--- a/components/shared/net/lib.rs
++++ b/components/shared/net/lib.rs
+@@ -511,6 +511,19 @@ impl ResourceThreads {
+         receiver.recv().unwrap()
+     }
+ 
++    /// Tell the networking layer the embedding application moved to the background.
++    ///
++    /// Blocks until the networking layer has persisted what it needs to, so that
++    /// the caller can rely on it having happened before the process is frozen or
++    /// killed.
++    pub fn notify_application_backgrounded(&self) {
++        let (sender, receiver) = generic_channel::channel().unwrap();
++        let _ = self
++            .core_thread
++            .send(CoreResourceMsg::ApplicationBackgrounded(Some(sender)));
++        let _ = receiver.recv();
++    }
++
+     pub fn clear_cache(&self) {
+         // NOTE: Messages used in these methods are currently handled
+         // synchronously on the backend without consulting other threads, so
+@@ -765,6 +778,10 @@ pub enum CoreResourceMsg {
+     GetCacheEntries(GenericSender<Vec<CacheEntryDescriptor>>),
+     /// Clear the network cache.
+     ClearCache(Option<GenericSender<()>>),
++    /// The embedding application moved to the background. Persist any network
++    /// state that is otherwise only written on a timer, because a backgrounded
++    /// application may be killed without further notice.
++    ApplicationBackgrounded(Option<GenericSender<()>>),
+     /// Send the service worker network mediator for an origin to CoreResourceThread
+     NetworkMediator(IpcSender<CustomResponseMediator>, ImmutableOrigin),
+     /// Message forwarded to file manager's handler
+diff --git a/ports/servoshell/egl/app.rs b/ports/servoshell/egl/app.rs
+index bd84a95a031..e713d2c6960 100644
+--- a/ports/servoshell/egl/app.rs
++++ b/ports/servoshell/egl/app.rs
+@@ -440,6 +440,18 @@ impl App {
+         warn!("TODO can't stop won't stop");
+     }
+ 
++    /// Tell Servo the embedding application moved to the background.
++    ///
++    /// A backgrounded application can be killed without any further callback, so
++    /// this is the last reliable chance to persist state such as the HTTP cache
++    /// index.
++    pub fn notify_application_backgrounded(&self) {
++        self.state
++            .servo
++            .network_manager()
++            .notify_application_backgrounded();
++    }
++
+     /// Go back in history.
+     pub fn go_back(&self) {
+         self.window()
+diff --git a/ports/servoshell/egl/ohos/mod.rs b/ports/servoshell/egl/ohos/mod.rs
+index dc081b636f8..c136233f3a8 100644
+--- a/ports/servoshell/egl/ohos/mod.rs
++++ b/ports/servoshell/egl/ohos/mod.rs
+@@ -387,6 +387,9 @@ pub(super) enum ServoAction {
+         width: i32,
+         height: i32,
+     },
++    /// Carries a channel so the caller can wait for the work to finish: the
++    /// application may be frozen shortly after `onBackground` returns.
++    ApplicationBackgrounded(std::sync::mpsc::SyncSender<()>),
+     FocusWindow(u32, Vec<u32>),
+     CreatePlatformWindow(XComponentWrapper, WindowWrapper),
+     RemovePlatformWindow(u32, Vec<u32>),
+@@ -397,6 +400,7 @@ impl std::fmt::Debug for ServoAction {
+         match self {
+             Self::WakeUp => write!(f, "WakeUp"),
+             Self::LoadUrl(arg0) => f.debug_tuple("LoadUrl").field(arg0).finish(),
++            Self::ApplicationBackgrounded(..) => write!(f, "ApplicationBackgrounded"),
+             Self::GoBack => write!(f, "GoBack"),
+             Self::GoForward => write!(f, "GoForward"),
+             Self::TouchEvent {
+@@ -462,6 +466,10 @@ impl ServoAction {
+                 servo.spin_event_loop();
+             },
+             LoadUrl(url) => servo.load_uri(url.as_str()),
++            ApplicationBackgrounded(done) => {
++                servo.notify_application_backgrounded();
++                let _ = done.send(());
++            },
+             GoBack => servo.go_back(),
+             GoForward => servo.go_forward(),
+             TouchEvent {
+@@ -975,6 +983,30 @@ pub fn load_url(url: String) {
+     call(ServoAction::LoadUrl(url)).expect("Failed to load url");
+ }
+ 
++/// How long `onApplicationBackground` will block the ability's main thread waiting
++/// for Servo to persist. The work itself is a few kilobytes with no `fsync`, so
++/// this bound exists only so that a busy Servo thread cannot stall the
++/// application; hitting it means something else is wrong.
++const BACKGROUND_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
++
++/// Called from `EntryAbility.onBackground()`.
++///
++/// This blocks until Servo has persisted, because the application can be frozen
++/// and then killed once the callback returns. The alternative would be a
++/// `backgroundTaskManager` transient task, but those are quota'd (10 minutes a
++/// day) and are meant for work measured in seconds; writing a few kilobytes is
++/// better done inline.
++#[napi(js_name = "onApplicationBackground")]
++pub fn on_application_background() {
++    let (done, wait) = std::sync::mpsc::sync_channel(0);
++    if call(ServoAction::ApplicationBackgrounded(done)).is_err() {
++        return;
++    }
++    if wait.recv_timeout(BACKGROUND_FLUSH_TIMEOUT).is_err() {
++        warn!("Servo did not finish persisting before the background timeout");
++    }
++}
++
+ #[napi]
+ pub fn go_back() {
+     call(ServoAction::GoBack).expect("Failed to call servo");
+diff --git a/ports/servoshell/prefs.rs b/ports/servoshell/prefs.rs
+index b4b4ed139f7..220d998a3a0 100644
+--- a/ports/servoshell/prefs.rs
++++ b/ports/servoshell/prefs.rs
+@@ -175,6 +175,22 @@ pub fn default_config_dir() -> Option<PathBuf> {
+     Some(config_dir)
+ }
+ 
++/// Where the HTTP cache keeps its files.
++///
++/// On Android and OpenHarmony this is under the application's cache directory,
++/// which the system may empty at any time; the cache is built to survive that.
++#[cfg(any(target_os = "android", target_env = "ohos"))]
++pub fn default_http_cache_dir() -> Option<PathBuf> {
++    default_config_dir().map(|dir| dir.join("http-cache"))
++}
++
++/// Where the HTTP cache keeps its files: `~/.cache` on Linux,
++/// `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows.
++#[cfg(not(any(target_os = "android", target_env = "ohos")))]
++pub fn default_http_cache_dir() -> Option<PathBuf> {
++    ::dirs::cache_dir().map(|dir| dir.join("servo").join("http-cache"))
++}
++
+ /// Get a Servo [`Preferences`] to use when initializing Servo by first reading the user
+ /// preferences file and then overriding these preferences with the ones from the `--prefs-file`
+ /// command-line argument, if given.
+@@ -748,6 +764,7 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
+         random_pipeline_closure_probability: cmd_args.random_pipeline_closure_probability,
+         random_pipeline_closure_seed: cmd_args.random_pipeline_closure_seed,
+         config_dir,
++        http_cache_dir: default_http_cache_dir(),
+         temporary_storage,
+         shaders_path: cmd_args.shaders,
+         certificate_path: cmd_args
+diff --git a/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets b/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets
+index ff01a37efbc..9fe5ee00d71 100644
+--- a/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets
++++ b/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets
+@@ -122,5 +122,13 @@ export default class EntryAbility extends UIAbility {
+   onBackground() {
+     // Ability has back to background
+     hilog.info(0x0000, 'testTag', '%{public}s', 'Ability onBackground');
++    // A backgrounded application can be frozen and then killed without any
++    // further callback, so this is the last reliable chance for Servo to persist
++    // state it would otherwise only write on a timer (e.g. the HTTP cache index).
++    try {
++      servoshell.onApplicationBackground();
++    } catch (e) {
++      hilog.warn(0x0000, 'testTag', 'onApplicationBackground failed: %{public}s', JSON.stringify(e));
++    }
+   }
+ };
