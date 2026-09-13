@@ -112,6 +112,9 @@ enum Action {
         id: u32,
         throttled: bool,
     },
+    /// The host application is no longer in the foreground. Carries a channel so
+    /// the caller can wait: the application may be frozen once `OnPause` returns.
+    ApplicationBackgrounded(std::sync::mpsc::SyncSender<()>),
     Touch {
         id: u32,
         kind: u8,
@@ -559,6 +562,10 @@ impl ServoThread {
         // `config_dir` must be set: the OHOS font cache unwraps `opts::get().config_dir`
         // (fonts/platform/freetype/ohos/font_cache.rs) when Servo initializes.
         let opts = Opts {
+            // Same layout as servoshell's `<cacheDir>/servo/http-cache`. Without this
+            // the store falls back to memory only, which is the opposite of what a
+            // webview embedded in someone else's application wants.
+            http_cache_dir: Some(config_dir.join("http-cache")),
             config_dir: Some(config_dir),
             ..Default::default()
         };
@@ -726,6 +733,15 @@ impl ServoThread {
                 // Observability marker for the on-device throttle tests (test_throttle.py).
                 info!("[arkweb] set_throttled id={id} {throttled}");
                 self.with_webview(id, |wv| wv.set_throttled(throttled))
+            },
+            Action::ApplicationBackgrounded(done) => {
+                // A backgrounded application can be killed without further notice,
+                // so give the networking layer a chance to persist first.
+                info!("[arkweb] application_backgrounded");
+                self.servo
+                    .network_manager()
+                    .notify_application_backgrounded();
+                let _ = done.send(());
             },
             Action::Touch {
                 id,
@@ -1669,6 +1685,21 @@ pub fn resize(id: u32, width: u32, height: u32) {
 pub fn set_throttled(id: u32, throttled: bool) {
     guard("set_throttled", || {
         send(Action::SetThrottled { id, throttled })
+    })
+}
+
+/// Bound on how long `OnPause` blocks the ACE UI thread waiting for Servo to
+/// persist. The work is a few kilobytes with no `fsync`; the bound only exists so
+/// a busy Servo thread cannot stall the host application.
+const BACKGROUND_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+pub fn application_backgrounded() {
+    guard("application_backgrounded", || {
+        let (done, wait) = std::sync::mpsc::sync_channel(0);
+        send(Action::ApplicationBackgrounded(done));
+        if wait.recv_timeout(BACKGROUND_FLUSH_TIMEOUT).is_err() {
+            error!("[arkweb] servo did not finish persisting before the background timeout");
+        }
     })
 }
 
