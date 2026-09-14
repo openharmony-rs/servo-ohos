@@ -52,6 +52,18 @@ Its diff between syncs is the GitHub-viewable form of the range-diff.
 
 32. `docs: stack ordering and feature-guard conventions` — B · none · watch: -
 
+33. `ohos: add a chrome-less mode to the servoshell app` — A · manual · watch: ports/servoshell/egl/ohos
+
+34. `layout: emit a trace marker when a reflow actually laid out` — A · CI · watch: components/layout
+
+35. `net: rebuild the HTTP cache on RFC 9111 semantics and a streaming store` — C · CI · watch: components/shared/net/request.rs components/net/fetch/fetch_params.rs components/net/connector.rs components/net/http_loader.rs tests/wpt/tests/fetch/http-cache tests/wpt/tests/fetch/range tests/wpt/tests/cors/304.htm
+
+36. `net: make the disk the primary HTTP cache` — B · device · watch: components/shared/base/threadboost.rs components/net/resource_thread.rs components/servo/servo.rs support/openharmony/entry/src/main/ets/pages
+
+37. `ports/arkweb: use a disk-backed HTTP cache and persist its index on pause` — A · device · watch: components/servo/network_manager.rs components/config/opts.rs components/net/http_cache/disk/index.rs
+
+38. `docs: add the HTTP cache patches to the stack manifest` — B · none · watch: -
+
 ## Sync log
 
 One entry per sync, newest first. Records the upstream range and every

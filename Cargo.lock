@@ -3984,6 +3984,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-cache-semantics"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0603b99309a1e404c2c0945650c0f775b50bb72ac90ae570cb93f9ff05d9efe7"
+dependencies = [
+ "http 1.5.0",
+ "http-serde",
+ "serde",
+ "time",
+]
+
+[[package]]
+name = "http-serde"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f056c8559e3757392c8d091e796416e4649d8e49e88b8d76df6c002f05027fd"
+dependencies = [
+ "http 1.5.0",
+ "serde",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6974,17 +6996,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quick_cache"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "403c1a912fec895cafb223201e368234842acb9220aaf08ab042ae89ba5f135c"
-dependencies = [
- "equivalent",
- "foldhash 0.2.0",
- "hashbrown 0.17.1",
-]
-
-[[package]]
 name = "quickcheck"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8787,6 +8798,7 @@ dependencies = [
  "chrono",
  "content-security-policy",
  "cookie 0.18.2",
+ "crc32fast",
  "crossbeam-channel",
  "data-url",
  "flate2",
@@ -8797,12 +8809,14 @@ dependencies = [
  "headers",
  "http 1.5.0",
  "http-body-util",
+ "http-cache-semantics",
  "hyper",
  "hyper-rustls",
  "hyper-util",
  "imsz",
  "ipc-channel",
  "itertools 0.15.0",
+ "libc",
  "log",
  "malloc_size_of_derive",
  "mime",
@@ -8810,17 +8824,13 @@ dependencies = [
  "nom 8.0.0",
  "parking_lot",
  "postcard",
- "quick_cache",
  "rand 0.10.2",
  "regex",
  "resvg",
- "rusqlite",
  "rustc-hash 2.1.3",
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
- "sea-query",
- "sea-query-rusqlite",
  "serde",
  "servo-base",
  "servo-config",
@@ -8838,6 +8848,7 @@ dependencies = [
  "servo-tracing",
  "servo-url",
  "servo_arc",
+ "sha1 0.11.0",
  "smallvec",
  "tempfile",
  "time",

@@ -175,6 +175,22 @@ pub fn default_config_dir() -> Option<PathBuf> {
     Some(config_dir)
 }
 
+/// Where the HTTP cache keeps its files.
+///
+/// On Android and OpenHarmony this is under the application's cache directory,
+/// which the system may empty at any time; the cache is built to survive that.
+#[cfg(any(target_os = "android", target_env = "ohos"))]
+pub fn default_http_cache_dir() -> Option<PathBuf> {
+    default_config_dir().map(|dir| dir.join("http-cache"))
+}
+
+/// Where the HTTP cache keeps its files: `~/.cache` on Linux,
+/// `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows.
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+pub fn default_http_cache_dir() -> Option<PathBuf> {
+    ::dirs::cache_dir().map(|dir| dir.join("servo").join("http-cache"))
+}
+
 /// Get a Servo [`Preferences`] to use when initializing Servo by first reading the user
 /// preferences file and then overriding these preferences with the ones from the `--prefs-file`
 /// command-line argument, if given.
@@ -748,6 +764,7 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         random_pipeline_closure_probability: cmd_args.random_pipeline_closure_probability,
         random_pipeline_closure_seed: cmd_args.random_pipeline_closure_seed,
         config_dir,
+        http_cache_dir: default_http_cache_dir(),
         temporary_storage,
         shaders_path: cmd_args.shaders,
         certificate_path: cmd_args
@@ -825,8 +842,8 @@ fn test_parse_pref_from_command_line() {
     assert_eq!(preferences.layout_threads, 42);
 
     // Test with unsigned numbers
-    let preferences = test_parse_pref("network_http_cache_size=50");
-    assert_eq!(preferences.network_http_cache_size, 50);
+    let preferences = test_parse_pref("network_http_memory_cache_size=50");
+    assert_eq!(preferences.network_http_memory_cache_size, 50);
     let preferences = test_parse_pref("network_connection_timeout=30");
     assert_eq!(preferences.network_connection_timeout, 30);
 
