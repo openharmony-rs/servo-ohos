@@ -610,8 +610,13 @@ impl FontContext {
 
     /// Decrement the count of font loads blocking the `document.fonts.ready` promise by one.
     pub fn decrement_count_of_loading_fonts_by_one(&self) {
+        self.decrement_count_of_loading_fonts(1);
+    }
+
+    /// Decrement the count of font loads blocking the `document.fonts.ready` promise.
+    pub fn decrement_count_of_loading_fonts(&self, count: usize) {
         self.number_of_loading_web_fonts
-            .fetch_sub(1, Ordering::SeqCst);
+            .fetch_sub(count, Ordering::SeqCst);
     }
 
     /// Returns true iff a `@font-face` rule is part of the active set.
