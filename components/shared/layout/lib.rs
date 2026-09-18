@@ -629,6 +629,8 @@ pub struct ReflowResult {
     pub iframe_sizes: Option<IFrameSizes>,
     /// Enumerates web fonts that were added or removed as part of restyling.
     pub changed_web_fonts: WebFontSetDifference,
+    /// Whether font matching found web fonts that the page needs and started loading them.
+    pub started_web_font_loads: bool,
 }
 
 bitflags! {

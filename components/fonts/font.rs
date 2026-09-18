@@ -15,7 +15,7 @@ use bitflags::bitflags;
 use euclid::default::{Point2D, Rect};
 use euclid::num::Zero;
 use font_types::NameId;
-use fonts_traits::FontDescriptor;
+use fonts_traits::{FontDescriptor, WebFontLoadState};
 use icu_locid::subtags::Language;
 use log::debug;
 use malloc_size_of_derive::MallocSizeOf;
@@ -986,6 +986,21 @@ impl FontGroupFamilyTemplate {
         if !template_predicate(self.template.clone()) {
             return None;
         }
+
+        // This is the point at which a web font is known to be needed: the face matches the
+        // style and its `unicode-range` covers the character. If its `src` has not been
+        // fetched yet, ask for it now and fall through to the next family in the meantime.
+        if let Some(font_face_rule) = self.template.font_face_rule() {
+            match font_face_rule.load_state() {
+                WebFontLoadState::Loaded => {},
+                WebFontLoadState::Unloaded => {
+                    font_context.request_web_font_load(&font_face_rule);
+                    return None;
+                },
+                WebFontLoadState::Loading | WebFontLoadState::Failed => return None,
+            }
+        }
+
         self.font(font_context, font_descriptor)
             .filter(font_predicate)
     }
