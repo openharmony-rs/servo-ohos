@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 18 Sep 2026 13:07:56 +0000
+Subject: [PATCH] docs: record patches 42 to 43 in the stack manifest
+
+Add the STACK.md lines and generated patch files for the integrity CI
+job, kept out of the patch itself so it cherry-picks cleanly.
+
+Validation: uv run docs/ohos-sync/check_integrity.py passes (derived base bc6153bb1bb = base/2026-08-29, manifest ok: 43 patches, patch set ok, base is an ancestor of servo/servo main).
+AI-assisted: Yes (agent session; tier and coverage chosen by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 7deae433798..2e12dc1b27d 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -70,6 +70,10 @@ Its diff between syncs is the GitHub-viewable form of the range-diff.
+ 
+ 41. `docs: record patches 33 to 41 in the stack manifest` — B · none · watch: -
+ 
++42. `ci: add an integrity job checking that base + patches reproduce the PR head` — A · tooling · watch: -
++
++43. `docs: record patches 42 to 43 in the stack manifest` — B · none · watch: -
++
+ ## Sync log
+ 
+ One entry per sync, newest first. Records the upstream range and every

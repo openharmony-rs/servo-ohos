@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 18 Sep 2026 13:07:48 +0000
+Subject: [PATCH] ci: add an integrity job checking that base + patches
+ reproduce the PR head
+
+check_stack.py only ran by hand at sync time, so a PR could land a commit
+without its STACK.md line or with stale patch files and nobody noticed
+(patches 33 and 34 did). The new `integrity` job runs on every PR.
+
+CI has no `base/<date>` tags, so check_integrity.py derives the base as
+`HEAD~<number of STACK.md entries>`, deepens the depth-1 checkout to it,
+and runs the existing manifest and `git am` checks. A PR that adds a
+commit without a manifest line shifts the derived base and fails the
+subject comparison. The base must also be an ancestor of servo/servo
+main, checked via the GitHub compare API. The job checks out the PR head
+rather than GitHub's merge commit, which would not be a linear stack.
+
+Validation: `uv run docs/ohos-sync/check_integrity.py` passes on ohos-main c405e238b69 (derives base/2026-08-29), both in the full checkout and in a `git clone --depth 1` with no git identity configured (~18 s); fails with a subject diff for an extra commit without a manifest line, and with "patch set does not reproduce the head tree" for an edited added line in a patch file. The workflow itself has not run on GitHub yet.
+AI-assisted: Yes (agent session; script and workflow written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/integrity.yml   | 24 ++++++++++++
+ docs/ohos-sync.md                 |  4 ++
+ docs/ohos-sync/check_integrity.py | 64 +++++++++++++++++++++++++++++++
+ 3 files changed, 92 insertions(+)
+ create mode 100644 .github/workflows/integrity.yml
+ create mode 100644 docs/ohos-sync/check_integrity.py
+
+diff --git a/.github/workflows/integrity.yml b/.github/workflows/integrity.yml
+new file mode 100644
+index 00000000000..f9c1efd83ef
+--- /dev/null
++++ b/.github/workflows/integrity.yml
+@@ -0,0 +1,24 @@
++name: Integrity
++
++on:
++  pull_request:
++
++permissions:
++  contents: read
++
++jobs:
++  integrity:
++    name: integrity
++    runs-on: ubuntu-24.04
++    steps:
++      # The PR head, not GitHub's merge commit: the stack must stay linear.
++      - uses: actions/checkout@v6
++        with:
++          ref: ${{ github.event.pull_request.head.sha }}
++          fetch-depth: 1
++      - name: Check that base + patches reproduce the PR head
++        env:
++          GITHUB_TOKEN: ${{ github.token }}
++          GIT_COMMITTER_NAME: integrity
++          GIT_COMMITTER_EMAIL: integrity@invalid
++        run: python3 docs/ohos-sync/check_integrity.py
+diff --git a/docs/ohos-sync.md b/docs/ohos-sync.md
+index bb82f84b233..d560f9305c1 100644
+--- a/docs/ohos-sync.md
++++ b/docs/ohos-sync.md
+@@ -22,6 +22,10 @@ disagree, `CONTRIBUTING.md` wins and this file must be fixed.
+   verified by `check_stack.py` (`git am` onto the base must reproduce the
+   tree). Its diff between syncs shows exactly which patches changed and
+   how — the reviewable form of the range-diff.
++- `integrity` CI job: runs `docs/ohos-sync/check_integrity.py` on every PR,
++  i.e. `check_stack.py` against the PR head with the base derived from the
++  manifest length (CI has no `base/<date>` tags), and checks that this base
++  is an upstream commit.
+ 
+ ## What a sync review consists of
+ 
+diff --git a/docs/ohos-sync/check_integrity.py b/docs/ohos-sync/check_integrity.py
+new file mode 100644
+index 00000000000..a21540ae0cb
+--- /dev/null
++++ b/docs/ohos-sync/check_integrity.py
+@@ -0,0 +1,64 @@
++# /// script
++# requires-python = ">=3.11"
++# ///
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at https://mozilla.org/MPL/2.0/.
++"""Check that base + patches reproduce <head-ref>, without a `base/<date>` tag.
++
++Usage: uv run docs/ohos-sync/check_integrity.py [head-ref]
++
++The base is derived as `<head-ref>~<number of STACK.md entries>`; a shallow
++clone is deepened to reach it. Then `check_stack.py` runs against it, and the
++base must be an ancestor of servo/servo `main` (checked via the GitHub API,
++authenticated with $GITHUB_TOKEN if set). This is the `integrity` CI job.
++"""
++
++import json
++import os
++import sys
++import urllib.error
++import urllib.request
++
++from check_stack import check_manifest, check_patches
++from stacklib import git, read_manifest
++
++
++def upstream_status(base: str) -> str:
++    request = urllib.request.Request(
++        f"https://api.github.com/repos/servo/servo/compare/{base}...main",
++        headers={"Accept": "application/vnd.github+json"},
++    )
++    if token := os.environ.get("GITHUB_TOKEN"):
++        request.add_header("Authorization", f"Bearer {token}")
++    try:
++        with urllib.request.urlopen(request) as response:
++            return json.load(response)["status"]
++    except urllib.error.HTTPError as e:
++        return f"HTTP {e.code}"
++
++
++def main() -> int:
++    head = git("rev-parse", sys.argv[1] if len(sys.argv) > 1 else "HEAD").strip()
++    n = len(read_manifest())
++    if git("rev-parse", "--is-shallow-repository").strip() == "true":
++        git("fetch", "-q", "--no-tags", f"--depth={n + 1}", "origin", head)
++    base = git("rev-parse", "--verify", "-q", f"{head}~{n}", check=False).strip()
++    if not base:
++        print(f"{head} has fewer than {n} ancestors, but STACK.md lists {n} patches")
++        return 1
++    print(f"base: {base} ({head}~{n})")
++
++    ok = check_manifest(base, head)
++    ok = check_patches(base, head) and ok
++    status = upstream_status(base)
++    if status in ("ahead", "identical"):
++        print("base ok: ancestor of servo/servo main")
++    else:
++        print(f"base is not an ancestor of servo/servo main (compare status: {status})")
++        ok = False
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
