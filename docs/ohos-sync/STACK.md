@@ -70,6 +70,10 @@ Its diff between syncs is the GitHub-viewable form of the range-diff.
 
 41. `docs: record patches 33 to 41 in the stack manifest` — B · none · watch: -
 
+42. `ci: add an integrity job checking that base + patches reproduce the PR head` — A · tooling · watch: -
+
+43. `docs: record patches 42 to 43 in the stack manifest` — B · none · watch: -
+
 ## Sync log
 
 One entry per sync, newest first. Records the upstream range and every
