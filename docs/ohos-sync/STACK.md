@@ -52,6 +52,24 @@ Its diff between syncs is the GitHub-viewable form of the range-diff.
 
 32. `docs: stack ordering and feature-guard conventions` — B · none · watch: -
 
+33. `ohos: add a chrome-less mode to the servoshell app` — B · manual · watch: ports/servoshell/prefs.rs
+
+34. `layout: emit a trace marker when a reflow actually laid out` — B · manual · watch: components/shared/layout/lib.rs
+
+35. `script: Return list of matching fonts from FontFaceSet.load (backport of #47564)` — B · CI · watch: -
+
+36. `fonts: Report the load state of @font-face rules in FontFace.status` — B · CI · watch: -
+
+37. `fonts: Only load @font-face fonts that the page uses` — C · CI · watch: components/shared/fonts/font_template.rs components/script/dom/document/document.rs
+
+38. `fonts: Only relayout for web font changes that can affect laid-out text` — B · CI · watch: -
+
+39. `script: Lay out once for web fonts that finish loading together` — B · CI · watch: components/script/dom/globalscope/globalscope.rs
+
+40. `Update rustls to unbreak CI. (#48079)` — B · CI · watch: -
+
+41. `docs: record patches 33 to 41 in the stack manifest` — B · none · watch: -
+
 ## Sync log
 
 One entry per sync, newest first. Records the upstream range and every
