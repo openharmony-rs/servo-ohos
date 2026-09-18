@@ -11,7 +11,7 @@ mod system_font_service_proxy;
 
 use std::ops::{Deref, Range};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub use font_descriptor::*;
 pub use font_identifier::*;
@@ -197,6 +197,30 @@ impl WebFontSetDifference {
     }
 }
 
+/// How far the font described by an `@font-face` rule has got towards being usable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebFontLoadState {
+    /// The face has not started loading.
+    Unloaded,
+    /// The face is being fetched, or is waiting to be.
+    Loading,
+    /// The face has a usable [`FontTemplate`].
+    Loaded,
+    /// None of the sources of the face could be used.
+    Failed,
+}
+
+impl From<usize> for WebFontLoadState {
+    fn from(value: usize) -> Self {
+        match value {
+            0 => Self::Unloaded,
+            1 => Self::Loading,
+            2 => Self::Loaded,
+            _ => Self::Failed,
+        }
+    }
+}
+
 #[derive(MallocSizeOf)]
 pub struct FontFaceRuleInfo {
     /// The index of this `@font-face` in the cascade, relative to all
@@ -210,4 +234,30 @@ pub struct FontFaceRuleInfo {
     /// to the set of live `@font-face` rules.
     #[conditional_malloc_size_of]
     pub rule: ServoArc<LockedFontFaceRule>,
+    /// The [`WebFontLoadState`] of this rule, shared with the `FontFace` object that
+    /// exposes it to script.
+    load_state: AtomicUsize,
+}
+
+impl FontFaceRuleInfo {
+    pub fn new(
+        cascade_index: usize,
+        descriptors: Descriptors,
+        rule: ServoArc<LockedFontFaceRule>,
+    ) -> Self {
+        Self {
+            cascade_index: AtomicUsize::new(cascade_index),
+            descriptors,
+            rule,
+            load_state: AtomicUsize::new(WebFontLoadState::Unloaded as usize),
+        }
+    }
+
+    pub fn load_state(&self) -> WebFontLoadState {
+        self.load_state.load(Ordering::SeqCst).into()
+    }
+
+    pub fn set_load_state(&self, state: WebFontLoadState) {
+        self.load_state.store(state as usize, Ordering::SeqCst);
+    }
 }
