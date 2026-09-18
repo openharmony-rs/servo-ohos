@@ -3265,7 +3265,12 @@ impl Document {
         }
 
         let fonts = self.Fonts(cx);
-        fonts.update_css_connected_face_statuses(cx);
+        // Faces that loaded while others were still loading are only applied in batches,
+        // and their promises are settled then, so only look for failures once nothing is
+        // loading anymore.
+        if self.window().font_context().web_fonts_still_loading() == 0 {
+            fonts.update_css_connected_face_statuses(cx);
+        }
         if !fonts.waiting_to_fullfill_promise() {
             return false;
         }
