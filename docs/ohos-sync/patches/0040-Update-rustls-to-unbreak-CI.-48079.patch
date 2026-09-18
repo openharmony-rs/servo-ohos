@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Josh Bowman-Matthews <josh@joshmatthews.net>
+Date: Mon, 14 Sep 2026 17:27:47 +0000
+Subject: [PATCH] Update rustls to unbreak CI. (#48079)
+
+rustls 0.23.44 has a cargo-deny error:
+```
+TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries: rustls 0.23.44 registry+https://github.com/rust-lang/crates.io-index
+```
+
+https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc
+
+Testing: Existing tests verify SSL support.
+
+Fork note: backport of upstream 866d0957e4f (#48079), which landed after
+base/2026-08-29. The base ships rustls 0.23.43, which the same advisory
+covers, so `./mach test-tidy` fails in cargo-deny on plain ohos-main.
+Upstream went 0.23.43 -> 0.23.44 (#47972) -> 0.23.45 (#48079); this commit
+takes the rustls hunk only, jumping straight to 0.23.45. The unrelated
+`cssparser-macros` syn 2 -> 3 hunk of #48079 is left out.
+
+Drop at the next sync: every later base contains 866d0957e4f, so this commit
+applies empty and becomes a `Superseded-by: 866d0957e4f` placeholder (runbook
+decision 3).
+
+Validation: `./mach test-tidy` passes (before: cargo-deny error at deny.toml:644, GHSA-2mjx-qc3c-rqvc for rustls 0.23.43); `./mach check --release` and `./mach check --ohos` compile. The rustls entry in Cargo.lock matches upstream 866d0957e4f exactly and was produced by `cargo update -p rustls --precise 0.23.45`, which changed nothing else.
+AI-assisted: Yes (agent session; cherry-pick of upstream 866d0957e4f with the Cargo.lock conflict resolved by `cargo update -p rustls --precise 0.23.45`, no code changes)
+Signed-off-by: Josh Matthews <josh@joshmatthews.net>
+(cherry picked from commit 866d0957e4fcd684570939809baed7accc791116)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 0a29ee1fcb9..f8b68eac03a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7462,9 +7462,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls"
+-version = "0.23.43"
++version = "0.23.45"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
++checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+ dependencies = [
+  "aws-lc-rs",
+  "log",
