@@ -74,6 +74,10 @@ Its diff between syncs is the GitHub-viewable form of the range-diff.
 
 43. `docs: record patches 42 to 43 in the stack manifest` — B · none · watch: -
 
+44. `fonts: Compute FreeType glyph advances without the autohinter` — B · CI · watch: -
+
+45. `docs: record patches 44 to 45 in the stack manifest` — B · none · watch: -
+
 ## Sync log
 
 One entry per sync, newest first. Records the upstream range and every

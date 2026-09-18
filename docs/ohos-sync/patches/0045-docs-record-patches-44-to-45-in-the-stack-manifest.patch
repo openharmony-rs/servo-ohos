@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 18 Sep 2026 18:00:19 +0000
+Subject: [PATCH] docs: record patches 44 to 45 in the stack manifest
+
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 2e12dc1b27d..26f66952027 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -74,6 +74,10 @@ Its diff between syncs is the GitHub-viewable form of the range-diff.
+ 
+ 43. `docs: record patches 42 to 43 in the stack manifest` — B · none · watch: -
+ 
++44. `fonts: Compute FreeType glyph advances without the autohinter` — B · CI · watch: -
++
++45. `docs: record patches 44 to 45 in the stack manifest` — B · none · watch: -
++
+ ## Sync log
+ 
+ One entry per sync, newest first. Records the upstream range and every
