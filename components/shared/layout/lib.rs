@@ -641,6 +641,8 @@ pub struct ReflowResult {
     pub iframe_sizes: Option<IFrameSizes>,
     /// Enumerates web fonts that were added or removed as part of restyling.
     pub changed_web_fonts: WebFontSetDifference,
+    /// Whether font matching found web fonts that the page needs and started loading them.
+    pub started_web_font_loads: bool,
     /// The LCP candidate during this layout pass, if any.
     pub lcp_candidate: Option<LCPCandidate>,
     /// The UntrustedNodeAddress for the LCP candidate if any.
