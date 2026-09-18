@@ -22,6 +22,10 @@ disagree, `CONTRIBUTING.md` wins and this file must be fixed.
   verified by `check_stack.py` (`git am` onto the base must reproduce the
   tree). Its diff between syncs shows exactly which patches changed and
   how — the reviewable form of the range-diff.
+- `integrity` CI job: runs `docs/ohos-sync/check_integrity.py` on every PR,
+  i.e. `check_stack.py` against the PR head with the base derived from the
+  manifest length (CI has no `base/<date>` tags), and checks that this base
+  is an upstream commit.
 
 ## What a sync review consists of
 
