@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 20 Sep 2026 14:34:38 +0000
+Subject: [PATCH] docs: record patches 46 to 48 in the stack manifest
+
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 26f66952027..ec717f616f3 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -17,6 +17,13 @@ The checked-in `patches/` directory is generated from the stack by
+ `gen_patches.py` and verified by `check_stack.py`; never edit it by hand.
+ Its diff between syncs is the GitHub-viewable form of the range-diff.
+ 
++Vendored third-party code under `third_party/<crate>/<crate>` is left out of
++the patch files, which would otherwise carry megabytes of generated sources.
++Each `third_party/<crate>/update.sh` regenerates its directory from upstream
++plus the patches next to it, so after applying the stack to a fresh base, run
++those scripts (they need network access). `check_stack.py` runs each with
++`--check` to verify the committed copy.
++
+ 1. `docs: add the ohos-main sync runbook and stack manifest` — A · tooling · watch: -
+ 2. `docs: Mark this repo as an experimental OHOS downstream fork` — B · none · watch: -
+ 3. `Allow clearly marked AI assisted contributions` — B · none · watch: -
+@@ -78,6 +85,12 @@ Its diff between syncs is the GitHub-viewable form of the range-diff.
+ 
+ 45. `docs: record patches 44 to 45 in the stack manifest` — B · none · watch: -
+ 
++46. `docs/ohos-sync: keep vendored third-party code out of the patch files` — A · tooling · watch: -
++
++47. `third_party: vendor freetype-sys with the openharmony-rs patches` — B · CI · watch: components/fonts/platform/freetype
++
++48. `docs: record patches 46 to 48 in the stack manifest` — B · none · watch: -
++
+ ## Sync log
+ 
+ One entry per sync, newest first. Records the upstream range and every
