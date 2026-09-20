@@ -10,6 +10,10 @@ from pathlib import Path
 
 STACK_MD = Path(__file__).with_name("STACK.md")
 PATCH_DIR = Path(__file__).with_name("patches")
+REPO = Path(__file__).resolve().parents[2]
+# Vendored third-party code that `third_party/*/update.sh` writes. It is kept out of the patch
+# files, which would otherwise carry megabytes of generated sources; the scripts check it instead.
+GENERATED_DIRS = ["third_party/freetype-sys/freetype-sys"]
 ENTRY = re.compile(r"^(\d+)\. `([^`]+)` — (\S+) · (\S+)(?: · watch: (.*))?$")
 
 
@@ -24,6 +28,15 @@ class Patch:
 
 def git(*args: str, check: bool = True) -> str:
     return subprocess.run(["git", *args], check=check, capture_output=True, text=True).stdout
+
+
+def excluded_pathspecs() -> list[str]:
+    """Pathspecs for what the patch files leave out."""
+    return [f":!{PATCH_DIR.relative_to(REPO)}", *(f":!{d}" for d in GENERATED_DIRS)]
+
+
+def vendor_scripts() -> list[Path]:
+    return sorted(REPO.glob("third_party/*/update.sh"))
 
 
 def read_manifest() -> list[Patch]:

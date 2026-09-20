@@ -10,14 +10,14 @@ Usage: uv run docs/ohos-sync/gen_patches.py <base-ref> [head-ref]
 
 Commit hashes are zeroed so a patch file only changes when the patch itself
 (diff, message, trailers) or the upstream blobs it touches change. The
-patches directory is excluded from the diff of the commit that carries it.
+patches directory is excluded from the diff of the commit that carries it, and
+so is the vendored code that `third_party/*/update.sh` regenerates.
 """
 
 import shutil
 import sys
-from pathlib import Path
 
-from stacklib import PATCH_DIR, git
+from stacklib import PATCH_DIR, excluded_pathspecs, git
 
 
 def main() -> int:
@@ -27,7 +27,6 @@ def main() -> int:
     base, head = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "HEAD"
     shutil.rmtree(PATCH_DIR, ignore_errors=True)
     PATCH_DIR.mkdir()
-    exclude = f":!{PATCH_DIR.relative_to(Path.cwd())}"
     out = git(
         "format-patch",
         "--zero-commit",
@@ -38,7 +37,7 @@ def main() -> int:
         f"{base}..{head}",
         "--",
         ".",
-        exclude,
+        *excluded_pathspecs(),
     )
     print(f"wrote {len(out.splitlines())} patches to {PATCH_DIR}")
     return 0
