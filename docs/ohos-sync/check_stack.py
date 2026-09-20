@@ -10,15 +10,24 @@ Usage: uv run docs/ohos-sync/check_stack.py <base-ref> [head-ref]
 
 1. The ordered subjects in STACK.md must equal the git log.
 2. `git am` of docs/ohos-sync/patches/*.patch onto <base-ref> must reproduce
-   the head tree (ignoring the patches directory itself).
+   the head tree (ignoring the patches directory and the vendored third-party
+   code the patches leave out).
+3. Each `third_party/*/update.sh --check` must agree that the vendored code in
+   the working tree is what the script produces. This needs network access.
 """
 
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
 
-from stacklib import PATCH_DIR, git, read_manifest, stack_commits
+from stacklib import (
+    PATCH_DIR,
+    excluded_pathspecs,
+    git,
+    read_manifest,
+    stack_commits,
+    vendor_scripts,
+)
 
 
 def check_manifest(base: str, head: str) -> bool:
@@ -56,12 +65,22 @@ def check_patches(base: str, head: str) -> bool:
             applied = git("-C", tmp, "rev-parse", "HEAD").strip()
         finally:
             git("worktree", "remove", "--force", tmp)
-    diff = git("diff", "--stat", applied, head, "--", ".", f":!{PATCH_DIR.relative_to(Path.cwd())}")
+    diff = git("diff", "--stat", applied, head, "--", ".", *excluded_pathspecs())
     if diff:
         print("patch set does not reproduce the head tree:\n" + diff)
         return False
     print(f"patch set ok: {n} patches reproduce {head}")
     return True
+
+
+def check_vendored() -> bool:
+    """Run the third-party vendoring scripts against the working tree."""
+    ok = True
+    for script in vendor_scripts():
+        r = subprocess.run([script, "--check"], capture_output=True, text=True)
+        print(f"{script.parent.name}: {r.stdout.strip() or r.stderr.strip()}")
+        ok = r.returncode == 0 and ok
+    return ok
 
 
 def main() -> int:
@@ -71,6 +90,7 @@ def main() -> int:
     base, head = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "HEAD"
     ok = check_manifest(base, head)
     ok = check_patches(base, head) and ok
+    ok = check_vendored() and ok
     return 0 if ok else 1
 
 

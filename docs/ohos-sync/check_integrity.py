@@ -9,9 +9,10 @@
 Usage: uv run docs/ohos-sync/check_integrity.py [head-ref]
 
 The base is derived as `<head-ref>~<number of STACK.md entries>`; a shallow
-clone is deepened to reach it. Then `check_stack.py` runs against it, and the
-base must be an ancestor of servo/servo `main` (checked via the GitHub API,
-authenticated with $GITHUB_TOKEN if set). This is the `integrity` CI job.
+clone is deepened to reach it. Then `check_stack.py` runs against it, including
+the `third_party/*/update.sh --check` vendoring checks, and the base must be an
+ancestor of servo/servo `main` (checked via the GitHub API, authenticated with
+$GITHUB_TOKEN if set). This is the `integrity` CI job.
 """
 
 import json
@@ -20,7 +21,7 @@ import sys
 import urllib.error
 import urllib.request
 
-from check_stack import check_manifest, check_patches
+from check_stack import check_manifest, check_patches, check_vendored
 from stacklib import git, read_manifest
 
 
@@ -51,6 +52,7 @@ def main() -> int:
 
     ok = check_manifest(base, head)
     ok = check_patches(base, head) and ok
+    ok = check_vendored() and ok
     status = upstream_status(base)
     if status in ("ahead", "identical"):
         print("base ok: ancestor of servo/servo main")
