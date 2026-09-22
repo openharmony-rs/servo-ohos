@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 22 Sep 2026 19:33:14 +0000
+Subject: [PATCH] fonts: Do not create fonts for web font faces that are not
+ loaded yet
+
+Since @font-face rules are loaded lazily, the font store holds templates for
+faces whose data has not been downloaded. `FontGroupFamilyTemplate::font_if_matches`
+skips them, but `FontContext::matching_templates` and `FontContext::font` are
+also used directly by the SVG font resolver, which then hit the "Should never
+create a web font without data" panic in `PlatformFont::new_from_template` for
+any SVG `<text>` using a web font.
+
+`FontContext::font` now returns `None` for a web font template without data,
+without caching the failure, so the face can be used once it has loaded. The
+SVG font resolver asks for the face to be loaded, like layout does when it
+matches one, and falls back to the next family in the meantime.
+
+Fork note: fixes a regression from "fonts: Only load @font-face fonts that the
+page uses"; fold into it at the next sync.
+
+Testing: Fixes the CRASH in svg/painting/svg-with-outline.html,
+css/css-transforms/transform-box/view-box-mutation-002.html and
+resize-observer/svg.html, which are back to their expected FAIL / TIMEOUT.
+
+Validation: `./mach test-wpt --release svg resize-observer css/css-transforms/transform-box` (1355 tests): all as expected (all three crashed before).
+AI-assisted: Yes (agent session; root-caused from the servo-ohos PR 12 try run and written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/fonts/font_context.rs         | 11 +++++++++++
+ components/script/event_loop/svg_font.rs |  7 +++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/components/fonts/font_context.rs b/components/fonts/font_context.rs
+index 92a90ea27b1..62f29de37a2 100644
+--- a/components/fonts/font_context.rs
++++ b/components/fonts/font_context.rs
+@@ -294,6 +294,17 @@ impl FontContext {
+             return font;
+         }
+ 
++        // A web font template can describe a face that has not been downloaded yet. It
++        // cannot be turned into a `Font`, and caching the failure would hide the face
++        // once its data arrives.
++        if matches!(
++            &*font_template.identifier(),
++            FontIdentifier::Web(_) | FontIdentifier::ArrayBuffer(_)
++        ) && self.get_font_data(&font_template.identifier()).is_none()
++        {
++            return None;
++        }
++
+         debug!(
+             "FontContext::font cache miss for font_template={:?} font_descriptor={:?}",
+             font_template, font_descriptor
+diff --git a/components/script/event_loop/svg_font.rs b/components/script/event_loop/svg_font.rs
+index a29e32f800e..d70ca08599a 100644
+--- a/components/script/event_loop/svg_font.rs
++++ b/components/script/event_loop/svg_font.rs
+@@ -9,6 +9,7 @@ use fonts::{
+     FallbackFontSelectionOptions, FontContext, FontDescriptor, FontFamilyDescriptor,
+     FontSearchScope, fallback_font_families,
+ };
++use fonts_traits::FontTemplateRefMethods;
+ use net_traits::image_cache::FontResolver;
+ use resvg::usvg::{Font, FontFamily, FontStretch, FontStyle, fontdb};
+ use rustc_hash::FxHashMap;
+@@ -65,6 +66,12 @@ impl SvgFontResolver {
+                 continue;
+             };
+ 
++            // A face that has not been downloaded yet cannot be rasterized. Ask for it, like
++            // layout does when it matches the face, and fall back to the next family for now.
++            if let Some(font_face_rule) = font_template.font_face_rule() {
++                self.context.request_web_font_load(&font_face_rule);
++            }
++
+             let Some(font_ref) = self.context.font(font_template, &font_descriptor) else {
+                 continue;
+             };

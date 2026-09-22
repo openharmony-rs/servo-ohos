@@ -91,6 +91,14 @@ those scripts (they need network access). `check_stack.py` runs each with
 
 48. `docs: record patches 46 to 48 in the stack manifest` — B · none · watch: -
 
+49. `fonts: Do not create fonts for web font faces that are not loaded yet` — B · CI · watch: -
+
+50. `script: Delay the load event while web fonts are loading` — B · CI · watch: -
+
+51. `fonts: Load the first available web font of elements without text` — B · CI · watch: -
+
+52. `docs: record patches 49 to 52 in the stack manifest` — B · none · watch: -
+
 ## Sync log
 
 One entry per sync, newest first. Records the upstream range and every
