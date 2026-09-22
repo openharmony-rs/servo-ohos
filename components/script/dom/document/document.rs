@@ -32,7 +32,7 @@ use js::context::{JSContext, NoGC};
 use js::realm::CurrentRealm;
 use js::rust::{HandleObject, HandleValue, MutableHandleValue};
 use layout_api::{
-    PendingRestyle, ReflowGoal, ReflowPhasesRun, ReflowStatistics, RestyleReason,
+    PendingRestyle, QueryMsg, ReflowGoal, ReflowPhasesRun, ReflowStatistics, RestyleReason,
     ScrollContainerQueryFlags, TrustedNodeAddress,
 };
 use metrics::{InteractiveFlag, InteractiveWindow, ProgressiveWebMetrics};
@@ -79,7 +79,7 @@ use time::Duration as TimeDuration;
 use url::{Host, Position};
 
 use crate::animations::Animations;
-use crate::document_loader::{DocumentLoader, LoadType};
+use crate::document_loader::{DocumentLoader, LoadBlocker, LoadType};
 use crate::dom::FlatTreeParent;
 use crate::dom::animationtimeline::AnimationTimeline;
 use crate::dom::attr::Attr;
@@ -538,6 +538,8 @@ pub(crate) struct Document {
     delayed_tasks: DomRefCell<Vec<Box<dyn NonSendTaskBox>>>,
     /// <https://html.spec.whatwg.org/multipage/#completely-loaded>
     completely_loaded: Cell<bool>,
+    /// Delays the load event while web fonts that the page needs are loading.
+    web_font_load_blocker: DomRefCell<Option<LoadBlocker>>,
     /// Set of shadow roots connected to the document tree.
     shadow_roots: DomRefCell<HashSet<Dom<ShadowRoot>>>,
     /// Whether any of the shadow roots need the stylesheets flushed.
@@ -2651,7 +2653,7 @@ impl Document {
     }
 
     /// Step 8 of <https://html.spec.whatwg.org/multipage/#the-end>
-    pub(crate) fn wait_until_load_blockers_have_resolved(&self, _cx: &mut JSContext) {
+    pub(crate) fn wait_until_load_blockers_have_resolved(&self, cx: &mut JSContext) {
         if self.current_the_end_loading_phase.get() !=
             TheEndLoadingPhase::WaitingForLoadEventBlockers
         {
@@ -2678,10 +2680,43 @@ impl Document {
             }
         }
 
+        // Web fonts are only loaded once layout finds text that needs them, so lay out
+        // pending changes, such as stylesheets that just finished loading, to let the fonts
+        // they need delay the load event.
+        if !self.restyle_reason(cx.no_gc()).is_empty() {
+            self.window()
+                .reflow(cx, ReflowGoal::LayoutQuery(QueryMsg::BoxArea));
+            if self.loader.borrow().is_blocked() {
+                return;
+            }
+        }
+
         self.current_the_end_loading_phase
             .set(TheEndLoadingPhase::Done);
         // TODO(43149): Add when document replacement is implemented
         // self.queue_document_completion(cx);
+    }
+
+    /// Delay the load event while web fonts are loading, so that `load` event handlers see
+    /// the page laid out with the fonts that it needs.
+    pub(crate) fn delay_load_event_for_web_fonts(&self) {
+        if self.current_the_end_loading_phase.get() == TheEndLoadingPhase::Done ||
+            self.web_font_load_blocker.borrow().is_some() ||
+            self.window().font_context().web_fonts_still_loading() == 0
+        {
+            return;
+        }
+        *self.web_font_load_blocker.borrow_mut() = Some(LoadBlocker::new(self, LoadType::WebFonts));
+    }
+
+    /// Stop delaying the load event once all web fonts that were loading have been applied.
+    pub(crate) fn maybe_stop_delaying_load_event_for_web_fonts(&self, cx: &mut JSContext) {
+        if self.web_font_load_blocker.borrow().is_none() ||
+            self.window().font_context().web_fonts_still_loading() != 0
+        {
+            return;
+        }
+        LoadBlocker::terminate(&self.web_font_load_blocker, cx);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#destroy-a-document-and-its-descendants>
@@ -3803,6 +3838,7 @@ impl Document {
             navigation_timing: Default::default(),
             resource_fetch_timing: RefCell::new(None),
             completely_loaded: Cell::new(false),
+            web_font_load_blocker: Default::default(),
             script_and_layout_blockers: Cell::new(0),
             delayed_tasks: Default::default(),
             shadow_roots: DomRefCell::new(HashSet::new()),
