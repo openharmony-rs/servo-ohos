@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 22 Sep 2026 19:51:28 +0000
+Subject: [PATCH] docs: record patches 49 to 52 in the stack manifest
+
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index ec717f616f3..75341c99403 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -91,6 +91,14 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 
+ 48. `docs: record patches 46 to 48 in the stack manifest` — B · none · watch: -
+ 
++49. `fonts: Do not create fonts for web font faces that are not loaded yet` — B · CI · watch: -
++
++50. `script: Delay the load event while web fonts are loading` — B · CI · watch: -
++
++51. `fonts: Load the first available web font of elements without text` — B · CI · watch: -
++
++52. `docs: record patches 49 to 52 in the stack manifest` — B · none · watch: -
++
+ ## Sync log
+ 
+ One entry per sync, newest first. Records the upstream range and every
