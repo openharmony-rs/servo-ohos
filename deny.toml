@@ -222,8 +222,9 @@ skip = [
     "wgpu-types",
 ]
 
-# github.com organizations to allow git sources for
+# github.com organizations to allow git sources for. Stylo, the only git dependency upstream,
+# is vendored in third_party/stylo, and cargo-deny warns about allowed organizations without a
+# git source, which test-tidy treats as an error. Restore the `servo` entry when a git
+# dependency comes back.
 [sources.allow-org]
-github = [
-    "servo",
-]
+github = []
