@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Vendors freetype-sys into freetype-sys/: upstream at UPSTREAM_COMMIT with patches/*.patch
-# applied, and libpng LIBPNG_VERSION and FreeType FREETYPE_VERSION vendored from their own
-# upstreams with the crate's update-libpng.sh and update-freetype.sh.
+# Vendors freetype-sys into third_party/freetype-sys/: upstream at UPSTREAM_COMMIT with the
+# patches in this directory applied, and libpng LIBPNG_VERSION and FreeType FREETYPE_VERSION
+# vendored from their own upstreams with the crate's update-libpng.sh and update-freetype.sh.
 #
-#   ./update.sh                                Replace freetype-sys/ and stage it.
-#   ./update.sh --check                        Compare freetype-sys/ with a fresh vendoring; exit
-#                                              non-zero if they differ.
-#   ./update.sh --export-patches <repo> <rev>  Replace patches/ with the commits from
+#   ./update.sh                                Replace third_party/freetype-sys/ and stage it.
+#   ./update.sh --check                        Compare third_party/freetype-sys/ with a fresh
+#                                              vendoring; exit non-zero if they differ.
+#   ./update.sh --export-patches <repo> <rev>  Replace the patches here with the commits from
 #                                              UPSTREAM_COMMIT to <rev> in the freetype-sys
 #                                              checkout <repo>. Commits that only write the
 #                                              vendored libpng and FreeType sources are left out,
@@ -48,6 +48,8 @@ FREETYPE_SUBMODULE=(
 )
 
 cd "$(dirname "$0")"
+repo_root=$(git rev-parse --show-toplevel)
+vendored_dir=$repo_root/third_party/freetype-sys
 
 usage() {
     sed -n '2,15s/^# \{0,1\}//p' "$0" >&2
@@ -58,8 +60,7 @@ if [ "${1-}" = --export-patches ]; then
     [ $# -eq 3 ] || usage
     repo=$2
     rev=$3
-    rm -f patches/*.patch
-    mkdir -p patches
+    rm -f ./*.patch
     number=1
     for commit in $(git -C "$repo" rev-list --reverse --no-merges "$UPSTREAM_COMMIT..$rev"); do
         # libpng/ and freetype2/ hold vendored upstream sources, which this script vendors with
@@ -70,10 +71,10 @@ if [ "${1-}" = --export-patches ]; then
             continue
         fi
         git -C "$repo" format-patch --quiet --zero-commit --no-signature --start-number "$number" \
-            -o "$PWD/patches" -1 "$commit"
+            -o "$PWD" -1 "$commit"
         number=$((number + 1))
     done
-    echo "Exported $((number - 1)) patches to patches/."
+    echo "Exported $((number - 1)) patches to $PWD."
     exit 0
 fi
 
@@ -91,7 +92,7 @@ crate="$work/crate"
 git init -q "$crate"
 git -C "$crate" fetch -q --depth 1 "$UPSTREAM" "$UPSTREAM_COMMIT"
 git -C "$crate" checkout -q FETCH_HEAD
-git -C "$crate" -c user.name=update.sh -c user.email=update.sh@invalid am -q --whitespace=nowarn "$PWD"/patches/*.patch
+git -C "$crate" -c user.name=update.sh -c user.email=update.sh@invalid am -q --whitespace=nowarn "$PWD"/*.patch
 "$crate/update-libpng.sh" "$LIBPNG_VERSION" > /dev/null
 if [ -x "$crate/update-freetype.sh" ]; then
     "$crate/update-freetype.sh" "$FREETYPE_VERSION" > /dev/null
@@ -111,16 +112,16 @@ for path in "${VENDORED[@]}"; do
 done
 
 if $check; then
-    if git diff --no-index --quiet freetype-sys "$vendored"; then
-        echo "freetype-sys/ is up to date."
+    if git diff --no-index --quiet "$vendored_dir" "$vendored"; then
+        echo "third_party/freetype-sys/ is up to date."
         exit 0
     fi
-    { git diff --no-index --stat freetype-sys "$vendored" || true; } | sed "s#$vendored#(fresh)#"
-    echo "freetype-sys/ differs from a fresh vendoring."
+    { git diff --no-index --stat "$vendored_dir" "$vendored" || true; } | sed "s#$vendored#(fresh)#"
+    echo "third_party/freetype-sys/ differs from a fresh vendoring."
     exit 1
 fi
 
-rm -rf freetype-sys
-mv "$vendored" freetype-sys
-git add --all --force freetype-sys
-echo "Vendored and staged freetype-sys in freetype-sys/."
+rm -rf "$vendored_dir"
+mv "$vendored" "$vendored_dir"
+git -C "$repo_root" add --all --force third_party/freetype-sys
+echo "Vendored and staged freetype-sys in third_party/freetype-sys/."

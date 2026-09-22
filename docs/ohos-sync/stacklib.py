@@ -11,11 +11,10 @@ from pathlib import Path
 STACK_MD = Path(__file__).with_name("STACK.md")
 PATCH_DIR = Path(__file__).with_name("patches")
 REPO = Path(__file__).resolve().parents[2]
-# Vendored third-party code that the update.sh scripts under third_party/ write, next to the
-# patches (third_party/patches/<name>/update.sh) or in the crate's own directory
-# (third_party/<crate>/update.sh). It is kept out of the patch files, which would otherwise carry
-# megabytes of generated sources; the scripts check it instead.
-GENERATED_DIRS = ["third_party/freetype-sys/freetype-sys", "third_party/stylo"]
+# Vendored third-party code that third_party/patches/<name>/update.sh writes. It is kept out of the
+# patch files, which would otherwise carry megabytes of generated sources; the scripts check it
+# instead.
+GENERATED_DIRS = ["third_party/freetype-sys", "third_party/stylo"]
 ENTRY = re.compile(r"^(\d+)\. `([^`]+)` — (\S+) · (\S+)(?: · watch: (.*))?$")
 
 
@@ -38,7 +37,7 @@ def excluded_pathspecs() -> list[str]:
 
 
 def vendor_scripts() -> list[Path]:
-    return sorted([*REPO.glob("third_party/patches/*/update.sh"), *REPO.glob("third_party/*/update.sh")])
+    return sorted(REPO.glob("third_party/patches/*/update.sh"))
 
 
 def read_manifest() -> list[Patch]:
