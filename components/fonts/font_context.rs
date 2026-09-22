@@ -218,6 +218,16 @@ impl FontContext {
         }
     }
 
+    /// Ask for the first available font for `style` to be loaded if it is a web font that has
+    /// not been fetched yet. See [`FontGroup::request_first_available_web_font`].
+    pub fn request_first_available_web_font(&self, style: ServoArc<FontStyleStruct>) {
+        if self.web_fonts.read().families.is_empty() {
+            return;
+        }
+        self.font_group(style)
+            .request_first_available_web_font(self);
+    }
+
     /// Returns a `FontGroup` representing fonts which can be used for layout, given the `style`.
     /// Font groups are cached, so subsequent calls with the same `style` will return a reference
     /// to an existing `FontGroup`.
