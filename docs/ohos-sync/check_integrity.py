@@ -10,9 +10,9 @@ Usage: uv run docs/ohos-sync/check_integrity.py [head-ref]
 
 The base is derived as `<head-ref>~<number of STACK.md entries>`; a shallow
 clone is deepened to reach it. Then `check_stack.py` runs against it, including
-the `third_party/*/update.sh --check` vendoring checks, and the base must be an
-ancestor of servo/servo `main` (checked via the GitHub API, authenticated with
-$GITHUB_TOKEN if set). This is the `integrity` CI job.
+the `--check` runs of the vendoring scripts under third_party/, and the base
+must be an ancestor of servo/servo `main` (checked via the GitHub API,
+authenticated with $GITHUB_TOKEN if set). This is the `integrity` CI job.
 """
 
 import json

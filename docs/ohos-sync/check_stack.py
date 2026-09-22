@@ -12,8 +12,10 @@ Usage: uv run docs/ohos-sync/check_stack.py <base-ref> [head-ref]
 2. `git am` of docs/ohos-sync/patches/*.patch onto <base-ref> must reproduce
    the head tree (ignoring the patches directory and the vendored third-party
    code the patches leave out).
-3. Each `third_party/*/update.sh --check` must agree that the vendored code in
-   the working tree is what the script produces. This needs network access.
+3. Each vendoring script under third_party/ (`third_party/patches/<name>/update.sh`
+   or `third_party/<crate>/update.sh`) run with `--check` must agree that the
+   vendored code in the working tree is what it produces. This needs network
+   access.
 """
 
 import subprocess
@@ -22,6 +24,7 @@ import tempfile
 
 from stacklib import (
     PATCH_DIR,
+    REPO,
     excluded_pathspecs,
     git,
     read_manifest,
@@ -78,7 +81,7 @@ def check_vendored() -> bool:
     ok = True
     for script in vendor_scripts():
         r = subprocess.run([script, "--check"], capture_output=True, text=True)
-        print(f"{script.parent.name}: {r.stdout.strip() or r.stderr.strip()}")
+        print(f"{script.relative_to(REPO)}: {r.stdout.strip() or r.stderr.strip()}")
         ok = r.returncode == 0 and ok
     return ok
 
