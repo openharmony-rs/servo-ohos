@@ -294,6 +294,17 @@ impl FontContext {
             return font;
         }
 
+        // A web font template can describe a face that has not been downloaded yet. It
+        // cannot be turned into a `Font`, and caching the failure would hide the face
+        // once its data arrives.
+        if matches!(
+            &*font_template.identifier(),
+            FontIdentifier::Web(_) | FontIdentifier::ArrayBuffer(_)
+        ) && self.get_font_data(&font_template.identifier()).is_none()
+        {
+            return None;
+        }
+
         debug!(
             "FontContext::font cache miss for font_template={:?} font_descriptor={:?}",
             font_template, font_descriptor
