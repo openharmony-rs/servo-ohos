@@ -1,0 +1,264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 23 Sep 2026 04:54:46 +0000
+Subject: [PATCH] script: Render SVG text again once the web font it uses has
+ loaded
+
+usvg turns SVG text into paths when it parses the image, using the fonts that
+the SVG font resolver hands it at that point. Since web fonts are loaded
+lazily, the resolver often sees a face that has not been downloaded yet, asks
+for it and falls back. The parsed image is cached under the element's
+serialized `data:` URL, so the text kept the fallback, or was not drawn at all
+when the web font was the only family, even after the font had loaded.
+
+The SVG font resolver now records on the `FontContext` when it skipped a face
+that is still unloaded or loading. When a batch of web font loads is applied
+and that happened, every serialized `<svg>` element that contains text is
+invalidated, which evicts its parsed and rasterized image and serializes it
+again, so that it is parsed with the loaded font.
+
+Fork note: follow-up to "fonts: Do not create fonts for web font faces that
+are not loaded yet"; fold into the lazy loading patches at the next sync.
+
+Testing: New test tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font.html,
+which fails without this change.
+
+Validation: the new reftest passes 3 of 3 runs (fails 3 of 3 without this change); `./mach test-wpt --release svg resize-observer css/css-transforms/transform-box` (1355 tests) all as expected; `css/css-fonts css/css-font-loading html/canvas/element/text` (704 tests): only font-variant-emoji-1 FAIL, which happens without an emoji font installed on plain ohos-main too. Headless screenshot of a page with SVG `<text>` in a web font Ahem: 20000 green pixels (two 100x100 squares) vs 0 before.
+AI-assisted: Yes (agent session; designed, written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/fonts/font_context.rs              | 17 +++++++++++++++++
+ components/script/dom/document/document.rs    | 19 +++++++++++++++++++
+ components/script/dom/svg/svgsvgelement.rs    | 18 +++++++++++++++++-
+ components/script/dom/window/window.rs        |  5 +++++
+ components/script/event_loop/svg_font.rs      | 12 ++++++++++--
+ tests/wpt/mozilla/meta/MANIFEST.json          | 17 +++++++++++++++++
+ .../mozilla/svg/svg-text-web-font-ref.html    |  7 +++++++
+ .../tests/mozilla/svg/svg-text-web-font.html  | 14 ++++++++++++++
+ 8 files changed, 106 insertions(+), 3 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font-ref.html
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font.html
+
+diff --git a/components/fonts/font_context.rs b/components/fonts/font_context.rs
+index 44369799bc0..98898558552 100644
+--- a/components/fonts/font_context.rs
++++ b/components/fonts/font_context.rs
+@@ -130,6 +130,10 @@ pub struct FontContext {
+     /// The number of fonts that are currently loading.
+     number_of_loading_web_fonts: AtomicUsize,
+ 
++    /// Whether an SVG image was rendered with a fallback because a web font that it uses
++    /// was not loaded yet.
++    svg_waiting_for_web_font: AtomicBool,
++
+     /// The `@font-face` rules that font matching has selected, but whose `src` has not been
+     /// fetched yet. Filled in while laying out and drained by
+     /// [`FontContextWebFontMethods::process_pending_web_font_loads`] afterwards.
+@@ -200,6 +204,7 @@ impl FontContext {
+             known_font_face_rules: Default::default(),
+             font_feature_value_map: Default::default(),
+             number_of_loading_web_fonts: Default::default(),
++            svg_waiting_for_web_font: Default::default(),
+             pending_web_font_loads: Default::default(),
+             used_font_families: Default::default(),
+         }
+@@ -1120,6 +1125,18 @@ impl FontContext {
+             .is_some_and(|family| self.is_font_family_used(&family.name.clone().into()))
+     }
+ 
++    /// Record that an SVG image was rendered with a fallback font because a web font that
++    /// it uses has not been loaded yet.
++    pub fn note_svg_waiting_for_web_font(&self) {
++        self.svg_waiting_for_web_font.store(true, Ordering::Relaxed);
++    }
++
++    /// Whether an SVG image was rendered with a fallback font for a web font that was not
++    /// loaded yet since the last call, and so might look different now.
++    pub fn take_svg_waiting_for_web_font(&self) -> bool {
++        self.svg_waiting_for_web_font.swap(false, Ordering::Relaxed)
++    }
++
+     /// Whether any web font loads have been asked for but not started yet.
+     pub fn has_pending_web_font_loads(&self) -> bool {
+         !self.pending_web_font_loads.lock().is_empty()
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 47c07af83d3..2160ab2beb6 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -204,6 +204,7 @@ use crate::dom::selection::Selection;
+ use crate::dom::servoparser::ServoParser;
+ use crate::dom::shadowroot::ShadowRoot;
+ use crate::dom::storageevent::StorageEvent;
++use crate::dom::svg::svgsvgelement::SVGSVGElement;
+ use crate::dom::text::Text;
+ use crate::dom::textevent::TextEvent;
+ use crate::dom::touchevent::TouchEvent as DomTouchEvent;
+@@ -1622,6 +1623,24 @@ impl Document {
+         }
+     }
+ 
++    /// Render the `<svg>` elements that contain text again, for instance because a web font
++    /// that their text might use has loaded.
++    pub(crate) fn invalidate_svg_images_with_text(&self, no_gc: &NoGC) {
++        let Some(root) = self.GetDocumentElement() else {
++            return;
++        };
++        for node in root
++            .upcast::<Node>()
++            .traverse_preorder_non_rooting(no_gc, ShadowIncluding::Yes)
++        {
++            if let Some(svg) = node.downcast::<SVGSVGElement>() &&
++                svg.contains_text(no_gc)
++            {
++                svg.invalidate_cached_serialized_subtree_and_rasterization_result(no_gc);
++            }
++        }
++    }
++
+     /// <https://drafts.csswg.org/cssom-view/#document-run-the-scroll-steps>
+     pub(crate) fn run_the_scroll_steps(&self, cx: &mut JSContext) {
+         // Step 1: For each scrolling box `box` that was scrolled:
+diff --git a/components/script/dom/svg/svgsvgelement.rs b/components/script/dom/svg/svgsvgelement.rs
+index 36447916221..7dcc175b8f2 100644
+--- a/components/script/dom/svg/svgsvgelement.rs
++++ b/components/script/dom/svg/svgsvgelement.rs
+@@ -163,7 +163,23 @@ impl SVGSVGElement {
+         let _ = root_node.AppendChild(cx, &cloned_node);
+     }
+ 
+-    fn invalidate_cached_serialized_subtree_and_rasterization_result(&self, no_gc: &NoGC) {
++    /// Whether this element has been serialized into an image and contains SVG text.
++    pub(crate) fn contains_text(&self, no_gc: &NoGC) -> bool {
++        matches!(*self.cached_serialized_data_url.borrow(), Some(Ok(_))) &&
++            self.upcast::<Node>()
++                .traverse_preorder_non_rooting(no_gc, ShadowIncluding::No)
++                .any(|node| {
++                    node.downcast::<Element>().is_some_and(|element| {
++                        *element.namespace() == ns!(svg) &&
++                            element.local_name() == &local_name!("text")
++                    })
++                })
++    }
++
++    pub(crate) fn invalidate_cached_serialized_subtree_and_rasterization_result(
++        &self,
++        no_gc: &NoGC,
++    ) {
+         let owner_window = self.owner_window();
+         owner_window
+             .image_cache()
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index cd82ed10193..c35ac4ad9e0 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -2853,6 +2853,11 @@ impl Window {
+         if pending.affects_laid_out_text {
+             document.dirty_all_nodes(cx.no_gc());
+         }
++        // Text in SVG images is turned into paths when the image is parsed, so an image that
++        // fell back to another font has to be parsed again to use the web font.
++        if self.font_context().take_svg_waiting_for_web_font() {
++            document.invalidate_svg_images_with_text(cx.no_gc());
++        }
+         document.Fonts(cx).update_css_connected_face_statuses(cx);
+         self.font_context()
+             .decrement_count_of_loading_fonts(pending.count);
+diff --git a/components/script/event_loop/svg_font.rs b/components/script/event_loop/svg_font.rs
+index d70ca08599a..deb8995f549 100644
+--- a/components/script/event_loop/svg_font.rs
++++ b/components/script/event_loop/svg_font.rs
+@@ -9,7 +9,7 @@ use fonts::{
+     FallbackFontSelectionOptions, FontContext, FontDescriptor, FontFamilyDescriptor,
+     FontSearchScope, fallback_font_families,
+ };
+-use fonts_traits::FontTemplateRefMethods;
++use fonts_traits::{FontTemplateRefMethods, WebFontLoadState};
+ use net_traits::image_cache::FontResolver;
+ use resvg::usvg::{Font, FontFamily, FontStretch, FontStyle, fontdb};
+ use rustc_hash::FxHashMap;
+@@ -68,8 +68,16 @@ impl SvgFontResolver {
+ 
+             // A face that has not been downloaded yet cannot be rasterized. Ask for it, like
+             // layout does when it matches the face, and fall back to the next family for now.
+-            if let Some(font_face_rule) = font_template.font_face_rule() {
++            // The SVG is rendered again once the face has loaded.
++            if let Some(font_face_rule) = font_template.font_face_rule() &&
++                matches!(
++                    font_face_rule.load_state(),
++                    WebFontLoadState::Unloaded | WebFontLoadState::Loading
++                )
++            {
+                 self.context.request_web_font_load(&font_face_rule);
++                self.context.note_svg_waiting_for_web_font();
++                continue;
+             }
+ 
+             let Some(font_ref) = self.context.font(font_template, &font_descriptor) else {
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 7025ff2fac6..0b699439a83 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -8179,6 +8179,19 @@
+        {}
+       ]
+      ],
++     "svg-text-web-font.html": [
++      "a9117f27538e04fd9d4f473399c80bbbe7180ba8",
++      [
++       null,
++       [
++        [
++         "/_mozilla/mozilla/svg/svg-text-web-font-ref.html",
++         "=="
++        ]
++       ],
++       {}
++      ]
++     ],
+      "svg.html": [
+       "5b57e5f27c34b1b73e9b3d91a5fd472606be7b73",
+       [
+@@ -11167,6 +11180,10 @@
+      "svg-relative-units-ref.html": [
+       "4631d475a68d0a99c43475887e5d644b49ecfff7",
+       []
++     ],
++     "svg-text-web-font-ref.html": [
++      "e1dbbb1c78b2f8c0f12fb0249ac93b2db22c516d",
++      []
+      ]
+     },
+     "table-valign-bottom-ref.html": [
+diff --git a/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font-ref.html b/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font-ref.html
+new file mode 100644
+index 00000000000..e1dbbb1c78b
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font-ref.html
+@@ -0,0 +1,7 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<style>
++body { margin: 0; }
++div { position: absolute; left: 0; top: 20px; width: 200px; height: 100px; background: green; }
++</style>
++<div></div>
+diff --git a/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font.html b/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font.html
+new file mode 100644
+index 00000000000..a9117f27538
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font.html
+@@ -0,0 +1,14 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>SVG text is rendered again with a web font once it has loaded</title>
++<link rel="match" href="svg-text-web-font-ref.html">
++<style>
++@font-face {
++  font-family: "TestWebFont";
++  src: url(/fonts/Ahem.ttf);
++}
++body { margin: 0; }
++</style>
++<svg width="300" height="150">
++  <text x="0" y="100" font-family="TestWebFont" font-size="100" fill="green">XX</text>
++</svg>

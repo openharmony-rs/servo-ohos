@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 23 Sep 2026 06:53:12 +0000
+Subject: [PATCH] docs: record patches 53 to 57 in the stack manifest
+
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 75341c99403..aa422974f1a 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -99,6 +99,16 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 
+ 52. `docs: record patches 49 to 52 in the stack manifest` — B · none · watch: -
+ 
++53. `squash! storage: add an OHOS RDB backend for webstorage, client_storage and indexeddb` — B · CI · watch: -
++
++54. `squash! fonts: Report the load state of @font-face rules in FontFace.status` — B · CI · watch: -
++
++55. `tests: Expect the two responsive-iframe allow-origins failures of the base` — B · CI · watch: -
++
++56. `script: Render SVG text again once the web font it uses has loaded` — B · CI · watch: components/net/image_cache.rs
++
++57. `docs: record patches 53 to 57 in the stack manifest` — B · none · watch: -
++
+ ## Sync log
+ 
+ One entry per sync, newest first. Records the upstream range and every

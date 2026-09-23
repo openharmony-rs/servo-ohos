@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 23 Sep 2026 06:52:17 +0000
+Subject: [PATCH] squash! fonts: Report the load state of @font-face rules in
+ FontFace.status
+
+Restore the expectations of css/css-fonts/font-variant-emoji-2.html and
+css/css-fonts/matching/font-unicode-presented-as-emoji-outline.html, which
+that patch removed as stale.
+
+They are not stale: both tests fail on Servo whenever a colour emoji font is
+installed, which is the case on the CI runners of this fork and of upstream
+alike, and upstream carries the same `expected: FAIL` for both. They only pass
+in a container without an emoji font, which is what the patch was validated
+in, so removing them made every CI run of this fork report two stable
+unexpected failures that upstream does not see.
+
+The restored files are byte-identical to upstream's, so nothing here diverges
+from upstream any more.
+
+Squash candidate: fold into the FontFace.status patch at the next sync.
+
+Validation: with fonts-noto-color-emoji installed (the CI configuration, which reproduces the CI failures) `./mach test-wpt --release css/css-fonts/font-variant-emoji-2.html css/css-fonts/matching/font-unicode-presented-as-emoji-outline.html` reports both as expected; both also fail with an upstream-only release build, and the two files match `upstream/main` exactly.
+AI-assisted: Yes (agent session; root-caused and written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ tests/wpt/meta/css/css-fonts/font-variant-emoji-2.html.ini      | 2 ++
+ .../matching/font-unicode-presented-as-emoji-outline.html.ini   | 2 ++
+ 2 files changed, 4 insertions(+)
+ create mode 100644 tests/wpt/meta/css/css-fonts/font-variant-emoji-2.html.ini
+ create mode 100644 tests/wpt/meta/css/css-fonts/matching/font-unicode-presented-as-emoji-outline.html.ini
+
+diff --git a/tests/wpt/meta/css/css-fonts/font-variant-emoji-2.html.ini b/tests/wpt/meta/css/css-fonts/font-variant-emoji-2.html.ini
+new file mode 100644
+index 00000000000..68aae843f87
+--- /dev/null
++++ b/tests/wpt/meta/css/css-fonts/font-variant-emoji-2.html.ini
+@@ -0,0 +1,2 @@
++[font-variant-emoji-2.html]
++  expected: FAIL
+diff --git a/tests/wpt/meta/css/css-fonts/matching/font-unicode-presented-as-emoji-outline.html.ini b/tests/wpt/meta/css/css-fonts/matching/font-unicode-presented-as-emoji-outline.html.ini
+new file mode 100644
+index 00000000000..2fc262eff9f
+--- /dev/null
++++ b/tests/wpt/meta/css/css-fonts/matching/font-unicode-presented-as-emoji-outline.html.ini
+@@ -0,0 +1,2 @@
++[font-unicode-presented-as-emoji-outline.html]
++  expected: FAIL
