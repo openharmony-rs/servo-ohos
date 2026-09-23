@@ -17,9 +17,9 @@ The checked-in `patches/` directory is generated from the stack by
 `gen_patches.py` and verified by `check_stack.py`; never edit it by hand.
 Its diff between syncs is the GitHub-viewable form of the range-diff.
 
-Vendored third-party code under `third_party/<crate>/<crate>` is left out of
-the patch files, which would otherwise carry megabytes of generated sources.
-Each `third_party/<crate>/update.sh` regenerates its directory from upstream
+Vendored third-party code under `third_party/<name>` is left out of the patch
+files, which would otherwise carry megabytes of generated sources. Each
+`third_party/patches/<name>/update.sh` regenerates its directory from upstream
 plus the patches next to it, so after applying the stack to a fresh base, run
 those scripts (they need network access). `check_stack.py` runs each with
 `--check` to verify the committed copy.
@@ -108,6 +108,14 @@ those scripts (they need network access). `check_stack.py` runs each with
 56. `script: Render SVG text again once the web font it uses has loaded` — B · CI · watch: components/net/image_cache.rs
 
 57. `docs: record patches 53 to 57 in the stack manifest` — B · none · watch: -
+
+58. `docs/ohos-sync: find vendoring scripts under third_party/patches too` — A · tooling · watch: -
+
+59. `third_party: vendor Stylo with the eager pseudo-element cascade skip` — B · CI · watch: Cargo.toml deny.toml components/layout/query.rs components/script/layout_dom/servo_layout_element.rs
+
+60. `third_party: move freetype-sys to the third_party/patches layout` — B · CI · watch: -
+
+61. `docs: record patches 58 to 61 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 22 Sep 2026 13:58:08 +0000
+Subject: [PATCH] docs/ohos-sync: find vendoring scripts under
+ third_party/patches too
+
+Vendored trees that are a whole upstream repository, like Stylo, live
+directly in third_party/<name> with their update.sh and patches in
+third_party/patches/<name>, so that the vendored directory holds nothing
+but upstream files. Let the stack tooling find those scripts next to the
+older third_party/<crate>/update.sh layout, and list third_party/stylo
+among the generated directories the patch files leave out.
+
+Validation: `uv run ruff check docs/ohos-sync` and `uv run ruff format
+--check docs/ohos-sync` pass; `uv run docs/ohos-sync/check_stack.py
+base/2026-08-29` at the tip of this branch reports the manifest, the patch
+set and both vendored directories as ok.
+AI-assisted: Yes (agent session; written and tested by the agent)
+
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/check_integrity.py |  6 +++---
+ docs/ohos-sync/check_stack.py     |  9 ++++++---
+ docs/ohos-sync/stacklib.py        | 10 ++++++----
+ 3 files changed, 15 insertions(+), 10 deletions(-)
+
+diff --git a/docs/ohos-sync/check_integrity.py b/docs/ohos-sync/check_integrity.py
+index 13d1afb36d5..f82ee4d0574 100644
+--- a/docs/ohos-sync/check_integrity.py
++++ b/docs/ohos-sync/check_integrity.py
+@@ -10,9 +10,9 @@ Usage: uv run docs/ohos-sync/check_integrity.py [head-ref]
+ 
+ The base is derived as `<head-ref>~<number of STACK.md entries>`; a shallow
+ clone is deepened to reach it. Then `check_stack.py` runs against it, including
+-the `third_party/*/update.sh --check` vendoring checks, and the base must be an
+-ancestor of servo/servo `main` (checked via the GitHub API, authenticated with
+-$GITHUB_TOKEN if set). This is the `integrity` CI job.
++the `--check` runs of the vendoring scripts under third_party/, and the base
++must be an ancestor of servo/servo `main` (checked via the GitHub API,
++authenticated with $GITHUB_TOKEN if set). This is the `integrity` CI job.
+ """
+ 
+ import json
+diff --git a/docs/ohos-sync/check_stack.py b/docs/ohos-sync/check_stack.py
+index b0efa26175c..d08c4c5a4a5 100644
+--- a/docs/ohos-sync/check_stack.py
++++ b/docs/ohos-sync/check_stack.py
+@@ -12,8 +12,10 @@ Usage: uv run docs/ohos-sync/check_stack.py <base-ref> [head-ref]
+ 2. `git am` of docs/ohos-sync/patches/*.patch onto <base-ref> must reproduce
+    the head tree (ignoring the patches directory and the vendored third-party
+    code the patches leave out).
+-3. Each `third_party/*/update.sh --check` must agree that the vendored code in
+-   the working tree is what the script produces. This needs network access.
++3. Each vendoring script under third_party/ (`third_party/patches/<name>/update.sh`
++   or `third_party/<crate>/update.sh`) run with `--check` must agree that the
++   vendored code in the working tree is what it produces. This needs network
++   access.
+ """
+ 
+ import subprocess
+@@ -22,6 +24,7 @@ import tempfile
+ 
+ from stacklib import (
+     PATCH_DIR,
++    REPO,
+     excluded_pathspecs,
+     git,
+     read_manifest,
+@@ -78,7 +81,7 @@ def check_vendored() -> bool:
+     ok = True
+     for script in vendor_scripts():
+         r = subprocess.run([script, "--check"], capture_output=True, text=True)
+-        print(f"{script.parent.name}: {r.stdout.strip() or r.stderr.strip()}")
++        print(f"{script.relative_to(REPO)}: {r.stdout.strip() or r.stderr.strip()}")
+         ok = r.returncode == 0 and ok
+     return ok
+ 
+diff --git a/docs/ohos-sync/stacklib.py b/docs/ohos-sync/stacklib.py
+index 019d6099cfc..1d924e7a6ba 100644
+--- a/docs/ohos-sync/stacklib.py
++++ b/docs/ohos-sync/stacklib.py
+@@ -11,9 +11,11 @@ from pathlib import Path
+ STACK_MD = Path(__file__).with_name("STACK.md")
+ PATCH_DIR = Path(__file__).with_name("patches")
+ REPO = Path(__file__).resolve().parents[2]
+-# Vendored third-party code that `third_party/*/update.sh` writes. It is kept out of the patch
+-# files, which would otherwise carry megabytes of generated sources; the scripts check it instead.
+-GENERATED_DIRS = ["third_party/freetype-sys/freetype-sys"]
++# Vendored third-party code that the update.sh scripts under third_party/ write, next to the
++# patches (third_party/patches/<name>/update.sh) or in the crate's own directory
++# (third_party/<crate>/update.sh). It is kept out of the patch files, which would otherwise carry
++# megabytes of generated sources; the scripts check it instead.
++GENERATED_DIRS = ["third_party/freetype-sys/freetype-sys", "third_party/stylo"]
+ ENTRY = re.compile(r"^(\d+)\. `([^`]+)` — (\S+) · (\S+)(?: · watch: (.*))?$")
+ 
+ 
+@@ -36,7 +38,7 @@ def excluded_pathspecs() -> list[str]:
+ 
+ 
+ def vendor_scripts() -> list[Path]:
+-    return sorted(REPO.glob("third_party/*/update.sh"))
++    return sorted([*REPO.glob("third_party/patches/*/update.sh"), *REPO.glob("third_party/*/update.sh")])
+ 
+ 
+ def read_manifest() -> list[Patch]:
