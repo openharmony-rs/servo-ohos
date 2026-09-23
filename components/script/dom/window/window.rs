@@ -2815,6 +2815,11 @@ impl Window {
         if pending.affects_laid_out_text {
             document.dirty_all_nodes(cx.no_gc());
         }
+        // Text in SVG images is turned into paths when the image is parsed, so an image that
+        // fell back to another font has to be parsed again to use the web font.
+        if self.font_context().take_svg_waiting_for_web_font() {
+            document.invalidate_svg_images_with_text(cx.no_gc());
+        }
         document.Fonts(cx).update_css_connected_face_statuses(cx);
         self.font_context()
             .decrement_count_of_loading_fonts(pending.count);

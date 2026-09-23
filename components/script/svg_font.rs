@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use app_units::Au;
 use fonts::{FontContext, FontDescriptor, FontFamilyDescriptor, FontSearchScope};
-use fonts_traits::FontTemplateRefMethods;
+use fonts_traits::{FontTemplateRefMethods, WebFontLoadState};
 use net_traits::image_cache::FontResolver;
 use resvg::usvg::{Font, FontFamily, FontStretch, FontStyle, fontdb};
 use style::computed_values::font_optical_sizing::T as FontOpticalSizing;
@@ -94,8 +94,16 @@ impl FontResolver for SvgFontResolver {
             };
             // A face that has not been downloaded yet cannot be rasterized. Ask for it, like
             // layout does when it matches the face, and fall back to the next family for now.
-            if let Some(font_face_rule) = font_template.font_face_rule() {
+            // The SVG is rendered again once the face has loaded.
+            if let Some(font_face_rule) = font_template.font_face_rule() &&
+                matches!(
+                    font_face_rule.load_state(),
+                    WebFontLoadState::Unloaded | WebFontLoadState::Loading
+                )
+            {
                 self.context.request_web_font_load(&font_face_rule);
+                self.context.note_svg_waiting_for_web_font();
+                continue;
             }
 
             let Some(font) = self.context.font(font_template, &font_descriptor) else {
