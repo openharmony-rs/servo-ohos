@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 23 Sep 2026 06:52:57 +0000
+Subject: [PATCH] tests: Expect the two responsive-iframe allow-origins
+ failures of the base
+
+Two `container=subdomain` variants of
+css/css-sizing/responsive-iframe/responsive-iframe-allow-origins.html fail
+their subtest at this fork's base, with an upstream-only build and without any
+patch of the stack touching the test or its expectations. Upstream tracked the
+same failures as servo/servo#47268 and settled them two days after this base,
+in the WPT sync f9b43a6f0b9 (30-08-2026), which renamed the variants from
+`allowed=` to `allow=` and marked their subtests as failing. This fork's base
+predates that sync, so it still has the old test files and the old
+expectations, and every CI run reports the two as stable unexpected results.
+
+The expectations here say for the old variant names what upstream says for the
+new ones.
+
+Fork note: drop at the next sync; the upstream expectations then apply.
+
+Validation: `./mach test-wpt --release css/css-sizing/responsive-iframe/responsive-iframe-allow-origins.html` (25 variants): all as expected; the two variants also fail with an upstream-only release build (f2cb0bebc77).
+AI-assisted: Yes (agent session; root-caused and written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../responsive-iframe-allow-origins.html.ini              | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/tests/wpt/meta/css/css-sizing/responsive-iframe/responsive-iframe-allow-origins.html.ini b/tests/wpt/meta/css/css-sizing/responsive-iframe/responsive-iframe-allow-origins.html.ini
+index 8016af1012e..2b28961e43c 100644
+--- a/tests/wpt/meta/css/css-sizing/responsive-iframe/responsive-iframe-allow-origins.html.ini
++++ b/tests/wpt/meta/css/css-sizing/responsive-iframe/responsive-iframe-allow-origins.html.ini
+@@ -3,7 +3,13 @@
+ [responsive-iframe-allow-origins.html?origin=same,allowed=none,expect=150]
+ 
+ [responsive-iframe-allow-origins.html?container=subdomain,origin=cross,allowed=wildcard,expect=400]
+-  expected: TIMEOUT
++  expected: [OK, TIMEOUT]
++  [Allowed origins check: container=subdomain, origin=cross, allowed=wildcard]
++    expected: [FAIL, TIMEOUT]
++
++[responsive-iframe-allow-origins.html?container=subdomain,origin=same,allowed=wildcard,expect=400]
++  [Allowed origins check: container=subdomain, origin=same, allowed=wildcard]
++    expected: FAIL
+ 
+ [responsive-iframe-allow-origins.html?origin=cross,allowed=self,expect=150]
+ 

@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 18 Sep 2026 18:11:51 +0000
+Subject: [PATCH] squash! storage: add an OHOS RDB backend for webstorage,
+ client_storage and indexeddb
+
+The RDB backend made `sqlite/encoding.rs` available to all engines through
+a `#[path]` module in `engines/mod.rs`, but `sqlite.rs` still declared it as
+its own submodule too. The file was compiled twice, which fails
+`./mach clippy -- -- --deny warnings` with `clippy::duplicate_mod`. Use the
+shared module from `sqlite.rs` instead.
+
+Squash candidate: fold into the RDB backend patch at the next sync.
+
+Validation: `./mach clippy --locked -- -- --deny warnings` (the CI lint command) now passes; `./mach test-unit -p servo-storage` 50/50; `./mach test-tidy`; `./mach check --ohos --features ohos-rdb-backend` builds the `ohos_rdb` configuration with both backends.
+AI-assisted: Yes (agent session; found, fixed and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/storage/indexeddb/engines/sqlite.rs | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/components/storage/indexeddb/engines/sqlite.rs b/components/storage/indexeddb/engines/sqlite.rs
+index 83101a63384..c7e234533c9 100644
+--- a/components/storage/indexeddb/engines/sqlite.rs
++++ b/components/storage/indexeddb/engines/sqlite.rs
+@@ -17,12 +17,11 @@ use storage_traits::indexeddb::{
+ };
+ 
+ use crate::indexeddb::IndexedDBDescription;
+-use crate::indexeddb::engines::{KvsEngine, KvsTransaction};
++use crate::indexeddb::engines::{KvsEngine, KvsTransaction, encoding};
+ use crate::shared::{DB_INIT_PRAGMAS, DB_PRAGMAS};
+ 
+ mod create;
+ mod database_model;
+-mod encoding;
+ mod object_data_model;
+ mod object_store_index_model;
+ mod object_store_model;

@@ -99,6 +99,16 @@ those scripts (they need network access). `check_stack.py` runs each with
 
 52. `docs: record patches 49 to 52 in the stack manifest` — B · none · watch: -
 
+53. `squash! storage: add an OHOS RDB backend for webstorage, client_storage and indexeddb` — B · CI · watch: -
+
+54. `squash! fonts: Report the load state of @font-face rules in FontFace.status` — B · CI · watch: -
+
+55. `tests: Expect the two responsive-iframe allow-origins failures of the base` — B · CI · watch: -
+
+56. `script: Render SVG text again once the web font it uses has loaded` — B · CI · watch: components/net/image_cache.rs
+
+57. `docs: record patches 53 to 57 in the stack manifest` — B · none · watch: -
+
 ## Sync log
 
 One entry per sync, newest first. Records the upstream range and every
