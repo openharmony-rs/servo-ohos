@@ -21,8 +21,13 @@ namespace OHOS::NWeb {
 class ServoCookieManager : public ServoCookieManagerStubBase {
 public:
     std::string ReturnCookie(const std::string& url, bool& is_valid, bool incognito_mode) override;
+    std::string ReturnCookie(const std::string& url, bool& is_valid, bool incognito_mode,
+                             bool include_partitioned_cookies) override;
     std::string ReturnCookieWithHttpOnly(const std::string& url, bool& is_valid,
                                          bool incognito_mode, bool includeHttpOnly) override;
+    std::string ReturnCookieWithHttpOnly(const std::string& url, bool& is_valid,
+                                         bool incognito_mode, bool includeHttpOnly,
+                                         bool include_partitioned_cookies) override;
     int SetCookie(const std::string& url, const std::string& value, bool incognito_mode) override;
     int SetCookieWithHttpOnly(const std::string& url, const std::string& value, bool incognito_mode,
                               bool includeHttpOnly) override;
