@@ -68,6 +68,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 42. `ci: Choose the pull request jobs from the changed files` — B · CI · watch: python/servo/try_parser.py .github/workflows/linux-wpt.yml
 43. `ci: Smoke test the x86_64 HAP on the OpenHarmony emulator` — B · CI · watch: .github/workflows/ohos.yml support/openharmony/entry/src/main/module.json5
 44. `docs: record patches 42 to 44 in the stack manifest` — B · none · watch: -
+45. `constellation: Abort superseded iframe navigations` — B · CI · watch: components/script/dom/html/embedded_content/htmliframeelement.rs
+46. `docs: record patches 45 to 46 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
