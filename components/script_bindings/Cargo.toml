@@ -73,6 +73,8 @@ harness = false
 [features]
 bluetooth = []
 gamepad = []
+# Build against the QuickJS implementation of the mozjs API (servo-quickjs).
+js-quickjs = []
 testbinding = []
 tracing = ["dep:tracing"]
 webcrypto = []
