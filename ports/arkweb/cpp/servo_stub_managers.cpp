@@ -17,6 +17,19 @@ std::string ServoCookieManager::ReturnCookieWithHttpOnly(const std::string& url,
     return cookie;
 }
 
+// Servo has no partitioned cookies, so the partitioned-cookie variants return the same jar.
+std::string ServoCookieManager::ReturnCookie(const std::string& url, bool& is_valid,
+                                             bool incognito_mode,
+                                             bool /*include_partitioned_cookies*/) {
+    return ReturnCookie(url, is_valid, incognito_mode);
+}
+
+std::string ServoCookieManager::ReturnCookieWithHttpOnly(const std::string& url, bool& is_valid,
+                                                         bool incognito_mode, bool includeHttpOnly,
+                                                         bool /*include_partitioned_cookies*/) {
+    return ReturnCookieWithHttpOnly(url, is_valid, incognito_mode, includeHttpOnly);
+}
+
 int ServoCookieManager::SetCookie(const std::string& url, const std::string& value,
                                   bool /*incognito_mode*/) {
     return servo::embedder::cookie_set(url, value) ? 0 : -1;
