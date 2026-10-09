@@ -1,8 +1,8 @@
 diff --git a/arkweb_utils/arkweb_utils.cpp b/arkweb_utils/arkweb_utils.cpp
-index dcda11e2c..0fa2abc83 100644
+index dfb3c9c29..0c6ac2047 100644
 --- a/arkweb_utils/arkweb_utils.cpp
 +++ b/arkweb_utils/arkweb_utils.cpp
-@@ -476,6 +476,8 @@ ArkWebEngineVersionMetrics MapToMetricsVersion(ArkWebEngineVersion version)
+@@ -512,6 +512,8 @@ ArkWebEngineVersionMetrics MapToMetricsVersion(ArkWebEngineVersion version)
              return ArkWebEngineVersionMetrics::M132;
          case ArkWebEngineVersion::M144:
              return ArkWebEngineVersionMetrics::M144;
@@ -11,7 +11,7 @@ index dcda11e2c..0fa2abc83 100644
      }
      WVLOG_W("Unexpected ArkWebEngineVersion: %{public}d", static_cast<int32_t>(version));
      return ArkWebEngineVersionMetrics::UNKNOWN_METRICS;
-@@ -508,7 +510,8 @@ ArkWebEngineVersion CalculateActiveWebEngineVersion()
+@@ -544,7 +546,8 @@ ArkWebEngineVersion CalculateActiveWebEngineVersion()
  {
      int webEngineEnforce = OHOS::system::GetIntParameter("web.engine.enforce", 0);
      if (webEngineEnforce == static_cast<int>(ArkWebEngineType::EVERGREEN) ||
@@ -21,7 +21,7 @@ index dcda11e2c..0fa2abc83 100644
          WVLOG_I("CalculateActiveWebEngineVersion, enforce %{public}d", webEngineEnforce);
          return static_cast<ArkWebEngineVersion>(webEngineEnforce);
      }
-@@ -550,6 +553,11 @@ bool IsActiveWebEngineEvergreen()
+@@ -586,6 +589,11 @@ bool IsActiveWebEngineEvergreen()
      return false;
  }
  
@@ -34,7 +34,7 @@ index dcda11e2c..0fa2abc83 100644
  {
      WVLOG_W("%{public}s unsupported engine version: %{public}d",
 diff --git a/arkweb_utils/arkweb_utils.h b/arkweb_utils/arkweb_utils.h
-index b04016097..bc53eb4a2 100644
+index 13dffa697..492b64870 100644
 --- a/arkweb_utils/arkweb_utils.h
 +++ b/arkweb_utils/arkweb_utils.h
 @@ -89,6 +89,7 @@ enum class ArkWebEngineVersion {
@@ -59,10 +59,10 @@ index b04016097..bc53eb4a2 100644
  ARKWEB_EXPORT bool IsActiveWebEngineEvergreen();
 +ARKWEB_EXPORT bool IsActiveWebEngineServo();
  ARKWEB_EXPORT void SelectWebcoreBeforeProcessRun(const std::string& appBundleName);
+ ARKWEB_EXPORT bool IsDataMigrate(const std::string& appBundleName);
  
- ARKWEB_EXPORT std::string GetArkwebLibPath();
 diff --git a/ohos_nweb/src/nweb_helper.cpp b/ohos_nweb/src/nweb_helper.cpp
-index 21180fecf..dc1c4489f 100644
+index fd739cde3..ea689ac17 100644
 --- a/ohos_nweb/src/nweb_helper.cpp
 +++ b/ohos_nweb/src/nweb_helper.cpp
 @@ -16,6 +16,7 @@
