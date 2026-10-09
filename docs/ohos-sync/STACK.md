@@ -70,6 +70,10 @@ those scripts (they need network access). `check_stack.py` runs each with
 44. `docs: record patches 42 to 44 in the stack manifest` — B · none · watch: -
 45. `constellation: Abort superseded iframe navigations` — B · CI · watch: components/script/dom/html/embedded_content/htmliframeelement.rs
 46. `docs: record patches 45 to 46 in the stack manifest` — B · none · watch: -
+47. `script: Fix TimerListener leak (#48752)` — B · manual · watch: -
+48. `script: ClearKeptObjects in microtask checkpoint (#48739)` — B · manual · watch: -
+49. `script: Drop tasks for closed pipelines` — B · manual · watch: components/script/messaging.rs
+50. `docs: record patches 47 to 50 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

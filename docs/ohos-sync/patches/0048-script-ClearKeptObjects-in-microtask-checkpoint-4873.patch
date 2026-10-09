@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <55576758+jschwe@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 03:02:28 +0000
+Subject: [PATCH] script: ClearKeptObjects in microtask checkpoint (#48739)
+
+Testing: Should be covered by existing tests (not starting to crash).
+[mach try](https://github.com/jschwe/servo/actions/runs/37752139247)
+
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+(cherry picked from commit 10c8149c3c8621cb2bf5b819223ca8f621ca7e50)
+
+----
+
+Fork note: backport of upstream 10c8149c3c8 (#48739), which landed after
+base/2026-10-08. Without ClearKeptObjects() (step 6 of
+https://html.spec.whatwg.org/multipage/#perform-a-microtask-checkpoint),
+SpiderMonkey keeps the target of every WeakRef that was created or
+dereferenced alive forever.
+Drop at the next sync: every later base contains 10c8149c3c8, so this
+commit applies empty and becomes a `Superseded-by: 10c8149c3c8`
+placeholder (runbook decision 3).
+
+Validation: Release builds of ohos-main and of ohos-main plus this patch alone, headless servoshell with `--pref=dom_testutils_enabled=true`, two runs each. A page that adds and removes 50 empty same-origin iframes, keeps a WeakRef to each document and calls `TestUtils.gc()`: 50/50 documents still alive without the patch, 0/50 with it. WPT with patches 47 to 49: `./mach test-wpt --release --processes 6 html/webappapis/timers html/browsers/browsing-the-web html/browsers/history page-visibility performance-timeline js workers html/webappapis/scripting/event-loops user-timing` (1029 tests): 1023 as expected. The other 6 are flaky or broken on plain ohos-main too (A/B repeats, plain ohos-main vs with the patches): navigation-unload-same-origin-fragment.html FAIL 6/10 vs 7/10; cross-origin-top-navigation-with-user-activation-in-parent.window.html TIMEOUT 23/30 vs 29/30 (18/20 vs 20/20 in the interleaved rounds); location_replace_session_history.html (expected TIMEOUT) ends in ERROR, TIMEOUT or CRASH on both, 28/2/0 vs 22/5/3 of 30; same-document-refresh.html PASS 9/10 vs 10/10 (stale FAIL expectation); form-submit-cross-frame.html FAIL 2/10 vs 0/10; iframe-src-204.html FAIL once in the full run, 0/10 vs 0/10 in repeats. `./mach fmt` and `./mach test-tidy` are clean.
+AI-assisted: Yes (agent session; the agent cherry-picked upstream commit 10c8149c3c8 without code changes and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/runtime/job_queue.rs | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/components/script/runtime/job_queue.rs b/components/script/runtime/job_queue.rs
+index b862debcedc..6791a953180 100644
+--- a/components/script/runtime/job_queue.rs
++++ b/components/script/runtime/job_queue.rs
+@@ -312,7 +312,8 @@ pub(crate) fn job_queue_microtask_checkpoint(
+         }
+     }
+ 
+-    // TODO: Step 6. Perform ClearKeptObjects().
++    // Step 6. Perform ClearKeptObjects().
++    unsafe { js::rust::wrappers2::ClearKeptObjects(cx) };
+ 
+     // Step 7. Set the event loop's performing a microtask checkpoint to false.
+     unsafe {
