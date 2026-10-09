@@ -30,6 +30,7 @@ class Workflow(str, Enum):
     ANDROID = "android"
     OHOS = "ohos"
     LINT = "lint"
+    QUICKJS = "quickjs"
 
 
 @dataclass
@@ -84,6 +85,8 @@ class JobConfig(object):
             self.name = "Android"
         elif self.workflow is Workflow.OHOS:
             self.name = "OpenHarmony"
+        elif self.workflow is Workflow.QUICKJS:
+            self.name = "Linux QuickJS"
         modifier = []
         if self.profile != "checked-release":
             modifier.append(self.profile.title())
@@ -110,7 +113,9 @@ class JobConfig(object):
 def handle_preset(s: str) -> Optional[JobConfig]:
     s = s.lower()
 
-    if any(word in s for word in ["linux-arm", "linux-arm64"]):
+    if "quickjs" in s:
+        return JobConfig("Linux QuickJS", Workflow.QUICKJS)
+    elif any(word in s for word in ["linux-arm", "linux-arm64"]):
         return JobConfig("Linux Arm64", Workflow.LINUX_ARM)
     elif any(word in s for word in ["linux"]):
         return JobConfig("Linux", Workflow.LINUX)
