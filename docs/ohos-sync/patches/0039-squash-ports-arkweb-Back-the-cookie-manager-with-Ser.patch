@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 9 Oct 2026 12:53:54 +0000
+Subject: [PATCH] squash! ports/arkweb: Back the cookie manager with Servo's
+ site-data manager
+
+OpenHarmony-v7.0-Release adds NWebCookieManager overloads taking an
+includePartitionedCookies flag, which the ArkTS fetchCookie(Sync) calls
+use when that argument is passed. They are non-pure virtuals returning
+an empty string, so forward the two sync variants to the existing
+implementations; Servo has no partitioned cookies.
+
+Validation: Compiled by `./mach build --ohos --release --no-package -p arkweb` and covered by the same on-device run as the header sync (35 passed, 1 xfailed). The test app does not call the new overloads, so they are not exercised automatically.
+AI-assisted: Yes (agent session; implementation)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/cpp/servo_stub_managers.cpp | 13 +++++++++++++
+ ports/arkweb/cpp/servo_stub_managers.h   |  5 +++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/ports/arkweb/cpp/servo_stub_managers.cpp b/ports/arkweb/cpp/servo_stub_managers.cpp
+index 1249785b71e..b016e8b4d7e 100644
+--- a/ports/arkweb/cpp/servo_stub_managers.cpp
++++ b/ports/arkweb/cpp/servo_stub_managers.cpp
+@@ -17,6 +17,19 @@ std::string ServoCookieManager::ReturnCookieWithHttpOnly(const std::string& url,
+     return cookie;
+ }
+ 
++// Servo has no partitioned cookies, so the partitioned-cookie variants return the same jar.
++std::string ServoCookieManager::ReturnCookie(const std::string& url, bool& is_valid,
++                                             bool incognito_mode,
++                                             bool /*include_partitioned_cookies*/) {
++    return ReturnCookie(url, is_valid, incognito_mode);
++}
++
++std::string ServoCookieManager::ReturnCookieWithHttpOnly(const std::string& url, bool& is_valid,
++                                                         bool incognito_mode, bool includeHttpOnly,
++                                                         bool /*include_partitioned_cookies*/) {
++    return ReturnCookieWithHttpOnly(url, is_valid, incognito_mode, includeHttpOnly);
++}
++
+ int ServoCookieManager::SetCookie(const std::string& url, const std::string& value,
+                                   bool /*incognito_mode*/) {
+     return servo::embedder::cookie_set(url, value) ? 0 : -1;
+diff --git a/ports/arkweb/cpp/servo_stub_managers.h b/ports/arkweb/cpp/servo_stub_managers.h
+index 5cc8749f5fd..0f131bc5253 100644
+--- a/ports/arkweb/cpp/servo_stub_managers.h
++++ b/ports/arkweb/cpp/servo_stub_managers.h
+@@ -21,8 +21,13 @@ namespace OHOS::NWeb {
+ class ServoCookieManager : public ServoCookieManagerStubBase {
+ public:
+     std::string ReturnCookie(const std::string& url, bool& is_valid, bool incognito_mode) override;
++    std::string ReturnCookie(const std::string& url, bool& is_valid, bool incognito_mode,
++                             bool include_partitioned_cookies) override;
+     std::string ReturnCookieWithHttpOnly(const std::string& url, bool& is_valid,
+                                          bool incognito_mode, bool includeHttpOnly) override;
++    std::string ReturnCookieWithHttpOnly(const std::string& url, bool& is_valid,
++                                         bool incognito_mode, bool includeHttpOnly,
++                                         bool include_partitioned_cookies) override;
+     int SetCookie(const std::string& url, const std::string& value, bool incognito_mode) override;
+     int SetCookieWithHttpOnly(const std::string& url, const std::string& value, bool incognito_mode,
+                               bool includeHttpOnly) override;

@@ -61,6 +61,10 @@ those scripts (they need network access). `check_stack.py` runs each with
 35. `script: Lay out once for web fonts that finish loading together` — B · CI · watch: components/script/dom/globalscope/globalscope.rs components/net/image_cache.rs
 36. `script: Delay the load event while web fonts are loading` — B · CI · watch: -
 37. `storage: add an OHOS RDB backend for webstorage, client_storage and indexeddb` — C · CI+device · watch: components/storage components/config/prefs.rs components/net/Cargo.toml
+38. `squash! ports/arkweb: Servo as an alternative ArkWeb webview backend` — B · device · watch: -
+39. `squash! ports/arkweb: Back the cookie manager with Servo's site-data manager` — B · device · watch: -
+40. `squash! ports/arkweb: restrict libservo_arkweb.so exported symbols and load it with RTLD_LOCAL` — A · device · watch: -
+41. `docs: record patches 38 to 41 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

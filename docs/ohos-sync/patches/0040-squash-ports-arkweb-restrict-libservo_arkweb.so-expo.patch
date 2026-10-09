@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 9 Oct 2026 12:53:55 +0000
+Subject: [PATCH] squash! ports/arkweb: restrict libservo_arkweb.so exported
+ symbols and load it with RTLD_LOCAL
+
+Rebase ohos-patches/0001 onto OpenHarmony-v7.0-Release (web_webview
+12cb9a37bbba) to match the re-synced NWeb headers. Only the context and
+line numbers change; the patch content is the same. It targets this
+patch because this is the last one in the stack that edits 0001.
+
+Validation: Built a full rk3568 arm64 image from OpenHarmony-v7.0-Release with ohos-patches/0001 and 0002 applied (without 0002 it boot-loops on appspawn) and flashed a HiHope DAYU200 (OpenHarmony 7.0, API 26); `./mach build --ohos --release --no-package -p arkweb`, deployed with `tools/deploy.py`, test app installed with `tools/build_test_app.py`; `HDC_TARGET=<serial> uv run --with pytest --with hdc-py --with pillow python -m pytest ports/arkweb/tools`: 35 passed, 1 xfailed. `tools/gen_stubs.py --check` is clean.
+AI-assisted: Yes (agent session; patch rebase and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../0001-webview-servo-engine-backend.patch        | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/ports/arkweb/ohos-patches/0001-webview-servo-engine-backend.patch b/ports/arkweb/ohos-patches/0001-webview-servo-engine-backend.patch
+index f62657b121e..34a46701de0 100644
+--- a/ports/arkweb/ohos-patches/0001-webview-servo-engine-backend.patch
++++ b/ports/arkweb/ohos-patches/0001-webview-servo-engine-backend.patch
+@@ -1,8 +1,8 @@
+ diff --git a/arkweb_utils/arkweb_utils.cpp b/arkweb_utils/arkweb_utils.cpp
+-index dcda11e2c..0fa2abc83 100644
++index dfb3c9c29..0c6ac2047 100644
+ --- a/arkweb_utils/arkweb_utils.cpp
+ +++ b/arkweb_utils/arkweb_utils.cpp
+-@@ -476,6 +476,8 @@ ArkWebEngineVersionMetrics MapToMetricsVersion(ArkWebEngineVersion version)
++@@ -512,6 +512,8 @@ ArkWebEngineVersionMetrics MapToMetricsVersion(ArkWebEngineVersion version)
+              return ArkWebEngineVersionMetrics::M132;
+          case ArkWebEngineVersion::M144:
+              return ArkWebEngineVersionMetrics::M144;
+@@ -11,7 +11,7 @@ index dcda11e2c..0fa2abc83 100644
+      }
+      WVLOG_W("Unexpected ArkWebEngineVersion: %{public}d", static_cast<int32_t>(version));
+      return ArkWebEngineVersionMetrics::UNKNOWN_METRICS;
+-@@ -508,7 +510,8 @@ ArkWebEngineVersion CalculateActiveWebEngineVersion()
++@@ -544,7 +546,8 @@ ArkWebEngineVersion CalculateActiveWebEngineVersion()
+  {
+      int webEngineEnforce = OHOS::system::GetIntParameter("web.engine.enforce", 0);
+      if (webEngineEnforce == static_cast<int>(ArkWebEngineType::EVERGREEN) ||
+@@ -21,7 +21,7 @@ index dcda11e2c..0fa2abc83 100644
+          WVLOG_I("CalculateActiveWebEngineVersion, enforce %{public}d", webEngineEnforce);
+          return static_cast<ArkWebEngineVersion>(webEngineEnforce);
+      }
+-@@ -550,6 +553,11 @@ bool IsActiveWebEngineEvergreen()
++@@ -586,6 +589,11 @@ bool IsActiveWebEngineEvergreen()
+      return false;
+  }
+  
+@@ -34,7 +34,7 @@ index dcda11e2c..0fa2abc83 100644
+  {
+      WVLOG_W("%{public}s unsupported engine version: %{public}d",
+ diff --git a/arkweb_utils/arkweb_utils.h b/arkweb_utils/arkweb_utils.h
+-index b04016097..bc53eb4a2 100644
++index 13dffa697..492b64870 100644
+ --- a/arkweb_utils/arkweb_utils.h
+ +++ b/arkweb_utils/arkweb_utils.h
+ @@ -89,6 +89,7 @@ enum class ArkWebEngineVersion {
+@@ -59,10 +59,10 @@ index b04016097..bc53eb4a2 100644
+  ARKWEB_EXPORT bool IsActiveWebEngineEvergreen();
+ +ARKWEB_EXPORT bool IsActiveWebEngineServo();
+  ARKWEB_EXPORT void SelectWebcoreBeforeProcessRun(const std::string& appBundleName);
++ ARKWEB_EXPORT bool IsDataMigrate(const std::string& appBundleName);
+  
+- ARKWEB_EXPORT std::string GetArkwebLibPath();
+ diff --git a/ohos_nweb/src/nweb_helper.cpp b/ohos_nweb/src/nweb_helper.cpp
+-index 21180fecf..dc1c4489f 100644
++index fd739cde3..ea689ac17 100644
+ --- a/ohos_nweb/src/nweb_helper.cpp
+ +++ b/ohos_nweb/src/nweb_helper.cpp
+ @@ -16,6 +16,7 @@
