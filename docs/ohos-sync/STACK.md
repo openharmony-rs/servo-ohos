@@ -65,6 +65,9 @@ those scripts (they need network access). `check_stack.py` runs each with
 39. `squash! ports/arkweb: Back the cookie manager with Servo's site-data manager` — B · device · watch: -
 40. `squash! ports/arkweb: restrict libservo_arkweb.so exported symbols and load it with RTLD_LOCAL` — A · device · watch: -
 41. `docs: record patches 38 to 41 in the stack manifest` — B · none · watch: -
+42. `ci: Choose the pull request jobs from the changed files` — B · CI · watch: python/servo/try_parser.py .github/workflows/linux-wpt.yml
+43. `ci: Smoke test the x86_64 HAP on the OpenHarmony emulator` — B · CI · watch: .github/workflows/ohos.yml support/openharmony/entry/src/main/module.json5
+44. `docs: record patches 42 to 44 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
