@@ -8,8 +8,8 @@ NAPI layers are untouched.
 ## Source
 
 - Repo: `https://gitcode.com/openharmony/web_webview` (component `base/web/webview`)
-- Branch/tag: `OpenHarmony-7.0-Beta1`
-- Base commit: `f0d95626a5fbd99b5d4106cbdd3785c2934a8152`
+- Branch/tag: `OpenHarmony-v7.0-Release`
+- Base commit: `12cb9a37bbba46574cfe667350acd1ab6137d40d`
 
 This matches the commit the NWeb headers in `../vendor/ohos_nweb/` were synced from, so the shim's
 vtable layout agrees with the patched libraries. Always build and deploy the shim and the patched
@@ -42,6 +42,14 @@ Then build the webview component (arm64) — see `../../../Servo-arkweb-plan.md`
   `web.engine.servo.path`, default `/system/lib64/libservo_arkweb.so`; ABI-version check; factory
   symbol) and a `SERVO` branch at the top of `NWebHelper::GetWebEngine` that uses it instead of the
   Chromium bridge-helper path.
+
+## arm64 board image fix (`0002`)
+
+`0002-init-seccomp-lp64-filter-path.patch` is not part of the Servo integration but is required for
+any 64-bit `OpenHarmony-v7.0-Release` image: `base/startup/init` tests the undefined macro
+`__LP__` instead of `__LP64__`, so seccomp filters are looked up under `lib/seccomp/`, appspawn
+exits at startup and init reboots the device in a loop. Apply it in `base/startup/init` before
+building the full rk3568 image.
 
 ## Toggle at runtime
 

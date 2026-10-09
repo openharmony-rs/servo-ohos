@@ -7,9 +7,9 @@ Verbatim copy of the OpenHarmony NWeb C++ interface headers, synced by
 | ----- | ----- |
 | Source repo | https://gitcode.com/openharmony/web_webview |
 | Source path | base/web/webview/ohos_interface/include/ohos_nweb |
-| Commit | `f0d95626a5fbd99b5d4106cbdd3785c2934a8152` |
-| Commit date | 2026-05-29 10:07:40 +0800 |
-| Commit subject | !5178 merge cherry-pick-mr-5175-1779955257202-auto into OpenHarmony-7.0-Beta1 |
+| Commit | `12cb9a37bbba46574cfe667350acd1ab6137d40d` |
+| Commit date | 2026-08-18 13:46:15 +0800 |
+| Commit subject | !5400 merge OpenHarmony-7.0-Release into OpenHarmony-7.0-Release |
 | Header count | 68 |
 
 Re-sync with:

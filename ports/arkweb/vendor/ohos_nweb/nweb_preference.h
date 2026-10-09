@@ -673,6 +673,11 @@ public:
     virtual void PutWebMediaAVSessionEnabled(bool enable) {}
 
     /**
+     * Set whether to enable media network proxy (HLS proxy download).
+     */
+    virtual void PutWebMediaNetworkProxyEnabled(bool enable) {}
+
+    /**
      * Set whether to use the intrinsic size. The default is false.
      */
     virtual void SetIntrinsicSizeEnable(bool enable) {}
@@ -725,6 +730,21 @@ public:
      * @param enable bool: Indicates the flag whether drag is enabled.
      */
     virtual void SetEnableDrag(bool enable) {}
+
+    /**
+     * @brief Sets whether to enable touch event feature detection.
+     *        When enabled, exposes ontouchstart/end/move/cancel properties on window
+     *
+     * @param enable bool: Indicates the flag whether touch event feature detection is enabled.
+     */
+    virtual void PutTouchEventFeatureDetectionEnabled(bool enable) {}
+
+    /**
+     * @brief Enables or disables full screen video overlay.
+     *
+     * @param enable bool: Indicates the flag whether full screen video overlay is enabled.
+     */
+    virtual void PutFullScreenVideoOverlayEnable(bool enable) {}
 };
 
 } // namespace OHOS::NWeb

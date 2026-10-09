@@ -237,6 +237,55 @@ public:
      * @return empty if get all cookies fails else return vector.
      */
     virtual std::vector<std::shared_ptr<NWebCookie>> GetAllCookies(bool incognitoMode) { return {}; }
+
+    /**
+     * @brief Gets all the cookies for the given URL. This is sync method
+     *
+     * @param url the URL for which the cookies are requested.
+     * @param isValid true if the returned cookie is valid, false otherwise.
+     * @param incognitoMode true if web is in the incognito mode, false otherwise.
+     * @param includePartitionedCookies If true, allows fetching first-party partitioned cookies.
+     * @return the cookie value for given URL.
+     */
+    virtual std::string ReturnCookie(const std::string& url, bool& isValid, bool incognitoMode,
+        bool includePartitionedCookies) { return std::string(); }
+
+    /**
+     * @brief Gets all the cookies for the given URL async.
+     *
+     * @param url the URL for which the cookies are requested.
+     * @param incognitoMode true if web is in the incognito mode, false otherwise.
+     * @param includePartitionedCookies If true, allows fetching first-party partitioned cookies.
+     * @param callback a callback which is executed when the cookies have been gotten.
+     */
+    virtual void GetCookieAsync(const std::string& url, bool incognitoMode,
+        bool includePartitionedCookies, std::shared_ptr<NWebStringValueCallback> callback) { return; }
+
+    /**
+     * @brief Gets all the cookies for the given URL. This is sync method
+     *
+     * @param url URL to which the cookie to be obtained belongs. A complete URL is recommended.
+     * @param isValid true if the returned cookie is valid, false otherwise.
+     * @param incognitoMode true if web is in the incognito mode, false otherwise.
+     * @param includeHttpOnly If true HTTP-only cookies will also be included in the cookieValue.
+     * @param includePartitionedCookies If true, allows fetching first-party partitioned cookies.
+     * @param cookieValue Get the cookie value corresponding to the URL.
+     * @return the cookie value for given URL.
+     */
+    virtual std::string ReturnCookieWithHttpOnly(const std::string& url, bool& isValid, bool incognitoMode,
+        bool includeHttpOnly, bool includePartitionedCookies) { return ""; }
+
+    /**
+     * @brief Gets all the cookies for the given URL async.
+     *
+     * @param url the URL for which the cookies are requested.
+     * @param incognitoMode true if web is in the incognito mode, false otherwise.
+     * @param includeHttpOnly If true HTTP-only cookies will also be included in the cookieValue.
+     * @param includePartitionedCookies If true, allows fetching first-party partitioned cookies.
+     * @param callback a callback which is executed when the cookies have been gotten.
+     */
+    virtual void ReturnCookieWithHttpOnly(const std::string& url, bool incognitoMode, bool includeHttpOnly,
+        bool includePartitionedCookies, std::shared_ptr<OHOS::NWeb::NWebStringValueCallback> callback) { return; }
 };
  
 class OHOS_NWEB_EXPORT NWebCookie {

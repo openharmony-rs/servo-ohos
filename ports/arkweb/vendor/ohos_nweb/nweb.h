@@ -119,6 +119,8 @@ public:
     virtual std::string GetSharedRenderProcessToken() {return "";}
     virtual bool GetEmulateTouchFromMouseEvent() {return false;}
     virtual bool GetUseCloudControlAutoLayoutConfig() {return false;}
+    virtual uint64_t GetSurfaceNodeId() { return 0; }
+    virtual uint64_t GetSurfaceRSHandle() { return 0; }
 };
 
 class OHOS_NWEB_EXPORT NWebOutputFrameCallback {
@@ -193,6 +195,7 @@ enum class FocusReason : int32_t {
 enum class RenderProcessMode : int32_t {
     SINGLE_MODE = 0,
     MULTIPLE_MODE = 1,
+    DEFAULT_MODE = 2,
 };
 
 enum class SiteIsolationMode {
@@ -1410,8 +1413,6 @@ public:
 
     virtual void OnCreateNativeMediaPlayer(std::shared_ptr<NWebCreateNativeMediaPlayerCallback> callback) = 0;
 
-    virtual void OnTouchCancelById(int32_t id, double x, double y, bool from_overlay) = 0;
-
     /**
      * Inject Offline Resource into Memory Cache.
      *
@@ -2560,6 +2561,69 @@ public:
     {
         return nullptr;
     }
+
+    /**
+     * Execute AI page command.
+     *
+     * @param command JSON-formatted command parameter
+     * @param callback command execution result. Empty result means null.
+     */
+    virtual void ExecuteAIPageCommand(const std::string& command, std::shared_ptr<NWebStringValueCallback> callback)
+    {
+        (void)command;
+        if (callback) {
+            callback->OnReceiveValue("");
+        }
+    }
+
+    /**
+     * @brief Set the native window surface for video rendering.
+     *
+     * @param native_window Pointer to the native window used for video output.
+     */
+    virtual void SetVideoSurface(void* native_window) {}
+
+    /**
+     * @brief Request media control action.
+     *
+     * @param action The media control action to perform.
+     * @param param The parameter string for the media control action.
+     */
+    virtual void RequestMediaControl(int32_t action, const std::string& param) {}
+
+    /**
+     * Get the information of the accessibility node by query params in the browser.
+     * @param accessibilityId The accessibility id of the original accessibility node.
+     * @param direction The focus move direction of the original accessibility node.
+     * @param elementType The required element type to query.
+     * @param params The optional params used to query the accessibility node.
+     * @return The obtained information of the accessibility node.
+     */
+    virtual std::shared_ptr<NWebAccessibilityNodeInfo> GetAccessibilityNodeInfoByParams(
+        int64_t accessibilityId, int32_t direction, int32_t elementType,
+        const std::map<std::string, std::string>& params)
+    {
+        (void)accessibilityId;
+        (void)direction;
+        (void)elementType;
+        (void)params;
+        return nullptr;
+    }
+
+    /**
+     * @brief Set whether enable the error page. onOverrideErrorPage will be triggered when the page error.
+     *
+     * @param enable bool: Whether enable the error page.
+     * @param includeSubframe bool: Whether also enable the error page for iframes. Default false.
+     *         When enable is false, both main frame and iframe error pages are disabled.
+     *         When enable is true and includeSubframe is true, iframe error pages are also enabled.
+     */
+    virtual void SetErrorPageEnabled(bool enable, bool includeSubframe) {}
+
+    /**
+     * @brief Get whether iframe error page feature is enabled.
+     */
+    virtual bool GetSubframeErrorPageEnabled() { return false; }
 };
 } // namespace OHOS::NWeb
 
