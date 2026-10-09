@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 9 Oct 2026 14:49:27 +0000
+Subject: [PATCH] docs: record patches 42 to 44 in the stack manifest
+
+AI-assisted: Yes (agent session; manifest entries and generated patch files)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 824c7f3a4f9..72159adafa3 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -65,6 +65,9 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 39. `squash! ports/arkweb: Back the cookie manager with Servo's site-data manager` — B · device · watch: -
+ 40. `squash! ports/arkweb: restrict libservo_arkweb.so exported symbols and load it with RTLD_LOCAL` — A · device · watch: -
+ 41. `docs: record patches 38 to 41 in the stack manifest` — B · none · watch: -
++42. `ci: Choose the pull request jobs from the changed files` — B · CI · watch: python/servo/try_parser.py .github/workflows/linux-wpt.yml
++43. `ci: Smoke test the x86_64 HAP on the OpenHarmony emulator` — B · CI · watch: .github/workflows/ohos.yml support/openharmony/entry/src/main/module.json5
++44. `docs: record patches 42 to 44 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 
