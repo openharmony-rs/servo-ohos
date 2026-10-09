@@ -74,6 +74,11 @@ those scripts (they need network access). `check_stack.py` runs each with
 48. `script: ClearKeptObjects in microtask checkpoint (#48739)` — B · manual · watch: -
 49. `script: Drop tasks for closed pipelines` — B · manual · watch: components/script/messaging.rs
 50. `docs: record patches 47 to 50 in the stack manifest` — B · none · watch: -
+51. `script: Add a js-quickjs feature for running on the QuickJS mozjs shim` — B · CI · watch: Cargo.toml components/script_bindings/trace.rs components/script/runtime/job_queue.rs components/script/modules/script_module.rs
+52. `script: Keep MediaQueryLists with change listeners alive` — B · CI · watch: -
+53. `script: Treat any defined detail as present in performance.measure` — B · CI · watch: -
+54. `ci: Build servoshell on QuickJS, and run WPT with it nightly` — A · CI · watch: .github/workflows/linux-wpt.yml .github/workflows/linux-common.yml .github/workflows/dispatch-workflow.yml python/servo/try_parser.py
+55. `docs: record patches 51 to 55 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
