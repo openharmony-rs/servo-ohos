@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <55576758+jschwe@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 15:28:51 +0000
+Subject: [PATCH] script: Fix TimerListener leak (#48752)
+
+Fixes a leak, where the Trusted reference would keep windows alive until
+the Timer expires.
+Looking up the global via the pipelineId avoids this. For workers we can
+keep the direct reference since the timer scheduler is owned by the
+worker, hence if that is dropped, so is the reference.
+
+Testing: We don't have automated tests to prevent leaks.
+
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+(cherry picked from commit 5f65837a45d56f857c099e8c640dbf317ab4a0d1)
+
+----
+
+Fork note: backport of upstream 5f65837a45d (#48752, fixes upstream
+issue 48741), which landed after base/2026-10-08. A window or iframe
+that is discarded while it has a pending timer stays alive, with its
+whole JS heap, until the timer would have fired. The upstream message
+above lacks its `Fixes:` line, so that it does not reference an issue of
+this repo, and its empty squash-merge separator.
+Drop at the next sync: every later base contains 5f65837a45d, so this
+commit applies empty and becomes a `Superseded-by: 5f65837a45d`
+placeholder (runbook decision 3).
+
+Validation: Release builds of ohos-main plus patch 48 alone and plus patches 47 and 48, headless servoshell with `--pref=dom_testutils_enabled=true`, two runs each. A page that adds and removes same-origin iframes and counts, after `TestUtils.gc()`, the removed documents still alive through WeakRefs: 20 iframes each with a pending 100 s timer, 20/20 alive without this patch and 0/20 with it; 40 iframes running a typical page (DOM, listeners, observers, a timer, promises, fonts, canvas, messaging), 40/40 alive at 571 MiB RSS without it and 0/40 at 299 MiB with it. WPT with patches 47 to 49: `./mach test-wpt --release --processes 6 html/webappapis/timers html/browsers/browsing-the-web html/browsers/history page-visibility performance-timeline js workers html/webappapis/scripting/event-loops user-timing` (1029 tests): 1023 as expected. The other 6 are flaky or broken on plain ohos-main too (A/B repeats, plain ohos-main vs with the patches): navigation-unload-same-origin-fragment.html FAIL 6/10 vs 7/10; cross-origin-top-navigation-with-user-activation-in-parent.window.html TIMEOUT 23/30 vs 29/30 (18/20 vs 20/20 in the interleaved rounds); location_replace_session_history.html (expected TIMEOUT) ends in ERROR, TIMEOUT or CRASH on both, 28/2/0 vs 22/5/3 of 30; same-document-refresh.html PASS 9/10 vs 10/10 (stale FAIL expectation); form-submit-cross-frame.html FAIL 2/10 vs 0/10; iframe-src-204.html FAIL once in the full run, 0/10 vs 0/10 in repeats. `./mach fmt` and `./mach test-tidy` are clean.
+AI-assisted: Yes (agent session; the agent cherry-picked upstream commit 5f65837a45d without code changes and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/event_loop/timers.rs | 51 +++++++++++++++++---------
+ 1 file changed, 33 insertions(+), 18 deletions(-)
+
+diff --git a/components/script/event_loop/timers.rs b/components/script/event_loop/timers.rs
+index a373bdd70cb..4c2ca261e86 100644
+--- a/components/script/event_loop/timers.rs
++++ b/components/script/event_loop/timers.rs
+@@ -34,7 +34,7 @@ use crate::dom::bindings::codegen::UnionTypes::TrustedScriptOrString;
+ use crate::dom::bindings::error::Fallible;
+ use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::refcounted::Trusted;
+-use crate::dom::bindings::root::{AsHandleValue, Dom};
++use crate::dom::bindings::root::{AsHandleValue, Dom, DomRoot};
+ use crate::dom::bindings::str::DOMString;
+ use crate::dom::csp::CspReporting;
+ use crate::dom::document::RefreshRedirectDue;
+@@ -45,7 +45,7 @@ use crate::dom::script_execution::ScriptOptions;
+ #[cfg(feature = "testbinding")]
+ use crate::dom::testbinding::TestBindingCallback;
+ use crate::dom::trustedtypes::trustedscript::TrustedScript;
+-use crate::dom::types::{Window, WorkerGlobalScope};
++use crate::dom::types::Window;
+ use crate::dom::xmlhttprequest::XHRTimeoutCallback;
+ use crate::event_loop::script_thread::ScriptThread;
+ use crate::modules::script_module::{ScriptFetchOptions, module_script_from_reference_private};
+@@ -625,10 +625,17 @@ impl OneshotTimers {
+         };
+ 
+         let expected_event_id = self.invalidate_expected_event_id();
++        let context = match timer.data.source {
++            TimerSource::FromWorker => {
++                TimerListenerContext::Worker(Trusted::new(&*self.global_scope))
++            },
++            TimerSource::FromWindow(pipelineid) => TimerListenerContext::Window(pipelineid),
++        };
++
+         // Step 12. Let completionStep be an algorithm step which queues a global
+         // task on the timer task source given global to run task.
+         let callback = TimerListener {
+-            context: Trusted::new(&*self.global_scope),
++            context,
+             task_source: self
+                 .global_scope
+                 .task_manager()
+@@ -1050,11 +1057,21 @@ pub struct TimerEventId(pub u32);
+ #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+ pub struct TimerEvent(pub TimerSource, pub TimerEventId);
+ 
++/// A helper to refer to the global of the timer.
++/// For workers the scheduler is owned by the worker itself.
++/// For window sources, the `Trusted` reference would keep the window alive until
++/// the timer fires, so we lookup the global via the pipeline instead.
++#[derive(Clone)]
++enum TimerListenerContext {
++    Worker(Trusted<GlobalScope>),
++    Window(PipelineId),
++}
++
+ /// A wrapper between timer events coming in over IPC, and the event-loop.
+ #[derive(Clone)]
+ struct TimerListener {
+     task_source: SendableTaskSource,
+-    context: Trusted<GlobalScope>,
++    context: TimerListenerContext,
+     source: TimerSource,
+     id: TimerEventId,
+ }
+@@ -1067,20 +1084,18 @@ impl TimerListener {
+         let context = self.context.clone();
+         // Step 9. Let task be a task that runs the following substeps:
+         self.task_source.queue(task!(timer_event: move |cx| {
+-                let global = context.root();
+-                let TimerEvent(source, id) = event;
+-                match source {
+-                    TimerSource::FromWorker => {
+-                        global.downcast::<WorkerGlobalScope>().expect("Window timer delivered to worker");
+-                    },
+-                    TimerSource::FromWindow(pipeline) => {
+-                        assert_eq!(pipeline, global.pipeline_id());
+-                        global.downcast::<Window>().expect("Worker timer delivered to window");
+-                    },
+-                };
+-                global.fire_timer(id, cx);
+-            })
+-        );
++            let TimerEvent(_source, id) = event;
++            let global = match context {
++                TimerListenerContext::Worker(global) => {
++                    global.root()
++                },
++                TimerListenerContext::Window(pipeline) => match ScriptThread::find_window(pipeline) {
++                    Some(window) => DomRoot::upcast::<GlobalScope>(window),
++                    None => return,
++                },
++            };
++            global.fire_timer(id, cx);
++        }));
+     }
+ 
+     fn into_callback(self) -> BoxedTimerCallback {
