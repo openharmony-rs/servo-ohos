@@ -79,6 +79,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 53. `script: Treat any defined detail as present in performance.measure` — B · CI · watch: -
 54. `ci: Build servoshell on QuickJS, and run WPT with it nightly` — A · CI · watch: .github/workflows/linux-wpt.yml .github/workflows/linux-common.yml .github/workflows/dispatch-workflow.yml python/servo/try_parser.py
 55. `docs: record patches 51 to 55 in the stack manifest` — B · none · watch: -
+56. `ci: Run the Linux build, lint and QuickJS jobs on the self-hosted runners` — B · CI · watch: .github/workflows/linux.yml .github/workflows/linux-arm64.yml
+57. `docs: record patches 56 to 57 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
