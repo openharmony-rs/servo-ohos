@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 11 Oct 2026 07:28:20 +0000
+Subject: [PATCH] docs: record patches 58 to 59 in the stack manifest
+
+AI-assisted: Yes (agent session; manifest entries and generated patch files)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index ff93068efcd..fbdcfcaf6c3 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -81,6 +81,8 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 55. `docs: record patches 51 to 55 in the stack manifest` — B · none · watch: -
+ 56. `ci: Run the Linux build, lint and QuickJS jobs on the self-hosted runners` — B · CI · watch: .github/workflows/linux.yml .github/workflows/linux-arm64.yml
+ 57. `docs: record patches 56 to 57 in the stack manifest` — B · none · watch: -
++58. `mach: Add a --js-engine option to build on QuickJS` — B · CI · watch: python/servo/build_commands.py python/servo/testing_commands.py
++59. `docs: record patches 58 to 59 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 

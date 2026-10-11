@@ -81,6 +81,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 55. `docs: record patches 51 to 55 in the stack manifest` — B · none · watch: -
 56. `ci: Run the Linux build, lint and QuickJS jobs on the self-hosted runners` — B · CI · watch: .github/workflows/linux.yml .github/workflows/linux-arm64.yml
 57. `docs: record patches 56 to 57 in the stack manifest` — B · none · watch: -
+58. `mach: Add a --js-engine option to build on QuickJS` — B · CI · watch: python/servo/build_commands.py python/servo/testing_commands.py
+59. `docs: record patches 58 to 59 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
