@@ -99,6 +99,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 73. `quickjs: Bump servo-quickjs for Intl web compatibility` — B · CI · watch: -
 74. `wpt: Run the ecmascript tests` — B · CI · watch: -
 75. `docs: record patches 69 to 75 in the stack manifest` — B · none · watch: -
+76. `script: Release each microtask's autorelease pool entries when it ends` — B · CI · watch: -
+77. `docs: record patches 76 to 77 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
