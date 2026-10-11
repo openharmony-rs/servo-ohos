@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 11 Oct 2026 15:50:00 +0000
+Subject: [PATCH] wpt: Run the ecmascript tests
+
+/ecmascript/ (locale-compat.html, regexp-lookbehind.html) was never
+added to include.ini. Both tests pass with SpiderMonkey and, since the
+previous patch, with QuickJS. locale-compat checks date and time
+formats that sites depend on.
+
+Validation: `./mach test-wpt tests/wpt/tests/ecmascript` ran both tests as expected with SpiderMonkey and with `--js-engine quickjs`; on servo-quickjs fdb3eab, locale-compat fails 4 subtests.
+AI-assisted: Yes (agent session; written by the agent, which also ran the WPT runs above)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ tests/wpt/include.ini | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/tests/wpt/include.ini b/tests/wpt/include.ini
+index f08edda2531..84a653b6169 100644
+--- a/tests/wpt/include.ini
++++ b/tests/wpt/include.ini
+@@ -146,6 +146,8 @@ skip: true
+   skip: false
+ [domxpath]
+   skip: false
++[ecmascript]
++  skip: false
+ [editing]
+   skip: false
+ [encoding]
