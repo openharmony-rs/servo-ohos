@@ -143,8 +143,12 @@ For each stop:
   pass. A stale copy still builds, because `[patch]` resolves to whatever is
   vendored, so check this whenever the pin moved, conflict or not.
 - QuickJS expectations (the `if js_engine == "quickjs"` conditions in
-  `tests/wpt/meta`): take upstream's side of the conflicting hunks; step 3
+  `tests/wpt/meta`, `tests/wpt/mozilla/meta` and `tests/wpt/webgl/meta`):
+  take upstream's side of the conflicting hunks; step 3
   regenerates the conditions.
+- When upstream moves the `mozjs` version, build `--js-engine quickjs`
+  right after the rebase. A `[[patch.unused]]` mozjs entry in the rewritten
+  `Cargo.lock` means the shim's version no longer matches.
 - Compile-check the crate(s) affected before continuing:
   `./mach check --ohos -p <crate>` (arkweb and other OHOS-only crates are
   not checkable on the host target). `mach` drops its `--features` when `-p`
@@ -271,7 +275,8 @@ Mandatory:
    `./mach test-wpt --js-engine quickjs --log-raw <log>`. Update the
    expectations from it (`./mach update-wpt <run URL or log>`) and amend them
    into `wpt: Add the QuickJS expectations`. An update from QuickJS results
-   alone keeps the SpiderMonkey expectations.
+   alone keeps the SpiderMonkey expectations; `--full` needs the logs of both
+   engines.
 
    A local run also reports the host's flaky and environment-specific
    results. Rerun the tests with unexpected results three times with each
@@ -283,6 +288,22 @@ Mandatory:
    default ports: some subtest names contain the test server's URL, so on
    other ports they are new subtests that neither the expectations nor the
    other engine's reruns match.
+
+   The rerun rule selects QuickJS conditions; it does not clear the rest.
+   Run every test whose unexpected result recurs with both engines once on
+   plain `base/<date>`. The same result on base is upstream or the host:
+   record the count in the sync log and compare it with the last sync's. A
+   different result is a stack effect: update the SpiderMonkey expectations
+   in the patch that causes it, or escalate.
+9. Someone who did not do the rebase, a person or a fresh agent, reviews
+   the fork delta, every range-diff entry with code changes, the sync log's
+   claims and every new shim commit. Findings are fixed or listed in the
+   sync report.
+10. Validation ends with a full CI run on the rebased stack: `ohos-main WPT`
+    and `OpenHarmony device WPT` on a `sync-candidate/<date>` branch. The
+    commit that gets pushed must have the same tree, except the sync docs.
+    A red job is a defect to fix on the stack or to explain test by test,
+    not background noise. A lost board is inconclusive.
 
 Any failure is a regression until proven a pre-existing upstream issue
 (check the same test on plain `base/<date>`). Regressions are fixed on the
