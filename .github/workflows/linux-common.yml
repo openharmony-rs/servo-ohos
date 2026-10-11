@@ -80,8 +80,9 @@ jobs:
     # The self-hosted runners labelled servo-ohos-linux have a target directory that is prebuilt
     # at a recent ohos-main. Pull requests from forks, architectures without self-hosted runners
     # (an empty self-hosted-image-name) and runs while the repository variable
-    # NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners.
-    runs-on: ${{ (inputs.self-hosted-image-name == '' || inputs.force-github-hosted-runner || vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request.head.repo.fork) && inputs.github-runner-label || 'servo-ohos-linux' }}
+    # NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners. `head.repo.fork` is no test for
+    # forks here: it is true for this repository too, a fork of servo/servo.
+    runs-on: ${{ (inputs.self-hosted-image-name == '' || inputs.force-github-hosted-runner || vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && inputs.github-runner-label || 'servo-ohos-linux' }}
     outputs:
       artifact_ids: ${{ steps.artifact_ids.outputs.artifact_ids }}
     steps:
