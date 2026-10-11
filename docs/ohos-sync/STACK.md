@@ -90,6 +90,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 64. `docs: record patches 60 to 64 in the stack manifest` — B · none · watch: -
 65. `squash! ci: Run the Linux build, lint and QuickJS jobs on the self-hosted runners` — B · CI · watch: -
 66. `docs: record patches 65 to 66 in the stack manifest` — B · none · watch: -
+67. `quickjs: Bump servo-quickjs for Intl over the system ICU` — B · CI · watch: -
+68. `docs: record patches 67 to 68 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
