@@ -60,7 +60,7 @@ jobs:
     # labelled servo-ohos-linux do. Their target directory has the checked-release QuickJS build of
     # a recent ohos-main. Pull requests from forks and runs while the repository variable
     # NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners.
-    runs-on: ${{ (vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request.head.repo.fork) && 'ubuntu-22.04' || 'servo-ohos-linux' }}
+    runs-on: ${{ (vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-22.04' || 'servo-ohos-linux' }}
     steps:
       - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Free Disk Space (Ubuntu)
