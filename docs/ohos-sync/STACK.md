@@ -84,7 +84,7 @@ those scripts (they need network access). `check_stack.py` runs each with
 58. `mach: Add a --js-engine option to build on QuickJS` — B · CI · watch: python/servo/build_commands.py python/servo/testing_commands.py
 59. `docs: record patches 58 to 59 in the stack manifest` — B · none · watch: -
 60. `ci: Pass the check-run data to curl through stdin` — B · CI · watch: -
-61. `wpt: Condition expectations on the JavaScript engine` — B · CI · watch: tests/wpt/tests/tools/wptrunner/wptrunner/metadata.py tests/wpt/tests/tools/wptrunner/wptrunner/browsers/servo.py
+61. `wpt: Condition expectations on the JavaScript engine` — B · CI · watch: tests/wpt/tests/tools/wptrunner/wptrunner/metadata.py tests/wpt/tests/tools/wptrunner/wptrunner/manifestupdate.py tests/wpt/tests/tools/wptrunner/wptrunner/manifestexpected.py tests/wpt/tests/tools/wptrunner/wptrunner/wpttest.py tests/wpt/tests/tools/wptrunner/wptrunner/products.py tests/wpt/tests/tools/wptrunner/wptrunner/browsers/servo.py
 62. `wpt: Add the QuickJS expectations` — B · CI · watch: -
 63. `ci: Run QuickJS WPT on pull requests and fail on unexpected results` — B · CI · watch: .github/workflows/linux.yml .github/workflows/main.yml
 64. `docs: record patches 60 to 64 in the stack manifest` — B · none · watch: -
@@ -92,6 +92,13 @@ those scripts (they need network access). `check_stack.py` runs each with
 66. `docs: record patches 65 to 66 in the stack manifest` — B · none · watch: -
 67. `quickjs: Bump servo-quickjs for Intl over the system ICU` — B · CI · watch: -
 68. `docs: record patches 67 to 68 in the stack manifest` — B · none · watch: -
+69. `wpt: Accept repository names with hyphens in update-wpt run URLs` — B · CI · watch: -
+70. `wpt: Keep both engines' expectations in update-wpt` — B · CI · watch: -
+71. `ci: Keep the QuickJS WPT run when a pull request needs a full run` — A · CI · watch: -
+72. `ci: Let the QuickJS WPT report create its check run and comment` — A · CI · watch: -
+73. `quickjs: Bump servo-quickjs for Intl web compatibility` — B · CI · watch: -
+74. `wpt: Run the ecmascript tests` — B · CI · watch: -
+75. `docs: record patches 69 to 75 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
