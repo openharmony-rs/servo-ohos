@@ -101,6 +101,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 75. `docs: record patches 69 to 75 in the stack manifest` — B · none · watch: -
 76. `script: Release each microtask's autorelease pool entries when it ends` — B · CI · watch: -
 77. `docs: record patches 76 to 77 in the stack manifest` — B · none · watch: -
+78. `quickjs: Bump servo-quickjs for shared runtime-state access` — B · CI · watch: -
+79. `docs: record patches 78 to 79 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

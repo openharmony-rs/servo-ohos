@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 12 Oct 2026 06:32:06 +0000
+Subject: [PATCH] docs: record patches 78 to 79 in the stack manifest
+
+AI-assisted: Yes (agent session; manifest entries and generated patch files)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 4f989e2d269..9be486bd86b 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -101,6 +101,8 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 75. `docs: record patches 69 to 75 in the stack manifest` — B · none · watch: -
+ 76. `script: Release each microtask's autorelease pool entries when it ends` — B · CI · watch: -
+ 77. `docs: record patches 76 to 77 in the stack manifest` — B · none · watch: -
++78. `quickjs: Bump servo-quickjs for shared runtime-state access` — B · CI · watch: -
++79. `docs: record patches 78 to 79 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 
