@@ -103,6 +103,12 @@ those scripts (they need network access). `check_stack.py` runs each with
 77. `docs: record patches 76 to 77 in the stack manifest` — B · none · watch: -
 78. `quickjs: Bump servo-quickjs for shared runtime-state access` — B · CI · watch: -
 79. `docs: record patches 78 to 79 in the stack manifest` — B · none · watch: -
+80. `servoshell: Move the headless window and event loop out of the desktop module` — B · CI · watch: -
+81. `servoshell: Run the servoshell executable headless on OpenHarmony` — B · manual · watch: ports/servoshell/desktop/cli.rs ports/servoshell/running_app_state.rs ports/servoshell/build.rs
+82. `wptrunner: Add a servo_ohos product for Servo on OpenHarmony devices` — B · manual · watch: tests/wpt/tests/tools/wptrunner/wptrunner/browsers/base.py tests/wpt/tests/tools/wptrunner/wptrunner/executors/executorservo.py tests/wpt/tests/tools/wptrunner/wptrunner/testrunner.py
+83. `mach: Run WPT on OpenHarmony devices with mach test-wpt --ohos` — B · manual · watch: python/servo/command_base.py
+84. `servoshell: Print a backtrace when the headless executable crashes on OpenHarmony` — B · manual · watch: ports/servoshell/panic_hook.rs
+85. `docs: record patches 80 to 85 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
