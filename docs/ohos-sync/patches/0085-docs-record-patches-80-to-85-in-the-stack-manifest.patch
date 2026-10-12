@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 12 Oct 2026 16:25:04 +0000
+Subject: [PATCH] docs: record patches 80 to 85 in the stack manifest
+
+AI-assisted: Yes (agent session; manifest entries and generated patch files)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 9be486bd86b..2e8210adbce 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -103,6 +103,12 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 77. `docs: record patches 76 to 77 in the stack manifest` — B · none · watch: -
+ 78. `quickjs: Bump servo-quickjs for shared runtime-state access` — B · CI · watch: -
+ 79. `docs: record patches 78 to 79 in the stack manifest` — B · none · watch: -
++80. `servoshell: Move the headless window and event loop out of the desktop module` — B · CI · watch: -
++81. `servoshell: Run the servoshell executable headless on OpenHarmony` — B · manual · watch: ports/servoshell/desktop/cli.rs ports/servoshell/running_app_state.rs ports/servoshell/build.rs
++82. `wptrunner: Add a servo_ohos product for Servo on OpenHarmony devices` — B · manual · watch: tests/wpt/tests/tools/wptrunner/wptrunner/browsers/base.py tests/wpt/tests/tools/wptrunner/wptrunner/executors/executorservo.py tests/wpt/tests/tools/wptrunner/wptrunner/testrunner.py
++83. `mach: Run WPT on OpenHarmony devices with mach test-wpt --ohos` — B · manual · watch: python/servo/command_base.py
++84. `servoshell: Print a backtrace when the headless executable crashes on OpenHarmony` — B · manual · watch: ports/servoshell/panic_hook.rs
++85. `docs: record patches 80 to 85 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 
