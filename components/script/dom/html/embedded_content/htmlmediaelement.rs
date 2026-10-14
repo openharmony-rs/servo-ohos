@@ -209,6 +209,9 @@ pub(crate) struct HTMLMediaElement {
     autoplaying: Cell<bool>,
     /// <https://html.spec.whatwg.org/multipage/#delaying-the-load-event-flag>
     delaying_the_load_event_flag: DomRefCell<Option<LoadBlocker>>,
+    /// Whether the owner document keeps this element alive, because it may still play or fire
+    /// events after script has dropped all references to it.
+    kept_alive_by_document: Cell<bool>,
     /// <https://html.spec.whatwg.org/multipage/#list-of-pending-play-promises>
     pending_play_promises: DomRefCell<Vec<TracedPromise>>,
     /// Play promises which are soon to be fulfilled by a queued task.
@@ -425,6 +428,7 @@ impl HTMLMediaElement {
             // FIXME(nox): Why is this initialised to true?
             autoplaying: Cell::new(true),
             delaying_the_load_event_flag: Default::default(),
+            kept_alive_by_document: Cell::new(false),
             pending_play_promises: Default::default(),
             in_flight_play_promises_queue: Default::default(),
             player: Default::default(),
@@ -461,6 +465,78 @@ impl HTMLMediaElement {
 
     pub(crate) fn network_state(&self) -> NetworkState {
         self.network_state.get()
+    }
+
+    fn set_network_state(&self, network_state: NetworkState) {
+        self.network_state.set(network_state);
+        self.update_keep_alive();
+    }
+
+    fn set_paused(&self, paused: bool) {
+        self.paused.set(paused);
+        self.update_keep_alive();
+    }
+
+    fn set_seeking(&self, seeking: bool) {
+        self.seeking.set(seeking);
+        self.update_keep_alive();
+    }
+
+    fn set_autoplaying(&self, autoplaying: bool) {
+        self.autoplaying.set(autoplaying);
+        self.update_keep_alive();
+    }
+
+    fn set_error(&self, error: Option<&MediaError>) {
+        self.error.set(error);
+        self.update_keep_alive();
+    }
+
+    /// Whether the element may still play audio or fire events without script acting on it, as
+    /// in other browsers: while it delays the load event (resource selection and loading up to
+    /// HAVE_CURRENT_DATA), and, with a resource and no error, while it seeks, or, until it has
+    /// ended playback, while it plays (also while waiting for data) or is eligible for autoplay.
+    /// While a fetch is in progress, the fetch listener keeps the element alive anyway.
+    fn has_pending_activity(&self) -> bool {
+        if self.delaying_the_load_event_flag.borrow().is_some() {
+            return true;
+        }
+        if self.in_error_state() ||
+            !matches!(
+                self.network_state.get(),
+                NetworkState::Loading | NetworkState::Idle
+            )
+        {
+            return false;
+        }
+        if self.seeking.get() {
+            return true;
+        }
+        if self.ended_playback(LoopCondition::Included) {
+            return false;
+        }
+        !self.paused.get() ||
+            (self.ready_state.get() < ReadyState::HaveEnoughData && self.eligible_for_autoplay())
+    }
+
+    /// Keeps the element alive through its owner document while it has pending activity.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/#playing-the-media-resource>
+    /// > Media elements must not stop playing just because all references to them have been
+    /// > removed; only once a media element is in a state where no further audio could ever be
+    /// > played by that element may the element be garbage collected.
+    fn update_keep_alive(&self) {
+        let keep_alive = self.has_pending_activity();
+        if keep_alive == self.kept_alive_by_document.get() {
+            return;
+        }
+        self.kept_alive_by_document.set(keep_alive);
+        let document = self.owner_document();
+        if keep_alive {
+            document.register_media_element_with_pending_activity(self);
+        } else {
+            document.unregister_media_element_with_pending_activity(self);
+        }
     }
 
     pub(crate) fn get_ready_state(&self) -> ReadyState {
@@ -522,6 +598,8 @@ impl HTMLMediaElement {
         } else {
             LoadBlocker::terminate(cx, blocker);
         }
+
+        self.update_keep_alive();
     }
 
     pub(crate) fn cue_container(&self, cx: &mut JSContext) -> DomRoot<Element> {
@@ -828,7 +906,7 @@ impl HTMLMediaElement {
         // Step 3. If the media element's paused attribute is true, then:
         if self.Paused() {
             // Step 3.1. Change the value of paused to false.
-            self.paused.set(false);
+            self.set_paused(false);
 
             // Step 3.2. If the show poster flag is true, set the element's show poster flag to
             // false and run the time marches on steps.
@@ -881,7 +959,7 @@ impl HTMLMediaElement {
         }
 
         // Step 5. Set the media element's can autoplay flag to false.
-        self.autoplaying.set(false);
+        self.set_autoplaying(false);
 
         self.update_media_state();
     }
@@ -889,12 +967,12 @@ impl HTMLMediaElement {
     /// <https://html.spec.whatwg.org/multipage/#internal-pause-steps>
     fn internal_pause_steps(&self) {
         // Step 1. Set the media element's can autoplay flag to false.
-        self.autoplaying.set(false);
+        self.set_autoplaying(false);
 
         // Step 2. If the media element's paused attribute is false, run the following steps:
         if !self.Paused() {
             // Step 2.1. Change the value of paused to true.
-            self.paused.set(true);
+            self.set_paused(true);
 
             // Step 2.2. Take pending play promises and let promises be the result.
             self.take_pending_play_promises(Err(Error::Abort(Some(
@@ -973,6 +1051,7 @@ impl HTMLMediaElement {
         let old_ready_state = self.ready_state.get();
         let was_potentially_playing = self.is_potentially_playing();
         self.ready_state.set(ready_state);
+        self.update_keep_alive();
 
         // > When the ready state of a media element whose networkState is not NETWORK_EMPTY changes,
         // > the user agent must follow the steps given below:
@@ -1097,7 +1176,7 @@ impl HTMLMediaElement {
                 // > The user agent may run the following substeps:
                 if self.eligible_for_autoplay() {
                     // Step 1. Set the paused attribute to false.
-                    self.paused.set(false);
+                    self.set_paused(false);
 
                     // Step 2. If the element's show poster flag is true, set it to false and run the
                     // time marches on steps.
@@ -1133,7 +1212,7 @@ impl HTMLMediaElement {
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm>
     fn invoke_resource_selection_algorithm(&self, cx: &mut JSContext) {
         // Step 1. Set the element's networkState attribute to the NETWORK_NO_SOURCE value.
-        self.network_state.set(NetworkState::NoSource);
+        self.set_network_state(NetworkState::NoSource);
 
         // Step 2. Set the element's show poster flag to true.
         self.show_poster.set(true);
@@ -1201,7 +1280,7 @@ impl HTMLMediaElement {
             self.load_state.set(LoadState::NotLoaded);
 
             // Step 6.none.1. Set the networkState to NETWORK_EMPTY.
-            self.network_state.set(NetworkState::Empty);
+            self.set_network_state(NetworkState::Empty);
 
             // Step 6.none.2. Set the element's delaying-the-load-event flag to false. This stops
             // delaying the load event.
@@ -1212,7 +1291,7 @@ impl HTMLMediaElement {
         };
 
         // Step 7. Set the media element's networkState to NETWORK_LOADING.
-        self.network_state.set(NetworkState::Loading);
+        self.set_network_state(NetworkState::Loading);
 
         // Step 8. Queue a media element task given the media element to fire an event named
         // loadstart at the media element.
@@ -1444,7 +1523,7 @@ impl HTMLMediaElement {
 
         // Step 9.children.18. Waiting: Set the element's networkState attribute to the
         // NETWORK_NO_SOURCE value.
-        self.network_state.set(NetworkState::NoSource);
+        self.set_network_state(NetworkState::NoSource);
 
         // Step 9.children.19. Set the element's show poster flag to true.
         self.show_poster.set(true);
@@ -1608,7 +1687,7 @@ impl HTMLMediaElement {
                 // none keyword).
                 if self.Preload() == "none" && !self.autoplaying.get() {
                     // Step 5.remote.1.1. Set the networkState to NETWORK_IDLE.
-                    self.network_state.set(NetworkState::Idle);
+                    self.set_network_state(NetworkState::Idle);
 
                     // Step 5.remote.1.2. Queue a media element task given the media element to fire
                     // an event named suspend at the element.
@@ -1701,7 +1780,7 @@ impl HTMLMediaElement {
                 this.fulfill_in_flight_play_promises(cx, |cx| {
                     // Step 1. Set the error attribute to the result of creating a MediaError with
                     // MEDIA_ERR_SRC_NOT_SUPPORTED.
-                    this.error.set(Some(&*MediaError::new(
+                    this.set_error(Some(&*MediaError::new(
                         cx,
                         &this.owner_window(),
                         MEDIA_ERR_SRC_NOT_SUPPORTED)));
@@ -1712,7 +1791,7 @@ impl HTMLMediaElement {
 
                     // Step 3. Set the element's networkState attribute to the NETWORK_NO_SOURCE
                     // value.
-                    this.network_state.set(NetworkState::NoSource);
+                    this.set_network_state(NetworkState::NoSource);
 
                     // Step 4. Set the element's show poster flag to true.
                     this.show_poster.set(true);
@@ -1842,7 +1921,7 @@ impl HTMLMediaElement {
             // Step 7.6. If the paused attribute is false, then:
             if !self.Paused() {
                 // Step 7.6.1. Set the paused attribute to true.
-                self.paused.set(true);
+                self.set_paused(true);
 
                 // Step 7.6.2. Take pending play promises and reject pending play promises with the
                 // result and an "AbortError" DOMException.
@@ -1853,7 +1932,7 @@ impl HTMLMediaElement {
             }
 
             // Step 7.7. If seeking is true, set it to false.
-            self.seeking.set(false);
+            self.set_seeking(false);
 
             self.current_seek_position.set(f64::NAN);
 
@@ -1877,8 +1956,8 @@ impl HTMLMediaElement {
         self.playback_rate.set(self.default_playback_rate.get());
 
         // Step 9. Set the error attribute to null and the can autoplay flag to true.
-        self.error.set(None);
-        self.autoplaying.set(true);
+        self.set_error(None);
+        self.set_autoplaying(true);
 
         // Step 10. Invoke the media element's resource selection algorithm.
         self.invoke_resource_selection_algorithm(cx);
@@ -2004,7 +2083,7 @@ impl HTMLMediaElement {
         self.delay_load_event(cx, true);
 
         // Step 9.children.25. Set the networkState back to NETWORK_LOADING.
-        self.network_state.set(NetworkState::Loading);
+        self.set_network_state(NetworkState::Loading);
 
         // Step 9.children.26. Jump back to the find next candidate step above.
         self.select_next_source_child(cx);
@@ -2038,11 +2117,10 @@ impl HTMLMediaElement {
 
         // Step 2. Set the error attribute to the result of creating a MediaError with
         // MEDIA_ERR_NETWORK/MEDIA_ERR_DECODE.
-        self.error
-            .set(Some(&*MediaError::new(cx, &self.owner_window(), error)));
+        self.set_error(Some(&*MediaError::new(cx, &self.owner_window(), error)));
 
         // Step 3. Set the element's networkState attribute to the NETWORK_IDLE value.
-        self.network_state.set(NetworkState::Idle);
+        self.set_network_state(NetworkState::Idle);
 
         // Step 4. Set the element's delaying-the-load-event flag to false. This stops delaying
         // the load event.
@@ -2070,7 +2148,7 @@ impl HTMLMediaElement {
         self.current_seek_position.set(f64::NAN);
 
         // Step 4. Set the seeking IDL attribute to true.
-        self.seeking.set(true);
+        self.set_seeking(true);
 
         // Step 5. If the seek was in response to a DOM method call or setting of an IDL attribute,
         // then continue the script. The remainder of these steps must be run in parallel.
@@ -2091,7 +2169,7 @@ impl HTMLMediaElement {
         let seekable = self.seekable();
 
         if seekable.is_empty() {
-            self.seeking.set(false);
+            self.set_seeking(false);
             return;
         }
 
@@ -2163,7 +2241,7 @@ impl HTMLMediaElement {
             .set(self.current_playback_position.get());
 
         // Step 14. Set the seeking IDL attribute to false.
-        self.seeking.set(false);
+        self.set_seeking(false);
 
         self.current_seek_position.set(f64::NAN);
 
@@ -2427,7 +2505,7 @@ impl HTMLMediaElement {
                     this.direction_of_playback() == PlaybackDirection::Forwards &&
                     !this.Paused() {
                     // Step 3.2.1. Set the paused attribute to true.
-                    this.paused.set(true);
+                    this.set_paused(true);
 
                     // Step 3.2.2. Fire an event named pause at the media element.
                     this.upcast::<EventTarget>().fire_event(cx, atom!("pause"));
@@ -2455,6 +2533,8 @@ impl HTMLMediaElement {
         if self.current_playback_position.get() <= self.earliest_possible_position() {
             self.queue_media_element_task_to_fire_event(atom!("timeupdate"));
         }
+
+        self.update_keep_alive();
     }
 
     fn playback_end(&self, cx: &mut JSContext) {
@@ -3704,6 +3784,7 @@ impl VirtualMethods for HTMLMediaElement {
                     self.remove_controls(cx);
                 }
             },
+            local_name!("autoplay") => self.update_keep_alive(),
             _ => (),
         };
     }
@@ -3727,6 +3808,12 @@ impl VirtualMethods for HTMLMediaElement {
 
     fn adopting_steps(&self, cx: &mut JSContext, old_doc: &Document) {
         self.super_type().unwrap().adopting_steps(cx, old_doc);
+
+        if self.kept_alive_by_document.get() {
+            old_doc.unregister_media_element_with_pending_activity(self);
+            self.owner_document()
+                .register_media_element_with_pending_activity(self);
+        }
 
         // Note that media control id should be adopting between documents so "privileged"
         // document.servoGetMediaControls(id) API is keeping access to the whitelist of media
@@ -4213,7 +4300,7 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
 
             // Step 2. Set the networkState to NETWORK_IDLE and fire an event named suspend at the
             // media element.
-            element.network_state.set(NetworkState::Idle);
+            element.set_network_state(NetworkState::Idle);
 
             element
                 .upcast::<EventTarget>()
