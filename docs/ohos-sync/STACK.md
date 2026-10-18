@@ -139,6 +139,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 113. `docs: record patches 111 to 113 in the stack manifest` — B · none · watch: -
 114. `media: Report the memory of the media cache` — B · manual · watch: components/profile/system_reporter.rs components/shared/profile/mem.rs
 115. `docs: record patches 114 to 115 in the stack manifest` — B · none · watch: -
+116. `ci: Build the GenUI-min configuration and report its size` — B · CI · watch: Cargo.toml ports/servoshell/Cargo.toml python/servo/package_commands.py .github/workflows/ohos.yml
+117. `docs: record patches 116 to 117 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
