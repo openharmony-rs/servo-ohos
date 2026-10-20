@@ -143,6 +143,11 @@ those scripts (they need network access). `check_stack.py` runs each with
 117. `docs: record patches 116 to 117 in the stack manifest` — B · none · watch: -
 118. `squash! ci: Build the GenUI-min configuration and report its size` — B · CI · watch: -
 119. `docs: record patches 118 to 119 in the stack manifest` — B · none · watch: -
+120. `net: Rebuild the HTTP cache on http-cache-rules and a streaming store` — C · CI · watch: components/shared/net/request.rs components/net/connector.rs tests/wpt/tests/fetch/http-cache
+121. `net: Make the disk the primary HTTP cache` — B · CI · watch: components/net/async_runtime.rs
+122. `servoshell (ohos): Write the HTTP cache index when backgrounded` — B · manual · watch: -
+123. `ports/arkweb: Use a disk-backed HTTP cache and persist its index on pause` — A · device · watch: components/servo/network_manager.rs
+124. `docs: record patches 120 to 124 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
