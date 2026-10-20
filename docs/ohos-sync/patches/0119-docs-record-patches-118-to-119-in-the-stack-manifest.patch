@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 20 Oct 2026 13:57:31 +0000
+Subject: [PATCH] docs: record patches 118 to 119 in the stack manifest
+
+AI-assisted: Yes (agent session; manifest entries and generated patch files)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 66d7c9095c9..aac7381b63a 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -141,6 +141,8 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 115. `docs: record patches 114 to 115 in the stack manifest` — B · none · watch: -
+ 116. `ci: Build the GenUI-min configuration and report its size` — B · CI · watch: Cargo.toml ports/servoshell/Cargo.toml python/servo/package_commands.py .github/workflows/ohos.yml
+ 117. `docs: record patches 116 to 117 in the stack manifest` — B · none · watch: -
++118. `squash! ci: Build the GenUI-min configuration and report its size` — B · CI · watch: -
++119. `docs: record patches 118 to 119 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 
