@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 20 Oct 2026 13:57:31 +0000
+Subject: [PATCH] squash! ci: Build the GenUI-min configuration and report its
+ size
+
+Set the Bencher threshold for the GenUI-min sizes from the ohos-main
+runs: an alert when a size grows by more than 0.1% over the previous
+push, with the percentage test on one sample. The sizes are
+deterministic, so the tests that estimate noise from the spread of the
+samples have none to work with, and an average of several samples would
+keep alerting for a few pushes after each jump. Pull requests already
+take the thresholds over from their base, and `--thresholds-reset`
+keeps the workflow the only place that sets them.
+
+Validation: `bencher run --dry-run` (CLI 0.6.13) with the job's script: the push report carries the file-size threshold (percentage, max_sample_size 1, upper_boundary 0.001, which Bencher's documentation defines as 0.1%), and the pull request report is unchanged. actionlint reports nothing new.
+AI-assisted: Yes (agent session; written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/ohos-genui-min.yml | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/.github/workflows/ohos-genui-min.yml b/.github/workflows/ohos-genui-min.yml
+index e63eb0d04e8..5b106e38d50 100644
+--- a/.github/workflows/ohos-genui-min.yml
++++ b/.github/workflows/ohos-genui-min.yml
+@@ -135,10 +135,13 @@ jobs:
+           jq -n --argjson library "$LIBRARY_SIZE" --argjson hap "$HAP_SIZE" \
+             '{"libservoshell.stripped.so": {"file-size": {"value": $library}}, "servoshell-default-unsigned.hap": {"file-size": {"value": $hap}}}' > size.json
+           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+-            branch=(--branch "$PR_NUMBER/PR" --hash "$HEAD_SHA" --start-point "$GITHUB_BASE_REF" \
++            options=(--branch "$PR_NUMBER/PR" --hash "$HEAD_SHA" --start-point "$GITHUB_BASE_REF" \
+               --start-point-hash "$BASE_SHA" --start-point-reset --start-point-clone-thresholds)
+           else
+-            branch=(--branch ohos-main --hash "$GITHUB_SHA")
++            # The sizes are deterministic, so each push is compared with the previous one.
++            options=(--branch ohos-main --hash "$GITHUB_SHA" --threshold-measure file-size \
++              --threshold-test percentage --threshold-max-sample-size 1 --threshold-upper-boundary 0.001 \
++              --thresholds-reset)
+           fi
+-          bencher run --project servo-ohos "${branch[@]}" --testbed aarch64-unknown-linux-ohos \
++          bencher run --project servo-ohos "${options[@]}" --testbed aarch64-unknown-linux-ohos \
+             --adapter json --file size.json --github-actions "$GITHUB_TOKEN"
