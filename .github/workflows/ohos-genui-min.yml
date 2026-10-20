@@ -135,10 +135,13 @@ jobs:
           jq -n --argjson library "$LIBRARY_SIZE" --argjson hap "$HAP_SIZE" \
             '{"libservoshell.stripped.so": {"file-size": {"value": $library}}, "servoshell-default-unsigned.hap": {"file-size": {"value": $hap}}}' > size.json
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            branch=(--branch "$PR_NUMBER/PR" --hash "$HEAD_SHA" --start-point "$GITHUB_BASE_REF" \
+            options=(--branch "$PR_NUMBER/PR" --hash "$HEAD_SHA" --start-point "$GITHUB_BASE_REF" \
               --start-point-hash "$BASE_SHA" --start-point-reset --start-point-clone-thresholds)
           else
-            branch=(--branch ohos-main --hash "$GITHUB_SHA")
+            # The sizes are deterministic, so each push is compared with the previous one.
+            options=(--branch ohos-main --hash "$GITHUB_SHA" --threshold-measure file-size \
+              --threshold-test percentage --threshold-max-sample-size 1 --threshold-upper-boundary 0.001 \
+              --thresholds-reset)
           fi
-          bencher run --project servo-ohos "${branch[@]}" --testbed aarch64-unknown-linux-ohos \
+          bencher run --project servo-ohos "${options[@]}" --testbed aarch64-unknown-linux-ohos \
             --adapter json --file size.json --github-actions "$GITHUB_TOKEN"
