@@ -1658,9 +1658,7 @@ impl ParserContext {
         let mut realm = enter_auto_realm(cx, &*document);
         let cx = &mut realm;
 
-        if status.is_ok() {
-            document.set_resource_fetch_timing(timing);
-        }
+        document.set_resource_fetch_timing(timing);
 
         if let Some(parser) = parser {
             parser.last_chunk_received.set(true);
