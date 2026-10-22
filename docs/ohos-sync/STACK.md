@@ -148,6 +148,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 122. `servoshell (ohos): Write the HTTP cache index when backgrounded` — B · manual · watch: -
 123. `ports/arkweb: Use a disk-backed HTTP cache and persist its index on pause` — A · device · watch: components/servo/network_manager.rs
 124. `docs: record patches 120 to 124 in the stack manifest` — B · none · watch: -
+125. `ci: Run WPT on every ohos-main push and store the results in servo-ohos-wpt` — B · CI · watch: .github/workflows/linux.yml
+126. `docs: record patches 125 to 126 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

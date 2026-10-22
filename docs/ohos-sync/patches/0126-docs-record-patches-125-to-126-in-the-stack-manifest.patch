@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 08:24:24 +0000
+Subject: [PATCH] docs: record patches 125 to 126 in the stack manifest
+
+AI-assisted: Yes (agent session; written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 8c05b00fa88..1327d255d8c 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -148,6 +148,8 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 122. `servoshell (ohos): Write the HTTP cache index when backgrounded` — B · manual · watch: -
+ 123. `ports/arkweb: Use a disk-backed HTTP cache and persist its index on pause` — A · device · watch: components/servo/network_manager.rs
+ 124. `docs: record patches 120 to 124 in the stack manifest` — B · none · watch: -
++125. `ci: Run WPT on every ohos-main push and store the results in servo-ohos-wpt` — B · CI · watch: .github/workflows/linux.yml
++126. `docs: record patches 125 to 126 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 
