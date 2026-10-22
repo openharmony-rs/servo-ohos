@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 18:41:15 +0000
+Subject: [PATCH] docs: record patches 112 to 122 in the stack manifest
+
+AI-assisted: Yes (agent session; written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 3371e8fd616..5a7d842aa9a 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -135,6 +135,17 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 109. `ports/arkweb: Use a disk-backed HTTP cache and persist its index on pause` — A · device · watch: components/servo/network_manager.rs
+ 110. `ci: Run WPT on every ohos-main push and store the results in servo-ohos-wpt` — B · CI · watch: .github/workflows/linux.yml
+ 111. `quickjs: Bump servo-quickjs for JS_GetGlobalFromScript` — B · CI · watch: components/script/scripting/module_loading.rs
++112. `net: Add an owned stream type for response bodies` — A · CI · watch: -
++113. `net: Take a TLS close without close_notify as the end of a close-delimited body` — B · CI · watch: components/net/connector.rs
++114. `net: Carry the response body in the response instead of a done channel` — C · CI · watch: components/shared/net/lib.rs components/net/http_cache/tee.rs components/net/decoder.rs
++115. `net: Check subresource integrity before handing the response over` — B · CI · watch: components/net/fetch/fetch_params.rs
++116. `script: Error the body of a fetch() response on any network error` — B · CI · watch: components/script/dom/stream/readablestream.rs
++117. `script: Reconnect an EventSource whose stream ends with a network error` — B · CI · watch: -
++118. `script: Fail a style sheet whose body ends with a network error` — B · CI · watch: components/script/dom/html/htmllinkelement.rs
++119. `script: Drop the received bytes of an XMLHttpRequest that ends with an error` — B · CI · watch: -
++120. `script: Keep the fetch timing of a document whose body ends with a network error` — B · CI · watch: components/script/dom/performance/performancenavigationtiming.rs
++121. `net: End a body cut short by the connection with a network error` — B · CI · watch: components/net/decoder.rs components/net/image_cache.rs
++122. `docs: record patches 112 to 122 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 
