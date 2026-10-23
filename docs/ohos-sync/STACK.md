@@ -146,6 +146,9 @@ those scripts (they need network access). `check_stack.py` runs each with
 120. `script: Keep the fetch timing of a document whose body ends with a network error` — B · CI · watch: components/script/dom/performance/performancenavigationtiming.rs
 121. `net: End a body cut short by the connection with a network error` — B · CI · watch: components/net/decoder.rs components/net/image_cache.rs
 122. `docs: record patches 112 to 122 in the stack manifest` — B · none · watch: -
+123. `quickjs: Bump servo-quickjs for interrupts and terminations in built-ins` — B · CI · watch: components/script/dom/promise/promise.rs components/script/scripting/script_execution.rs
+124. `wpt: Add a crashtest for terminating workers that create promises` — A · CI · watch: -
+125. `docs: record patches 123 to 125 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
