@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 26 Oct 2026 16:47:41 +0000
+Subject: [PATCH] docs: record patches 126 to 127 in the stack manifest
+
+AI-assisted: Yes (agent session; written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index e9ffc38b23f..7e02f0ccf2f 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -149,6 +149,8 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 123. `quickjs: Bump servo-quickjs for interrupts and terminations in built-ins` — B · CI · watch: components/script/dom/promise/promise.rs components/script/scripting/script_execution.rs
+ 124. `wpt: Add a crashtest for terminating workers that create promises` — A · CI · watch: -
+ 125. `docs: record patches 123 to 125 in the stack manifest` — B · none · watch: -
++126. `ci: Run WPT on the DAYU200 board of a self-hosted runner` — A · manual · watch: .github/workflows/ohos.yml .github/actions/setup-python/action.yml
++127. `docs: record patches 126 to 127 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 
