@@ -2,8 +2,9 @@
 # headless servoshell of `./mach build --ohos --headless-binary`. There are no expectations for
 # OpenHarmony yet, so the tests never fail the run.
 #
-# Every night, when ohos-main changed since the last nightly run, it runs the nightly subset of WPT
-# and stores the results in openharmony-rs/servo-ohos-wpt as `ohos-dayu200-spidermonkey`. All of
+# Every night, unless servo-ohos-wpt has a run of the ohos-main commit already, it runs the
+# nightly subset of WPT and stores the results in openharmony-rs/servo-ohos-wpt as
+# `ohos-dayu200-spidermonkey`. All of
 # WPT would take the board about a day. Otherwise it runs on request only: pull requests must not
 # reach the board.
 name: OpenHarmony device WPT
@@ -37,6 +38,8 @@ env:
   CARGO_INCREMENTAL: 0
   # About 9,000 tests, which take the board about three hours. The stored runs have to keep to
   # one subset for their scores to be comparable.
+  # The configuration of the stored runs, as in the results job.
+  RESULTS_CONFIG: ohos-dayu200-spidermonkey
   NIGHTLY_TESTS: >-
     /infrastructure /dom /url /fetch/api /css/css-flexbox /css/css-grid /css/css-text
     /css/css-backgrounds /css/css-fonts
@@ -45,8 +48,7 @@ jobs:
   setup:
     name: Setup
     runs-on: ubuntu-24.04
-    permissions:
-      actions: read
+    permissions: {}
     outputs:
       run: ${{ steps.setup.outputs.run }}
       tests: ${{ steps.setup.outputs.tests }}
@@ -56,7 +58,6 @@ jobs:
       - name: Choose what to run
         id: setup
         env:
-          GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           TESTS: ${{ inputs.tests }}
           PROFILE: ${{ inputs.profile || 'checked-release' }}
@@ -66,10 +67,10 @@ jobs:
           store=false
           if [ "$EVENT" = schedule ]; then
             store=true
-            last=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ohos-device-wpt.yml/runs?event=schedule&status=success&per_page=1" \
-              --jq '.workflow_runs[0].head_sha // ""')
-            if [ "$last" = "$GITHUB_SHA" ]; then
-              echo "The last nightly run tested $GITHUB_SHA already."
+            # Asks the results, so that a run whose results weren't stored doesn't count.
+            git clone --quiet --depth 1 --no-tags https://github.com/openharmony-rs/servo-ohos-wpt results
+            git -C results fetch --quiet --no-tags origin "+refs/runs/$RESULTS_CONFIG/*:refs/runs/$RESULTS_CONFIG/*"
+            if (cd results && python3 scripts/wpt_store.py tested --config "$RESULTS_CONFIG" "$GITHUB_SHA"); then
               run=false
             fi
           elif [ "$STORE" = true ]; then
@@ -189,6 +190,7 @@ jobs:
     secrets:
       SERVO_OHOS_WPT_TOKEN: ${{ secrets.SERVO_OHOS_WPT_TOKEN }}
     with:
+      # RESULTS_CONFIG; `with` can't read env.
       artifacts: '{"ohos-dayu200-spidermonkey": "wpt-full-logs-ohos-dayu200"}'
       chunks: 1
       upstream: false
