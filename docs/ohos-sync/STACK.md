@@ -151,6 +151,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 125. `docs: record patches 123 to 125 in the stack manifest` — B · none · watch: -
 126. `ci: Run WPT on the DAYU200 board of a self-hosted runner` — A · manual · watch: .github/workflows/ohos.yml .github/actions/setup-python/action.yml
 127. `docs: record patches 126 to 127 in the stack manifest` — B · none · watch: -
+128. `ci: Skip the nightly device WPT run only when its results were stored` — A · manual · watch: -
+129. `docs: record patches 128 to 129 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
