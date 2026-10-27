@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 27 Oct 2026 07:25:49 +0000
+Subject: [PATCH] ci: Skip the nightly device WPT run only when its results
+ were stored
+
+The nightly run skipped a commit when the last successful nightly run
+had tested it. When storing the results failed, which only warns, that
+commit was never stored and never tested again. It now asks
+servo-ohos-wpt whether it has a run of the commit, with the results
+repository's own `tested` command.
+
+Validation: actionlint passes, apart from its warnings about the metadata of the repository's local actions; the setup script, run against servo-ohos-wpt, runs the commit of the first nightly run, whose results weren't stored, and skips a commit that has a stored linux-spidermonkey run.
+AI-assisted: Yes (agent session; written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/ohos-device-wpt.yml | 20 +++++++++++---------
+ 1 file changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/.github/workflows/ohos-device-wpt.yml b/.github/workflows/ohos-device-wpt.yml
+index f418aa4fce9..5c8783aca91 100644
+--- a/.github/workflows/ohos-device-wpt.yml
++++ b/.github/workflows/ohos-device-wpt.yml
+@@ -2,8 +2,9 @@
+ # headless servoshell of `./mach build --ohos --headless-binary`. There are no expectations for
+ # OpenHarmony yet, so the tests never fail the run.
+ #
+-# Every night, when ohos-main changed since the last nightly run, it runs the nightly subset of WPT
+-# and stores the results in openharmony-rs/servo-ohos-wpt as `ohos-dayu200-spidermonkey`. All of
++# Every night, unless servo-ohos-wpt has a run of the ohos-main commit already, it runs the
++# nightly subset of WPT and stores the results in openharmony-rs/servo-ohos-wpt as
++# `ohos-dayu200-spidermonkey`. All of
+ # WPT would take the board about a day. Otherwise it runs on request only: pull requests must not
+ # reach the board.
+ name: OpenHarmony device WPT
+@@ -37,6 +38,8 @@ env:
+   CARGO_INCREMENTAL: 0
+   # About 9,000 tests, which take the board about three hours. The stored runs have to keep to
+   # one subset for their scores to be comparable.
++  # The configuration of the stored runs, as in the results job.
++  RESULTS_CONFIG: ohos-dayu200-spidermonkey
+   NIGHTLY_TESTS: >-
+     /infrastructure /dom /url /fetch/api /css/css-flexbox /css/css-grid /css/css-text
+     /css/css-backgrounds /css/css-fonts
+@@ -45,8 +48,7 @@ jobs:
+   setup:
+     name: Setup
+     runs-on: ubuntu-24.04
+-    permissions:
+-      actions: read
++    permissions: {}
+     outputs:
+       run: ${{ steps.setup.outputs.run }}
+       tests: ${{ steps.setup.outputs.tests }}
+@@ -56,7 +58,6 @@ jobs:
+       - name: Choose what to run
+         id: setup
+         env:
+-          GH_TOKEN: ${{ github.token }}
+           EVENT: ${{ github.event_name }}
+           TESTS: ${{ inputs.tests }}
+           PROFILE: ${{ inputs.profile || 'checked-release' }}
+@@ -66,10 +67,10 @@ jobs:
+           store=false
+           if [ "$EVENT" = schedule ]; then
+             store=true
+-            last=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ohos-device-wpt.yml/runs?event=schedule&status=success&per_page=1" \
+-              --jq '.workflow_runs[0].head_sha // ""')
+-            if [ "$last" = "$GITHUB_SHA" ]; then
+-              echo "The last nightly run tested $GITHUB_SHA already."
++            # Asks the results, so that a run whose results weren't stored doesn't count.
++            git clone --quiet --depth 1 --no-tags https://github.com/openharmony-rs/servo-ohos-wpt results
++            git -C results fetch --quiet --no-tags origin "+refs/runs/$RESULTS_CONFIG/*:refs/runs/$RESULTS_CONFIG/*"
++            if (cd results && python3 scripts/wpt_store.py tested --config "$RESULTS_CONFIG" "$GITHUB_SHA"); then
+               run=false
+             fi
+           elif [ "$STORE" = true ]; then
+@@ -189,6 +190,7 @@ jobs:
+     secrets:
+       SERVO_OHOS_WPT_TOKEN: ${{ secrets.SERVO_OHOS_WPT_TOKEN }}
+     with:
++      # RESULTS_CONFIG; `with` can't read env.
+       artifacts: '{"ohos-dayu200-spidermonkey": "wpt-full-logs-ohos-dayu200"}'
+       chunks: 1
+       upstream: false
