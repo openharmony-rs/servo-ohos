@@ -157,6 +157,9 @@ those scripts (they need network access). `check_stack.py` runs each with
 131. `build: bump ctutils (#49187)` — B · CI · watch: -
 132. `cargo: Bump crypto-biginit to resolve cargo-deny error (#49218)` — B · CI · watch: -
 133. `docs: record patches 130 to 133 in the stack manifest` — B · none · watch: -
+134. `deps: Take WebRender from servo/webrender#4892, for FreeType on OpenHarmony` — B · CI · watch: -
+135. `ci: Run the device WPT with QuickJS and RDB, on a subset for GenUI` — A · manual · watch: ports/servoshell/Cargo.toml
+136. `docs: record patches 134 to 136 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

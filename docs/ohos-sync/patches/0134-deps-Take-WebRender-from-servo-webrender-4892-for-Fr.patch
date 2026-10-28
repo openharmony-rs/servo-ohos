@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 28 Oct 2026 14:35:36 +0000
+Subject: [PATCH] deps: Take WebRender from servo/webrender#4892, for FreeType
+ on OpenHarmony
+
+wr_glyph_rasterizer looks up FT_Get_MM_Var, FT_Set_Var_Design_Coordinates
+and two more FreeType functions with dlsym everywhere but Android. On
+OpenHarmony that finds the FreeType 2.13.3 of the system's Skia
+(libskia_canvaskit.z.so), not the bundled 2.14.3, whose symbols are
+local, and calls it on faces of the bundled one. Its base layer doesn't
+know 2.14's internal return code -2, so setting the axes of the variable
+system font fails, and checked-release builds panic on
+`debug_assert!(succeeded(res))`: most CRASH results of the nightly
+DAYU200 WPT run. servo/webrender#4892 links the functions on
+OpenHarmony as on Android. All crates of the WebRender repository come
+from its commit, so that there is one copy of each; drop them for the
+first wr_glyph_rasterizer release with the fix.
+
+Validation: on a DAYU200 (OpenHarmony 7.0.0.38), the same change applied to wr_glyph_rasterizer 0.70.0 removed the assertion from the 188 tests that crashed (113 in css-backgrounds and a sample of 75 from css-grid, css-text, css-flexbox, css-fonts and dom), and 184 of them then gave the Linux result; with this commit, a checked-release QuickJS build has no FT_ symbols in its dynamic symbol table and passes css-backgrounds/background-clip-002.html, which crashed before; Cargo.lock only changes the sources of the seven crates; test-tidy (cargo-deny included) passes.
+AI-assisted: Yes (agent session; the agent found the cause, wrote the change and ran the device tests)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock | 21 +++++++--------------
+ Cargo.toml | 11 +++++++++++
+ 2 files changed, 18 insertions(+), 14 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index d68a13cc703..c43d8777378 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -6692,8 +6692,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+ [[package]]
+ name = "peek-poke"
+ version = "0.3.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ef60922033e31835f6cf98b9b81b58368037b71d2a81928985cd9d0b3b3171fb"
++source = "git+https://github.com/servo/webrender?rev=02d1ddd4d368487f077c4e779e2fe44d760ef95e#02d1ddd4d368487f077c4e779e2fe44d760ef95e"
+ dependencies = [
+  "euclid",
+  "peek-poke-derive",
+@@ -6702,8 +6701,7 @@ dependencies = [
+ [[package]]
+ name = "peek-poke-derive"
+ version = "0.3.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "271f78bae1e699b58c180a384a2e8d78ccbb60b853e15db92339725f3a2764d5"
++source = "git+https://github.com/servo/webrender?rev=02d1ddd4d368487f077c4e779e2fe44d760ef95e#02d1ddd4d368487f077c4e779e2fe44d760ef95e"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+@@ -12053,8 +12051,7 @@ dependencies = [
+ [[package]]
+ name = "webrender"
+ version = "0.70.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ede9dbc3cfb3e2c073a68e20f8fd54d9f6be8587be1c7c948e1ac51112421ef6"
++source = "git+https://github.com/servo/webrender?rev=02d1ddd4d368487f077c4e779e2fe44d760ef95e#02d1ddd4d368487f077c4e779e2fe44d760ef95e"
+ dependencies = [
+  "allocator-api2",
+  "bincode",
+@@ -12089,8 +12086,7 @@ dependencies = [
+ [[package]]
+ name = "webrender_api"
+ version = "0.70.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "11fa15766536df782680147d2ed7a2d2cebd2dc9f0f48e89c56ca39f11259d76"
++source = "git+https://github.com/servo/webrender?rev=02d1ddd4d368487f077c4e779e2fe44d760ef95e#02d1ddd4d368487f077c4e779e2fe44d760ef95e"
+ dependencies = [
+  "app_units",
+  "bitflags 2.13.2",
+@@ -12109,8 +12105,7 @@ dependencies = [
+ [[package]]
+ name = "webrender_build"
+ version = "0.70.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "674538885dba825ee1ddda72ade941fef81364cb843bbb0452fe7d134068ed89"
++source = "git+https://github.com/servo/webrender?rev=02d1ddd4d368487f077c4e779e2fe44d760ef95e#02d1ddd4d368487f077c4e779e2fe44d760ef95e"
+ dependencies = [
+  "bitflags 2.13.2",
+  "lazy_static",
+@@ -12728,8 +12723,7 @@ dependencies = [
+ [[package]]
+ name = "wr_glyph_rasterizer"
+ version = "0.70.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "bcda26d8788ba57a04cd75ae4a2c6da3aa8e5ab16ed1cfd5db09d0fbc04df2fb"
++source = "git+https://github.com/servo/webrender?rev=02d1ddd4d368487f077c4e779e2fe44d760ef95e#02d1ddd4d368487f077c4e779e2fe44d760ef95e"
+ dependencies = [
+  "core-foundation 0.9.4",
+  "core-graphics",
+@@ -12753,8 +12747,7 @@ dependencies = [
+ [[package]]
+ name = "wr_malloc_size_of"
+ version = "0.2.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "482308b684f11723b200a32808094bb460b5ac4840903ccbcb78ad92a6354a1f"
++source = "git+https://github.com/servo/webrender?rev=02d1ddd4d368487f077c4e779e2fe44d760ef95e#02d1ddd4d368487f077c4e779e2fe44d760ef95e"
+ dependencies = [
+  "app_units",
+  "euclid",
+diff --git a/Cargo.toml b/Cargo.toml
+index 8a78ae40ec9..d183475e04b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -458,6 +458,17 @@ codegen-units = 1
+ # OpenHarmony fork with FreeType 2.14.3, mmap-backed streams and ABI fixes; see
+ # third_party/patches/freetype-sys/update.sh.
+ freetype-sys = { path = "third_party/freetype-sys" }
++# WebRender 0.70 with servo/webrender#4892, which links the FreeType variation functions on
++# OpenHarmony. Their dlsym lookup found the FreeType of the system's Skia instead of the one above.
++# All crates of the WebRender repository, so that there is one copy of each. Drop them for the
++# first wr_glyph_rasterizer release with the fix.
++peek-poke = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
++peek-poke-derive = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
++webrender = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
++webrender_api = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
++webrender_build = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
++wr_glyph_rasterizer = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
++wr_malloc_size_of = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
+ 
+ # If you need to temporarily test Servo with a local fork of some upstream
+ # crate, add that here. Use the form:
