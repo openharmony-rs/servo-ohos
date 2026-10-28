@@ -458,6 +458,17 @@ codegen-units = 1
 # OpenHarmony fork with FreeType 2.14.3, mmap-backed streams and ABI fixes; see
 # third_party/patches/freetype-sys/update.sh.
 freetype-sys = { path = "third_party/freetype-sys" }
+# WebRender 0.70 with servo/webrender#4892, which links the FreeType variation functions on
+# OpenHarmony. Their dlsym lookup found the FreeType of the system's Skia instead of the one above.
+# All crates of the WebRender repository, so that there is one copy of each. Drop them for the
+# first wr_glyph_rasterizer release with the fix.
+peek-poke = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
+peek-poke-derive = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
+webrender = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
+webrender_api = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
+webrender_build = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
+wr_glyph_rasterizer = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
+wr_malloc_size_of = { git = "https://github.com/servo/webrender", rev = "02d1ddd4d368487f077c4e779e2fe44d760ef95e" }
 
 # If you need to temporarily test Servo with a local fork of some upstream
 # crate, add that here. Use the form:
