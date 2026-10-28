@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tim van der Lippe <TimvdLippe@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 08:47:18 +0000
+Subject: [PATCH] cargo: Bump crypto-biginit to resolve cargo-deny error
+ (#49218)
+
+0.7.5. got yanked
+
+Testing: no behavior change
+
+Signed-off-by: Tim van der Lippe <tvanderlippe@gmail.com>
+(cherry picked from commit e78fc913f26cbd5229cb0f7952b3ea3a4c269236)
+
+----
+
+Fork note: backport of upstream e78fc913f26 (#49218), which landed after
+base/2026-10-22. RustSec published RUSTSEC-2026-0387 for crypto-bigint
+0.7.5, so `cargo-deny` in `./mach test-tidy` failed on ohos-main. The
+commit also takes ctutils to 0.4.5 and cssparser-macros to syn 3.0.4,
+which the lock already contains, exactly as upstream.
+Drop at the next sync: every later base contains e78fc913f26, so this
+commit applies empty and becomes a `Superseded-by: e78fc913f26`
+placeholder (runbook decision 3).
+
+Validation: `./mach test-tidy` on ohos-main bf7c1c76aff fails in `cargo-deny` with RUSTSEC-2026-0387 (crypto-bigint 0.7.5) and RUSTSEC-2026-0385 (ctutils 0.4.3), as the Lint job of every pull request would; with both backports it passes, and `cargo-deny check` reports advisories, bans, licenses and sources ok. Same patch-id as upstream (`git patch-id --stable`). With both, on top of patch 130: `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`, the same build with `--ohos` (the Rust part; packaging then stops at the local signing configuration), and `./mach test-unit --profile checked-release` (1,255 tests) and `--doc` (46) pass.
+AI-assisted: Yes (agent session; the agent cherry-picked upstream commit e78fc913f26 without changes and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 48c8e71025d..d68a13cc703 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1780,9 +1780,9 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+ 
+ [[package]]
+ name = "crypto-bigint"
+-version = "0.7.5"
++version = "0.7.6"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
++checksum = "6bb08299a6046833a879ace115697f12fd2bd6c8d3e93c909ffc9e0738e7cae0"
+ dependencies = [
+  "cpubits",
+  "ctutils",
+@@ -1858,7 +1858,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
+ dependencies = [
+  "quote",
+- "syn 2.0.119",
++ "syn 3.0.4",
+ ]
+ 
+ [[package]]
+@@ -1878,9 +1878,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "ctutils"
+-version = "0.4.4"
++version = "0.4.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
++checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
+ dependencies = [
+  "cmov",
+  "subtle",

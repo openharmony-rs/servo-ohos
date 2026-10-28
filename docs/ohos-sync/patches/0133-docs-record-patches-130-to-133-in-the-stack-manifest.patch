@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 28 Oct 2026 08:09:28 +0000
+Subject: [PATCH] docs: record patches 130 to 133 in the stack manifest
+
+AI-assisted: Yes (agent session; written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index c8d40d2b08e..b65fe5d0885 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -153,6 +153,10 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 127. `docs: record patches 126 to 127 in the stack manifest` — B · none · watch: -
+ 128. `ci: Skip the nightly device WPT run only when its results were stored` — A · manual · watch: -
+ 129. `docs: record patches 128 to 129 in the stack manifest` — B · none · watch: -
++130. `quickjs: Bump servo-quickjs for three QuickJS-only memory leaks` — B · CI · watch: components/script_bindings/reflector.rs components/script/dom/node/customelementregistry.rs components/script/runtime/script_runtime.rs
++131. `build: bump ctutils (#49187)` — B · CI · watch: -
++132. `cargo: Bump crypto-biginit to resolve cargo-deny error (#49218)` — B · CI · watch: -
++133. `docs: record patches 130 to 133 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 
