@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Asset Malik <5373400+janeoa@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 09:05:11 +0000
+Subject: [PATCH] build: bump ctutils (#49187)
+
+Current main seem to
+```
+  | /home/jane/dev/servo/deny.toml:169: Non-constant-time mask generation and `u128` comparisons: ctutils 0.4.3 registry+https://github.com/rust-lang/crates.io-index
+```
+
+so I did
+```
+cargo update -p ctutils --precise 0.4.4
+```
+
+and it updated a sole dependency
+after update, the error is gone
+
+Fixes
+[RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385.html)
+
+Checked for no PRs addressing it yet
+
+Testing: `./mach test-tidy`
+
+Signed-off-by: Asset Malik <5373400+janeoa@users.noreply.github.com>
+(cherry picked from commit 7615ccf8186b57ef57f96b35b8ff7cc571f8da54)
+
+----
+
+Fork note: backport of upstream 7615ccf8186 (#49187), which landed after
+base/2026-10-22. RustSec published RUSTSEC-2026-0385 for ctutils 0.4.3,
+so `cargo-deny` in `./mach test-tidy` failed on ohos-main. The next
+commit, the backport of e78fc913f26, moves ctutils on to 0.4.5, as
+upstream did.
+Drop at the next sync: every later base contains 7615ccf8186, so this
+commit applies empty and becomes a `Superseded-by: 7615ccf8186`
+placeholder (runbook decision 3).
+
+Validation: `./mach test-tidy` on ohos-main bf7c1c76aff fails in `cargo-deny` with RUSTSEC-2026-0387 (crypto-bigint 0.7.5) and RUSTSEC-2026-0385 (ctutils 0.4.3), as the Lint job of every pull request would; with both backports it passes, and `cargo-deny check` reports advisories, bans, licenses and sources ok. Same patch-id as upstream (`git patch-id --stable`). With both, on top of patch 130: `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`, the same build with `--ohos` (the Rust part; packaging then stops at the local signing configuration), and `./mach test-unit --profile checked-release` (1,255 tests) and `--doc` (46) pass.
+AI-assisted: Yes (agent session; the agent cherry-picked upstream commit 7615ccf8186 without changes and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 6d131c63fbd..48c8e71025d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1878,9 +1878,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "ctutils"
+-version = "0.4.3"
++version = "0.4.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
++checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
+ dependencies = [
+  "cmov",
+  "subtle",

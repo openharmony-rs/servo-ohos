@@ -153,6 +153,10 @@ those scripts (they need network access). `check_stack.py` runs each with
 127. `docs: record patches 126 to 127 in the stack manifest` — B · none · watch: -
 128. `ci: Skip the nightly device WPT run only when its results were stored` — A · manual · watch: -
 129. `docs: record patches 128 to 129 in the stack manifest` — B · none · watch: -
+130. `quickjs: Bump servo-quickjs for three QuickJS-only memory leaks` — B · CI · watch: components/script_bindings/reflector.rs components/script/dom/node/customelementregistry.rs components/script/runtime/script_runtime.rs
+131. `build: bump ctutils (#49187)` — B · CI · watch: -
+132. `cargo: Bump crypto-biginit to resolve cargo-deny error (#49218)` — B · CI · watch: -
+133. `docs: record patches 130 to 133 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
