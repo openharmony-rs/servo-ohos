@@ -160,6 +160,9 @@ those scripts (they need network access). `check_stack.py` runs each with
 134. `deps: Take WebRender from servo/webrender#4892, for FreeType on OpenHarmony` — B · CI · watch: -
 135. `ci: Run the device WPT with QuickJS and RDB, on a subset for GenUI` — A · manual · watch: ports/servoshell/Cargo.toml
 136. `docs: record patches 134 to 136 in the stack manifest` — B · none · watch: -
+137. `wpt: Let the kernel kill a headless Servo on OpenHarmony that runs out of memory` — A · manual · watch: -
+138. `ci: Store the device WPT results only when every test ran` — A · manual · watch: -
+139. `docs: record patches 137 to 139 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
