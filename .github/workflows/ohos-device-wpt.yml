@@ -181,6 +181,28 @@ jobs:
           ./mach test-wpt --ohos --profile "$PROFILE" --js-engine quickjs --processes 2 --always-succeed \
             --log-raw wpt-full-logs/raw.log --log-wptreport wpt-full-logs/linux/wptreport/1.json \
             $TESTS
+      # wptrunner gives up on the remaining tests when it can't start Servo again, e.g. after the
+      # board rebooted, and `--always-succeed` hides that. A partial run must not be stored, as its
+      # scores aren't comparable.
+      - name: Check that all tests ran
+        run: |
+          uv run --no-project python - wpt-full-logs/raw.log <<'EOF'
+          import json
+          import sys
+
+          planned = ended = 0
+          with open(sys.argv[1]) as log:
+              for line in log:
+                  event = json.loads(line)
+                  if event["action"] == "suite_start":
+                      planned += sum(len(tests) for tests in event["tests"].values())
+                  elif event["action"] == "test_end":
+                      ended += 1
+          print(f"{ended} of {planned} tests ran")
+          if ended < planned:
+              print(f"::error::Only {ended} of the {planned} tests ran, so the results aren't stored")
+              sys.exit(1)
+          EOF
       - name: Upload the results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
