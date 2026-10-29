@@ -408,7 +408,11 @@ class ServoOhosBrowser(WebDriverBrowser):
         args = self.servo_args()
         if self.headless:
             executable = f"{self.executable_dir}/servoshell"
-            script = (f"cd {self.files_dir}; "
+            # The shells of hdcd have its oom_score_adj of -1000, which would keep the kernel from
+            # killing Servo when it runs out of memory: it kills the system services instead and
+            # then panics. Make Servo the first process to go instead.
+            script = ("echo 1000 > /proc/self/oom_score_adj 2>/dev/null; "
+                      f"cd {self.files_dir}; "
                       f"LD_LIBRARY_PATH={self.executable_dir} RUST_BACKTRACE=1 "
                       f"{executable} {shlex.join(args)} about:blank 2>&1 & "
                       f"echo {PID_MARKER}$!; wait $!; echo {EXIT_MARKER}$?")
