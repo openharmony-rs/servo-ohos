@@ -7,7 +7,7 @@ use std::sync::Arc;
 use log::{info, warn};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use rusqlite::{Connection, Error, OptionalExtension, params};
-use sea_query::{Condition, Expr, ExprTrait, IntoCondition, SqliteQueryBuilder};
+use sea_query::{Condition, Expr, ExprTrait, IntoCondition, Order, SqliteQueryBuilder};
 use sea_query_rusqlite::RusqliteBinder;
 use servo_base::threadpool::ThreadPool;
 use storage_traits::indexeddb::{
@@ -179,6 +179,7 @@ impl SqliteEngine {
         store: object_store_model::Model,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
+        reverse: bool,
     ) -> Result<Vec<object_data_model::Model>, Error> {
         let query = range_to_query(key_range);
         let mut sql_query = sea_query::Query::select();
@@ -189,7 +190,11 @@ impl SqliteEngine {
                 object_data_model::Column::Key,
                 object_data_model::Column::Data,
             ])
-            .and_where(query.and(Expr::col(object_data_model::Column::ObjectStoreId).is(store.id)));
+            .and_where(query.and(Expr::col(object_data_model::Column::ObjectStoreId).is(store.id)))
+            .order_by(
+                object_data_model::Column::Key,
+                if reverse { Order::Desc } else { Order::Asc },
+            );
         if let Some(count) = count {
             sql_query.limit(count as u64);
         }
@@ -209,7 +214,7 @@ impl SqliteEngine {
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
     ) -> Result<Vec<Vec<u8>>, Error> {
-        Self::get_all(connection, store, key_range, count)
+        Self::get_all(connection, store, key_range, count, false)
             .map(|models| models.into_iter().map(|m| m.key).collect())
     }
 
@@ -219,7 +224,7 @@ impl SqliteEngine {
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
     ) -> Result<Vec<Vec<u8>>, Error> {
-        Self::get_all(connection, store, key_range, count)
+        Self::get_all(connection, store, key_range, count, false)
             .map(|models| models.into_iter().map(|m| m.data).collect())
     }
 
@@ -228,9 +233,17 @@ impl SqliteEngine {
         connection: &Connection,
         store: object_store_model::Model,
         key_range: IndexedDBKeyRange,
+        count: Option<u32>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
-        Self::get_all(connection, store, key_range, None)
-            .map(|models| models.into_iter().map(|m| (m.key, m.data)).collect())
+        Self::get_all(connection, store, key_range, count, reverse).map(|models| {
+            let records = models.into_iter().map(|m| (m.key, m.data));
+            if reverse {
+                records.rev().collect()
+            } else {
+                records.collect()
+            }
+        })
     }
 
     fn put_item(
@@ -651,10 +664,18 @@ impl KvsEngine for SqliteEngine {
                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
                         callback,
                         key_range,
+                        count,
+                        reverse,
                     }) => {
                         let _ = callback.send(
-                            Self::get_all_records(&connection, object_store, key_range)
-                                .map(|records| {
+                            Self::get_all_records(
+                                &connection,
+                                object_store,
+                                key_range,
+                                count,
+                                reverse,
+                            )
+                            .map(|records| {
                                     records
                                         .into_iter()
                                         .map(|(key, data)| IndexedDBRecord {

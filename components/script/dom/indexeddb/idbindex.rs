@@ -13,7 +13,6 @@ use script_bindings::domstring::TracedDOMString;
 use script_bindings::error::{Error, ErrorResult, Fallible};
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use script_bindings::str::DOMString;
-use storage_traits::indexeddb::{AsyncOperation, AsyncReadOnlyOperation};
 
 use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
 use crate::dom::bindings::refcounted::Trusted;
@@ -130,7 +129,7 @@ impl IDBIndex {
                 direction,
                 false,
                 ObjectStoreOrIndex::Index(Dom::from_ref(self)),
-                range.clone(),
+                range,
                 key_only,
             )
         } else {
@@ -141,7 +140,7 @@ impl IDBIndex {
                 direction,
                 false,
                 ObjectStoreOrIndex::Index(Dom::from_ref(self)),
-                range.clone(),
+                range,
                 key_only,
             ))
         };
@@ -157,12 +156,7 @@ impl IDBIndex {
         IDBRequest::execute_async(
             cx,
             &self.object_store,
-            |callback| {
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
-                    callback,
-                    key_range: range,
-                })
-            },
+            |callback| cursor.iterate_operation(callback, None, 1),
             None,
             Some(iteration_param),
         )

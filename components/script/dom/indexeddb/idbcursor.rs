@@ -11,11 +11,12 @@ use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, NullValue, UndefinedValue};
 use js::rust::{HandleValue, MutableHandleValue};
+use profile_traits::generic_callback::GenericCallback;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use storage_traits::indexeddb::{
-    AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, IndexedDBKeyRange,
-    IndexedDBKeyType, IndexedDBRecord,
+    AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, BackendResult,
+    IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
 };
 
 use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::{
@@ -211,6 +212,53 @@ impl IDBCursor {
         }
         Ok(())
     }
+
+    /// The operation that gets the records for the steps to iterate a cursor with `key` and
+    /// `count`, which pick from the records after the cursor's position in its direction. For an
+    /// object store source, whose keys are unique, these steps only reach the next `count`
+    /// records, so only those are read.
+    pub(crate) fn iterate_operation(
+        &self,
+        callback: GenericCallback<BackendResult<Vec<IndexedDBRecord>>>,
+        key: Option<&IndexedDBKeyType>,
+        count: u32,
+    ) -> AsyncOperation {
+        let mut key_range = self.range.clone();
+        let (count, reverse) = match self.source {
+            // TODO: The backends store no index records yet, so an index source still reads
+            // every record in its range.
+            ObjectStoreOrIndex::Index(_) => (None, false),
+            ObjectStoreOrIndex::ObjectStore(_) => {
+                let position = self.position.borrow();
+                match self.direction {
+                    IDBCursorDirection::Next | IDBCursorDirection::Nextunique => {
+                        if let Some(position) = position.as_ref() {
+                            key_range.restrict_lower(position.clone(), true);
+                        }
+                        if let Some(key) = key {
+                            key_range.restrict_lower(key.clone(), false);
+                        }
+                        (Some(count), false)
+                    },
+                    IDBCursorDirection::Prev | IDBCursorDirection::Prevunique => {
+                        if let Some(position) = position.as_ref() {
+                            key_range.restrict_upper(position.clone(), true);
+                        }
+                        if let Some(key) = key {
+                            key_range.restrict_upper(key.clone(), false);
+                        }
+                        (Some(count), true)
+                    },
+                }
+            },
+        };
+        AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+            callback,
+            key_range,
+            count,
+            reverse,
+        })
+    }
 }
 
 impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
@@ -328,19 +376,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
             count: Some(count),
         };
 
-        let range = self.range.clone();
         // NOTE: According to the spec, execute_async should take the cursor's source
         // (which may be an index). Using effective_object_store here is a temporary
         // workaround until execute_async supports ObjectStoreOrIndex as source.
         IDBRequest::execute_async(
             cx,
             &self.effective_object_store(),
-            |callback| {
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
-                    callback,
-                    key_range: range,
-                })
-            },
+            |callback| self.iterate_operation(callback, None, count),
             Some(request),
             Some(iteration_param),
         )?;
@@ -415,6 +457,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         // Step 9: Run the steps to asynchronously execute a request with the cursor's source as
         // source, the steps to iterate a cursor as operation and request, using the current Realm
         // as targetRealm, this cursor and key (if given).
+        let operation_key = key.clone();
         let iteration_param = IterationParam {
             cursor: Trusted::new(self),
             key,
@@ -422,19 +465,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
             count: None,
         };
 
-        let range = self.range.clone();
         // NOTE: According to the spec, execute_async should take the cursor's source
         // (which may be an index). Using effective_object_store here is a temporary
         // workaround until execute_async supports ObjectStoreOrIndex as source.
         IDBRequest::execute_async(
             cx,
             &self.effective_object_store(),
-            |callback| {
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
-                    callback,
-                    key_range: range,
-                })
-            },
+            |callback| self.iterate_operation(callback, operation_key.as_ref(), 1),
             Some(request),
             Some(iteration_param),
         )?;
@@ -561,6 +598,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         // Step 20: Run the steps to asynchronously execute a request with the cursor's source as
         // source, the steps to iterate a cursor as operation and request, using the current Realm
         // as targetRealm, this cursor, key and primaryKey.
+        let operation_key = key.clone();
         let iteration_param = IterationParam {
             cursor: Trusted::new(self),
             key: Some(key),
@@ -568,19 +606,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
             count: None,
         };
 
-        let range = self.range.clone();
         // NOTE: According to the spec, execute_async should take the cursor's source
         // (which may be an index). Using effective_object_store here is a temporary
         // workaround until execute_async supports ObjectStoreOrIndex as source.
         IDBRequest::execute_async(
             cx,
             &self.effective_object_store(),
-            |callback| {
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
-                    callback,
-                    key_range: range,
-                })
-            },
+            |callback| self.iterate_operation(callback, Some(&operation_key), 1),
             Some(request),
             Some(iteration_param),
         )?;

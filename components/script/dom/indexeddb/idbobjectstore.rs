@@ -537,7 +537,7 @@ impl IDBObjectStore {
                 direction,
                 false,
                 ObjectStoreOrIndex::ObjectStore(Dom::from_ref(self)),
-                range.clone(),
+                range,
                 key_only,
             )
         } else {
@@ -548,7 +548,7 @@ impl IDBObjectStore {
                 direction,
                 false,
                 ObjectStoreOrIndex::ObjectStore(Dom::from_ref(self)),
-                range.clone(),
+                range,
                 key_only,
             ))
         };
@@ -567,12 +567,7 @@ impl IDBObjectStore {
         IDBRequest::execute_async(
             cx,
             self,
-            |callback| {
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
-                    callback,
-                    key_range: range,
-                })
-            },
+            |callback| cursor.iterate_operation(callback, None, 1),
             None,
             Some(iteration_param),
         )

@@ -305,18 +305,22 @@ impl OhosRdbEngine {
         store: &ObjectStoreModel,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
+        reverse: bool,
     ) -> OhosRdbResult<Vec<ObjectDataModel>> {
         let (sql, args) = shared::object_data_select_sql::<OhosRdbTransaction>(
             "object_store_id, key, data",
             store.id,
             key_range,
             count,
-            true,
+            reverse,
         )?;
         let mut cursor = tx.query_sql(&sql, &args)?;
         let mut rows = Vec::new();
         while cursor.next_row()? {
             rows.push(Self::read_object_data(&cursor)?);
+        }
+        if reverse {
+            rows.reverse();
         }
         Ok(rows)
     }
@@ -584,7 +588,7 @@ impl KvsEngine for OhosRdbEngine {
                             &mut success_actions,
                             &mut commit_error_actions,
                             callback,
-                            Self::object_data_rows(&tx, &object_store, key_range, Some(1))
+                            Self::object_data_rows(&tx, &object_store, key_range, Some(1), false)
                                 .map(|mut rows| rows.pop().map(|row| row.data))
                                 .map_err(|error| BackendError::DbErr(format!("{error:?}"))),
                         );
@@ -594,13 +598,16 @@ impl KvsEngine for OhosRdbEngine {
                         key_range,
                         count,
                     }) => {
-                        let result = Self::object_data_rows(&tx, &object_store, key_range, count)
-                            .and_then(|rows| {
-                                rows.into_iter()
-                                    .map(|row| Self::decode_key(&row.key, "object data key decode"))
-                                    .collect::<OhosRdbResult<Vec<_>>>()
-                            })
-                            .map_err(|error| BackendError::DbErr(format!("{error:?}")));
+                        let result =
+                            Self::object_data_rows(&tx, &object_store, key_range, count, false)
+                                .and_then(|rows| {
+                                    rows.into_iter()
+                                        .map(|row| {
+                                            Self::decode_key(&row.key, "object data key decode")
+                                        })
+                                        .collect::<OhosRdbResult<Vec<_>>>()
+                                })
+                                .map_err(|error| BackendError::DbErr(format!("{error:?}")));
                         Self::enqueue_result(
                             &mut success_actions,
                             &mut commit_error_actions,
@@ -617,7 +624,7 @@ impl KvsEngine for OhosRdbEngine {
                             &mut success_actions,
                             &mut commit_error_actions,
                             callback,
-                            Self::object_data_rows(&tx, &object_store, key_range, count)
+                            Self::object_data_rows(&tx, &object_store, key_range, count, false)
                                 .map(|rows| rows.into_iter().map(|row| row.data).collect())
                                 .map_err(|error| BackendError::DbErr(format!("{error:?}"))),
                         );
@@ -657,22 +664,27 @@ impl KvsEngine for OhosRdbEngine {
                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
                         callback,
                         key_range,
+                        count,
+                        reverse,
                     }) => {
-                        let result = Self::object_data_rows(&tx, &object_store, key_range, None)
-                            .and_then(|rows| {
-                                rows.into_iter()
-                                    .map(|row| {
-                                        let key =
-                                            Self::decode_key(&row.key, "object data key decode")?;
-                                        Ok(IndexedDBRecord {
-                                            key: key.clone(),
-                                            primary_key: key,
-                                            value: row.data,
+                        let result =
+                            Self::object_data_rows(&tx, &object_store, key_range, count, reverse)
+                                .and_then(|rows| {
+                                    rows.into_iter()
+                                        .map(|row| {
+                                            let key = Self::decode_key(
+                                                &row.key,
+                                                "object data key decode",
+                                            )?;
+                                            Ok(IndexedDBRecord {
+                                                key: key.clone(),
+                                                primary_key: key,
+                                                value: row.data,
+                                            })
                                         })
-                                    })
-                                    .collect::<OhosRdbResult<Vec<_>>>()
-                            })
-                            .map_err(|error| BackendError::DbErr(format!("{error:?}")));
+                                        .collect::<OhosRdbResult<Vec<_>>>()
+                                })
+                                .map_err(|error| BackendError::DbErr(format!("{error:?}")));
                         Self::enqueue_result(
                             &mut success_actions,
                             &mut commit_error_actions,
@@ -700,13 +712,16 @@ impl KvsEngine for OhosRdbEngine {
                         callback,
                         key_range,
                     }) => {
-                        let result = Self::object_data_rows(&tx, &object_store, key_range, Some(1))
-                            .and_then(|mut rows| {
-                                rows.pop()
-                                    .map(|row| Self::decode_key(&row.key, "object data key decode"))
-                                    .transpose()
-                            })
-                            .map_err(|error| BackendError::DbErr(format!("{error:?}")));
+                        let result =
+                            Self::object_data_rows(&tx, &object_store, key_range, Some(1), false)
+                                .and_then(|mut rows| {
+                                    rows.pop()
+                                        .map(|row| {
+                                            Self::decode_key(&row.key, "object data key decode")
+                                        })
+                                        .transpose()
+                                })
+                                .map_err(|error| BackendError::DbErr(format!("{error:?}")));
                         Self::enqueue_result(
                             &mut success_actions,
                             &mut commit_error_actions,

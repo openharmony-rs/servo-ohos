@@ -19,8 +19,8 @@ use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, Storage
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
     BackendError, BackendResult, ConnectionMsg, IndexedDBKeyRange, IndexedDBKeyType,
-    IndexedDBObjectStore, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath, PutItemResult,
-    SyncOperation, TxnCompleteMsg,
+    IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath,
+    PutItemResult, SyncOperation, TxnCompleteMsg,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -482,6 +482,39 @@ fn get_all_keys_request(
                 callback: sender,
                 key_range,
                 count: None,
+            }),
+        ),
+    )
+    .unwrap();
+    receiver
+}
+
+#[allow(clippy::too_many_arguments)]
+fn iterate_request(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    store_name: &str,
+    txn: u64,
+    key_range: IndexedDBKeyRange,
+    count: Option<u32>,
+    reverse: bool,
+    request_id: u64,
+) -> mpsc::Receiver<Option<BackendResult<Vec<IndexedDBRecord>>>> {
+    let (sender, receiver) = make_profile_callback();
+    GenericSend::send(
+        &ctx.private_threads,
+        IndexedDBThreadMsg::Async(
+            ctx.origin.clone(),
+            db_name.to_string(),
+            store_name.to_string(),
+            txn,
+            request_id,
+            IndexedDBTxnMode::Readonly,
+            AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+                callback: sender,
+                key_range,
+                count,
+                reverse,
             }),
         ),
     )
@@ -1200,6 +1233,138 @@ fn test_indexeddb_cross_type_key_sort_order() {
             IndexedDBKeyType::Array(vec![IndexedDBKeyType::Number(1.0)]),
         ]
     );
+
+    close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+#[test]
+fn test_indexeddb_iterate_count_and_reverse() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-iterate";
+    let store_name = "items";
+    let connection_id =
+        expect_upgrade_and_initialize_database(&ctx, db_name, store_name, "by_author", None);
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readwrite,
+        vec![store_name.to_string()],
+    );
+    let mut receivers = Vec::new();
+    for request_id in 1..=5 {
+        let key = IndexedDBKeyType::Number(request_id as f64);
+        receivers.push((
+            request_id,
+            put_item_request(
+                &ctx,
+                db_name,
+                store_name,
+                txn,
+                request_id,
+                Some(key),
+                vec![request_id as u8],
+                true,
+            ),
+        ));
+    }
+    let commit_result = commit_transaction(&ctx, db_name, txn);
+    for (request_id, receiver) in receivers {
+        let result = recv_callback_timeout(&receiver, "iterate put reply");
+        assert!(result.is_ok(), "request {request_id} should succeed");
+        mark_request_handled(&ctx, db_name, txn, request_id);
+    }
+    let commit_msg = recv_callback_timeout(&commit_result, "iterate commit reply");
+    assert!(commit_msg.result.is_ok());
+    finish_transaction(&ctx, db_name, txn);
+
+    let number = |n: f64| IndexedDBKeyType::Number(n);
+    let cases = [
+        (
+            IndexedDBKeyRange::default(),
+            None,
+            false,
+            vec![1, 2, 3, 4, 5],
+        ),
+        (
+            IndexedDBKeyRange::default(),
+            None,
+            true,
+            vec![1, 2, 3, 4, 5],
+        ),
+        (
+            IndexedDBKeyRange::lower_bound(number(2.0), true),
+            Some(2),
+            false,
+            vec![3, 4],
+        ),
+        (
+            IndexedDBKeyRange::upper_bound(number(4.0), true),
+            Some(2),
+            true,
+            vec![2, 3],
+        ),
+        (
+            IndexedDBKeyRange::new(Some(number(2.0)), Some(number(4.0)), false, false),
+            Some(10),
+            true,
+            vec![2, 3, 4],
+        ),
+        (
+            IndexedDBKeyRange::lower_bound(number(5.0), true),
+            Some(1),
+            false,
+            vec![],
+        ),
+    ];
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readonly,
+        vec![store_name.to_string()],
+    );
+    let receivers: Vec<_> = cases
+        .iter()
+        .zip(1..)
+        .map(|((key_range, count, reverse, _), request_id)| {
+            iterate_request(
+                &ctx,
+                db_name,
+                store_name,
+                txn,
+                key_range.clone(),
+                *count,
+                *reverse,
+                request_id,
+            )
+        })
+        .collect();
+    let commit_result = commit_transaction(&ctx, db_name, txn);
+    for ((receiver, (key_range, count, reverse, expected)), request_id) in
+        receivers.iter().zip(&cases).zip(1..)
+    {
+        let records = recv_callback_timeout(receiver, "iterate reply").unwrap();
+        mark_request_handled(&ctx, db_name, txn, request_id);
+        let keys: Vec<_> = records.iter().map(|record| record.key.clone()).collect();
+        let values: Vec<_> = records.iter().map(|record| record.value.clone()).collect();
+        assert_eq!(
+            keys,
+            expected
+                .iter()
+                .map(|n| number(*n as f64))
+                .collect::<Vec<_>>(),
+            "{key_range:?} count {count:?} reverse {reverse}"
+        );
+        assert_eq!(
+            values,
+            expected.iter().map(|n| vec![*n as u8]).collect::<Vec<_>>()
+        );
+    }
+    let commit_msg = recv_callback_timeout(&commit_result, "iterate read commit reply");
+    assert!(commit_msg.result.is_ok());
+    finish_transaction(&ctx, db_name, txn);
 
     close_database(&ctx, connection_id, db_name);
     ctx.shutdown();

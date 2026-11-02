@@ -532,7 +532,7 @@ pub(crate) fn object_data_select_sql<T: StorageSqlTransaction>(
     store_id: i64,
     key_range: IndexedDBKeyRange,
     count: Option<u32>,
-    order_by_key: bool,
+    reverse: bool,
 ) -> Result<(String, T::Values), T::Error> {
     let mut values = T::new_values()?;
     T::push_int(&mut values, store_id)?;
@@ -541,9 +541,11 @@ pub(crate) fn object_data_select_sql<T: StorageSqlTransaction>(
     let mut sql = format!(
         "SELECT {select_list} FROM object_data WHERE object_store_id = ?1 AND {range_clause}"
     );
-    if order_by_key {
-        sql.push_str(" ORDER BY key ASC");
-    }
+    sql.push_str(if reverse {
+        " ORDER BY key DESC"
+    } else {
+        " ORDER BY key ASC"
+    });
     if let Some(count) = count {
         T::push_int(&mut values, count as i64)?;
         sql.push_str(&format!(" LIMIT ?{}", T::value_count(&values)?));

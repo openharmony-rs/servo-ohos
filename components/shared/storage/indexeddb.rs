@@ -249,6 +249,30 @@ impl IndexedDBKeyRange {
         }
         None
     }
+
+    /// Raises the lower bound to `key` (excluded if `open`), unless the current one is tighter.
+    pub fn restrict_lower(&mut self, key: IndexedDBKeyType, open: bool) {
+        let tighter = self
+            .lower
+            .as_ref()
+            .is_none_or(|lower| &key > lower || (&key == lower && open && !self.lower_open));
+        if tighter {
+            self.lower = Some(key);
+            self.lower_open = open;
+        }
+    }
+
+    /// Lowers the upper bound to `key` (excluded if `open`), unless the current one is tighter.
+    pub fn restrict_upper(&mut self, key: IndexedDBKeyType, open: bool) {
+        let tighter = self
+            .upper
+            .as_ref()
+            .is_none_or(|upper| &key < upper || (&key == upper && open && !self.upper_open));
+        if tighter {
+            self.upper = Some(key);
+            self.upper_open = open;
+        }
+    }
 }
 
 /// <https://w3c.github.io/IndexedDB/#record-snapshot>
@@ -309,9 +333,13 @@ pub enum AsyncReadOnlyOperation {
         callback: GenericCallback<BackendResult<u64>>,
         key_range: IndexedDBKeyRange,
     },
+    /// Gets the records in `key_range` in ascending key order: the first `count` of them, or the
+    /// last `count` if `reverse` is set, or all of them if `count` is `None`.
     Iterate {
         callback: GenericCallback<BackendResult<Vec<IndexedDBRecord>>>,
         key_range: IndexedDBKeyRange,
+        count: Option<u32>,
+        reverse: bool,
     },
 }
 
@@ -681,5 +709,38 @@ mod test {
         let full_range = IndexedDBKeyRange::new(None, None, false, false);
         assert!(!full_range.is_singleton());
         assert!(full_range.as_singleton().is_none());
+    }
+
+    #[test]
+    fn test_restrict_bounds() {
+        let one = IndexedDBKeyType::Number(1.0);
+        let two = IndexedDBKeyType::Number(2.0);
+        let three = IndexedDBKeyType::Number(3.0);
+
+        let mut range =
+            IndexedDBKeyRange::new(Some(two.clone()), Some(three.clone()), false, false);
+        range.restrict_lower(one.clone(), true);
+        assert_eq!(range.lower, Some(two.clone()));
+        assert!(!range.lower_open);
+        range.restrict_lower(two.clone(), false);
+        assert!(!range.lower_open);
+        range.restrict_lower(two.clone(), true);
+        assert!(range.lower_open);
+        range.restrict_lower(three.clone(), false);
+        assert_eq!(range.lower, Some(three.clone()));
+        assert!(!range.lower_open);
+
+        let mut range = IndexedDBKeyRange::default();
+        range.restrict_upper(two.clone(), true);
+        assert_eq!(range.upper, Some(two.clone()));
+        assert!(range.upper_open);
+        range.restrict_upper(two.clone(), false);
+        assert!(range.upper_open);
+        range.restrict_upper(three, true);
+        assert_eq!(range.upper, Some(two));
+        range.restrict_upper(one.clone(), false);
+        assert_eq!(range.upper, Some(one));
+        assert!(!range.upper_open);
+        assert!(range.lower.is_none());
     }
 }
