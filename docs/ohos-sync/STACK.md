@@ -153,6 +153,9 @@ those scripts (they need network access). `check_stack.py` runs each with
 127. `wpt: Let the kernel kill a headless Servo on OpenHarmony that runs out of memory` — A · manual · watch: -
 128. `ci: Store the device WPT results only when every test ran` — A · manual · watch: -
 129. `quickjs: Bump servo-quickjs for mozjs 0.26.9` — B · CI · watch: components/script_bindings/observablearray.rs
+130. `ci: Run the device WPT in one chunk per DAYU200 board` — A · manual · watch: -
+131. `ci: Double the nightly device WPT subset for two boards` — A · manual · watch: tests/wpt/include.ini
+132. `docs: record patches 130 to 132 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 2 Nov 2026 14:25:50 +0000
+Subject: [PATCH] docs: record patches 130 to 132 in the stack manifest
+
+AI-assisted: Yes (agent session; the agent wrote the manifest entries)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 146813ff9ef..69a0c97612c 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -153,6 +153,9 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 127. `wpt: Let the kernel kill a headless Servo on OpenHarmony that runs out of memory` — A · manual · watch: -
+ 128. `ci: Store the device WPT results only when every test ran` — A · manual · watch: -
+ 129. `quickjs: Bump servo-quickjs for mozjs 0.26.9` — B · CI · watch: components/script_bindings/observablearray.rs
++130. `ci: Run the device WPT in one chunk per DAYU200 board` — A · manual · watch: -
++131. `ci: Double the nightly device WPT subset for two boards` — A · manual · watch: tests/wpt/include.ini
++132. `docs: record patches 130 to 132 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 
