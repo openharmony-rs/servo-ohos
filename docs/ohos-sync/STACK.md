@@ -160,6 +160,9 @@ those scripts (they need network access). `check_stack.py` runs each with
 134. `fixup! fonts: Only load @font-face fonts that the page uses` — C · CI · watch: tests/wpt/tests/mathml/support/feature-detection.js
 135. `fixup! script: Delay the load event while web fonts are loading` — B · CI · watch: -
 136. `docs: record patches 133 to 136 in the stack manifest` — B · none · watch: -
+137. `script: Run debugger.js on QuickJS` — B · CI · watch: components/default-resources/resources/debugger.js support/quickjs/cargo-config.toml
+138. `ci: Run the devtools tests on QuickJS` — A · CI · watch: python/servo/devtools_tests
+139. `docs: record patches 137 to 139 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
