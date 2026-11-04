@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 4 Nov 2026 18:23:28 +0000
+Subject: [PATCH] docs: record patches 137 to 139 in the stack manifest
+
+AI-assisted: Yes (agent session; the agent wrote the manifest entries)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 46e960bbf12..54a163b1382 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -160,6 +160,9 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 134. `fixup! fonts: Only load @font-face fonts that the page uses` — C · CI · watch: tests/wpt/tests/mathml/support/feature-detection.js
+ 135. `fixup! script: Delay the load event while web fonts are loading` — B · CI · watch: -
+ 136. `docs: record patches 133 to 136 in the stack manifest` — B · none · watch: -
++137. `script: Run debugger.js on QuickJS` — B · CI · watch: components/default-resources/resources/debugger.js support/quickjs/cargo-config.toml
++138. `ci: Run the devtools tests on QuickJS` — A · CI · watch: python/servo/devtools_tests
++139. `docs: record patches 137 to 139 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 
