@@ -859,6 +859,12 @@ class CommandBase(object):
                 features.append("js_backtrace")
             args += ["--features", " ".join(features)]
 
+        if self.js_engine == "quickjs":
+            # servo-quickjs builds its debugger, which devtools need, only when asked: Servo can't
+            # enable a feature of it that SpiderMonkey's mozjs doesn't have. Servo v0.6 always builds
+            # devtools and creates the debugger global, so every QuickJS build asks for it.
+            env["SERVO_QUICKJS_DEBUGGER"] = "1"
+
         if with_debug_assertions or self.config["build"]["debug-assertions"]:
             env["RUSTFLAGS"] = env.get("RUSTFLAGS", "") + " -C debug_assertions"
 
