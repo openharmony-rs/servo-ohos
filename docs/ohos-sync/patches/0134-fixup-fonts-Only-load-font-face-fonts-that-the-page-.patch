@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 4 Nov 2026 16:29:54 +0000
+Subject: [PATCH] fixup! fonts: Only load @font-face fonts that the page uses
+
+Two of upstream's MathML reftests, mo-lspace-rspace-dynamic and
+operator-dictionary-empty-and-three-chars, pass on plain upstream and
+fail with this patch. Their screenshots differ from the references only
+in the red square that `ensure_for_match_reftest("has_operator_spacing")`
+of mathml/support/feature-detection.js adds when it measures no operator
+spacing, which Servo doesn't implement. Why the check passes on plain
+upstream wasn't traced. In CI, operator-dictionary-empty-and-three-chars
+fails on plain upstream too.
+
+Validation: `./mach test-wpt --processes 8 --timeout-multiplier 2 mathml` with release builds: both tests pass with the stack up to the previous patch and fail from this one on, with SpiderMonkey and QuickJS. With these expectations, the ohos-main tip has no unexpected result for them.
+AI-assisted: Yes (agent session; bisected and written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../operators/mo-lspace-rspace-dynamic.html.ini                 | 2 ++
+ .../operator-dictionary-empty-and-three-chars.html.ini          | 2 ++
+ 2 files changed, 4 insertions(+)
+ create mode 100644 tests/wpt/meta/mathml/presentation-markup/operators/mo-lspace-rspace-dynamic.html.ini
+ create mode 100644 tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-empty-and-three-chars.html.ini
+
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/mo-lspace-rspace-dynamic.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/mo-lspace-rspace-dynamic.html.ini
+new file mode 100644
+index 00000000000..e6296d8a13f
+--- /dev/null
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/mo-lspace-rspace-dynamic.html.ini
+@@ -0,0 +1,2 @@
++[mo-lspace-rspace-dynamic.html]
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-empty-and-three-chars.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-empty-and-three-chars.html.ini
+new file mode 100644
+index 00000000000..00538c38e67
+--- /dev/null
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-empty-and-three-chars.html.ini
+@@ -0,0 +1,2 @@
++[operator-dictionary-empty-and-three-chars.html]
++  expected: FAIL
