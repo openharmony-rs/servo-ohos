@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 9 Nov 2026 10:58:57 +0000
+Subject: [PATCH] deps: Bump mozjs to 0.26.14
+
+Upstream moved mozjs to 0.26.13 with its off-thread compilation of
+classic scripts (#45687), and to 0.26.14 for a potential out-of-bounds
+read (#49514). Take 0.26.14 on ohos-main ahead of the next sync, so
+that the QuickJS shim, which follows ohos-main's mozjs version, can
+move to it and be tested on its own. ohos-main needs no code change
+for it: what the newer mozjs adds is the API of the off-thread
+compilation, which ohos-main doesn't use yet.
+
+Keep it until the base requires 0.26.14 itself. Servo 0.8.0 requires
+0.26.13; upstream's bump to 0.26.14 (bbad078a6c2) came after it and,
+like this commit, changes only the version.
+
+Validation: `cargo update -p mozjs` changes only the mozjs crates (mozjs 0.26.14, mozjs_sys 153.6.0-2 and its ICU and glue crates 153.6.0); a release build with SpiderMonkey passes, and `./mach test-wpt --release html/webappapis/scripting/events` runs its 51 tests as expected. The SpiderMonkey tests whose results on this host differ from ohos-main's stored CI run give the same results with ohos-main before this commit, three runs each (image-percentage-height, stale-while-revalidate's stale-css, -image and -script, element_click/navigate.py, window-open-multi-global, which timed out 3 of 3 times before and 2 of 3 after).
+AI-assisted: Yes (agent session; written by the agent during the 2026-11-08 sync)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock | 58 +++++++++++++++++++++++++++---------------------------
+ Cargo.toml |  2 +-
+ 2 files changed, 30 insertions(+), 30 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 8e40e30cfb8..cf6505f0b8a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -418,7 +418,7 @@ dependencies = [
+  "objc2-foundation 0.3.2",
+  "parking_lot",
+  "percent-encoding",
+- "windows-sys 0.52.0",
++ "windows-sys 0.61.2",
+  "wl-clipboard-rs",
+  "x11rb",
+ ]
+@@ -5419,9 +5419,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs"
+-version = "0.26.9"
++version = "0.26.14"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4aacb6f380367d4f6d331dcea3dcae40e04c4052d4e9ed5cd24af62843020d72"
++checksum = "1a28e00320a723648e8d51b9bac89a55abf6f2029287fc3126ec3c0c395bbaa6"
+ dependencies = [
+  "bindgen",
+  "cc",
+@@ -5434,9 +5434,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs_collator_glue"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "fa27e6309c3350d72532aaa125e9cc9895ff14247d75f16fded2b8b430b5c144"
++checksum = "35033c6b0805271adbed9b50047bf07efb5e999c1a8a86753af79b742b02f8dd"
+ dependencies = [
+  "arraystring",
+  "arrayvec",
+@@ -5449,9 +5449,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs_icu_collator"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6f670d18f02ffd5b7ad8f4b7470f33d84937bac528c1eca33fc5ddf7282bd244"
++checksum = "00b76d0de5caa407560685c101a9823a58902008b3d9e6c062c4315c66917945"
+ dependencies = [
+  "displaydoc",
+  "icu_locale",
+@@ -5470,15 +5470,15 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs_icu_collator_data"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7880095e89f8e29bc40ca905fa649462be93b9b732e8af759e65e13b9d7bd824"
++checksum = "905f380c3d72b517739a618d84d2d196a55fb0d8cdf76dd96f21d074650140ce"
+ 
+ [[package]]
+ name = "mozjs_icu_collections"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ef0a6c26642b58dec22c91310777063693168dcd7b398299ab229b5c5bced741"
++checksum = "04e3240b3156db0f1b0acda72cd79b53eebbbd032300519b450bc9be51648c2b"
+ dependencies = [
+  "displaydoc",
+  "icu_casemap",
+@@ -5491,9 +5491,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs_icu_normalizer"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "2bd461855a67e695fe96705258a83a23f6c6178a5eb201c0852e52cafabed380"
++checksum = "f4c5c74ab2d167ca63b41b7e8b6fce2ecc047e8342a90208c422c73d6bc9a099"
+ dependencies = [
+  "displaydoc",
+  "icu_properties",
+@@ -5509,15 +5509,15 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs_icu_normalizer_data"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "04f63b94dde6b7333933c1d541d22cd1478a9d0abdd83b387a01ac420cdc23e4"
++checksum = "366ea39d07901d23c51a0b149bf332afa8c4dc84ab7619b2d899bfe01b3e3dbc"
+ 
+ [[package]]
+ name = "mozjs_locale_glue"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "5a89cd38403297581629a88fa18858fe5a66d6330ced0ac5ae9bb978e45f8110"
++checksum = "e239a7291a90e08c8d93a02fe54fb904e906d434859f762b7d1634f7f0152ad1"
+ dependencies = [
+  "cbindgen",
+  "icu_locale",
+@@ -5525,9 +5525,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs_normalizer_glue"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e4a72e85a7a59b74f9d5f0ef2e84561de9b60b72011e603e2adba9fbc8734a0e"
++checksum = "a692f74e0255a0e0223e29f847ee8fd3a5bd846dbc64c6dd2cdb7b94435bf1eb"
+ dependencies = [
+  "cbindgen",
+  "encoding_rs",
+@@ -5538,9 +5538,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs_properties_glue"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "665004aa26f9f54cfc0e77068922bda7c2780d6eab6960ab8a79b7841d67c36f"
++checksum = "e7e0d6dd3ea602e1c749f3c046e68d3cd84dfab0c1a5270bccba014259478d6e"
+ dependencies = [
+  "cbindgen",
+  "icu_casemap",
+@@ -5550,9 +5550,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs_sys"
+-version = "153.4.0-1"
++version = "153.6.0-2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9491fea40e8544d6697f9f4d1d2565f26e6d58b7af7f993610a384cf8f31062e"
++checksum = "b0f69b286813322420ea4aeea951abe15fa14e27b23600300da6a2128ad6ef04"
+ dependencies = [
+  "bindgen",
+  "cc",
+@@ -5573,9 +5573,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs_unicode_bidi_ffi"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "eb27b4c58ea6fcdee8a83fcd75e39b69b12afdfff77d131f9780b974abedb336"
++checksum = "37b4e0d187cf9d048329996116e68172b99702ec6af6ad1e3a067d4cf8a89202"
+ dependencies = [
+  "cbindgen",
+  "icu_properties",
+@@ -5584,18 +5584,18 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs_utf16_iter"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "957b668eb3be4d74acdada353e8d5ee5ef87f01bc1e970e3c5733bf36b6f4af0"
++checksum = "c0f5cccbc6429d442b3b7be04093b49509f188e514780a34ef3704f601e731be"
+ dependencies = [
+  "mozjs_icu_collections",
+ ]
+ 
+ [[package]]
+ name = "mozjs_utf8_iter"
+-version = "153.4.0"
++version = "153.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a16a6e8bb44b47da3e43d996b0800cd623001db3abcbc8509c4fa1a2b5cb72c1"
++checksum = "fd4ba02f48ea0cd8e2279a2d66e89dc367b4448561f4c6e44e75f85ac465099f"
+ dependencies = [
+  "mozjs_icu_collections",
+ ]
+diff --git a/Cargo.toml b/Cargo.toml
+index 3c77325585a..34b7e281ad0 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -148,7 +148,7 @@ inventory = "0.3.24"
+ ipc-channel = "0.23"
+ itertools = "0.15"
+ jni = "0.22"
+-js = { package = "mozjs", version = "=0.26.9", default-features = false, features = ["intl", "libz-sys"] }
++js = { package = "mozjs", version = "=0.26.14", default-features = false, features = ["intl", "libz-sys"] }
+ k12 = "0.5"
+ keccak = "0.2"
+ keyboard-types = { version = "0.8.3", features = ["serde", "webdriver"] }
