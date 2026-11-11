@@ -1,0 +1,11 @@
+# Known QuickJS defects relative to the SpiderMonkey contract.
+#
+# SpiderMonkey is the reference implementation. Each entry names one case and the compared fields
+# that may differ. The comparison still prints every known defect; an unlisted difference fails
+# the run. Never add an entry merely to silence a failure, and remove it when the shim is fixed.
+
+[[difference]]
+id = "rooter.trace_on_gc"
+fields = ["value"]
+reason = "QuickJS does not invoke CustomAutoRooter trace callbacks during an explicit collection"
+owner = "servo-quickjs"

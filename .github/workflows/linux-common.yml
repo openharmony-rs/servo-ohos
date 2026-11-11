@@ -173,9 +173,27 @@ jobs:
         env:
           NEXTEST_RETRIES: 2 # https://github.com/servo/servo/issues/30683
           LANG: en-US
+          # The engine contract test records the API entries each case calls here.
+          CONTRACT_ENGINE: spidermonkey
+          CONTRACT_OUT: ${{ github.workspace }}/target/contract/sm.jsonl
         run: |
+          mkdir -p target/contract
           ./mach test-unit --profile ${{ inputs.profile }} --nextest-profile ci
           ./mach test-unit --profile ${{ inputs.profile }} --doc
+      - name: Engine contract API coverage
+        if: ${{ inputs.unit-tests }}
+        shell: bash
+        run: |
+          qjs_dir="${RUNNER_TEMP}/servo-quickjs"
+          rev=$(sed -nE 's/.*rev = "([0-9a-f]{40})".*/\1/p' support/quickjs/cargo-config.toml)
+          test -n "$rev" || { echo "::error::support/quickjs/cargo-config.toml has no servo-quickjs revision"; exit 1; }
+          git clone --quiet --filter=blob:none --no-checkout \
+            https://github.com/openharmony-rs/servo-quickjs "$qjs_dir"
+          git -C "$qjs_dir" sparse-checkout set --no-cone \
+            mozjs/upstream-bindgen mozjs/src/engine mozjs/stub_bindings.py
+          git -C "$qjs_dir" checkout --quiet "$rev"
+          QJS_DIR="$qjs_dir" OUT_DIR="${{ github.workspace }}/target/contract" \
+            tests/unit/engine_contract/tools/run.sh coverage
       # We upload the test-results to Codecov to help us identify flaky unit-tests.
       - name: Upload test results to Codecov
         # Upload test results to Codecov, also for failed unit-tests, but only

@@ -34,3 +34,13 @@ genui-min-size:
     for hap in target/openharmony/{{genui_min_target}}/genui-min/entry/build/*/outputs/default/*.hap; do
         size "$hap" "$(basename "$hap")"
     done
+
+# Run the shared engine contract tests on SpiderMonkey (the reference) and QuickJS, then compare.
+contract-sm *args:
+    tests/unit/engine_contract/tools/run.sh sm {{args}}
+
+contract-qjs *args:
+    tests/unit/engine_contract/tools/run.sh qjs {{args}}
+
+contract-diff:
+    tests/unit/engine_contract/tools/run.sh diff
