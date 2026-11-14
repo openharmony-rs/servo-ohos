@@ -22,17 +22,19 @@ use std::ptr::NonNull;
 pub(crate) use cursor::OhosRdbCursor;
 pub(crate) use error::{OhosRdbError, Result};
 use log::warn;
-use ohos_rdb_sys::data_value::OH_Value_Destroy;
+use ohos_rdb_sys::data_value::{OH_Value_Destroy, OH_Value_GetInt, OH_Value_GetType};
 use ohos_rdb_sys::rdb_transaction::{
     OH_RDB_TransOptions, OH_RDB_TransType, OH_Rdb_Transaction, OH_RdbTrans_Commit,
     OH_RdbTrans_CreateOptions, OH_RdbTrans_Destroy, OH_RdbTrans_DestroyOptions,
     OH_RdbTrans_Execute, OH_RdbTrans_QuerySql, OH_RdbTrans_Rollback, OH_RdbTransOption_SetType,
 };
+use ohos_rdb_sys::rdb_types::{OH_ColumnType, OH_Data_Value};
 use ohos_rdb_sys::relational_store::{
     OH_Rdb_CloseStore, OH_Rdb_ConfigV2, OH_Rdb_CreateConfig, OH_Rdb_CreateOrOpen,
-    OH_Rdb_CreateTransaction, OH_Rdb_DestroyConfig, OH_Rdb_Execute, OH_Rdb_SecurityLevel,
-    OH_Rdb_SetArea, OH_Rdb_SetDatabaseDir, OH_Rdb_SetDbType, OH_Rdb_SetSecurityLevel,
-    OH_Rdb_SetStoreName, OH_Rdb_Store, Rdb_DBType, Rdb_SecurityArea,
+    OH_Rdb_CreateTransaction, OH_Rdb_DestroyConfig, OH_Rdb_Execute, OH_Rdb_ExecuteQueryV2,
+    OH_Rdb_ExecuteV2, OH_Rdb_SecurityLevel, OH_Rdb_SetArea, OH_Rdb_SetDatabaseDir,
+    OH_Rdb_SetDbType, OH_Rdb_SetSecurityLevel, OH_Rdb_SetStoreName, OH_Rdb_Store, Rdb_DBType,
+    Rdb_SecurityArea,
 };
 use ohos_rdb_sys::relational_store_error_code::OH_Rdb_ErrCode;
 pub(crate) use params::OhosRdbValues;
@@ -42,6 +44,40 @@ use crate::client_storage_shared::StorageSqlTransaction;
 
 fn cstring_from_path(path: &Path) -> Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(Into::into)
+}
+
+const INT64_COLUMN_TYPE: OH_ColumnType = OH_ColumnType(1);
+
+/// Reads and destroys the value an execute call returned: for an `UPDATE` or `DELETE` the number
+/// of changed rows, for an `INSERT` the row id of the new row or -1.
+///
+/// # Safety
+///
+/// `result` is null or an owned `OH_Data_Value` that `OH_Rdb_ExecuteV2` or `OH_RdbTrans_Execute`
+/// returned, which is not used afterwards.
+unsafe fn take_integer_result(result: *mut OH_Data_Value) -> Result<Option<i64>> {
+    let Some(result) = NonNull::new(result) else {
+        return Ok(None);
+    };
+    let mut column_type = OH_ColumnType(0);
+    let mut integer = 0i64;
+    // SAFETY: `result` is the owned value handle returned by the execute call, and the API
+    // writes only to the local out-parameters.
+    let (status, context) = unsafe {
+        match OH_Value_GetType(result.as_ptr(), &mut column_type) {
+            status if status != OH_Rdb_ErrCode::RDB_OK.0 => (status, "OH_Value_GetType"),
+            _ if column_type != INT64_COLUMN_TYPE => (OH_Rdb_ErrCode::RDB_OK.0, "OH_Value_GetType"),
+            _ => (
+                OH_Value_GetInt(result.as_ptr(), &mut integer),
+                "OH_Value_GetInt",
+            ),
+        }
+    };
+    // SAFETY: The value handle is destroyed exactly once, here.
+    let destroy_status = unsafe { OH_Value_Destroy(result.as_ptr()) };
+    ensure_success(status, context)?;
+    ensure_success(destroy_status, "OH_Value_Destroy")?;
+    Ok((column_type == INT64_COLUMN_TYPE).then_some(integer))
 }
 
 struct OhosRdbConfig {
@@ -186,11 +222,20 @@ impl OhosRdbStore {
     }
 
     pub(crate) fn transaction(&self) -> Result<OhosRdbTransaction> {
+        self.transaction_of_type(OH_RDB_TransType::RDB_TRANS_DEFERRED)
+    }
+
+    /// Begins a transaction of `transaction_type` (`BEGIN DEFERRED`, `IMMEDIATE` or `EXCLUSIVE`)
+    /// on a connection of its own.
+    pub(crate) fn transaction_of_type(
+        &self,
+        transaction_type: OH_RDB_TransType,
+    ) -> Result<OhosRdbTransaction> {
         let options = OhosRdbTransOptions::new()?;
         // SAFETY: The options handle is owned locally and the API fills only local pointers.
         unsafe {
             ensure_success(
-                OH_RdbTransOption_SetType(options.as_ptr(), OH_RDB_TransType::RDB_TRANS_DEFERRED),
+                OH_RdbTransOption_SetType(options.as_ptr(), transaction_type),
                 "OH_RdbTransOption_SetType",
             )?;
 
@@ -221,6 +266,35 @@ impl OhosRdbStore {
         }
     }
 
+    /// Runs a statement outside of a transaction, like [`OhosRdbTransaction::execute_with_result`].
+    pub(crate) fn execute_with_args(&self, sql: &str, args: &OhosRdbValues) -> Result<Option<i64>> {
+        let sql = CString::new(sql)?;
+        let mut result = std::ptr::null_mut();
+        // SAFETY: The store handle is valid, the SQL string and the arguments outlive the call,
+        // and `result` is a local out-parameter.
+        unsafe {
+            ensure_success(
+                OH_Rdb_ExecuteV2(self.as_ptr(), sql.as_ptr(), args.as_ptr(), &mut result),
+                "OH_Rdb_ExecuteV2",
+            )?;
+        }
+        // SAFETY: `result` is null or the value handle the call above returned, owned here.
+        unsafe { take_integer_result(result) }
+    }
+
+    /// Runs a query outside of a transaction and returns a cursor borrowed from this store.
+    pub(crate) fn query_sql(&self, sql: &str, args: &OhosRdbValues) -> Result<OhosRdbCursor<'_>> {
+        let sql = CString::new(sql)?;
+        // SAFETY: The store handle is valid, the arguments outlive the call, and the returned
+        // cursor's lifetime is pinned to `&self`.
+        unsafe {
+            OhosRdbCursor::from_raw(
+                OH_Rdb_ExecuteQueryV2(self.as_ptr(), sql.as_ptr(), args.as_ptr()),
+                "OH_Rdb_ExecuteQueryV2",
+            )
+        }
+    }
+
     fn as_ptr(&self) -> *mut OH_Rdb_Store {
         self.inner.as_ptr()
     }
@@ -239,6 +313,14 @@ impl Drop for OhosRdbStore {
 pub(crate) struct OhosRdbTransaction {
     inner: Option<NonNull<OH_Rdb_Transaction>>,
 }
+
+// SAFETY: An `OH_Rdb_Transaction` owns a dedicated connection from the store's transaction pool,
+// and RDB ties neither to a thread: the pool records the acquiring thread (`ConnNode::tid_`,
+// connection_pool.cpp) only for dumps, and E_STEP_RESULT_SET_CROSS_THREADS is defined but
+// never raised (OpenHarmony-7.0-Release). A cursor never moves with the transaction, since
+// `OhosRdbCursor` is `!Send` and borrows it. The IndexedDB executor keeps a transaction open
+// across calls on whatever thread runs them.
+unsafe impl Send for OhosRdbTransaction {}
 
 impl OhosRdbTransaction {
     /// # Safety
@@ -277,15 +359,24 @@ impl OhosRdbTransaction {
         // SAFETY: The transaction handle is valid, the arguments outlive the
         // call, and the returned cursor's lifetime is pinned to `&self`.
         unsafe {
-            OhosRdbCursor::from_raw(OH_RdbTrans_QuerySql(
-                self.as_ptr(),
-                sql.as_ptr(),
-                args.as_ptr(),
-            ))
+            OhosRdbCursor::from_raw(
+                OH_RdbTrans_QuerySql(self.as_ptr(), sql.as_ptr(), args.as_ptr()),
+                "OH_RdbTrans_QuerySql",
+            )
         }
     }
 
     pub(crate) fn execute(&self, sql: &str, args: &OhosRdbValues) -> Result<()> {
+        self.execute_with_result(sql, args).map(|_| ())
+    }
+
+    /// Runs a statement and returns its integer result: the number of changed rows for an
+    /// `UPDATE` or `DELETE`, the row id of the new row or -1 for an `INSERT`.
+    pub(crate) fn execute_with_result(
+        &self,
+        sql: &str,
+        args: &OhosRdbValues,
+    ) -> Result<Option<i64>> {
         let sql = CString::new(sql)?;
         let mut result = std::ptr::null_mut();
         // SAFETY: The transaction handle is valid and `result` is a local out-parameter.
@@ -295,15 +386,8 @@ impl OhosRdbTransaction {
                 "OH_RdbTrans_Execute",
             )?;
         }
-
-        if let Some(result) = NonNull::new(result) {
-            // SAFETY: The API returned an owned value handle that must be destroyed once.
-            unsafe {
-                ensure_success(OH_Value_Destroy(result.as_ptr()), "OH_Value_Destroy")?;
-            }
-        }
-
-        Ok(())
+        // SAFETY: `result` is null or the value handle the call above returned, owned here.
+        unsafe { take_integer_result(result) }
     }
 
     pub(crate) fn commit(self) -> Result<()> {
@@ -471,7 +555,7 @@ mod tests {
         ROW_INDEX.store(-1, Ordering::SeqCst);
 
         let raw = fake_cursor();
-        let mut cursor = unsafe { OhosRdbCursor::from_raw(raw) }.unwrap();
+        let mut cursor = unsafe { OhosRdbCursor::from_raw(raw, "fake cursor") }.unwrap();
 
         assert!(cursor.next_row().unwrap());
         assert_eq!(cursor.text(0).unwrap(), Some(String::from("a\0b")));
@@ -655,7 +739,7 @@ mod dispatch_tests {
         DESTROYED.store(false, Ordering::SeqCst);
 
         let raw = fake_cursor();
-        let cursor = unsafe { OhosRdbCursor::from_raw(raw) }.unwrap();
+        let cursor = unsafe { OhosRdbCursor::from_raw(raw, "fake cursor") }.unwrap();
 
         assert_eq!(cursor.text(0).unwrap(), Some(String::from("alpha")));
         assert_eq!(cursor.text(1).unwrap(), Some(String::from("a\0b")));

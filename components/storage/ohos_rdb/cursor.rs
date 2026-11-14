@@ -27,7 +27,7 @@ macro_rules! cursor_call {
 
 const BLOB_COLUMN_TYPE: OH_ColumnType = OH_ColumnType(4);
 
-/// A row cursor borrowed from the transaction that produced it.
+/// A row cursor borrowed from the transaction, or the store, that produced it.
 ///
 /// The `'trans` lifetime ties the cursor to that transaction: committing,
 /// rolling back, or dropping the transaction destroys the native transaction
@@ -42,11 +42,13 @@ pub(crate) struct OhosRdbCursor<'trans> {
 impl<'trans> OhosRdbCursor<'trans> {
     /// # Safety
     ///
-    /// `raw` must be a live cursor returned by `OH_RdbTrans_QuerySql`, the
-    /// wrapper takes ownership of its destruction, and the caller must pin
-    /// `'trans` to the transaction that produced `raw`.
-    pub(crate) unsafe fn from_raw(raw: *mut OH_Cursor) -> Result<Self> {
-        let inner = into_handle(raw, "OH_RdbTrans_QuerySql")?;
+    /// `raw` must be a live cursor returned by `OH_RdbTrans_QuerySql` or
+    /// `OH_Rdb_ExecuteQueryV2`, the wrapper takes ownership of its
+    /// destruction, and the caller must pin `'trans` to the transaction or
+    /// store that produced `raw`. `context` names the call, for the error
+    /// if `raw` is null.
+    pub(crate) unsafe fn from_raw(raw: *mut OH_Cursor, context: &'static str) -> Result<Self> {
+        let inner = into_handle(raw, context)?;
         // SAFETY: `inner` is a live cursor handle; reading the callback pointer is side-effect free.
         let destroy = unsafe { (*inner.as_ptr()).destroy };
         if destroy.is_none() {

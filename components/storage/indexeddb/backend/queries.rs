@@ -1,0 +1,503 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+//! The IndexedDB operations on the tables of `schema.rs`.
+
+use storage_traits::indexeddb::{
+    CreateObjectResult, IndexedDBIndex, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
+    KeyPath, PutItemResult,
+};
+
+use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
+use crate::indexeddb::engines::encoding;
+
+/// A row of `object_store`.
+#[derive(Clone, Debug)]
+pub(crate) struct ObjectStore {
+    pub(crate) id: i64,
+    /// The encoded key path, see [`encode_key_path`].
+    pub(crate) key_path: Option<Vec<u8>>,
+    /// The key generator's current number, or 0 for a store without a key generator.
+    pub(crate) auto_increment: i64,
+}
+
+pub(crate) fn encode_key_path(key_path: &KeyPath) -> Result<Vec<u8>, SqlError> {
+    postcard::to_stdvec(key_path).map_err(SqlError::KeyPath)
+}
+
+pub(crate) fn decode_key_path(data: &[u8]) -> Result<KeyPath, SqlError> {
+    postcard::from_bytes(data).map_err(SqlError::KeyPath)
+}
+
+fn decode_key(data: &[u8]) -> Result<IndexedDBKeyType, SqlError> {
+    encoding::deserialize(data).ok_or(SqlError::InvalidKey)
+}
+
+fn expect_one_changed_row(changed: u64, context: &'static str) -> Result<(), SqlError> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(SqlError::MissingRow(context))
+    }
+}
+
+pub(crate) fn object_store<X: SqlExecutor>(
+    executor: &mut X,
+    store_name: &str,
+) -> Result<Option<ObjectStore>, SqlError> {
+    query_row(
+        executor,
+        "SELECT id, key_path, auto_increment FROM object_store WHERE name = ?",
+        &[SqlParam::Text(store_name)],
+        |row| {
+            Ok(ObjectStore {
+                id: row.integer(0)?,
+                key_path: row.optional_blob(1)?,
+                auto_increment: row.integer(2)?,
+            })
+        },
+    )
+}
+
+fn required_object_store<X: SqlExecutor>(
+    executor: &mut X,
+    store_name: &str,
+) -> Result<ObjectStore, SqlError> {
+    object_store(executor, store_name)?.ok_or(SqlError::MissingRow("object store"))
+}
+
+pub(crate) fn object_store_names<X: SqlExecutor>(
+    executor: &mut X,
+) -> Result<Vec<String>, SqlError> {
+    query_rows(
+        executor,
+        "SELECT name FROM object_store ORDER BY id",
+        &[],
+        |row| row.text(0),
+    )
+}
+
+pub(crate) fn create_object_store<X: SqlExecutor>(
+    executor: &mut X,
+    store_name: &str,
+    key_path: Option<&KeyPath>,
+    auto_increment: bool,
+) -> Result<CreateObjectResult, SqlError> {
+    if object_store(executor, store_name)?.is_some() {
+        return Ok(CreateObjectResult::AlreadyExists);
+    }
+    let key_path = key_path.map(encode_key_path).transpose()?;
+    executor.execute(
+        "INSERT INTO object_store (name, key_path, auto_increment) VALUES (?, ?, ?)",
+        &[
+            SqlParam::Text(store_name),
+            key_path.as_deref().map_or(SqlParam::Null, SqlParam::Blob),
+            SqlParam::Integer(auto_increment as i64),
+        ],
+    )?;
+    Ok(CreateObjectResult::Created)
+}
+
+pub(crate) fn delete_object_store<X: SqlExecutor>(
+    executor: &mut X,
+    store_name: &str,
+) -> Result<(), SqlError> {
+    // https://www.w3.org/TR/IndexedDB-3/#dom-idbdatabase-deleteobjectstore
+    // Step 7. Destroy store.
+    let store = required_object_store(executor, store_name)?;
+    let params = [SqlParam::Integer(store.id)];
+    executor.execute("DELETE FROM index_data WHERE object_store_id = ?", &params)?;
+    executor.execute(
+        "DELETE FROM unique_index_data WHERE object_store_id = ?",
+        &params,
+    )?;
+    executor.execute(
+        "DELETE FROM object_store_index WHERE object_store_id = ?",
+        &params,
+    )?;
+    executor.execute("DELETE FROM object_data WHERE object_store_id = ?", &params)?;
+    let changed = executor.execute("DELETE FROM object_store WHERE id = ?", &params)?;
+    expect_one_changed_row(changed, "object store delete")
+}
+
+pub(crate) fn key_path<X: SqlExecutor>(
+    executor: &mut X,
+    store_name: &str,
+) -> Result<Option<KeyPath>, SqlError> {
+    object_store(executor, store_name)?
+        .and_then(|store| store.key_path)
+        .map(|key_path| decode_key_path(&key_path))
+        .transpose()
+}
+
+/// <https://w3c.github.io/IndexedDB/#key-generator-current-number>, or `None` for a store without
+/// a key generator.
+pub(crate) fn key_generator_current_number<X: SqlExecutor>(
+    executor: &mut X,
+    store_name: &str,
+) -> Result<Option<i64>, SqlError> {
+    Ok(object_store(executor, store_name)?
+        .and_then(|store| (store.auto_increment != 0).then_some(store.auto_increment)))
+}
+
+pub(crate) fn set_key_generator_current_number<X: SqlExecutor>(
+    executor: &mut X,
+    store_name: &str,
+    current_number: i64,
+) -> Result<(), SqlError> {
+    let store = required_object_store(executor, store_name)?;
+    let changed = executor.execute(
+        "UPDATE object_store SET auto_increment = ? WHERE id = ?",
+        &[
+            SqlParam::Integer(current_number),
+            SqlParam::Integer(store.id),
+        ],
+    )?;
+    expect_one_changed_row(changed, "key generator update")
+}
+
+pub(crate) fn indexes<X: SqlExecutor>(
+    executor: &mut X,
+    store_name: &str,
+) -> Result<Vec<IndexedDBIndex>, SqlError> {
+    let store = required_object_store(executor, store_name)?;
+    query_rows(
+        executor,
+        "SELECT name, key_path, unique_index, multi_entry_index FROM object_store_index \
+         WHERE object_store_id = ? ORDER BY id",
+        &[SqlParam::Integer(store.id)],
+        |row| {
+            Ok(IndexedDBIndex {
+                name: row.text(0)?,
+                key_path: decode_key_path(&row.blob(1)?)?,
+                unique: row.integer(2)? != 0,
+                multi_entry: row.integer(3)? != 0,
+            })
+        },
+    )
+}
+
+pub(crate) fn create_index<X: SqlExecutor>(
+    executor: &mut X,
+    store_name: &str,
+    index_name: &str,
+    key_path: &KeyPath,
+    unique: bool,
+    multi_entry: bool,
+) -> Result<CreateObjectResult, SqlError> {
+    let store = required_object_store(executor, store_name)?;
+    let exists = query_row(
+        executor,
+        "SELECT 1 FROM object_store_index WHERE object_store_id = ? AND name = ?",
+        &[SqlParam::Integer(store.id), SqlParam::Text(index_name)],
+        |_| Ok(()),
+    )?
+    .is_some();
+    if exists {
+        return Ok(CreateObjectResult::AlreadyExists);
+    }
+    executor.execute(
+        "INSERT INTO object_store_index \
+         (object_store_id, name, key_path, unique_index, multi_entry_index) \
+         VALUES (?, ?, ?, ?, ?)",
+        &[
+            SqlParam::Integer(store.id),
+            SqlParam::Text(index_name),
+            SqlParam::Blob(&encode_key_path(key_path)?),
+            SqlParam::Integer(unique as i64),
+            SqlParam::Integer(multi_entry as i64),
+        ],
+    )?;
+    Ok(CreateObjectResult::Created)
+}
+
+/// Renaming an index that does not exist is not an error.
+pub(crate) fn rename_index<X: SqlExecutor>(
+    executor: &mut X,
+    store_name: &str,
+    index_name: &str,
+    new_name: &str,
+) -> Result<(), SqlError> {
+    let store = required_object_store(executor, store_name)?;
+    executor.execute(
+        "UPDATE object_store_index SET name = ? WHERE name = ? AND object_store_id = ?",
+        &[
+            SqlParam::Text(new_name),
+            SqlParam::Text(index_name),
+            SqlParam::Integer(store.id),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Deleting an index that does not exist is not an error.
+pub(crate) fn delete_index<X: SqlExecutor>(
+    executor: &mut X,
+    store_name: &str,
+    index_name: &str,
+) -> Result<(), SqlError> {
+    let store = required_object_store(executor, store_name)?;
+    executor.execute(
+        "DELETE FROM object_store_index WHERE name = ? AND object_store_id = ?",
+        &[SqlParam::Text(index_name), SqlParam::Integer(store.id)],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn version<X: SqlExecutor>(executor: &mut X) -> Result<u64, SqlError> {
+    let version = query_row(
+        executor,
+        "SELECT version FROM database LIMIT 1",
+        &[],
+        |row| row.integer(0),
+    )?
+    .ok_or(SqlError::MissingRow("database version"))?;
+    Ok(u64::from_ne_bytes(version.to_ne_bytes()))
+}
+
+pub(crate) fn set_version<X: SqlExecutor>(executor: &mut X, version: u64) -> Result<(), SqlError> {
+    let changed = executor.execute(
+        "UPDATE database SET version = ?",
+        &[SqlParam::Integer(i64::from_ne_bytes(version.to_ne_bytes()))],
+    )?;
+    if changed == 0 {
+        return Err(SqlError::MissingRow("database version update"));
+    }
+    Ok(())
+}
+
+/// The `key` conditions for a key range, to append to a `WHERE` clause, and the encoded bounds
+/// to bind for their placeholders, in order.
+#[derive(Default)]
+struct RangeCondition {
+    sql: String,
+    bounds: Vec<Vec<u8>>,
+}
+
+impl RangeCondition {
+    fn push(&mut self, sql: &str, bound: &IndexedDBKeyType) {
+        self.sql.push_str(sql);
+        self.bounds.push(encoding::serialize(bound));
+    }
+
+    /// The parameters for `object_store_id = ?` followed by this condition.
+    fn params(&self, store: &ObjectStore) -> Vec<SqlParam<'_>> {
+        std::iter::once(SqlParam::Integer(store.id))
+            .chain(self.bounds.iter().map(|bound| SqlParam::Blob(bound)))
+            .collect()
+    }
+}
+
+fn range_condition(range: &IndexedDBKeyRange) -> RangeCondition {
+    let mut condition = RangeCondition::default();
+    if let Some(singleton) = range.as_singleton() {
+        condition.push(" AND key = ?", singleton);
+        return condition;
+    }
+    if let Some(lower) = range.lower.as_ref() {
+        let sql = if range.lower_open {
+            " AND key > ?"
+        } else {
+            " AND key >= ?"
+        };
+        condition.push(sql, lower);
+    }
+    if let Some(upper) = range.upper.as_ref() {
+        let sql = if range.upper_open {
+            " AND key < ?"
+        } else {
+            " AND key <= ?"
+        };
+        condition.push(sql, upper);
+    }
+    condition
+}
+
+/// Selects `columns` of the records of `store` in `range`, in ascending key order or descending
+/// if `reverse` is set, at most `count` of them.
+fn select_records<X: SqlExecutor, T>(
+    executor: &mut X,
+    columns: &str,
+    store: &ObjectStore,
+    range: &IndexedDBKeyRange,
+    count: Option<u32>,
+    reverse: bool,
+    map_row: impl Fn(&dyn SqlRow) -> Result<T, SqlError>,
+) -> Result<Vec<T>, SqlError> {
+    let condition = range_condition(range);
+    let mut sql = format!(
+        "SELECT {columns} FROM object_data WHERE object_store_id = ?{} ORDER BY key {}",
+        condition.sql,
+        if reverse { "DESC" } else { "ASC" }
+    );
+    let mut params = condition.params(store);
+    if let Some(count) = count {
+        sql.push_str(" LIMIT ?");
+        params.push(SqlParam::Integer(count.into()));
+    }
+    query_rows(executor, &sql, &params, map_row)
+}
+
+pub(crate) fn get_value<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    range: &IndexedDBKeyRange,
+) -> Result<Option<Vec<u8>>, SqlError> {
+    Ok(
+        select_records(executor, "data", store, range, Some(1), false, |row| {
+            row.blob(0)
+        })?
+        .pop(),
+    )
+}
+
+pub(crate) fn get_key<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    range: &IndexedDBKeyRange,
+) -> Result<Option<IndexedDBKeyType>, SqlError> {
+    Ok(
+        select_records(executor, "key", store, range, Some(1), false, |row| {
+            decode_key(&row.blob(0)?)
+        })?
+        .pop(),
+    )
+}
+
+pub(crate) fn get_all_keys<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    range: &IndexedDBKeyRange,
+    count: Option<u32>,
+) -> Result<Vec<IndexedDBKeyType>, SqlError> {
+    select_records(executor, "key", store, range, count, false, |row| {
+        decode_key(&row.blob(0)?)
+    })
+}
+
+pub(crate) fn get_all_values<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    range: &IndexedDBKeyRange,
+    count: Option<u32>,
+) -> Result<Vec<Vec<u8>>, SqlError> {
+    select_records(executor, "data", store, range, count, false, |row| {
+        row.blob(0)
+    })
+}
+
+/// The records of `store` in `range` in ascending key order: the first `count` of them, or the
+/// last `count` if `reverse` is set.
+pub(crate) fn get_records<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    range: &IndexedDBKeyRange,
+    count: Option<u32>,
+    reverse: bool,
+) -> Result<Vec<IndexedDBRecord>, SqlError> {
+    let mut records = select_records(executor, "key, data", store, range, count, reverse, |row| {
+        let key = decode_key(&row.blob(0)?)?;
+        Ok(IndexedDBRecord {
+            key: key.clone(),
+            primary_key: key,
+            value: row.blob(1)?,
+        })
+    })?;
+    if reverse {
+        records.reverse();
+    }
+    Ok(records)
+}
+
+pub(crate) fn count<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    range: &IndexedDBKeyRange,
+) -> Result<u64, SqlError> {
+    let condition = range_condition(range);
+    let sql = format!(
+        "SELECT COUNT(*) FROM object_data WHERE object_store_id = ?{}",
+        condition.sql
+    );
+    let params = condition.params(store);
+    let count = query_row(executor, &sql, &params, |row| row.integer(0))?.unwrap_or_default();
+    Ok(count as u64)
+}
+
+/// Stores `value` under `key`, unless a record with `key` exists and `overwrite` isn't set, and
+/// then sets the store's key generator current number to `key_generator_current_number`, if any.
+pub(crate) fn put_record<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    key: IndexedDBKeyType,
+    value: &[u8],
+    overwrite: bool,
+    key_generator_current_number: Option<i64>,
+) -> Result<PutItemResult, SqlError> {
+    let encoded_key = encoding::serialize(&key);
+    let exists = query_row(
+        executor,
+        "SELECT 1 FROM object_data WHERE object_store_id = ? AND key = ?",
+        &[SqlParam::Integer(store.id), SqlParam::Blob(&encoded_key)],
+        |_| Ok(()),
+    )?
+    .is_some();
+    if exists {
+        if !overwrite {
+            return Ok(PutItemResult::CannotOverwrite);
+        }
+        // Preserve `put()` semantics by replacing the stored value when the primary
+        // key already exists.
+        executor.execute(
+            "UPDATE object_data SET data = ? WHERE object_store_id = ? AND key = ?",
+            &[
+                SqlParam::Blob(value),
+                SqlParam::Integer(store.id),
+                SqlParam::Blob(&encoded_key),
+            ],
+        )?;
+    } else {
+        executor.execute(
+            "INSERT INTO object_data (object_store_id, key, data) VALUES (?, ?, ?)",
+            &[
+                SqlParam::Integer(store.id),
+                SqlParam::Blob(&encoded_key),
+                SqlParam::Blob(value),
+            ],
+        )?;
+    }
+    if let Some(current_number) = key_generator_current_number {
+        executor.execute(
+            "UPDATE object_store SET auto_increment = ? WHERE id = ?",
+            &[
+                SqlParam::Integer(current_number),
+                SqlParam::Integer(store.id),
+            ],
+        )?;
+    }
+    Ok(PutItemResult::Key(key))
+}
+
+pub(crate) fn delete_records<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    range: &IndexedDBKeyRange,
+) -> Result<(), SqlError> {
+    let condition = range_condition(range);
+    let sql = format!(
+        "DELETE FROM object_data WHERE object_store_id = ?{}",
+        condition.sql
+    );
+    let params = condition.params(store);
+    executor.execute(&sql, &params)?;
+    Ok(())
+}
+
+pub(crate) fn clear<X: SqlExecutor>(executor: &mut X, store: &ObjectStore) -> Result<(), SqlError> {
+    executor.execute(
+        "DELETE FROM object_data WHERE object_store_id = ?",
+        &[SqlParam::Integer(store.id)],
+    )?;
+    Ok(())
+}

@@ -2,21 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+mod backend;
 mod engines;
 
 use std::borrow::ToOwned;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(ohos_rdb)]
-use std::error::Error as StdError;
 use std::sync::Arc;
 use std::thread;
 
 use log::{debug, error, warn};
 use malloc_size_of::MallocSizeOf;
 use malloc_size_of_derive::MallocSizeOf;
-#[cfg(ohos_rdb)]
-use ohos_rdb_sys::relational_store_error_code::OH_Rdb_ErrCode;
 use profile_traits::generic_callback::GenericCallback;
 use profile_traits::mem::{
     ProcessReports, ProfilerChan as MemProfilerChan, Report, ReportKind, perform_memory_report,
@@ -37,8 +34,6 @@ use storage_traits::indexeddb::{
 use uuid::Uuid;
 
 use crate::indexeddb::engines::{ActiveKvsEngine, KvsEngine, KvsOperation, KvsTransaction};
-#[cfg(ohos_rdb)]
-use crate::ohos_rdb::OhosRdbError;
 #[cfg(feature = "sqlite-backend")]
 use crate::shared::is_sqlite_disk_full_error;
 
@@ -825,29 +820,6 @@ impl BackendErrorMapper for RusqliteError {
             BackendError::QuotaExceeded
         } else {
             BackendError::DbErr(format!("{self:?}"))
-        }
-    }
-}
-
-#[cfg(ohos_rdb)]
-impl BackendErrorMapper for OhosRdbError {
-    fn into_backend_error(self) -> BackendError {
-        if matches!(self, OhosRdbError::Api { code, .. } if code == OH_Rdb_ErrCode::RDB_E_SQLITE_FULL.0 || code == OH_Rdb_ErrCode::RDB_E_SQLITE_IOERR.0) ||
-            crate::shared::has_enospc(Some(&self as &(dyn StdError + 'static)))
-        {
-            BackendError::QuotaExceeded
-        } else {
-            BackendError::DbErr(format!("{self:?}"))
-        }
-    }
-}
-
-#[cfg(all(feature = "sqlite-backend", ohos_rdb))]
-impl BackendErrorMapper for crate::shared::TwinError {
-    fn into_backend_error(self) -> BackendError {
-        match self {
-            Self::Sqlite(error) => error.into_backend_error(),
-            Self::Rdb(error) => error.into_backend_error(),
         }
     }
 }
@@ -2532,7 +2504,6 @@ impl IndexedDBManager {
     }
 }
 
-#[cfg(feature = "sqlite-backend")]
 #[cfg(test)]
 mod tests {
     use servo_base::generic_channel;
@@ -2542,7 +2513,14 @@ mod tests {
     use url::Host;
 
     use super::{IndexedDBDescription, IndexedDBEnvironment};
-    use crate::indexeddb::engines::SqliteEngine;
+    use crate::indexeddb::backend::SqlEngine;
+    use crate::indexeddb::backend::executor::SqlExecutor;
+    use crate::indexeddb::backend::tests::executor_tests;
+
+    executor_tests!(
+        test_restore_object_stores_removes_created_store_and_indexes,
+        test_abort_transaction_restores_readwrite_key_generator_current_number,
+    );
 
     fn test_origin() -> ImmutableOrigin {
         ImmutableOrigin::Tuple(
@@ -2552,15 +2530,14 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_restore_object_stores_removes_created_store_and_indexes() {
+    fn test_restore_object_stores_removes_created_store_and_indexes<X: SqlExecutor>() {
         let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let thread_pool = ThreadPool::global();
         let description = IndexedDBDescription {
             name: "test_db".to_string(),
             origin: test_origin(),
         };
-        let engine = SqliteEngine::new(
+        let engine = SqlEngine::<X>::new(
             base_dir.path().to_path_buf(),
             true,
             &description,
@@ -2588,15 +2565,14 @@ mod tests {
         assert_eq!(env.object_store_names().unwrap(), Vec::<String>::new());
     }
 
-    #[test]
-    fn test_abort_transaction_restores_readwrite_key_generator_current_number() {
+    fn test_abort_transaction_restores_readwrite_key_generator_current_number<X: SqlExecutor>() {
         let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let thread_pool = ThreadPool::global();
         let description = IndexedDBDescription {
             name: "test_db".to_string(),
             origin: test_origin(),
         };
-        let engine = SqliteEngine::new(
+        let engine = SqlEngine::<X>::new(
             base_dir.path().to_path_buf(),
             true,
             &description,
@@ -2661,61 +2637,5 @@ mod tests {
             },
             other => panic!("unexpected backend error: {other:?}"),
         }
-    }
-}
-
-#[cfg(all(test, ohos_rdb))]
-mod tests_ohos {
-    use tempfile::tempdir;
-
-    use super::backend_error_from_storage_error;
-    use crate::ohos_rdb::{OhosRdbStore, OhosRdbValues};
-    use crate::shared::has_enospc;
-
-    #[test]
-    fn has_enospc_detects_enospc_and_nothing_else() {
-        let full = std::io::Error::from_raw_os_error(libc::ENOSPC);
-        assert!(has_enospc(Some(&full)));
-        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
-        assert!(!has_enospc(Some(&denied)));
-        assert!(!has_enospc(None));
-    }
-
-    #[test]
-    fn sql_full_maps_to_quota_exceeded() {
-        let dir = tempdir().unwrap();
-        let store = OhosRdbStore::open(dir.path(), "quota-exceeded").unwrap();
-        let tx = store.transaction().unwrap();
-        let values = OhosRdbValues::new().unwrap();
-        tx.execute(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);",
-            &values,
-        )
-        .unwrap();
-        tx.execute("PRAGMA max_page_count = 2;", &values).unwrap();
-
-        let mut error = None;
-        for i in 0..128 {
-            let mut insert_values = OhosRdbValues::new().unwrap();
-            insert_values.push_int(i).unwrap();
-            insert_values.push_blob(&vec![0u8; 65536]).unwrap();
-            match tx.execute("INSERT INTO t (id, data) VALUES (?1, ?2);", &insert_values) {
-                Ok(()) => continue,
-                Err(err) => {
-                    error = Some(err);
-                    break;
-                },
-            }
-        }
-
-        let error = match error {
-            Some(error) => error,
-            None => tx.commit().expect_err("expected quota failure"),
-        };
-
-        assert_eq!(
-            backend_error_from_storage_error(error),
-            storage_traits::indexeddb::BackendError::QuotaExceeded
-        );
     }
 }
