@@ -35,6 +35,9 @@ pub enum BackendError {
     QuotaExceeded,
     /// The transaction was aborted
     Abort,
+    /// A unique index got the same key for two records while it was populated, which aborts the
+    /// upgrade transaction with a "ConstraintError" DOMException.
+    Constraint,
 
     DbErr(DbError),
 }
@@ -52,6 +55,7 @@ impl Display for BackendError {
             BackendError::StoreNotFound => write!(f, "StoreNotFound"),
             BackendError::QuotaExceeded => write!(f, "QuotaExceeded"),
             BackendError::Abort => write!(f, "Abort"),
+            BackendError::Constraint => write!(f, "Constraint"),
             BackendError::DbErr(err) => write!(f, "{err}"),
         }
     }
@@ -478,6 +482,14 @@ pub struct IndexedDBIndexKeys {
     pub keys: Vec<IndexedDBIndexKey>,
 }
 
+/// The keys that script computed for an index that it populates, from the value of the record
+/// with the key `primary_key`, as [`IndexedDBIndexKeys`] has them.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct IndexedDBRecordIndexKeys {
+    pub primary_key: IndexedDBKeyType,
+    pub keys: Vec<IndexedDBIndexKey>,
+}
+
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum PutItemResult {
     Key(IndexedDBKeyType),
@@ -552,13 +564,18 @@ pub enum AsyncSchemaOperation {
     DeleteObjectStore,
     /// Renames the object store, which keeps its records and indexes.
     RenameObjectStore { new_name: Utf16String },
-    /// Creates an index of the object store, with its id from script.
+    /// Creates an index of the object store, with its id from script. With `populate`, the store
+    /// may have records, and script populates the index from them: the backend reports the first
+    /// records as [`IndexPopulationEvent::Records`], script answers with
+    /// [`AsyncSchemaOperation::PopulateIndex`] steps, and the transaction's later requests and
+    /// schema operations wait until the population is done, so that they see the whole index.
     CreateIndex {
         index_id: IndexedDBIndexId,
         name: Utf16String,
         key_path: KeyPath,
         unique: bool,
         multi_entry: bool,
+        populate: bool,
     },
     /// Renames an index of the object store.
     RenameIndex {
@@ -567,6 +584,43 @@ pub enum AsyncSchemaOperation {
     },
     /// Deletes an index of the object store.
     DeleteIndex { index_id: IndexedDBIndexId },
+    /// A step of populating the index `index_id` of the object store, which runs ahead of the
+    /// requests that wait for the population.
+    PopulateIndex {
+        index_id: IndexedDBIndexId,
+        step: IndexPopulationStep,
+    },
+}
+
+/// A step of populating an index that
+/// <https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex> created on an object store
+/// with records.
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum IndexPopulationStep {
+    /// Reads the records after the one with the key `after`, reported as
+    /// [`IndexPopulationEvent::Records`].
+    ReadRecords { after: IndexedDBKeyType },
+    /// Stores the index records of `records`. With `done`, no records follow, and the backend
+    /// reports [`IndexPopulationEvent::Done`].
+    SetIndexKeys {
+        records: Vec<IndexedDBRecordIndexKeys>,
+        done: bool,
+    },
+}
+
+/// What the backend reports about the population of an index.
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum IndexPopulationEvent {
+    /// The next records of the object store in key order, a batch of limited size, and whether
+    /// they are the last.
+    Records {
+        records: Vec<IndexedDBValue>,
+        last: bool,
+    },
+    /// The population ended: every record has its index records, or the population failed with
+    /// the error, which failed the transaction. [`BackendError::Constraint`] means that a unique
+    /// index got the same key for two records.
+    Done(BackendResult<()>),
 }
 
 /// Operations that are not executed instantly, but rather added to a
@@ -609,6 +663,11 @@ pub enum TransactionEvent {
     },
     /// A schema operation failed, which fails the transaction.
     SchemaChangeFailed(BackendError),
+    /// About the population of the index `index_id`.
+    IndexPopulation {
+        index_id: IndexedDBIndexId,
+        event: IndexPopulationEvent,
+    },
     /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>: the changes of the transaction
     /// were written, or writing them failed and they were rolled back.
     Committed(BackendResult<()>),

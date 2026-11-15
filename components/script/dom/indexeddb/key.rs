@@ -576,7 +576,7 @@ pub(crate) fn convert_value_to_multientry_key(
 
 /// Clears the exception of a failed JavaScript operation whose failure is ignored.
 #[expect(unsafe_code)]
-fn clear_pending_exception(cx: &mut JSContext) {
+pub(crate) fn clear_pending_exception(cx: &mut JSContext) {
     if JS_IsExceptionPending(cx) {
         // SAFETY: `cx` is the context the exception is pending on.
         unsafe { JS_ClearPendingException(cx) };
@@ -631,6 +631,28 @@ pub(crate) fn map_backend_error_to_dom_error(error: BackendError) -> Error {
             Error::Operation(Some(format!("IndexedDB open failed: {details}")))
         },
         other => Error::Operation(Some(format!("IndexedDB open failed: {other:?}"))),
+    }
+}
+
+/// The error that a transaction aborts with when the backend, or script on its behalf, failed
+/// it: a "QuotaExceededError" for a full disk, a "ConstraintError" for a unique index that got
+/// the same key for two records while it was populated, and otherwise an "UnknownError" with a
+/// neutral message, as <https://w3c.github.io/IndexedDB/#commit-a-transaction> step 2.4 suggests;
+/// the details only go to the log.
+pub(crate) fn map_transaction_error_to_dom_error(error: BackendError) -> Error {
+    match error {
+        BackendError::QuotaExceeded => Error::QuotaExceeded {
+            quota: None,
+            requested: None,
+        },
+        BackendError::Constraint => Error::Constraint(Some(
+            "A unique index has the same key for two records".to_owned(),
+        )),
+        BackendError::Abort => Error::Abort(Some("The transaction was aborted".to_owned())),
+        other => {
+            warn!("IndexedDB transaction failed: {other}");
+            Error::Unknown(Some("The IndexedDB transaction failed".to_owned()))
+        },
     }
 }
 

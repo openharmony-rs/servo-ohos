@@ -1,7 +1,7 @@
 ./components/script/dom/abort/abortsignal.rs 3
 ./components/script/dom/animations/keyframeeffect.rs 3
 ./components/script/dom/bindings/constructor.rs 3
-./components/script/dom/bindings/error.rs 29
+./components/script/dom/bindings/error.rs 30
 ./components/script/dom/bindings/structuredclone.rs 2
 ./components/script/dom/bluetooth/bluetooth.rs 6
 ./components/script/dom/bluetooth/bluetoothremotegattserver.rs 1

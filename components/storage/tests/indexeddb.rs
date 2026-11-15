@@ -20,10 +20,11 @@ use storage::ClientStorageThreadFactory;
 use storage_traits::StorageThreads;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBIndexKeys,
-    IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg,
-    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput,
-    StorageBottleSource, SyncOperation, TransactionEvent,
+    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexPopulationEvent,
+    IndexPopulationStep, IndexedDBIndexKey, IndexedDBIndexKeys, IndexedDBKeyRange,
+    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBRecordIndexKeys,
+    IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
+    RequestOutput, StorageBottleSource, SyncOperation, TransactionEvent,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -80,6 +81,7 @@ backend_tests!(
     test_indexeddb_transaction_of_a_dropped_connection_holds_back_no_one,
     test_indexeddb_requests_outside_the_mode_or_scope_fail_the_transaction,
     test_indexeddb_versionchange_follows_the_open_result_on_one_channel,
+    test_indexeddb_create_index_population_runs_before_later_requests,
 );
 
 static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -212,6 +214,8 @@ struct Routes {
     requests: HashMap<(Uuid, u64, u64), RequestRoute>,
     commits: HashMap<(Uuid, u64), mpsc::Sender<Option<BackendResult<()>>>>,
     schema_failures: HashMap<(Uuid, u64), mpsc::Sender<Option<BackendError>>>,
+    /// The index population events, by (connection, transaction serial).
+    populations: HashMap<(Uuid, u64), mpsc::Sender<(i64, IndexPopulationEvent)>>,
     /// The transaction events of each connection, in the order they arrived, as (transaction
     /// serial, request id or `None` for a commit result).
     log: HashMap<Uuid, Vec<(u64, Option<u64>)>>,
@@ -258,6 +262,11 @@ fn route(connection: Uuid, event: ConnectionEvent) {
         TransactionEvent::SchemaChangeFailed(error) => {
             if let Some(sender) = routes.schema_failures.get(&(connection, serial)) {
                 let _ = sender.send(Some(error));
+            }
+        },
+        TransactionEvent::IndexPopulation { index_id, event } => {
+            if let Some(sender) = routes.populations.get(&(connection, serial)) {
+                let _ = sender.send((index_id, event));
             }
         },
     }
@@ -466,6 +475,7 @@ fn create_index(
             key_path,
             unique,
             multi_entry,
+            populate: false,
         },
     )
 }
@@ -2476,5 +2486,136 @@ fn test_indexeddb_versionchange_follows_the_open_result_on_one_channel() {
         other => panic!("unexpected upgrade message: {other:?}"),
     };
     close_database(&ctx, upgraded, db_name);
+    ctx.shutdown();
+}
+
+/// An index that an upgrade transaction creates on a store with records is populated by script's
+/// steps, and the transaction's requests that came after its creation wait until it is done and
+/// see the whole index.
+fn test_indexeddb_create_index_population_runs_before_later_requests() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-create-index-population";
+    let receiver = open_database(&ctx, db_name, Some(1));
+    let ConnectionMsg::Upgrade { transaction, .. } =
+        recv_callback_timeout(&receiver, "upgrade message")
+    else {
+        panic!("expected an upgrade");
+    };
+    let (population_sender, populations) = mpsc::channel();
+    ROUTES.lock().unwrap().populations.insert(
+        (transaction.connection, transaction.serial),
+        population_sender,
+    );
+    let failures = create_object_store(&ctx, db_name, STORE, "store", transaction, None, false);
+    let before: Vec<_> = (1..=3)
+        .map(|key| {
+            indexed_put_request(
+                &ctx,
+                db_name,
+                STORE,
+                transaction,
+                key,
+                Some(IndexedDBKeyType::Number(key as f64)),
+                vec![key as u8],
+                false,
+                vec![],
+            )
+        })
+        .collect();
+    let index = 1;
+    send_schema_operation(
+        &ctx,
+        db_name,
+        STORE,
+        transaction,
+        AsyncSchemaOperation::CreateIndex {
+            index_id: index,
+            name: "unique".into(),
+            key_path: KeyPath::String("k".to_owned()),
+            unique: true,
+            multi_entry: false,
+            populate: true,
+        },
+    );
+    let string_key = |key: &str| IndexedDBIndexKeys {
+        index_id: index,
+        keys: vec![IndexedDBIndexKey::Key(IndexedDBKeyType::String(key.into()))],
+    };
+    let after = [(4, "d"), (5, "a")].map(|(key, index_key)| {
+        indexed_put_request(
+            &ctx,
+            db_name,
+            STORE,
+            transaction,
+            key,
+            Some(IndexedDBKeyType::Number(key as f64)),
+            vec![key as u8],
+            false,
+            vec![string_key(index_key)],
+        )
+    });
+    for (key, receiver) in (1..).zip(&before) {
+        assert_eq!(
+            recv_callback_timeout(receiver, "put before createIndex"),
+            Ok(PutItemResult::Key(IndexedDBKeyType::Number(key as f64)))
+        );
+    }
+
+    let (event_index, event) = populations.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(event_index, index);
+    let IndexPopulationEvent::Records { records, last } = event else {
+        panic!("expected the store's records: {event:?}");
+    };
+    assert!(last);
+    assert_eq!(records.len(), 3);
+    assert!(
+        after[0].recv_timeout(Duration::from_millis(200)).is_err(),
+        "the put after createIndex waits for the population"
+    );
+    let records = records
+        .into_iter()
+        .map(|record| IndexedDBRecordIndexKeys {
+            keys: vec![IndexedDBIndexKey::Key(IndexedDBKeyType::String(
+                ["a", "b", "c"][record.value[0] as usize - 1].into(),
+            ))],
+            primary_key: record.primary_key,
+        })
+        .collect();
+    send_schema_operation(
+        &ctx,
+        db_name,
+        STORE,
+        transaction,
+        AsyncSchemaOperation::PopulateIndex {
+            index_id: index,
+            step: IndexPopulationStep::SetIndexKeys {
+                records,
+                done: true,
+            },
+        },
+    );
+    assert!(matches!(
+        populations.recv_timeout(TIMEOUT).unwrap(),
+        (1, IndexPopulationEvent::Done(Ok(())))
+    ));
+    assert_eq!(
+        recv_callback_timeout(&after[0], "put after createIndex"),
+        Ok(PutItemResult::Key(IndexedDBKeyType::Number(4.0)))
+    );
+    assert_eq!(
+        recv_callback_timeout(&after[1], "conflicting put after createIndex"),
+        Ok(PutItemResult::UniqueIndexKeyExists(index))
+    );
+    assert!(failures.try_recv().is_err());
+
+    commit_upgrade_transaction(&ctx, db_name, transaction);
+    let ConnectionMsg::Connection {
+        id, object_stores, ..
+    } = recv_callback_timeout(&receiver, "connection message")
+    else {
+        panic!("expected the connection");
+    };
+    assert_eq!(object_stores[0].indexes.len(), 1);
+    close_database(&ctx, id, db_name);
     ctx.shutdown();
 }

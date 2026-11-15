@@ -12,7 +12,8 @@ use rustc_hash::FxHashMap;
 use servo_base::threadpool::ThreadPool;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBTxnId,
+    BackendError, BackendResult, IndexPopulationEvent, IndexPopulationStep, IndexedDBIndexId,
+    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBTxnId,
     IndexedDBTxnMode, RequestOutput, TransactionEvent,
 };
 
@@ -63,6 +64,7 @@ impl<X: SqlExecutor> SqlEngine<X> {
                     versionchange: None,
                     metadata: metadata.clone(),
                     failed: FxHashMap::default(),
+                    population: None,
                 })),
             }),
             metadata,
@@ -285,10 +287,29 @@ pub(super) struct Database<X> {
     /// Transactions whose changes were rolled back by a failure, with the error that their later
     /// requests and their commit report, until the transaction aborts.
     failed: FxHashMap<IndexedDBTxnId, BackendError>,
+    /// The index population of the upgrade transaction, while one runs or while the requests
+    /// that waited for it run.
+    population: Option<Population>,
+}
+
+/// The population of an index that an upgrade transaction created on an object store that may
+/// have records (<https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex>), which script
+/// drives with [`AsyncSchemaOperation::PopulateIndex`] steps. Its requests and schema operations
+/// that come after the index's creation wait, in order, while the steps run as they come, as in
+/// Chromium's preemptive task queue: so they see the whole index, and those that change the
+/// store or its indexes come after the population.
+struct Population {
+    transaction: IndexedDBTxnId,
+    /// The index being populated, or `None` while the waiting requests run, until one of them
+    /// starts populating another index.
+    index: Option<IndexedDBIndexId>,
+    waiting: VecDeque<KvsOperation>,
 }
 
 impl<X: SqlExecutor> Database<X> {
     /// Runs the requests of a batch in order and sends each result to `results` as it has run.
+    /// Requests that come after the creation of an index that is being populated wait for the
+    /// population instead.
     fn run_batch(
         &mut self,
         transaction: IndexedDBTxnId,
@@ -297,26 +318,105 @@ impl<X: SqlExecutor> Database<X> {
     ) {
         let writes = batch.mode != IndexedDBTxnMode::Readonly;
         for request in batch.requests {
-            if let Some(error) = self.failed.get(&transaction) {
-                results.send(request.failure_event(error.clone()));
+            let Some(population) = self
+                .population
+                .as_mut()
+                .filter(|population| population.transaction == transaction)
+            else {
+                self.run(transaction, writes, request, results);
                 continue;
+            };
+            // The active population's own steps run at once, so none of them ever waits.
+            let failed = self.failed.contains_key(&transaction);
+            if !failed &&
+                population
+                    .index
+                    .is_some_and(|index| request.is_population_step_of(index))
+            {
+                self.run(transaction, true, request, results);
+            } else {
+                population.waiting.push_back(request);
             }
-            if writes && let Err(error) = self.begin(transaction) {
-                results.send(request.failure_event(error));
-                continue;
+            self.run_waiting(transaction, results);
+        }
+    }
+
+    /// Runs the waiting requests of `transaction` that can run now: once the index population is
+    /// done, or if the transaction has failed, all of them in order, until one of them starts
+    /// populating another index.
+    fn run_waiting(&mut self, transaction: IndexedDBTxnId, results: &TransactionResults) {
+        loop {
+            let failed = self.failed.contains_key(&transaction);
+            let Some(population) = self
+                .population
+                .as_mut()
+                .filter(|population| population.transaction == transaction)
+            else {
+                return;
+            };
+            if population.index.is_some() && !failed {
+                return;
             }
-            let (event, failure) = run_request(&mut self.executor, request);
-            if let Some(event) = event {
-                results.send(event);
-            }
-            self.notice_ended_transaction(|| {
-                failure
-                    .as_ref()
-                    .map_or_else(ended_early, |failure| failure.error().clone())
-            });
-            if let Some(Failure::Write(error)) = failure {
-                self.fail(transaction, error);
-            }
+            let Some(request) = population.waiting.pop_front() else {
+                self.population = None;
+                return;
+            };
+            self.run(transaction, true, request, results);
+        }
+    }
+
+    /// Runs a request of `transaction` and sends what it reports to `results`.
+    fn run(
+        &mut self,
+        transaction: IndexedDBTxnId,
+        writes: bool,
+        request: KvsOperation,
+        results: &TransactionResults,
+    ) {
+        if let Some(error) = self.failed.get(&transaction) {
+            return results.send(request.failure_event(error.clone()));
+        }
+        if writes && let Err(error) = self.begin(transaction) {
+            return results.send(request.failure_event(error));
+        }
+        let populating = self
+            .population
+            .as_ref()
+            .filter(|population| population.transaction == transaction)
+            .and_then(|population| population.index);
+        let outcome = run_request(&mut self.executor, request, populating);
+        if let Some(event) = outcome.event {
+            results.send(event);
+        }
+        self.notice_ended_transaction(|| {
+            outcome
+                .failure
+                .as_ref()
+                .map_or_else(ended_early, |failure| failure.error().clone())
+        });
+        if let Some(Failure::Write(error)) = outcome.failure {
+            self.fail(transaction, error);
+        }
+        match outcome.population {
+            Some(PopulationChange::Starts(index)) => match self.population.as_mut() {
+                Some(population) if population.transaction == transaction => {
+                    population.index = Some(index);
+                },
+                _ => {
+                    debug_assert!(self.population.is_none(), "One upgrade at a time");
+                    self.population = Some(Population {
+                        transaction,
+                        index: Some(index),
+                        waiting: VecDeque::new(),
+                    });
+                },
+            },
+            Some(PopulationChange::Ends) => {
+                if let Some(population) = self.population.as_mut() {
+                    population.index = None;
+                }
+            },
+            None => {},
         }
     }
 
@@ -376,8 +476,19 @@ impl<X: SqlExecutor> Database<X> {
             .versionchange
             .take_if(|versionchange| *versionchange == transaction)
             .is_some();
+        let populating = self
+            .population
+            .take_if(|population| population.transaction == transaction)
+            .is_some();
         if let Some(error) = self.failed.remove(&transaction) {
             return Err(error);
+        }
+        if populating {
+            error!("IndexedDB transaction {transaction} committed while it populated an index");
+            self.roll_back(transaction);
+            return Err(BackendError::DbErr(
+                "The transaction committed before its index population ended".to_owned(),
+            ));
         }
         // An upgrade transaction without requests still sets the version.
         if self
@@ -420,6 +531,8 @@ impl<X: SqlExecutor> Database<X> {
     /// <https://w3c.github.io/IndexedDB/#abort-a-transaction>
     fn abort(&mut self, transaction: IndexedDBTxnId) {
         self.failed.remove(&transaction);
+        self.population
+            .take_if(|population| population.transaction == transaction);
         if self
             .upgrade
             .is_some_and(|(upgrade, _)| upgrade == transaction)
@@ -564,14 +677,57 @@ fn outcome<T>(
     }
 }
 
-/// Runs a request, and returns what to report about it, if anything, and how it failed if it
-/// failed in the database. A request that fails before reading or writing anything, such as one
-/// for a missing object store, fails only itself; a schema operation that fails fails its
-/// transaction, and is the only kind of operation that reports nothing when it succeeds.
+/// How a request changes the index population of its transaction.
+enum PopulationChange {
+    /// The request created the index, which is populated now.
+    Starts(IndexedDBIndexId),
+    /// The population of the index ended.
+    Ends,
+}
+
+/// What running a request gives.
+#[derive(Default)]
+struct Outcome {
+    /// What to report about the request.
+    event: Option<TransactionEvent>,
+    /// How the request failed, if it failed in the database.
+    failure: Option<Failure>,
+    population: Option<PopulationChange>,
+}
+
+impl Outcome {
+    /// A failed schema operation, which fails its transaction.
+    fn schema_failure(error: BackendError) -> Self {
+        Self {
+            event: Some(TransactionEvent::SchemaChangeFailed(error.clone())),
+            failure: Some(Failure::Write(error)),
+            population: None,
+        }
+    }
+
+    /// A population of the index `index_id` that failed with `error`, which fails its
+    /// transaction.
+    fn population_failure(index_id: IndexedDBIndexId, error: BackendError) -> Self {
+        Self {
+            event: Some(TransactionEvent::IndexPopulation {
+                index_id,
+                event: IndexPopulationEvent::Done(Err(error.clone())),
+            }),
+            failure: Some(Failure::Write(error)),
+            population: None,
+        }
+    }
+}
+
+/// Runs a request. A request that fails before reading or writing anything, such as one for a
+/// missing object store, fails only itself; a schema operation that fails fails its transaction,
+/// and reports nothing when it succeeds, except for the steps of an index population.
+/// `populating` is the index that the request's transaction populates.
 fn run_request<X: SqlExecutor>(
     executor: &mut X,
     request: KvsOperation,
-) -> (Option<TransactionEvent>, Option<Failure>) {
+    populating: Option<IndexedDBIndexId>,
+) -> Outcome {
     let KvsOperation {
         store,
         request_id,
@@ -580,17 +736,13 @@ fn run_request<X: SqlExecutor>(
 
     let operation = match operation {
         AsyncOperation::Schema(operation) => {
-            let failure = run_schema(executor, store, operation);
-            let event = failure
-                .as_ref()
-                .map(|failure| TransactionEvent::SchemaChangeFailed(failure.error().clone()));
-            return (event, failure);
+            return run_schema(executor, store, operation, populating);
         },
         operation => operation,
     };
     let Some(request_id) = request_id else {
         error!("IndexedDB request without a request id");
-        return (None, None);
+        return Outcome::default();
     };
 
     let (result, failure) = match queries::object_store(executor, store) {
@@ -605,10 +757,11 @@ fn run_request<X: SqlExecutor>(
             (Err(error.clone()), Some(Failure::Read(error)))
         },
     };
-    (
-        Some(TransactionEvent::Request { request_id, result }),
+    Outcome {
+        event: Some(TransactionEvent::Request { request_id, result }),
         failure,
-    )
+        population: None,
+    }
 }
 
 fn run_read_only<X: SqlExecutor>(
@@ -689,12 +842,14 @@ fn run_read_write<X: SqlExecutor>(
     }
 }
 
-/// Runs a schema operation, and returns how it failed if it failed.
+/// Runs a schema operation of the store `store`. `populating` is the index that the
+/// transaction populates.
 fn run_schema<X: SqlExecutor>(
     executor: &mut X,
     store: IndexedDBObjectStoreId,
     operation: AsyncSchemaOperation,
-) -> Option<Failure> {
+    populating: Option<IndexedDBIndexId>,
+) -> Outcome {
     let result = match operation {
         AsyncSchemaOperation::CreateObjectStore {
             name,
@@ -713,21 +868,113 @@ fn run_schema<X: SqlExecutor>(
             key_path,
             unique,
             multi_entry,
-        } => queries::create_index(
-            executor,
-            store,
-            index_id,
-            &name,
-            &key_path,
-            unique,
-            multi_entry,
-        ),
+            populate,
+        } => {
+            let result = queries::create_index(
+                executor,
+                store,
+                index_id,
+                &name,
+                &key_path,
+                unique,
+                multi_entry,
+            );
+            match result {
+                Ok(()) if populate => {
+                    let mut outcome = read_population_records(executor, store, index_id, None);
+                    if outcome.failure.is_none() {
+                        outcome.population = Some(PopulationChange::Starts(index_id));
+                    }
+                    return outcome;
+                },
+                Err(error) if populate => {
+                    return Outcome::population_failure(index_id, error.to_backend_error());
+                },
+                result => result,
+            }
+        },
         AsyncSchemaOperation::RenameIndex { index_id, new_name } => {
             queries::rename_index(executor, store, index_id, &new_name)
         },
         AsyncSchemaOperation::DeleteIndex { index_id } => {
             queries::delete_index(executor, store, index_id)
         },
+        AsyncSchemaOperation::PopulateIndex { index_id, step } => {
+            if populating != Some(index_id) {
+                let error = SqlError::InvalidMetadata("a step of an index population that ended");
+                return Outcome::population_failure(index_id, error.to_backend_error());
+            }
+            return run_population_step(executor, store, index_id, step);
+        },
     };
-    Some(Failure::Write(result.err()?.to_backend_error()))
+    match result {
+        Ok(()) => Outcome::default(),
+        Err(error) => Outcome::schema_failure(error.to_backend_error()),
+    }
+}
+
+/// Reads the next records of the store `store` for populating its index `index_id`: those after
+/// the key `after`, or from the first one.
+fn read_population_records<X: SqlExecutor>(
+    executor: &mut X,
+    store: IndexedDBObjectStoreId,
+    index_id: IndexedDBIndexId,
+    after: Option<&IndexedDBKeyType>,
+) -> Outcome {
+    let result = queries::object_store(executor, store)
+        .and_then(|store| store.ok_or(SqlError::MissingRow("object store")))
+        .and_then(|store| queries::population_records(executor, &store, after));
+    match result {
+        Ok((records, last)) => Outcome {
+            event: Some(TransactionEvent::IndexPopulation {
+                index_id,
+                event: IndexPopulationEvent::Records { records, last },
+            }),
+            ..Outcome::default()
+        },
+        Err(error) => Outcome::population_failure(index_id, error.to_backend_error()),
+    }
+}
+
+/// Runs a step of populating the index `index_id` of the store `store`. A unique index that gets
+/// a key twice fails the transaction with [`BackendError::Constraint`].
+fn run_population_step<X: SqlExecutor>(
+    executor: &mut X,
+    store: IndexedDBObjectStoreId,
+    index_id: IndexedDBIndexId,
+    step: IndexPopulationStep,
+) -> Outcome {
+    let (records, done) = match step {
+        IndexPopulationStep::ReadRecords { after } => {
+            return read_population_records(executor, store, index_id, Some(&after));
+        },
+        IndexPopulationStep::SetIndexKeys { records, done } => (records, done),
+    };
+    let result = queries::object_store(executor, store)
+        .and_then(|store| store.ok_or(SqlError::MissingRow("object store")))
+        .and_then(|store| {
+            let index = store
+                .index(index_id)
+                .ok_or(SqlError::InvalidMetadata("population of a missing index"))?;
+            queries::set_index_keys(executor, &store, index, records)
+        });
+    match result {
+        Ok(true) if done => Outcome {
+            event: Some(TransactionEvent::IndexPopulation {
+                index_id,
+                event: IndexPopulationEvent::Done(Ok(())),
+            }),
+            failure: None,
+            population: Some(PopulationChange::Ends),
+        },
+        Ok(true) => Outcome::default(),
+        // https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex
+        // If the referenced object store already contains data which violates these
+        // constraints, this must not cause the implementation of createIndex() to throw an
+        // exception or affect what it returns. The implementation must still create and
+        // return an IDBIndex object, and the implementation must queue a database task to
+        // abort the upgrade transaction which was used for the createIndex() call.
+        Ok(false) => Outcome::population_failure(index_id, BackendError::Constraint),
+        Err(error) => Outcome::population_failure(index_id, error.to_backend_error()),
+    }
 }

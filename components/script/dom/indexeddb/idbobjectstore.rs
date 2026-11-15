@@ -17,8 +17,9 @@ use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::generic_channel::{GenericSend, GenericSender};
 use storage_traits::indexeddb::{
     self, AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    IndexedDBIndex, IndexedDBIndexId, IndexedDBIndexKeys, IndexedDBKeyType, IndexedDBObjectStore,
-    IndexedDBObjectStoreId, IndexedDBThreadMsg, Utf16String,
+    BackendError, BackendResult, IndexPopulationStep, IndexedDBIndex, IndexedDBIndexId,
+    IndexedDBIndexKeys, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBObjectStoreId,
+    IndexedDBRecordIndexKeys, IndexedDBThreadMsg, IndexedDBValue, Utf16String,
 };
 
 use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
@@ -41,10 +42,10 @@ use crate::dom::indexeddb::idbindex::IDBIndex;
 use crate::dom::indexeddb::idbrequest::IDBRequest;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::key::{
-    EvaluationResult, ExtractionResult, can_inject_key_into_value, convert_value_to_key,
-    convert_value_to_key_range, dom_string_from_name, evaluate_key_path_on_value, extract_key,
-    index_keys, inject_key_into_value, injected_key_is_stored, is_valid_key_path,
-    name_from_dom_string, sorted_name_list,
+    EvaluationResult, ExtractionResult, can_inject_key_into_value, clear_pending_exception,
+    convert_value_to_key, convert_value_to_key_range, dom_string_from_name,
+    evaluate_key_path_on_value, extract_key, index_keys, inject_key_into_value,
+    injected_key_is_stored, is_valid_key_path, name_from_dom_string, sorted_name_list,
 };
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
@@ -315,6 +316,58 @@ impl IDBObjectStore {
         })
     }
 
+    /// The keys that the records `records` of this store get in `index`, which is being
+    /// populated: steps 5.1 and 5.2 of
+    /// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store> on each stored
+    /// value, with its generated key injected. Records without keys are left out. Stops early if
+    /// page code that computing the keys reached aborted the transaction.
+    pub(crate) fn index_keys_of_records(
+        &self,
+        cx: &mut JSContext,
+        index: &IndexedDBIndex,
+        records: Vec<IndexedDBValue>,
+    ) -> BackendResult<Vec<IndexedDBRecordIndexKeys>> {
+        let mut keys_of_records = Vec::with_capacity(records.len());
+        rooted!(&in(cx) let mut value = UndefinedValue());
+        for record in records {
+            if !self.transaction.is_usable() {
+                break;
+            }
+            if self
+                .deserialize_value(cx, &record.primary_key, &record.value, value.handle_mut())
+                .is_err()
+            {
+                clear_pending_exception(cx);
+                return Err(BackendError::DbErr(
+                    "Failed to read a stored value to populate an index".to_owned(),
+                ));
+            }
+            let keys =
+                self.with_transaction_inactive(|| index_keys(cx, value.handle(), index, None));
+            if !keys.is_empty() {
+                keys_of_records.push(IndexedDBRecordIndexKeys {
+                    primary_key: record.primary_key,
+                    keys,
+                });
+            }
+        }
+        Ok(keys_of_records)
+    }
+
+    /// Sends a step of populating the index `index_id` of this handle's store to the backend.
+    pub(crate) fn send_index_population_step(
+        &self,
+        index_id: IndexedDBIndexId,
+        step: IndexPopulationStep,
+    ) {
+        if self
+            .send_schema_operation(AsyncSchemaOperation::PopulateIndex { index_id, step })
+            .is_err()
+        {
+            error!("Failed to send a step of populating IndexedDB index {index_id}");
+        }
+    }
+
     /// <https://www.w3.org/TR/IndexedDB-3/#object-store-in-line-keys>
     pub(crate) fn uses_inline_keys(&self) -> bool {
         self.key_path.is_some()
@@ -449,6 +502,7 @@ impl IDBObjectStore {
         // it: reading the value injects the key, see `deserialize_value`. The index keys that the
         // operation's step 5 extracts from the clone are computed here.
         let index_keys = self.index_keys(cx, cloned_js_value.handle(), serialized_key.is_none());
+        self.transaction.note_records_added(self.id);
         // Step 13. Return the result (an IDBRequest) of running asynchronously execute a request
         // with handle and operation.
         IDBRequest::execute_async(
@@ -994,14 +1048,23 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             unique: options.unique,
             multi_entry: options.multiEntry,
         };
+        // NOTE: The index gets records for the store's records, which creating it "processed as
+        // an asynchronous request within the upgrade transaction" computes, and the backend holds
+        // the transaction's later requests back until then. A store that the transaction created
+        // and that no record was added to has none.
+        let populate = !self.transaction.is_new_empty_store(self.id);
         self.send_schema_operation(AsyncSchemaOperation::CreateIndex {
             index_id: index.id,
             name: index.name.clone(),
             key_path: index.key_path.clone(),
             unique: index.unique,
             multi_entry: index.multi_entry,
+            populate,
         })?;
         db.add_index(self.id, index.clone());
+        if populate {
+            self.transaction.start_index_population(self, index.clone());
+        }
 
         // Step 12. Add index to this object store handle's index set.
         let index = self.add_index(cx, &index);

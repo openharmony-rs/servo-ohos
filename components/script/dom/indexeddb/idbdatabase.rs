@@ -566,6 +566,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         self.object_stores
             .safe_borrow_mut(cx.no_gc())
             .push(store.clone());
+        transaction.note_new_empty_store(store_id);
 
         let object_store = IDBObjectStore::new(cx, &self.global(), &store, &transaction);
         transaction.register_object_store_handle(&object_store);

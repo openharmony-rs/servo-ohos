@@ -78,6 +78,8 @@ pub enum Error {
     Encoding(Option<String>),
     /// ConstraintError DOMException
     Constraint(Option<String>),
+    /// UnknownError DOMException
+    Unknown(Option<String>),
 
     /// TypeError JavaScript Error
     Type(CString),

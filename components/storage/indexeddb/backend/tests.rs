@@ -16,10 +16,11 @@ use servo_base::threadpool::ThreadPool;
 use servo_url::ImmutableOrigin;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, ConnectionEvent, IndexedDBIndex, IndexedDBIndexKey,
-    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord,
-    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput,
-    TransactionEvent, Utf16String,
+    BackendError, BackendResult, ConnectionEvent, IndexPopulationEvent, IndexPopulationStep,
+    IndexedDBIndex, IndexedDBIndexKey, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
+    IndexedDBObjectStore, IndexedDBRecord, IndexedDBRecordIndexKeys, IndexedDBTxnId,
+    IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput, TransactionEvent,
+    Utf16String,
 };
 use tempfile::TempDir;
 use url::Host;
@@ -122,6 +123,17 @@ executor_tests!(
     test_placeholders_become_the_record_key,
     test_abort_reverts_index_records,
     test_index_keys_for_other_indexes_fail_the_transaction,
+    test_population_gives_the_index_records_that_puts_give,
+    test_population_unique_conflict_fails_the_upgrade,
+    test_population_of_a_unique_multi_entry_index,
+    test_requests_after_create_index_wait_for_the_population,
+    test_waiting_put_sees_the_populated_unique_index,
+    test_indexes_created_one_after_another_populate_in_turn,
+    test_abort_during_population_leaves_nothing,
+    test_commit_of_a_transaction_that_failed_while_populating,
+    test_population_of_an_empty_store_and_a_step_out_of_turn,
+    test_population_batches_are_limited_in_size,
+    test_population_finds_unique_conflicts_in_every_check,
 );
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -1240,7 +1252,22 @@ fn routed_results(
     transaction: u64,
     schema_failures: mpsc::Sender<BackendError>,
 ) -> TransactionResults {
+    routed_results_with_populations(transaction, schema_failures, None)
+}
+
+/// [`routed_results`], with the index population events to `populations`.
+fn routed_results_with_populations(
+    transaction: u64,
+    schema_failures: mpsc::Sender<BackendError>,
+    populations: Option<mpsc::Sender<(i64, IndexPopulationEvent)>>,
+) -> TransactionResults {
     let channel = GenericCallback::new(move |event| match event.unwrap() {
+        ConnectionEvent::Transaction {
+            event: TransactionEvent::IndexPopulation { index_id, event },
+            ..
+        } if populations.is_some() => {
+            let _ = populations.as_ref().unwrap().send((index_id, event));
+        },
         ConnectionEvent::Transaction {
             event: TransactionEvent::Request { request_id, result },
             ..
@@ -2086,6 +2113,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
                     key_path: KeyPath::String("b".to_owned()),
                     unique: false,
                     multi_entry: false,
+                    populate: false,
                 },
             ),
             schema(
@@ -2187,6 +2215,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
                     key_path: KeyPath::String("a".to_owned()),
                     unique: false,
                     multi_entry: false,
+                    populate: false,
                 },
             ),
             (
@@ -2197,6 +2226,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
                     key_path: KeyPath::String("a".to_owned()),
                     unique: false,
                     multi_entry: false,
+                    populate: false,
                 },
             ),
             (store, AsyncSchemaOperation::DeleteIndex { index_id: 1 }),
@@ -3307,6 +3337,7 @@ fn test_deleted_indexes_take_their_records_along<X: SqlExecutor>() {
                 key_path: key_path.clone(),
                 unique: false,
                 multi_entry: false,
+                populate: false,
             },
         )],
     );
@@ -3571,6 +3602,788 @@ fn test_index_keys_for_other_indexes_fail_the_transaction<X: SqlExecutor>() {
         assert!(commit(&db, transaction).is_err());
         assert_eq!(stored_keys(&db, store), vec![]);
     }
+}
+
+/// The index population events of a batch.
+type PopulationEvents = Vec<(i64, IndexPopulationEvent)>;
+
+/// Runs a batch of the upgrade `transaction`, waits until it has run, and returns the index
+/// population events it gave.
+fn run_upgrade_batch<X: SqlExecutor>(
+    db: &SqlEngine<X>,
+    transaction: u64,
+    requests: Vec<KvsOperation>,
+) -> PopulationEvents {
+    let (done_sender, done_receiver) = mpsc::channel();
+    let (schema_failures, _) = mpsc::channel();
+    let (populations, events) = mpsc::channel();
+    db.process_transaction(
+        txn(transaction),
+        KvsTransaction {
+            mode: IndexedDBTxnMode::Versionchange,
+            requests: VecDeque::from(requests),
+        },
+        routed_results_with_populations(transaction, schema_failures, Some(populations)),
+        Box::new(move || {
+            let _ = done_sender.send(());
+        }),
+    );
+    done_receiver
+        .recv_timeout(TIMEOUT)
+        .expect("The batch should complete");
+    events.try_iter().collect()
+}
+
+/// Creates the index `index` of `store` on the key path `key_path`, populated from the store's
+/// records.
+fn create_populated_index(
+    store: i64,
+    index: i64,
+    key_path: &str,
+    unique: bool,
+    multi_entry: bool,
+) -> KvsOperation {
+    schema(
+        store,
+        AsyncSchemaOperation::CreateIndex {
+            index_id: index,
+            name: key_path.into(),
+            key_path: KeyPath::String(key_path.to_owned()),
+            unique,
+            multi_entry,
+            populate: true,
+        },
+    )
+}
+
+fn population_step(store: i64, index: i64, step: IndexPopulationStep) -> KvsOperation {
+    schema(
+        store,
+        AsyncSchemaOperation::PopulateIndex {
+            index_id: index,
+            step,
+        },
+    )
+}
+
+/// The steps that script takes after the batch of records `records` of the population of
+/// `index`: it reads the next records unless these are the last, and sends the keys that
+/// `keys` gives each record.
+fn population_steps(
+    store: i64,
+    index: i64,
+    records: &[IndexedDBValue],
+    last: bool,
+    keys: &impl Fn(&IndexedDBValue) -> Vec<IndexedDBKeyType>,
+) -> Vec<KvsOperation> {
+    let mut steps = Vec::new();
+    if !last {
+        let after = records.last().unwrap().primary_key.clone();
+        steps.push(population_step(
+            store,
+            index,
+            IndexPopulationStep::ReadRecords { after },
+        ));
+    }
+    let records = records
+        .iter()
+        .map(|record| IndexedDBRecordIndexKeys {
+            primary_key: record.primary_key.clone(),
+            keys: keys(record)
+                .into_iter()
+                .map(IndexedDBIndexKey::Key)
+                .collect(),
+        })
+        .collect();
+    steps.push(population_step(
+        store,
+        index,
+        IndexPopulationStep::SetIndexKeys {
+            records,
+            done: last,
+        },
+    ));
+    steps
+}
+
+/// Populates `index` of `store` in the upgrade `transaction` as script does, from `events`, the
+/// events of the batch that created it, with `keys` computing the index keys of a record.
+/// Returns how the population ended, the population events of the other indexes on the way, and
+/// the number of record batches.
+fn populate<X: SqlExecutor>(
+    db: &SqlEngine<X>,
+    transaction: u64,
+    store: i64,
+    index: i64,
+    mut events: PopulationEvents,
+    keys: impl Fn(&IndexedDBValue) -> Vec<IndexedDBKeyType>,
+) -> (BackendResult<()>, PopulationEvents, usize) {
+    let mut others = Vec::new();
+    let mut batches = 0;
+    loop {
+        let mut next = None;
+        let mut done = None;
+        for (index_id, event) in events {
+            match event {
+                _ if index_id != index || done.is_some() => others.push((index_id, event)),
+                IndexPopulationEvent::Done(result) => done = Some(result),
+                IndexPopulationEvent::Records { records, last } => {
+                    assert!(next.is_none(), "One batch of records at a time");
+                    next = Some((records, last));
+                },
+            }
+        }
+        if let Some(result) = done {
+            return (result, others, batches);
+        }
+        let (records, last) = next.expect("The population should go on");
+        batches += 1;
+        let steps = population_steps(store, index, &records, last, &keys);
+        events = run_upgrade_batch(db, transaction, steps);
+    }
+}
+
+/// The number that a test value is: its bytes, big-endian.
+fn value_number(record: &IndexedDBValue) -> u32 {
+    u32::from_be_bytes(record.value[..4].try_into().unwrap())
+}
+
+/// The index records that populating an index gives a store's records are those that puts give
+/// them in an index that exists already, with several batches of records, a multiEntry index, a
+/// unique index and records without keys.
+fn test_population_gives_the_index_records_that_puts_give<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    // The keys of the record `n` in the index `kind`: by parity, none for multiples of ten; by
+    // digit, multiEntry; by name, unique.
+    let keys = |kind: usize, n: u32| -> Vec<IndexedDBKeyType> {
+        match kind {
+            0 if n.is_multiple_of(10) => vec![],
+            0 => vec![number(f64::from(n % 2))],
+            1 => {
+                let mut digits: Vec<u8> = n.to_string().bytes().map(|digit| digit - b'0').collect();
+                digits.sort();
+                digits.dedup();
+                digits
+                    .into_iter()
+                    .map(|digit| number(digit.into()))
+                    .collect()
+            },
+            _ => vec![string(&format!("n{n}"))],
+        }
+    };
+    let options = [
+        ("parity", false, false),
+        ("digit", false, true),
+        ("name", true, false),
+    ];
+
+    let indexed = create_store(&db, "indexed", None, false).unwrap();
+    let indexes: Vec<i64> = options
+        .iter()
+        .map(|(name, unique, multi_entry)| {
+            let key_path = KeyPath::String((*name).to_owned());
+            create_index(
+                &db,
+                indexed,
+                (*name).to_owned(),
+                key_path,
+                *unique,
+                *multi_entry,
+            )
+            .unwrap()
+        })
+        .collect();
+    let populated = create_store(&db, "populated", None, false).unwrap();
+    let count = 2 * queries::POPULATION_BATCH_RECORDS as u32 + 234;
+    let puts: Vec<_> = (1..=count)
+        .map(|n| {
+            let index_keys = (0..)
+                .zip(&indexes)
+                .map(|(kind, index)| index_keys(*index, keys(kind, n)))
+                .collect();
+            (
+                Some(number(f64::from(n))),
+                n.to_be_bytes().to_vec(),
+                index_keys,
+            )
+        })
+        .collect();
+    let plain_puts = puts
+        .iter()
+        .map(|(key, value, _)| (key.clone(), value.clone()))
+        .collect();
+    assert!(
+        run_indexed_puts(&db, 1, indexed, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert!(
+        run_puts(&db, 1, populated, plain_puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    db.upgrade_version(txn(2), 2);
+    let mut new_indexes = Vec::new();
+    for (kind, (name, unique, multi_entry)) in options.iter().enumerate() {
+        let index = indexes[2] + 1 + kind as i64;
+        let events = run_upgrade_batch(
+            &db,
+            2,
+            vec![create_populated_index(
+                populated,
+                index,
+                name,
+                *unique,
+                *multi_entry,
+            )],
+        );
+        let (result, others, batches) = populate(&db, 2, populated, index, events, |record| {
+            keys(kind, value_number(record))
+        });
+        assert_eq!(result, Ok(()));
+        assert!(others.is_empty());
+        assert_eq!(batches, 3);
+        new_indexes.push(index);
+    }
+    assert_eq!(commit(&db, 2), Ok(()));
+    for (index, new_index) in indexes.iter().zip(&new_indexes) {
+        let records = index_records_of(&db, indexed, *index);
+        assert!(!records.is_empty());
+        assert_eq!(index_records_of(&db, populated, *new_index), records);
+    }
+    assert_eq!(dangling_index_records(&db), 0);
+}
+
+/// A unique index that gets a key twice while it is populated, here from records in different
+/// batches, fails the upgrade transaction with Constraint: the requests that waited for the
+/// population and later steps fail, the commit fails, and aborting it leaves the database as it
+/// was.
+fn test_population_unique_conflict_fails_the_upgrade<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let count = queries::POPULATION_BATCH_RECORDS as u32 + 150;
+    let puts = (1..=count)
+        .map(|n| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
+        .collect();
+    assert!(
+        run_puts(&db, 1, store, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+    let unique_key = |n: u32| string(&format!("k{}", if n == count - 1 { 3 } else { n }));
+
+    db.upgrade_version(txn(2), 2);
+    let (before, after) = (get_callback::<PutReply>(), get_callback::<PutReply>());
+    let index = 1;
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![
+            put_request(
+                store,
+                before.0,
+                number(0.0),
+                0u32.to_be_bytes().to_vec(),
+                false,
+            ),
+            create_populated_index(store, index, "k", true, false),
+            indexed_put_request(
+                store,
+                after.0,
+                Some(number(-1.0)),
+                vec![],
+                false,
+                vec![index_keys(index, [string("new")])],
+            ),
+        ],
+    );
+    assert_eq!(recv(&before.1), key_reply(0.0));
+    assert!(
+        after.1.try_recv().is_err(),
+        "The put waits for the population"
+    );
+    let (result, _, batches) = populate(&db, 2, store, index, events, |record| {
+        vec![unique_key(value_number(record))]
+    });
+    assert_eq!(result, Err(BackendError::Constraint));
+    assert_eq!(batches, 2);
+    assert_eq!(recv(&after.1), Err(BackendError::Constraint));
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![population_step(
+            store,
+            index,
+            IndexPopulationStep::ReadRecords { after: number(1.0) },
+        )],
+    );
+    assert!(matches!(
+        &events[..],
+        [(1, IndexPopulationEvent::Done(Err(BackendError::Constraint)))]
+    ));
+    assert_eq!(commit(&db, 2), Err(BackendError::Constraint));
+    abort(&db, 2);
+
+    assert!(db.object_stores()[0].indexes.is_empty());
+    assert_eq!(index_record_count(&db, index), 0);
+    assert_eq!(stored_keys(&db, store).len(), count as usize);
+    assert_eq!(stored_keys(&db, store)[0], number(1.0));
+}
+
+/// A unique multiEntry index gets each of a record's keys once and fails if two records share
+/// one.
+fn test_population_of_a_unique_multi_entry_index<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let puts = (1..=3)
+        .map(|n: u32| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
+        .collect();
+    assert!(
+        run_puts(&db, 1, store, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+    let tags = |third: &'static str| {
+        move |record: &IndexedDBValue| match value_number(record) {
+            1 => vec![string("a"), string("a"), string("b")],
+            2 => vec![string("c")],
+            _ => vec![string(third), string("d")],
+        }
+    };
+
+    db.upgrade_version(txn(2), 2);
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![create_populated_index(store, 1, "t", true, true)],
+    );
+    assert_eq!(populate(&db, 2, store, 1, events, tags("e")).0, Ok(()));
+    assert_eq!(
+        index_records_of(&db, store, 1),
+        string_records(&[("a", 1.0), ("b", 1.0), ("c", 2.0), ("d", 3.0), ("e", 3.0)])
+    );
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![create_populated_index(store, 2, "u", true, true)],
+    );
+    assert_eq!(
+        populate(&db, 2, store, 2, events, tags("b")).0,
+        Err(BackendError::Constraint)
+    );
+    abort(&db, 2);
+}
+
+/// The requests and schema operations that come after the creation of an index that is
+/// populated run once the population is done, in order, and see the whole index: a put whose
+/// unique key an existing record has fails, and one after the index's deletion doesn't.
+fn test_requests_after_create_index_wait_for_the_population<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let puts = (1..=3)
+        .map(|n: u32| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
+        .collect();
+    assert!(
+        run_puts(&db, 1, store, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    db.upgrade_version(txn(2), 2);
+    let index = 1;
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![create_populated_index(store, index, "k", true, false)],
+    );
+    let (order_sender, order) = mpsc::channel();
+    let put = |id, key: f64, index_key: Option<&str>| {
+        let index_keys = index_key.map(|key| vec![index_keys(index, [string(key)])]);
+        indexed_put_request(
+            store,
+            tagged(&order_sender, id),
+            Some(number(key)),
+            vec![],
+            false,
+            index_keys.unwrap_or_default(),
+        )
+    };
+    assert!(
+        run_upgrade_batch(
+            &db,
+            2,
+            vec![
+                put(4, 4.0, Some("k1")),
+                put(5, 5.0, Some("k5")),
+                schema(store, AsyncSchemaOperation::DeleteIndex { index_id: index }),
+                put(6, 6.0, None),
+            ],
+        )
+        .is_empty()
+    );
+    assert!(
+        order.try_recv().is_err(),
+        "The requests wait for the population"
+    );
+    let (result, _, _) = populate(&db, 2, store, index, events, |record| {
+        vec![string(&format!("k{}", value_number(record)))]
+    });
+    assert_eq!(result, Ok(()));
+    assert_eq!(order.try_iter().collect::<Vec<_>>(), vec![4, 5, 6]);
+    assert_eq!(commit(&db, 2), Ok(()));
+    assert_eq!(stored_keys(&db, store), number_keys([1, 2, 3, 5, 6]));
+    assert!(db.object_stores()[0].indexes.is_empty());
+    assert_eq!(index_record_count(&db, index), 0);
+}
+
+/// The results of the requests that waited, and the unique conflict of one of them with an
+/// existing record.
+fn test_waiting_put_sees_the_populated_unique_index<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let puts = vec![(Some(number(1.0)), 1u32.to_be_bytes().to_vec())];
+    assert!(
+        run_puts(&db, 1, store, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    db.upgrade_version(txn(2), 2);
+    let (conflict, other) = (get_callback::<PutReply>(), get_callback::<PutReply>());
+    let index = 1;
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![
+            create_populated_index(store, index, "k", true, false),
+            indexed_put_request(
+                store,
+                conflict.0,
+                Some(number(2.0)),
+                vec![],
+                false,
+                vec![index_keys(index, [string("k1")])],
+            ),
+            indexed_put_request(
+                store,
+                other.0,
+                Some(number(3.0)),
+                vec![],
+                false,
+                vec![index_keys(index, [string("k3")])],
+            ),
+        ],
+    );
+    let (result, _, _) = populate(&db, 2, store, index, events, |record| {
+        vec![string(&format!("k{}", value_number(record)))]
+    });
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        recv(&conflict.1),
+        Ok(PutItemResult::UniqueIndexKeyExists(index))
+    );
+    assert_eq!(recv(&other.1), key_reply(3.0));
+    assert_eq!(commit(&db, 2), Ok(()));
+    assert_eq!(
+        index_records_of(&db, store, index),
+        string_records(&[("k1", 1.0), ("k3", 3.0)])
+    );
+}
+
+/// Indexes created one after another are populated one after another, each after the requests
+/// that came before its creation, so the second sees a record put between the two.
+fn test_indexes_created_one_after_another_populate_in_turn<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let puts = (1..=3)
+        .map(|n: u32| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
+        .collect();
+    assert!(
+        run_puts(&db, 1, store, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    db.upgrade_version(txn(2), 2);
+    let (first, second) = (1, 2);
+    let put = get_callback::<PutReply>();
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![
+            create_populated_index(store, first, "a", false, false),
+            indexed_put_request(
+                store,
+                put.0,
+                Some(number(4.0)),
+                4u32.to_be_bytes().to_vec(),
+                false,
+                vec![index_keys(first, [number(4.0)])],
+            ),
+            create_populated_index(store, second, "b", false, false),
+        ],
+    );
+    assert!(events.iter().all(|(index, _)| *index == first));
+    let same = |record: &IndexedDBValue| vec![number(f64::from(value_number(record)))];
+    let (result, others, _) = populate(&db, 2, store, first, events, same);
+    assert_eq!(result, Ok(()));
+    assert_eq!(recv(&put.1), key_reply(4.0));
+    let [
+        (
+            _,
+            IndexPopulationEvent::Records {
+                records,
+                last: true,
+            },
+        ),
+    ] = &others[..]
+    else {
+        panic!("The second population should start: {others:?}");
+    };
+    assert_eq!(records.len(), 4);
+    let (result, _, _) = populate(&db, 2, store, second, others, same);
+    assert_eq!(result, Ok(()));
+    assert_eq!(commit(&db, 2), Ok(()));
+    let records: Vec<_> = (1..=4)
+        .map(|n| (number(f64::from(n)), number(f64::from(n))))
+        .collect();
+    assert_eq!(index_records_of(&db, store, first), records);
+    assert_eq!(index_records_of(&db, store, second), records);
+}
+
+/// Aborting the upgrade transaction during a population rolls it back and drops the requests
+/// that waited, and the database's next writer runs.
+fn test_abort_during_population_leaves_nothing<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let count = queries::POPULATION_BATCH_RECORDS as u32 + 10;
+    let puts = (1..=count)
+        .map(|n| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
+        .collect();
+    assert!(
+        run_puts(&db, 1, store, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    db.upgrade_version(txn(2), 2);
+    let index = 1;
+    let waiting = get_callback::<PutReply>();
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![
+            create_populated_index(store, index, "k", false, false),
+            put_request(store, waiting.0, number(0.0), vec![], false),
+        ],
+    );
+    let [
+        (
+            _,
+            IndexPopulationEvent::Records {
+                records,
+                last: false,
+            },
+        ),
+    ] = &events[..]
+    else {
+        panic!("The population should start: {events:?}");
+    };
+    let steps = population_steps(store, index, records, false, &|_| vec![number(1.0)]);
+    assert_eq!(run_upgrade_batch(&db, 2, steps).len(), 1);
+    assert!(index_record_count(&db, index) > 0);
+    abort(&db, 2);
+    assert!(waiting.1.recv_timeout(Duration::from_millis(100)).is_err());
+
+    assert_eq!(index_record_count(&db, index), 0);
+    assert!(db.object_stores()[0].indexes.is_empty());
+    let replies = run_puts(&db, 3, store, vec![(Some(number(0.0)), vec![])], false);
+    assert_eq!(replies, vec![key_reply(0.0)]);
+    assert_eq!(commit(&db, 3), Ok(()));
+    assert_eq!(stored_keys(&db, store).len(), count as usize + 1);
+}
+
+/// The commit of an upgrade transaction that failed while it populated an index fails and drops
+/// the population, so that the next upgrade can populate an index without an abort in between.
+fn test_commit_of_a_transaction_that_failed_while_populating<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_faulty_engine::<X>(&dir);
+    db.upgrade_version(txn(2), 2);
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![create_populated_index(TEST_STORE, 1, "k", false, false)],
+    );
+    assert!(
+        matches!(&events[..], [(1, IndexPopulationEvent::Records { .. })]),
+        "The population should start: {events:?}"
+    );
+    // A job outside the transaction's requests ends its SQL transaction; the fault clears
+    // itself when it fires.
+    faults_for(dir.path()).lock().unwrap().statement = Some(("FROM object_store", 0));
+    db.spawn_on_connection(|executor| {
+        let _ = queries::object_store(executor, TEST_STORE);
+    });
+    assert!(commit(&db, 2).is_err());
+
+    db.upgrade_version(txn(3), 2);
+    let events = run_upgrade_batch(
+        &db,
+        3,
+        vec![create_populated_index(TEST_STORE, 1, "k", false, false)],
+    );
+    let (result, _, batches) = populate(&db, 3, TEST_STORE, 1, events, |_| vec![number(1.0)]);
+    assert_eq!((result, batches), (Ok(()), 1));
+    assert_eq!(commit(&db, 3), Ok(()));
+    assert_eq!(index_record_count(&db, 1), 1);
+}
+
+/// An index of an empty store is populated in one step, and a step for an index that isn't
+/// being populated fails the transaction.
+fn test_population_of_an_empty_store_and_a_step_out_of_turn<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+
+    db.upgrade_version(txn(1), 1);
+    let events = run_upgrade_batch(
+        &db,
+        1,
+        vec![create_populated_index(store, 1, "a", false, false)],
+    );
+    let [
+        (
+            1,
+            IndexPopulationEvent::Records {
+                records,
+                last: true,
+            },
+        ),
+    ] = &events[..]
+    else {
+        panic!("The population should start with no records: {events:?}");
+    };
+    assert!(records.is_empty());
+    let (result, _, batches) = populate(&db, 1, store, 1, events, |_| vec![]);
+    assert_eq!((result, batches), (Ok(()), 1));
+
+    let put = get_callback::<PutReply>();
+    let events = run_upgrade_batch(
+        &db,
+        1,
+        vec![
+            population_step(
+                store,
+                1,
+                IndexPopulationStep::SetIndexKeys {
+                    records: vec![],
+                    done: true,
+                },
+            ),
+            put_request(store, put.0, number(1.0), vec![], false),
+        ],
+    );
+    assert!(matches!(
+        &events[..],
+        [(1, IndexPopulationEvent::Done(Err(BackendError::DbErr(_))))]
+    ));
+    assert!(recv(&put.1).is_err());
+    assert!(commit(&db, 1).is_err());
+}
+
+/// A unique index's keys in a batch of records are checked against the records of earlier
+/// batches in several statements, and a conflict in any of them fails the population.
+fn test_population_finds_unique_conflicts_in_every_check<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let count = queries::POPULATION_BATCH_RECORDS as u32 + 300;
+    let puts = (1..=count)
+        .map(|n| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
+        .collect();
+    assert!(
+        run_puts(&db, 1, store, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+    // Two keys per record; the last record's first key is the first record's, which the second
+    // batch's 600 keys only reach in their second check.
+    let keys = |last_conflicts: bool| {
+        move |record: &IndexedDBValue| {
+            let n = f64::from(value_number(record));
+            match n as u32 {
+                n if n == count && last_conflicts => vec![number(2.0), number(f64::from(2 * n))],
+                _ => vec![number(2.0 * n), number(2.0 * n + 1.0)],
+            }
+        }
+    };
+
+    db.upgrade_version(txn(2), 2);
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![create_populated_index(store, 1, "a", true, true)],
+    );
+    let (result, _, batches) = populate(&db, 2, store, 1, events, keys(false));
+    assert_eq!((result, batches), (Ok(()), 2));
+    assert_eq!(index_record_count(&db, 1), 2 * i64::from(count));
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![create_populated_index(store, 2, "b", true, true)],
+    );
+    let (result, _, _) = populate(&db, 2, store, 2, events, keys(true));
+    assert_eq!(result, Err(BackendError::Constraint));
+    abort(&db, 2);
+}
+
+/// A batch of records for a population stops early once their values reach the size limit.
+fn test_population_batches_are_limited_in_size<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let puts = (1..=10)
+        .map(|n| (Some(number(f64::from(n))), vec![n as u8; 300 * 1024]))
+        .collect();
+    assert!(
+        run_puts(&db, 1, store, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    let mut connection = db.connection();
+    let object_store = queries::object_store(&mut *connection, store)
+        .unwrap()
+        .unwrap();
+    let mut after = None;
+    let mut batches = Vec::new();
+    loop {
+        let (records, last) =
+            queries::population_records(&mut *connection, &object_store, after.as_ref()).unwrap();
+        batches.push((records.len(), last));
+        if last {
+            break;
+        }
+        after = Some(records.last().unwrap().primary_key.clone());
+    }
+    assert_eq!(batches, vec![(4, false), (4, false), (2, true)]);
 }
 
 #[test]

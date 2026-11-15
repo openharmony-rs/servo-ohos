@@ -58,6 +58,7 @@ pub(crate) enum DOMErrorName {
     OperationError,
     NotAllowedError,
     ConstraintError,
+    UnknownError,
 }
 
 impl DOMErrorName {
@@ -94,6 +95,7 @@ impl DOMErrorName {
             "OperationError" => Some(DOMErrorName::OperationError),
             "NotAllowedError" => Some(DOMErrorName::NotAllowedError),
             "ConstraintError" => Some(DOMErrorName::ConstraintError),
+            "UnknownError" => Some(DOMErrorName::UnknownError),
             _ => None,
         )
     }
@@ -160,6 +162,9 @@ impl DOMException {
             },
             DOMErrorName::ConstraintError => {
                 "A mutation operation in a transaction failed because a constraint was not satisfied."
+            },
+            DOMErrorName::UnknownError => {
+                "The operation failed for an unknown transient reason (e.g. out of memory)."
             },
         };
 

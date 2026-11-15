@@ -5,11 +5,13 @@
 //! The IndexedDB operations on the tables of `schema.rs`.
 
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
+use rustc_hash::FxHashSet;
 use storage_traits::indexeddb::{
     IndexedDBIndex, IndexedDBIndexId, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
-    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBValue, KeyPath,
-    PutItemResult, Utf16String,
+    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBRecordIndexKeys,
+    IndexedDBValue, KeyPath, PutItemResult, Utf16String,
 };
 
 use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
@@ -52,7 +54,6 @@ impl StoreIndex {
     /// the record in the store. `unique_index_data`'s primary key `(index_id, value)` allows one
     /// record per key; `index_data`'s is `(index_id, value, object_data_key)`. Both read in
     /// (key, primary key) order.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn table(&self) -> &'static str {
         if self.unique {
             "unique_index_data"
@@ -857,6 +858,113 @@ pub(crate) fn put_record<X: SqlExecutor>(
 
     // Step 6. Return key.
     Ok(PutItemResult::Key(key))
+}
+
+/// The most records that one step of populating an index reads.
+pub(crate) const POPULATION_BATCH_RECORDS: usize = 500;
+
+/// The size of the values above which a step of populating an index reads no more records.
+const POPULATION_BATCH_BYTES: usize = 1 << 20;
+
+/// The records of `store` after the key `after`, or from the first one, in key order, for
+/// populating an index: at most [`POPULATION_BATCH_RECORDS`], and no more once their values add
+/// up to [`POPULATION_BATCH_BYTES`]. Returns them, and whether no records follow them.
+pub(crate) fn population_records<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    after: Option<&IndexedDBKeyType>,
+) -> Result<(Vec<IndexedDBValue>, bool), SqlError> {
+    let after = after.map(encoding::serialize);
+    let mut sql = "SELECT key, data FROM object_data WHERE object_store_id = ?".to_owned();
+    let mut params = vec![SqlParam::Integer(store.id)];
+    if let Some(after) = &after {
+        sql.push_str(" AND key > ?");
+        params.push(SqlParam::Blob(after));
+    }
+    sql.push_str(" ORDER BY key LIMIT ?");
+    params.push(SqlParam::Integer(POPULATION_BATCH_RECORDS as i64));
+    let mut records = Vec::new();
+    let mut bytes = 0;
+    let mut full = false;
+    executor.query(&sql, &params, &mut |row| {
+        let record = value_of_row(row)?;
+        bytes += record.value.len();
+        records.push(record);
+        full = bytes >= POPULATION_BATCH_BYTES;
+        Ok(if full {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        })
+    })?;
+    let last = !full && records.len() < POPULATION_BATCH_RECORDS;
+    Ok((records, last))
+}
+
+/// The most keys that one statement of [`set_index_keys`] checks.
+const POPULATION_KEYS_PER_CHECK: usize = 500;
+
+/// The most index records that one statement of [`set_index_keys`] inserts, four parameters
+/// each, so that a statement stays below SQLite's oldest limit of 999 parameters.
+const POPULATION_RECORDS_PER_INSERT: usize = 200;
+
+/// Stores the records of `index`, which is being populated, for the records of `store` that
+/// `records` has the index keys of. Returns false, having stored none of them, if the index is
+/// unique and two of the records, or one of them and a record stored before, have the same key.
+/// The statements cover many records each, since on RDB each statement costs about 0.2 ms.
+pub(crate) fn set_index_keys<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    index: StoreIndex,
+    records: Vec<IndexedDBRecordIndexKeys>,
+) -> Result<bool, SqlError> {
+    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for IndexedDBRecordIndexKeys { primary_key, keys } in records {
+        let encoded_key = encoding::serialize(&primary_key);
+        let keys: BTreeSet<Vec<u8>> = keys
+            .into_iter()
+            .map(|key| encoding::serialize(&key.with_primary_key(&primary_key)))
+            .collect();
+        rows.extend(keys.into_iter().map(|key| (key, encoded_key.clone())));
+    }
+    if index.unique {
+        let mut keys = FxHashSet::default();
+        if !rows.iter().all(|(key, _)| keys.insert(key.as_slice())) {
+            return Ok(false);
+        }
+        for chunk in rows.chunks(POPULATION_KEYS_PER_CHECK) {
+            let sql = format!(
+                "SELECT 1 FROM unique_index_data WHERE index_id = ? AND value IN ({}) LIMIT 1",
+                vec!["?"; chunk.len()].join(", ")
+            );
+            let params: Vec<_> = std::iter::once(SqlParam::Integer(index.id))
+                .chain(chunk.iter().map(|(key, _)| SqlParam::Blob(key)))
+                .collect();
+            if query_row(executor, &sql, &params, |_| Ok(()))?.is_some() {
+                return Ok(false);
+            }
+        }
+    }
+    for chunk in rows.chunks(POPULATION_RECORDS_PER_INSERT) {
+        let sql = format!(
+            "INSERT INTO {} (index_id, value, object_data_key, object_store_id) VALUES {}",
+            index.table(),
+            vec!["(?, ?, ?, ?)"; chunk.len()].join(", ")
+        );
+        let params: Vec<_> = chunk
+            .iter()
+            .flat_map(|(key, primary_key)| {
+                [
+                    SqlParam::Integer(index.id),
+                    SqlParam::Blob(key),
+                    SqlParam::Blob(primary_key),
+                    SqlParam::Integer(store.id),
+                ]
+            })
+            .collect();
+        executor.execute(&sql, &params)?;
+    }
+    Ok(true)
 }
 
 /// <https://w3c.github.io/IndexedDB/#delete-records-from-an-object-store>

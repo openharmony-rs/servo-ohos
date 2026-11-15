@@ -2449,6 +2449,7 @@ mod tests {
                 key_path: KeyPath::String("author".to_string()),
                 unique: false,
                 multi_entry: false,
+                populate: false,
             }),
         );
         assert_eq!(

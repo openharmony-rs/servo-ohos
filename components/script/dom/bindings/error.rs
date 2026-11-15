@@ -233,6 +233,10 @@ pub(crate) fn create_dom_exception(
             return new_custom_exception(DOMErrorName::ConstraintError, custom_message);
         },
         Error::Constraint(None) => DOMErrorName::ConstraintError,
+        Error::Unknown(Some(custom_message)) => {
+            return new_custom_exception(DOMErrorName::UnknownError, custom_message);
+        },
+        Error::Unknown(None) => DOMErrorName::UnknownError,
         Error::Type(message) => return Err(JsEngineError::Type(message)),
         Error::Range(message) => return Err(JsEngineError::Range(message)),
         Error::JSFailed => return Err(JsEngineError::JSFailed),

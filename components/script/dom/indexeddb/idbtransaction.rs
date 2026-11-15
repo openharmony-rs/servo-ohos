@@ -13,8 +13,9 @@ use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::{GenericSend, GenericSender};
 use servo_base::id::ScriptEventLoopId;
 use storage_traits::indexeddb::{
-    BackendError, BackendResult, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg,
-    IndexedDBTxnId, IndexedDBTxnMode, RequestOutput, SyncOperation, TransactionEvent, Utf16String,
+    BackendResult, IndexPopulationEvent, IndexPopulationStep, IndexedDBIndex, IndexedDBIndexId,
+    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId,
+    IndexedDBTxnMode, RequestOutput, SyncOperation, TransactionEvent, Utf16String,
 };
 use stylo_atoms::Atom;
 
@@ -37,14 +38,16 @@ use crate::dom::indexeddb::idbcursor::IterationParam;
 use crate::dom::indexeddb::idbdatabase::IDBDatabase;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
 use crate::dom::indexeddb::idbrequest::IDBRequest;
-use crate::dom::indexeddb::key::{map_backend_error_to_dom_error, name_from_dom_string};
+use crate::dom::indexeddb::key::{map_transaction_error_to_dom_error, name_from_dom_string};
 use crate::realms::enter_auto_realm;
 
 /// A request in a transaction's request list, and its result once the backend has reported it.
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct PendingRequest {
-    request: Dom<IDBRequest>,
+    /// The request, or `None` for the population of an index, which createIndex makes "an
+    /// asynchronous request within the upgrade transaction" without an IDBRequest.
+    request: Option<Dom<IDBRequest>>,
     /// The id of this execution of the request, which a cursor's request has once per
     /// iteration.
     id: u64,
@@ -53,6 +56,20 @@ struct PendingRequest {
     iteration_param: Option<IterationParam>,
     #[no_trace]
     result: Option<BackendResult<RequestOutput>>,
+}
+
+/// The population of an index that createIndex created on an object store that may have
+/// records: script reads the store's records in batches, computes their keys in the index and
+/// sends them to the backend, which holds the transaction's later requests back meanwhile.
+#[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+struct IndexPopulation {
+    /// The handle that createIndex was called on.
+    store: Dom<IDBObjectStore>,
+    #[no_trace]
+    index: IndexedDBIndex,
+    /// The id of the request list entry that the population completes.
+    entry: u64,
 }
 
 #[dom_struct]
@@ -74,6 +91,11 @@ pub struct IDBTransaction {
     /// task hasn't run, in the order they were made. Results are delivered from the front only,
     /// so that they complete in request order.
     requests: DomRefCell<VecDeque<PendingRequest>>,
+    /// The index populations of this upgrade transaction that haven't ended.
+    index_populations: DomRefCell<Vec<IndexPopulation>>,
+    /// The object stores that this upgrade transaction created and that no put or add has been
+    /// made on since, which have no records to populate an index from.
+    new_empty_stores: DomRefCell<Vec<IndexedDBObjectStoreId>>,
     // https://www.w3.org/TR/IndexedDB-3/#transaction-active-flag
     active: Cell<bool>,
     // https://www.w3.org/TR/IndexedDB-3/#transaction-finish
@@ -118,6 +140,8 @@ impl IDBTransaction {
 
             store_handles: Default::default(),
             requests: Default::default(),
+            index_populations: Default::default(),
+            new_empty_stores: Default::default(),
             active: Cell::new(true),
             finished: Cell::new(false),
             abort_initiated: Cell::new(false),
@@ -397,11 +421,126 @@ impl IDBTransaction {
         iteration_param: Option<IterationParam>,
     ) {
         self.requests.borrow_mut().push_back(PendingRequest {
-            request: Dom::from_ref(request),
+            request: Some(Dom::from_ref(request)),
             id,
             iteration_param,
             result: None,
         });
+    }
+
+    /// Notes that this upgrade transaction created the object store `store`, which has no
+    /// records.
+    pub(crate) fn note_new_empty_store(&self, store: IndexedDBObjectStoreId) {
+        self.new_empty_stores.borrow_mut().push(store);
+    }
+
+    /// Notes that a request that adds a record to the object store `store` was made.
+    pub(crate) fn note_records_added(&self, store: IndexedDBObjectStoreId) {
+        self.new_empty_stores.borrow_mut().retain(|id| *id != store);
+    }
+
+    /// Whether the object store `store` is one that this upgrade transaction created and that
+    /// no record was added to since.
+    pub(crate) fn is_new_empty_store(&self, store: IndexedDBObjectStoreId) -> bool {
+        self.new_empty_stores.borrow().contains(&store)
+    }
+
+    /// Populates the index `index`, which createIndex created on the store of `store`, the handle
+    /// it was called on: the backend reports the store's first records, see
+    /// [`Self::index_population_event`]. The population is a request list entry without an
+    /// IDBRequest, so that it ends in request order.
+    pub(crate) fn start_index_population(&self, store: &IDBObjectStore, index: IndexedDBIndex) {
+        let entry = self.allocate_request_id();
+        self.requests.borrow_mut().push_back(PendingRequest {
+            request: None,
+            id: entry,
+            iteration_param: None,
+            result: None,
+        });
+        self.index_populations.borrow_mut().push(IndexPopulation {
+            store: Dom::from_ref(store),
+            index,
+            entry,
+        });
+    }
+
+    /// Takes the next step of populating the index `index_id` after the backend reported
+    /// `event`: reads the next records and sends the index keys of those that arrived, or ends
+    /// the population's request list entry.
+    fn index_population_event(
+        &self,
+        cx: &mut JSContext,
+        index_id: IndexedDBIndexId,
+        event: IndexPopulationEvent,
+    ) {
+        if self.finished.get() || self.abort_initiated.get() {
+            return;
+        }
+        let Some((store, index, entry)) = self
+            .index_populations
+            .borrow()
+            .iter()
+            .find(|population| population.index.id == index_id)
+            .map(|population| {
+                (
+                    population.store.as_rooted(),
+                    population.index.clone(),
+                    population.entry,
+                )
+            })
+        else {
+            return;
+        };
+        let (records, last) = match event {
+            IndexPopulationEvent::Records { records, last } => (records, last),
+            IndexPopulationEvent::Done(result) => {
+                return self.end_index_population(cx, index_id, entry, result);
+            },
+        };
+        // An index or store deleted since is still populated: the requests made before the
+        // deletion see the whole index, and the backend runs the deletion after them.
+
+        // The next records are read while these are indexed.
+        if !last && let Some(record) = records.last() {
+            store.send_index_population_step(
+                index_id,
+                IndexPopulationStep::ReadRecords {
+                    after: record.primary_key.clone(),
+                },
+            );
+        }
+        let mut realm = enter_auto_realm(cx, &*store);
+        let cx: &mut JSContext = &mut realm;
+        let keys = store.index_keys_of_records(cx, &index, records);
+        // Page code that computing the keys reached may have aborted the transaction.
+        if self.finished.get() || self.abort_initiated.get() {
+            return;
+        }
+        match keys {
+            Ok(records) => store.send_index_population_step(
+                index_id,
+                IndexPopulationStep::SetIndexKeys {
+                    records,
+                    done: last,
+                },
+            ),
+            Err(error) => self.end_index_population(cx, index_id, entry, Err(error)),
+        }
+    }
+
+    /// Ends the population of the index `index_id`, whose request list entry is `entry`, with
+    /// `result`, and delivers the results that are next in request order.
+    fn end_index_population(
+        &self,
+        cx: &mut JSContext,
+        index_id: IndexedDBIndexId,
+        entry: u64,
+        result: BackendResult<()>,
+    ) {
+        self.index_populations
+            .safe_borrow_mut(cx.no_gc())
+            .retain(|population| population.index.id != index_id);
+        self.request_result_arrived(cx, entry, result.map(|()| RequestOutput::Done));
     }
 
     /// Handles what the backend reported about this transaction on the connection's result
@@ -412,7 +551,10 @@ impl IDBTransaction {
                 self.request_result_arrived(cx, request_id, result)
             },
             TransactionEvent::SchemaChangeFailed(error) => {
-                self.abort(cx, map_backend_error_to_dom_error(error))
+                self.abort(cx, map_transaction_error_to_dom_error(error))
+            },
+            TransactionEvent::IndexPopulation { index_id, event } => {
+                self.index_population_event(cx, index_id, event)
             },
             TransactionEvent::Committed(result) => self.commit_result_arrived(cx, result),
         }
@@ -459,7 +601,7 @@ impl IDBTransaction {
                 return;
             };
             let first = (
-                first.request.as_rooted(),
+                first.request.as_ref().map(|request| request.as_rooted()),
                 first.id,
                 first.iteration_param.take(),
                 result,
@@ -469,25 +611,49 @@ impl IDBTransaction {
             first
         };
 
-        let mut realm = enter_auto_realm(cx, &*request);
-        let cx: &mut JSContext = &mut realm;
-        rooted!(&in(cx) let mut answer = UndefinedValue());
-        match request.convert_result(cx, result, iteration_param.as_ref(), answer.handle_mut()) {
-            // Step 5.3: If result is an error and transaction’s state is committing, then run
-            // abort a transaction with transaction and result, and terminate these steps.
-            // The request stays in the request list, so the abort fires its error event.
-            Err(error) if self.committing.get() => {
-                self.requests.borrow_mut().push_front(PendingRequest {
-                    request: Dom::from_ref(&*request),
-                    id,
-                    iteration_param: None,
-                    result: None,
-                });
-                self.abort(cx, error);
-                return;
+        match request {
+            Some(request) => {
+                let mut realm = enter_auto_realm(cx, &*request);
+                let cx: &mut JSContext = &mut realm;
+                rooted!(&in(cx) let mut answer = UndefinedValue());
+                match request.convert_result(
+                    cx,
+                    result,
+                    iteration_param.as_ref(),
+                    answer.handle_mut(),
+                ) {
+                    // Step 5.3: If result is an error and transaction’s state is committing, then
+                    // run abort a transaction with transaction and result, and terminate these
+                    // steps.
+                    // The request stays in the request list, so the abort fires its error event.
+                    Err(error) if self.committing.get() => {
+                        self.requests.borrow_mut().push_front(PendingRequest {
+                            request: Some(Dom::from_ref(&*request)),
+                            id,
+                            iteration_param: None,
+                            result: None,
+                        });
+                        self.abort(cx, error);
+                        return;
+                    },
+                    Err(error) => request.finish_with_error(cx, self, error),
+                    Ok(()) => request.finish_with_success(cx, self, answer.handle()),
+                }
             },
-            Err(error) => request.finish_with_error(cx, self, error),
-            Ok(()) => request.finish_with_success(cx, self, answer.handle()),
+            None => {
+                let mut realm = enter_auto_realm(cx, self);
+                let cx: &mut JSContext = &mut realm;
+                // https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex
+                // Once the implementation determines that creating the index has failed, it
+                // must run the steps to abort a transaction using an appropriate error. For
+                // example [...] if the index can't be created due to unique flag constraints, a
+                // "ConstraintError" DOMException must be used as error.
+                if let Err(error) = result {
+                    self.abort(cx, map_transaction_error_to_dom_error(error));
+                    return;
+                }
+                self.maybe_commit(cx);
+            },
         }
 
         if self
@@ -523,13 +689,7 @@ impl IDBTransaction {
                 // run abort a transaction with transaction and an appropriate type for the error,
                 // for example a QuotaExceededError or an "UnknownError" DOMException, and
                 // terminate these steps.
-                let error = match err {
-                    BackendError::DbErr(details) => {
-                        Error::Operation(Some(format!("IndexedDB commit failed: {details}")))
-                    },
-                    other => map_backend_error_to_dom_error(other),
-                };
-                self.abort(cx, error);
+                self.abort(cx, map_transaction_error_to_dom_error(err));
             },
         }
     }
@@ -590,11 +750,12 @@ impl IDBTransaction {
         let global = self.global();
         let task_manager = global.task_manager();
         let task_source = task_manager.database_access_task_source();
+        self.index_populations.safe_borrow_mut(cx.no_gc()).clear();
         let requests: Vec<Trusted<IDBRequest>> = self
             .requests
             .safe_borrow_mut(cx.no_gc())
             .drain(..)
-            .map(|pending| Trusted::new(&*pending.request))
+            .filter_map(|pending| pending.request.as_deref().map(Trusted::new))
             .collect();
         for request in requests {
             task_source.queue(task!(fire_indexeddb_request_abort_error: move |cx| {
@@ -679,6 +840,7 @@ impl IDBTransaction {
         }
         self.finished.set(true);
         self.requests.borrow_mut().clear();
+        self.index_populations.borrow_mut().clear();
         self.send_abort_to_backend();
         self.notify_backend_transaction_finished();
         self.db.remove_transaction(self);

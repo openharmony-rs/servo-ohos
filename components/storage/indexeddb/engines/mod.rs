@@ -9,8 +9,9 @@ use malloc_size_of::MallocSizeOf;
 use malloc_size_of_derive::MallocSizeOf;
 use profile_traits::generic_callback::GenericCallback;
 use storage_traits::indexeddb::{
-    AsyncOperation, BackendError, BackendResult, ConnectionEvent, IndexedDBObjectStore,
-    IndexedDBObjectStoreId, IndexedDBTxnId, IndexedDBTxnMode, TransactionEvent,
+    AsyncOperation, AsyncSchemaOperation, BackendError, BackendResult, ConnectionEvent,
+    IndexPopulationEvent, IndexedDBIndexId, IndexedDBObjectStore, IndexedDBObjectStoreId,
+    IndexedDBTxnId, IndexedDBTxnMode, TransactionEvent,
 };
 
 pub(crate) use crate::indexeddb::backend::ActiveKvsEngine;
@@ -30,13 +31,43 @@ pub struct KvsOperation {
 impl KvsOperation {
     /// What to report when the operation fails with `error`.
     pub fn failure_event(&self, error: BackendError) -> TransactionEvent {
-        match self.request_id {
-            Some(request_id) => TransactionEvent::Request {
+        if let Some(request_id) = self.request_id {
+            return TransactionEvent::Request {
                 request_id,
                 result: Err(error),
+            };
+        }
+        match self.populated_index() {
+            Some(index_id) => TransactionEvent::IndexPopulation {
+                index_id,
+                event: IndexPopulationEvent::Done(Err(error)),
             },
             None => TransactionEvent::SchemaChangeFailed(error),
         }
+    }
+
+    /// The index that the operation populates or starts populating, if it does.
+    fn populated_index(&self) -> Option<IndexedDBIndexId> {
+        match &self.operation {
+            AsyncOperation::Schema(
+                AsyncSchemaOperation::CreateIndex {
+                    index_id,
+                    populate: true,
+                    ..
+                } |
+                AsyncSchemaOperation::PopulateIndex { index_id, .. },
+            ) => Some(*index_id),
+            _ => None,
+        }
+    }
+
+    /// Whether the operation is a step of populating the index `index`.
+    pub fn is_population_step_of(&self, index: IndexedDBIndexId) -> bool {
+        matches!(
+            &self.operation,
+            AsyncOperation::Schema(AsyncSchemaOperation::PopulateIndex { index_id, .. })
+                if *index_id == index
+        )
     }
 }
 
