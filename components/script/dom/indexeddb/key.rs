@@ -653,7 +653,11 @@ pub(crate) fn evaluate_key_path_on_value(
         // Step 1. If keyPath is a list of strings, then:
         KeyPath::StringSequence(key_path) => {
             // Step 1.1. Let result be a new Array object created as if by the expression [].
-            rooted!(&in(cx) let mut result = JS_NewObject(cx, None));
+            // SAFETY: `cx` is a live context; the new array is rooted right away.
+            rooted!(&in(cx) let mut result = unsafe { NewArrayObject1(cx.raw_cx(), 0) });
+            if result.is_null() {
+                return Err(Error::JSFailed);
+            }
 
             // Step 1.2. Let i be 0.
             // Step 1.3. For each item in keyPath:
