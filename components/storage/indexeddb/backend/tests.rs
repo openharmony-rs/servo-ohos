@@ -66,6 +66,9 @@ executor_tests!(
     executor_disk_full_maps_to_quota_exceeded,
     executor_disk_full_ends_the_transaction,
     executor_failing_query_reports_the_transaction_state,
+    executor_constraint_violation_keeps_the_transaction,
+    executor_immediate_locks_at_begin_and_deferred_reads_a_snapshot,
+    executor_runs_each_kind_of_statement,
     executor_user_version_is_transactional_and_persistent,
     executor_delete_removes_the_database,
     schema_version_is_stamped_on_a_new_database,
@@ -149,6 +152,13 @@ fn open_executor<X: SqlExecutor>(dir: &Path) -> X {
     executor
         .execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v BLOB)", &[])
         .unwrap();
+    executor
+}
+
+/// An executor like [`open_executor`]'s, in WAL mode like the engine's databases.
+fn open_wal_executor<X: SqlExecutor>(dir: &Path) -> X {
+    let mut executor = open_executor::<X>(dir);
+    executor.execute("PRAGMA journal_mode = WAL", &[]).unwrap();
     executor
 }
 
@@ -355,6 +365,88 @@ fn executor_failing_query_reports_the_transaction_state<X: SqlExecutor>() {
         assert_eq!(keys_in_t(&mut executor), vec![1]);
     } else {
         assert_eq!(keys_in_t(&mut executor), vec![1, 3]);
+    }
+}
+
+fn executor_constraint_violation_keeps_the_transaction<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut executor = open_executor::<X>(dir.path());
+    insert_into_t(&mut executor, 1);
+    executor.begin(TransactionBehavior::Immediate).unwrap();
+    insert_into_t(&mut executor, 2);
+    assert!(
+        executor
+            .execute("INSERT INTO t (k) VALUES (1)", &[])
+            .is_err()
+    );
+    assert!(executor.in_transaction());
+    insert_into_t(&mut executor, 3);
+    executor.commit().unwrap();
+    assert_eq!(keys_in_t(&mut executor), vec![1, 2, 3]);
+}
+
+fn executor_immediate_locks_at_begin_and_deferred_reads_a_snapshot<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = open_wal_executor::<X>(dir.path());
+    let mut b = a.connector()().unwrap();
+    // A second writer fails once the busy timeout has run out. RDB's transactions wait 2 s
+    // whatever this sets.
+    b.execute("PRAGMA busy_timeout = 100", &[]).unwrap();
+    insert_into_t(&mut a, 1);
+
+    // The write lock is taken before the transaction writes, so a second writer can't begin.
+    a.begin(TransactionBehavior::Immediate).unwrap();
+    assert!(b.begin(TransactionBehavior::Immediate).is_err());
+    assert!(!b.in_transaction());
+    b.begin(TransactionBehavior::Deferred).unwrap();
+    assert_eq!(keys_in_t(&mut b), vec![1]);
+    b.commit().unwrap();
+    a.commit().unwrap();
+
+    // A deferred transaction reads one snapshot, taken by its first read.
+    a.begin(TransactionBehavior::Deferred).unwrap();
+    insert_into_t(&mut b, 2);
+    assert_eq!(keys_in_t(&mut a), vec![1, 2]);
+    insert_into_t(&mut b, 3);
+    assert_eq!(keys_in_t(&mut a), vec![1, 2]);
+    a.commit().unwrap();
+    assert_eq!(keys_in_t(&mut a), vec![1, 2, 3]);
+}
+
+/// The kinds of statement that the IndexedDB layer runs, inside a transaction and outside one.
+fn executor_runs_each_kind_of_statement<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut executor = open_executor::<X>(dir.path());
+    for in_transaction in [false, true] {
+        if in_transaction {
+            executor.begin(TransactionBehavior::Immediate).unwrap();
+        }
+        for statement in [
+            "\n  CREATE TABLE s (x INTEGER PRIMARY KEY)",
+            "CREATE INDEX s_x ON s (x)",
+            "ALTER TABLE s ADD COLUMN y INTEGER",
+            "INSERT INTO s (x) VALUES (1)",
+            "INSERT INTO s (x) VALUES (2)",
+            "UPDATE s SET y = 3",
+            "DELETE FROM s WHERE x = 2",
+            "PRAGMA user_version = 4",
+            "DROP INDEX s_x",
+        ] {
+            if let Err(error) = executor.execute(statement, &[]) {
+                panic!("{statement:?} in a transaction: {in_transaction}: {error:?}");
+            }
+        }
+        let rows = query_rows(&mut executor, "SELECT x, y FROM s", &[], |row| {
+            Ok((row.integer(0)?, row.integer(1)?))
+        })
+        .unwrap();
+        assert_eq!(rows, vec![(1, 3)]);
+        assert_eq!(schema::stored_schema_version(&mut executor).unwrap(), 4);
+        executor.execute("DROP TABLE s", &[]).unwrap();
+        if in_transaction {
+            executor.commit().unwrap();
+        }
+        assert!(!has_table(&mut executor, "s"));
     }
 }
 

@@ -257,3 +257,91 @@ impl SqlExecutor for RdbExecutor {
         0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::indexeddb::backend::executor::query_rows;
+
+    fn open(dir: &Path) -> RdbExecutor {
+        let mut executor = RdbExecutor::open(dir).unwrap();
+        executor
+            .execute("CREATE TABLE t (k INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        executor
+    }
+
+    fn insert(executor: &mut RdbExecutor, key: i64) -> Result<u64, SqlError> {
+        executor.execute("INSERT INTO t (k) VALUES (?)", &[SqlParam::Integer(key)])
+    }
+
+    fn keys(executor: &mut RdbExecutor) -> Vec<i64> {
+        query_rows(executor, "SELECT k FROM t ORDER BY k", &[], |row| {
+            row.integer(0)
+        })
+        .unwrap()
+    }
+
+    fn code(error: SqlError) -> i32 {
+        match error {
+            SqlError::Rdb(OhosRdbError::Api { code, .. }) => code,
+            other => panic!("not an RDB API error: {other:?}"),
+        }
+    }
+
+    /// In a transaction, RDB's execute runs `SAVEPOINT` and `ROLLBACK TO` but rejects `RELEASE`,
+    /// so the IndexedDB layer uses no savepoints; the SQLite executor refuses all three.
+    #[test]
+    fn accepts_savepoints_but_rejects_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut executor = open(dir.path());
+        executor.begin(TransactionBehavior::Immediate).unwrap();
+        insert(&mut executor, 1).unwrap();
+        executor.execute("SAVEPOINT s", &[]).unwrap();
+        insert(&mut executor, 2).unwrap();
+        executor.execute("ROLLBACK TO s", &[]).unwrap();
+        assert_eq!(
+            code(executor.execute("RELEASE s", &[]).unwrap_err()),
+            OH_Rdb_ErrCode::RDB_E_INVALID_ARGS.0
+        );
+        executor.commit().unwrap();
+        assert_eq!(keys(&mut executor), vec![1]);
+    }
+
+    #[test]
+    fn reports_constraint_violations_as_sqlite_constraint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut executor = open(dir.path());
+        insert(&mut executor, 1).unwrap();
+        let constraint = OH_Rdb_ErrCode::RDB_E_SQLITE_CONSTRAINT.0;
+        assert_eq!(code(insert(&mut executor, 1).unwrap_err()), constraint);
+        executor.begin(TransactionBehavior::Immediate).unwrap();
+        assert_eq!(code(insert(&mut executor, 1).unwrap_err()), constraint);
+        executor.commit().unwrap();
+    }
+
+    /// The database actor keeps a write transaction open while script runs. RDB closes its pooled
+    /// transaction connections after 150 s unused; an open transaction must survive that. Takes
+    /// more than three minutes, so it runs only with `--run-ignored only` and a raised nextest
+    /// slow-timeout.
+    #[test]
+    #[ignore]
+    fn transaction_stays_open_across_idle_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut executor = open(dir.path());
+        let mut other = executor.connector()().unwrap();
+        let start = Instant::now();
+        executor.begin(TransactionBehavior::Immediate).unwrap();
+        for (key, idle_seconds) in [(1, 160), (2, 20), (3, 0)] {
+            insert(&mut executor, key).unwrap();
+            assert_eq!(keys(&mut other), Vec::<i64>::new());
+            std::thread::sleep(Duration::from_secs(idle_seconds));
+        }
+        assert_eq!(keys(&mut executor), vec![1, 2, 3]);
+        executor.commit().unwrap();
+        assert!(start.elapsed() > Duration::from_secs(180));
+        assert_eq!(keys(&mut other), vec![1, 2, 3]);
+    }
+}
