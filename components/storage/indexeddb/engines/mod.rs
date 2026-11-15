@@ -4,11 +4,13 @@
 
 use std::collections::VecDeque;
 
+use log::debug;
 use malloc_size_of::MallocSizeOf;
 use malloc_size_of_derive::MallocSizeOf;
+use profile_traits::generic_callback::GenericCallback;
 use storage_traits::indexeddb::{
-    AsyncOperation, BackendResult, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBTxnId,
-    IndexedDBTxnMode,
+    AsyncOperation, BackendError, BackendResult, ConnectionEvent, IndexedDBObjectStore,
+    IndexedDBObjectStoreId, IndexedDBTxnId, IndexedDBTxnMode, TransactionEvent,
 };
 
 pub(crate) use crate::indexeddb::backend::ActiveKvsEngine;
@@ -19,7 +21,64 @@ pub(crate) mod encoding;
 #[derive(MallocSizeOf)]
 pub struct KvsOperation {
     pub store: IndexedDBObjectStoreId,
+    /// The id of the request in its transaction; `None` for a schema operation, which only
+    /// reports a failure.
+    pub request_id: Option<u64>,
     pub operation: AsyncOperation,
+}
+
+impl KvsOperation {
+    /// What to report when the operation fails with `error`.
+    pub fn failure_event(&self, error: BackendError) -> TransactionEvent {
+        match self.request_id {
+            Some(request_id) => TransactionEvent::Request {
+                request_id,
+                result: Err(error),
+            },
+            None => TransactionEvent::SchemaChangeFailed(error),
+        }
+    }
+}
+
+/// Where the results of a transaction go: the result channel of its connection, which keeps the
+/// order in which they are sent.
+#[derive(Clone, MallocSizeOf)]
+pub struct TransactionResults {
+    transaction: IndexedDBTxnId,
+    /// `None` for a transaction of a connection the backend doesn't know, whose results are
+    /// dropped.
+    channel: Option<GenericCallback<ConnectionEvent>>,
+}
+
+impl TransactionResults {
+    pub fn new(
+        transaction: IndexedDBTxnId,
+        channel: Option<GenericCallback<ConnectionEvent>>,
+    ) -> Self {
+        Self {
+            transaction,
+            channel,
+        }
+    }
+
+    pub fn send(&self, event: TransactionEvent) {
+        let Some(channel) = &self.channel else {
+            return debug!(
+                "Dropped a result of IndexedDB transaction {}, whose connection is unknown",
+                self.transaction
+            );
+        };
+        let message = ConnectionEvent::Transaction {
+            serial: self.transaction.serial,
+            event,
+        };
+        if channel.send(message).is_err() {
+            debug!(
+                "Script went away before a result of IndexedDB transaction {}",
+                self.transaction
+            );
+        }
+    }
 }
 
 #[derive(MallocSizeOf)]
@@ -36,12 +95,13 @@ pub trait KvsEngine: MallocSizeOf {
     #[expect(dead_code)]
     fn close_store(&self, store_name: &str) -> Result<(), Self::Error>;
 
-    /// Runs a batch of requests of `transaction` after all work handed over before, and calls
-    /// `on_complete` once they have run.
+    /// Runs a batch of requests of `transaction` after all work handed over before, sends each
+    /// result to `results` as the request has run, and calls `on_complete` once they have run.
     fn process_transaction(
         &self,
         transaction: IndexedDBTxnId,
         batch: KvsTransaction,
+        results: TransactionResults,
         on_complete: Box<dyn FnOnce() + Send + 'static>,
     );
 

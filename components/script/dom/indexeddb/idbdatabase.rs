@@ -11,7 +11,7 @@ use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::{GenericSend, GenericSender};
 use storage_traits::indexeddb::{
-    AsyncSchemaOperation, IndexedDBIndex, IndexedDBIndexId, IndexedDBObjectStore,
+    AsyncSchemaOperation, ConnectionEvent, IndexedDBIndex, IndexedDBIndexId, IndexedDBObjectStore,
     IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId, KeyPath, SyncOperation,
 };
 use stylo_atoms::Atom;
@@ -25,7 +25,7 @@ use crate::dom::bindings::codegen::UnionTypes::StringOrStringSequence;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomGlobal;
-use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::domstringlist::DOMStringList;
 use crate::dom::eventtarget::EventTarget;
@@ -49,6 +49,9 @@ pub struct IDBDatabase {
     object_stores: DomRefCell<Vec<IndexedDBObjectStore>>,
     /// <https://w3c.github.io/IndexedDB/#database-upgrade-transaction>
     upgrade_transaction: MutNullableDom<IDBTransaction>,
+    /// The transactions of this connection that haven't finished, which the results on the
+    /// connection's result channel are for.
+    transactions: DomRefCell<Vec<Dom<IDBTransaction>>>,
 
     #[no_trace]
     id: Uuid,
@@ -85,6 +88,7 @@ impl IDBDatabase {
             version: Cell::new(version),
             object_stores: DomRefCell::new(object_stores),
             upgrade_transaction: Default::default(),
+            transactions: Default::default(),
             next_transaction_serial: Cell::new(1),
             next_object_store_id: Cell::new(largest_store_id.unwrap_or(0) + 1),
             next_index_id: Cell::new(largest_index_id.unwrap_or(0) + 1),
@@ -122,6 +126,65 @@ impl IDBDatabase {
         IndexedDBTxnId {
             connection: self.id,
             serial,
+        }
+    }
+
+    pub(crate) fn add_transaction(&self, transaction: &IDBTransaction) {
+        self.transactions
+            .borrow_mut()
+            .push(Dom::from_ref(transaction));
+    }
+
+    pub(crate) fn remove_transaction(&self, transaction: &IDBTransaction) {
+        self.transactions
+            .borrow_mut()
+            .retain(|entry| &**entry != transaction);
+    }
+
+    /// Handles a message from the backend on the connection's result channel.
+    pub(crate) fn handle_connection_event(&self, cx: &mut JSContext, event: ConnectionEvent) {
+        match event {
+            ConnectionEvent::Open(_) => {
+                debug_assert!(false, "The open request handles its own messages");
+            },
+            ConnectionEvent::Transaction { serial, event } => {
+                let transaction = self
+                    .transactions
+                    .borrow()
+                    .iter()
+                    .find(|transaction| transaction.id().serial == serial)
+                    .map(|transaction| transaction.as_rooted());
+                match transaction {
+                    Some(transaction) => transaction.handle_event(cx, event),
+                    None => debug!("IndexedDB result for finished transaction {serial}"),
+                }
+            },
+            ConnectionEvent::VersionChange {
+                old_version,
+                new_version,
+            } => {
+                // https://w3c.github.io/IndexedDB/#open-a-database-connection
+                // Step 10.2: fire a version change event named versionchange at entry with db’s
+                // version and version.
+                self.dispatch_versionchange(cx, old_version, Some(new_version));
+
+                // Step 10.3: Wait for all of the events to be fired.
+                // Note: backend is at this step; sending a message to continue algo there.
+                let global = self.global();
+                let operation = SyncOperation::NotifyEndOfVersionChange {
+                    id: self.id,
+                    name: self.name.to_string(),
+                    old_version,
+                    origin: global.origin().immutable().clone(),
+                };
+                if self
+                    .get_idb_thread()
+                    .send(IndexedDBThreadMsg::Sync(operation))
+                    .is_err()
+                {
+                    error!("Failed to send SyncOperation::NotifyEndOfVersionChange.");
+                }
+            },
         }
     }
 
@@ -283,6 +346,11 @@ impl IDBDatabase {
     }
 
     /// <https://w3c.github.io/IndexedDB/#close-a-database-connection>
+    /// <https://w3c.github.io/IndexedDB/#connection-close-pending-flag>
+    pub(crate) fn is_close_pending(&self) -> bool {
+        self.close_pending.get()
+    }
+
     pub(crate) fn close_a_database_connection(&self, _forced: bool) {
         // Step 1: Set connection’s close pending flag to true.
         self.close_pending.set(true);
@@ -460,7 +528,6 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
             indexes: Vec::new(),
         };
         let operation = AsyncSchemaOperation::CreateObjectStore {
-            callback: transaction.create_abort_callback(),
             name: store.name.clone(),
             key_path,
             auto_increment,
@@ -523,9 +590,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         }
 
         // Step 7. Destroy store.
-        let operation = AsyncSchemaOperation::DeleteObjectStore {
-            callback: transaction.create_abort_callback(),
-        };
+        let operation = AsyncSchemaOperation::DeleteObjectStore;
         if self
             .get_idb_thread()
             .send(IndexedDBThreadMsg::AsyncSchemaOperation {

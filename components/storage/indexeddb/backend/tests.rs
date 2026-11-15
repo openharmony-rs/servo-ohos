@@ -5,18 +5,20 @@
 //! Tests of the executors and of the engine, run on every executor compiled in.
 
 use std::collections::{HashMap, VecDeque};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use profile_traits::generic_callback::GenericCallback;
-use serde::{Deserialize, Serialize};
 use servo_base::threadpool::ThreadPool;
 use servo_url::ImmutableOrigin;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, IndexedDBIndex, IndexedDBKeyRange, IndexedDBKeyType,
-    IndexedDBObjectStore, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
+    BackendError, BackendResult, ConnectionEvent, IndexedDBIndex, IndexedDBKeyRange,
+    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBTxnId, IndexedDBTxnMode,
+    IndexedDBValue, KeyPath, PutItemResult, RequestOutput, TransactionEvent,
 };
 use tempfile::TempDir;
 use url::Host;
@@ -29,7 +31,9 @@ use super::executor::{
 };
 use super::queries;
 use super::schema::{self, SCHEMA_VERSION};
-use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction, encoding};
+use crate::indexeddb::engines::{
+    KvsEngine, KvsOperation, KvsTransaction, TransactionResults, encoding,
+};
 use crate::indexeddb::{BackendErrorMapper, IndexedDBDescription};
 
 /// Defines a `#[test]` for every executor compiled in, for each of the given generic functions,
@@ -1015,36 +1019,140 @@ fn test_delete_store_removes_store_records<X: SqlExecutor>() {
     assert_eq!(record_count(&mut *db.connection(), store_id), 0);
 }
 
-/// A callback and the receiver of what it is called with.
-type Callback<T> = (GenericCallback<T>, mpsc::Receiver<T>);
-
-fn get_callback<T>() -> Callback<T>
-where
-    T: for<'de> Deserialize<'de> + Serialize + Send + Sync + 'static,
-{
-    let (sender, receiver) = mpsc::channel();
-    let callback = GenericCallback::new(move |result| {
-        assert!(sender.send(result.unwrap()).is_ok());
-    })
-    .expect("Could not construct callback");
-    (callback, receiver)
+/// The result of a request, as the kind of operation reports it.
+trait TestReply: Sized + Send + 'static {
+    fn from_result(result: BackendResult<RequestOutput>) -> Self;
 }
 
-fn request(store: i64, operation: AsyncOperation) -> KvsOperation {
-    KvsOperation { store, operation }
+macro_rules! test_reply {
+    ($type:ty, $variant:ident) => {
+        impl TestReply for BackendResult<$type> {
+            fn from_result(result: BackendResult<RequestOutput>) -> Self {
+                result.map(|output| match output {
+                    RequestOutput::$variant(value) => value,
+                    other => panic!("unexpected request output {other:?}"),
+                })
+            }
+        }
+    };
+}
+test_reply!(Option<IndexedDBKeyType>, Key);
+test_reply!(Option<IndexedDBValue>, Value);
+test_reply!(Vec<IndexedDBKeyType>, Keys);
+test_reply!(Vec<IndexedDBValue>, Values);
+test_reply!(u64, Count);
+test_reply!(Vec<IndexedDBRecord>, Records);
+test_reply!(PutItemResult, Put);
+
+impl TestReply for BackendResult<()> {
+    fn from_result(result: BackendResult<RequestOutput>) -> Self {
+        result.map(|output| assert_eq!(output, RequestOutput::Done))
+    }
+}
+
+type ReplyHandler = Box<dyn FnOnce(BackendResult<RequestOutput>) + Send>;
+
+/// Where the result of each test request goes, by request id. Request ids are unique in the
+/// test process.
+static REPLY_HANDLERS: LazyLock<Mutex<HashMap<u64, ReplyHandler>>> =
+    LazyLock::new(Default::default);
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A new request id whose result `handler` gets.
+fn register_reply(handler: ReplyHandler) -> u64 {
+    let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    REPLY_HANDLERS.lock().unwrap().insert(id, handler);
+    id
+}
+
+/// The id of a test request whose result reaches the test as a `T`.
+struct ReplyId<T>(u64, PhantomData<T>);
+
+impl<T> Clone for ReplyId<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for ReplyId<T> {}
+
+type PutReply = BackendResult<PutItemResult>;
+type GetReply = BackendResult<Option<IndexedDBValue>>;
+
+/// A request id and the receiver of the request's result.
+type Callback<T> = (ReplyId<T>, mpsc::Receiver<T>);
+
+fn get_callback<T: TestReply>() -> Callback<T> {
+    let (sender, receiver) = mpsc::channel();
+    let id = register_reply(Box::new(move |result| {
+        assert!(sender.send(T::from_result(result)).is_ok());
+    }));
+    (ReplyId(id, PhantomData), receiver)
+}
+
+/// Where the results of `transaction` go in a test: each request result to the handler of its
+/// id, and each schema operation failure to `schema_failures`.
+fn routed_results(
+    transaction: u64,
+    schema_failures: mpsc::Sender<BackendError>,
+) -> TransactionResults {
+    let channel = GenericCallback::new(move |event| match event.unwrap() {
+        ConnectionEvent::Transaction {
+            event: TransactionEvent::Request { request_id, result },
+            ..
+        } => {
+            let handler = REPLY_HANDLERS
+                .lock()
+                .unwrap()
+                .remove(&request_id)
+                .expect("A request replies once");
+            handler(result);
+        },
+        ConnectionEvent::Transaction {
+            event: TransactionEvent::SchemaChangeFailed(error),
+            ..
+        } => {
+            let _ = schema_failures.send(error);
+        },
+        other => panic!("unexpected result of a batch: {other:?}"),
+    })
+    .unwrap();
+    TransactionResults::new(txn(transaction), Some(channel))
+}
+
+/// Where the results of `transaction` go in a test whose schema operations don't fail.
+fn results(transaction: u64) -> TransactionResults {
+    let (schema_failures, _) = mpsc::channel();
+    routed_results(transaction, schema_failures)
+}
+
+fn request<T>(store: i64, request_id: ReplyId<T>, operation: AsyncOperation) -> KvsOperation {
+    KvsOperation {
+        store,
+        request_id: Some(request_id.0),
+        operation,
+    }
+}
+
+fn schema(store: i64, operation: AsyncSchemaOperation) -> KvsOperation {
+    KvsOperation {
+        store,
+        request_id: None,
+        operation: AsyncOperation::Schema(operation),
+    }
 }
 
 fn put_request(
     store: i64,
-    callback: GenericCallback<BackendResult<PutItemResult>>,
+    request_id: ReplyId<PutReply>,
     key: IndexedDBKeyType,
     value: Vec<u8>,
     should_overwrite: bool,
 ) -> KvsOperation {
     request(
         store,
+        request_id,
         AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
-            callback,
             key: Some(key),
             value,
             should_overwrite,
@@ -1064,14 +1172,13 @@ fn run_puts<X: SqlExecutor>(
     let (requests, receivers): (Vec<_>, Vec<_>) = puts
         .into_iter()
         .map(|(key, value)| {
-            let (callback, receiver) = get_callback();
+            let (id, receiver) = get_callback();
             let operation = AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
-                callback,
                 key,
                 value,
                 should_overwrite,
             });
-            (request(store, operation), receiver)
+            (request(store, id, operation), receiver)
         })
         .unzip();
     run_batch(db, transaction, IndexedDBTxnMode::Readwrite, requests);
@@ -1083,20 +1190,23 @@ fn key_reply(key: f64) -> BackendResult<PutItemResult> {
     Ok(PutItemResult::Key(IndexedDBKeyType::Number(key)))
 }
 
-/// Runs a batch of `transaction` and waits until it has run.
+/// Runs a batch of `transaction`, waits until it has run, and returns the failures of its
+/// schema operations, in order.
 fn run_batch<X: SqlExecutor>(
     db: &SqlEngine<X>,
     transaction: u64,
     mode: IndexedDBTxnMode,
     requests: Vec<KvsOperation>,
-) {
+) -> Vec<BackendError> {
     let (done_sender, done_receiver) = mpsc::channel();
+    let (schema_failures, failures) = mpsc::channel();
     db.process_transaction(
         txn(transaction),
         KvsTransaction {
             mode,
             requests: VecDeque::from(requests),
         },
+        routed_results(transaction, schema_failures),
         Box::new(move || {
             let _ = done_sender.send(());
         }),
@@ -1104,6 +1214,7 @@ fn run_batch<X: SqlExecutor>(
     done_receiver
         .recv_timeout(TIMEOUT)
         .expect("The batch should complete");
+    failures.try_iter().collect()
 }
 
 /// Commits `transaction` and waits for the result.
@@ -1176,12 +1287,12 @@ fn test_async_operations<X: SqlExecutor>() {
     let put3 = get_callback();
     let put_dup = get_callback();
     let put_overwrite = get_callback();
-    let get_item_some = get_callback();
-    let get_item_none = get_callback();
-    let get_all_items = get_callback();
-    let count = get_callback();
-    let remove = get_callback();
-    let clear = get_callback();
+    let get_item_some = get_callback::<GetReply>();
+    let get_item_none = get_callback::<GetReply>();
+    let get_all_items = get_callback::<BackendResult<Vec<IndexedDBValue>>>();
+    let count = get_callback::<BackendResult<u64>>();
+    let remove = get_callback::<BackendResult<()>>();
+    let clear = get_callback::<BackendResult<()>>();
     run_batch(
         &db,
         1,
@@ -1228,43 +1339,44 @@ fn test_async_operations<X: SqlExecutor>() {
             ),
             request(
                 store_id,
+                get_item_some.0,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
-                    callback: get_item_some.0,
                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
                 }),
             ),
             request(
                 store_id,
+                get_item_none.0,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
-                    callback: get_item_none.0,
                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(5.0)),
                 }),
             ),
             request(
                 store_id,
+                get_all_items.0,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
-                    callback: get_all_items.0,
                     key_range: IndexedDBKeyRange::lower_bound(IndexedDBKeyType::Number(0.0), false),
                     count: None,
                 }),
             ),
             request(
                 store_id,
+                count.0,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
-                    callback: count.0,
                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
                 }),
             ),
             request(
                 store_id,
+                remove.0,
                 AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
-                    callback: remove.0,
                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
                 }),
             ),
             request(
                 store_id,
-                AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear(clear.0)),
+                clear.0,
+                AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear),
             ),
         ],
     );
@@ -1418,9 +1530,8 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
         .collect();
 
     let put = get_callback();
-    let rename = get_callback();
     let put_after = get_callback();
-    run_batch(
+    let schema_failures = run_batch(
         &db,
         1,
         IndexedDBTxnMode::Versionchange,
@@ -1433,13 +1544,12 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
                 false,
             ),
             // Index names are unique per store, so this fails in the database.
-            request(
+            schema(
                 store_id,
-                AsyncOperation::Schema(AsyncSchemaOperation::RenameIndex {
-                    callback: rename.0,
+                AsyncSchemaOperation::RenameIndex {
                     index_id: index_ids[0],
                     new_name: "b".to_owned(),
-                }),
+                },
             ),
             put_request(
                 store_id,
@@ -1454,7 +1564,7 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
         recv(&put.1),
         Ok(PutItemResult::Key(IndexedDBKeyType::Number(1.0)))
     );
-    assert!(matches!(recv(&rename.1), BackendError::DbErr(_)));
+    assert!(matches!(schema_failures[..], [BackendError::DbErr(_)]));
     assert!(recv(&put_after.1).is_err());
 
     let put_later = get_callback();
@@ -1737,24 +1847,16 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
             .into_iter()
             .zip(&seeds)
             .map(|(store, seed)| {
-                put_request(
-                    store,
-                    seed.0.clone(),
-                    IndexedDBKeyType::Number(1.0),
-                    vec![1],
-                    false,
-                )
+                put_request(store, seed.0, IndexedDBKeyType::Number(1.0), vec![1], false)
             })
             .collect(),
     );
     assert_eq!(commit(&db, 1), Ok(()));
 
-    let (schema_callback, schema_errors) = get_callback::<BackendError>();
-    let schema = |store, operation| request(store, AsyncOperation::Schema(operation));
     let created = 3;
     let put = get_callback();
     db.upgrade_version(txn(2), 2);
-    run_batch(
+    let schema_failures = run_batch(
         &db,
         2,
         IndexedDBTxnMode::Versionchange,
@@ -1763,7 +1865,6 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
             schema(
                 created,
                 AsyncSchemaOperation::CreateObjectStore {
-                    callback: schema_callback.clone(),
                     name: "created".to_owned(),
                     key_path: None,
                     auto_increment: true,
@@ -1772,7 +1873,6 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
             schema(
                 kept,
                 AsyncSchemaOperation::CreateIndex {
-                    callback: schema_callback.clone(),
                     index_id: 2,
                     name: "by_b".to_owned(),
                     key_path: KeyPath::String("b".to_owned()),
@@ -1783,35 +1883,28 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
             schema(
                 kept,
                 AsyncSchemaOperation::RenameIndex {
-                    callback: schema_callback.clone(),
                     index_id: by_a,
                     new_name: "by_c".to_owned(),
                 },
             ),
-            schema(
-                deleted,
-                AsyncSchemaOperation::DeleteObjectStore {
-                    callback: schema_callback.clone(),
-                },
-            ),
+            schema(deleted, AsyncSchemaOperation::DeleteObjectStore),
             schema(
                 kept,
                 AsyncSchemaOperation::RenameObjectStore {
-                    callback: schema_callback.clone(),
                     new_name: "renamed".to_owned(),
                 },
             ),
         ],
     );
-    let generated = get_callback();
+    let generated = get_callback::<PutReply>();
     run_batch(
         &db,
         2,
         IndexedDBTxnMode::Versionchange,
         vec![request(
             created,
+            generated.0,
             AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
-                callback: generated.0,
                 key: None,
                 value: vec![3],
                 should_overwrite: false,
@@ -1823,7 +1916,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
         recv(&generated.1),
         Ok(PutItemResult::Key(IndexedDBKeyType::Number(1.0)))
     );
-    assert!(schema_errors.try_recv().is_err());
+    assert_eq!(schema_failures, vec![]);
     let index_names = |db: &SqlEngine<X>| -> Vec<String> {
         queries::object_stores(&mut *db.connection())
             .unwrap()
@@ -1867,12 +1960,11 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
     let store = create_store(&db, "test_store", None, false).unwrap();
-    let invalid_operations = |callback: GenericCallback<BackendError>| {
+    let invalid_operations = || {
         vec![
             (
                 store,
                 AsyncSchemaOperation::CreateObjectStore {
-                    callback: callback.clone(),
                     name: "other".to_owned(),
                     key_path: None,
                     auto_increment: false,
@@ -1881,7 +1973,6 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
             (
                 store + 1,
                 AsyncSchemaOperation::CreateIndex {
-                    callback: callback.clone(),
                     index_id: 0,
                     name: "index".to_owned(),
                     key_path: KeyPath::String("a".to_owned()),
@@ -1892,7 +1983,6 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
             (
                 store + 5,
                 AsyncSchemaOperation::CreateIndex {
-                    callback: callback.clone(),
                     index_id: 1,
                     name: "index".to_owned(),
                     key_path: KeyPath::String("a".to_owned()),
@@ -1900,17 +1990,10 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
                     multi_entry: false,
                 },
             ),
-            (
-                store,
-                AsyncSchemaOperation::DeleteIndex {
-                    callback: callback.clone(),
-                    index_id: 1,
-                },
-            ),
+            (store, AsyncSchemaOperation::DeleteIndex { index_id: 1 }),
             (
                 store,
                 AsyncSchemaOperation::RenameIndex {
-                    callback: callback.clone(),
                     index_id: 1,
                     new_name: "index".to_owned(),
                 },
@@ -1918,48 +2001,40 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
             (
                 store,
                 AsyncSchemaOperation::RenameObjectStore {
-                    callback: callback.clone(),
                     new_name: "created".to_owned(),
                 },
             ),
             (
                 store + 5,
                 AsyncSchemaOperation::RenameObjectStore {
-                    callback: callback.clone(),
                     new_name: "other".to_owned(),
                 },
             ),
-            (
-                store + 5,
-                AsyncSchemaOperation::DeleteObjectStore { callback },
-            ),
+            (store + 5, AsyncSchemaOperation::DeleteObjectStore),
         ]
     };
-    let (callback, errors) = get_callback::<BackendError>();
-    for (serial, (target, operation)) in (1..).zip(invalid_operations(callback)) {
+    for (serial, (target, operation)) in (1..).zip(invalid_operations()) {
         db.upgrade_version(txn(serial), serial + 1);
         let put = get_callback();
-        let created = get_callback::<BackendError>();
-        run_batch(
+        let schema_failures = run_batch(
             &db,
             serial,
             IndexedDBTxnMode::Versionchange,
             vec![
-                request(
+                schema(
                     store + 1,
-                    AsyncOperation::Schema(AsyncSchemaOperation::CreateObjectStore {
-                        callback: created.0,
+                    AsyncSchemaOperation::CreateObjectStore {
                         name: "created".to_owned(),
                         key_path: None,
                         auto_increment: false,
-                    }),
+                    },
                 ),
-                request(target, AsyncOperation::Schema(operation)),
+                schema(target, operation),
                 put_request(store, put.0, IndexedDBKeyType::Number(1.0), vec![1], false),
             ],
         );
-        assert!(created.1.try_recv().is_err());
-        assert!(matches!(recv(&errors), BackendError::DbErr(_)));
+        // Only the invalid operation fails: the store is created before it.
+        assert!(matches!(schema_failures[..], [BackendError::DbErr(_)]));
         assert!(recv(&put.1).is_err());
         assert!(commit(&db, serial).is_err());
         abort(&db, serial);
@@ -2027,16 +2102,15 @@ fn test_transaction_spanning_batches_commits_atomically<X: SqlExecutor>() {
     assert_eq!(stored_keys(&db, TEST_STORE), number_keys(1..=10));
 }
 
-/// A callback that reports `id` on `order` when it is called.
-fn tagged<T>(order: &mpsc::Sender<u32>, id: u32) -> GenericCallback<T>
-where
-    T: for<'de> Deserialize<'de> + Serialize + Send + 'static,
-{
+/// A request id whose result reports `id` on `order`.
+fn tagged<T>(order: &mpsc::Sender<u32>, id: u32) -> ReplyId<T> {
     let order = order.clone();
-    GenericCallback::new(move |_| {
-        let _ = order.send(id);
-    })
-    .unwrap()
+    ReplyId(
+        register_reply(Box::new(move |_| {
+            let _ = order.send(id);
+        })),
+        PhantomData,
+    )
 }
 
 /// Requests run in the order they were handed over: those of one transaction, and those of
@@ -2059,8 +2133,8 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
     let read = |id: u32| {
         request(
             read,
+            tagged::<BackendResult<u64>>(&order_sender, id),
             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
-                callback: tagged(&order_sender, id),
                 key_range: IndexedDBKeyRange::default(),
             }),
         )
@@ -2086,6 +2160,7 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
                 mode,
                 requests: VecDeque::from(requests),
             },
+            results(transaction),
             Box::new(move || {
                 let _ = done_sender.send(());
             }),
@@ -2105,15 +2180,15 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
     assert_eq!(replies, (0..7).collect::<Vec<_>>());
     assert_eq!(commit(&db, 1), Ok(()));
 
-    let value = get_callback();
+    let value = get_callback::<GetReply>();
     run_batch(
         &db,
         4,
         IndexedDBTxnMode::Readonly,
         vec![request(
             written,
+            value.0,
             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
-                callback: value.0,
                 key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
             }),
         )],
@@ -2159,6 +2234,7 @@ fn test_two_databases_progress_independently<X: SqlExecutor>() {
             mode: IndexedDBTxnMode::Readonly,
             requests: VecDeque::from([get_request(get.0, 1.0)]),
         },
+        results(2),
         Box::new(|| {}),
     );
 
@@ -2354,14 +2430,11 @@ fn open_faulty_engine<X: SqlExecutor>(dir: &TempDir) -> SqlEngine<Faulty<X>> {
     db
 }
 
-fn get_request(
-    callback: GenericCallback<BackendResult<Option<IndexedDBValue>>>,
-    key: f64,
-) -> KvsOperation {
+fn get_request(request_id: ReplyId<GetReply>, key: f64) -> KvsOperation {
     request(
         TEST_STORE,
+        request_id,
         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
-            callback,
             key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(key)),
         }),
     )
@@ -2376,7 +2449,7 @@ fn put_requests(
         .map(|(put, key)| {
             put_request(
                 TEST_STORE,
-                put.0.clone(),
+                put.0,
                 IndexedDBKeyType::Number(key.into()),
                 vec![1],
                 false,
@@ -2442,9 +2515,7 @@ fn test_statement_failure_that_ends_the_transaction_fails_it<X: SqlExecutor>() {
         &db,
         2,
         IndexedDBTxnMode::Readonly,
-        gets.iter()
-            .map(|get| get_request(get.0.clone(), 1.0))
-            .collect(),
+        gets.iter().map(|get| get_request(get.0, 1.0)).collect(),
     );
     assert_eq!(recv(&gets[0].1), Ok(Some(stored_value(1.0, vec![1]))));
     assert!(recv(&gets[1].1).is_err());
@@ -2465,15 +2536,15 @@ fn test_readonly_failure_that_ends_the_sql_transaction_fails_the_writer<X: SqlEx
     assert!(recv(&puts[0].1).is_ok());
 
     faults_for(dir.path()).lock().unwrap().statement = Some(("FROM object_data", 0));
-    let get = get_callback();
+    let get = get_callback::<GetReply>();
     run_batch(
         &db,
         2,
         IndexedDBTxnMode::Readonly,
         vec![request(
             other,
+            get.0,
             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
-                callback: get.0,
                 key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
             }),
         )],
@@ -2533,6 +2604,7 @@ fn test_batches_reply_in_dispatch_order<X: SqlExecutor>() {
                 mode: IndexedDBTxnMode::Readonly,
                 requests: VecDeque::from([get_request(tagged(&order_sender, id), 1.0)]),
             },
+            results(id.into()),
             Box::new(move || {
                 let _ = done_sender.send(());
             }),

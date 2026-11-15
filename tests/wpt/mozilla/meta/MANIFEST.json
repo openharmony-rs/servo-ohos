@@ -11616,6 +11616,69 @@
   },
   "testharness": {
    "IndexedDB": {
+    "connection-after-aborted-upgrade.any.js": [
+     "8b7e54ee97d9c2a1a5702ae531acf242328bab25",
+     [
+      "IndexedDB/connection-after-aborted-upgrade.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the connection of an aborted upgrade is closed"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/connection-after-aborted-upgrade.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the connection of an aborted upgrade is closed"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/connection-after-aborted-upgrade.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the connection of an aborted upgrade is closed"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/connection-after-aborted-upgrade.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the connection of an aborted upgrade is closed"
+        ]
+       ]
+      }
+     ]
+    ],
     "generated-key-value-kinds.any.js": [
      "93e646d1ad6073457e3aa79c4751b7ab82b16066",
      [
@@ -11686,6 +11749,89 @@
       {}
      ]
     ],
+    "request-result-order.any.js": [
+     "0d1ffcde775dfce11401ffeff8241639595d00d8",
+     [
+      "IndexedDB/request-result-order.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: request results are delivered in request order"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/request-result-order.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: request results are delivered in request order"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/request-result-order.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: request results are delivered in request order"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/request-result-order.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: request results are delivered in request order"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
     "upgrade-metadata-by-id.any.js": [
      "8da07ef7c26414dfc154868aa33032afd3af6d52",
      [
@@ -11746,6 +11892,89 @@
          "IndexedDB: object stores and indexes keep their identity through renames and deletes"
         ]
        ]
+      }
+     ]
+    ],
+    "versionchange-after-open-success.any.js": [
+     "6905bbd212edc40a0be1b7514e27d9840c5206b4",
+     [
+      "IndexedDB/versionchange-after-open-success.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: versionchange comes after the success of the connection's open request"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/versionchange-after-open-success.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: versionchange comes after the success of the connection's open request"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/versionchange-after-open-success.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: versionchange comes after the success of the connection's open request"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/versionchange-after-open-success.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: versionchange comes after the success of the connection's open request"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
       }
      ]
     ]

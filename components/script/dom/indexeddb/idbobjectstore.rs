@@ -417,14 +417,11 @@ impl IDBObjectStore {
         IDBRequest::execute_async(
             cx,
             self,
-            |callback| {
-                AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
-                    callback,
-                    key: serialized_key,
-                    value: serialized_value,
-                    should_overwrite: !no_overwrite,
-                })
-            },
+            AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
+                key: serialized_key,
+                value: serialized_value,
+                should_overwrite: !no_overwrite,
+            }),
             None,
             None,
         )
@@ -499,7 +496,7 @@ impl IDBObjectStore {
         IDBRequest::execute_async(
             cx,
             self,
-            |callback| cursor.iterate_operation(callback, None, 1),
+            cursor.iterate_operation(None, 1),
             None,
             Some(iteration_param),
         )
@@ -571,7 +568,6 @@ impl IDBObjectStore {
             .get_db()
             .rename_index(self.id, index, new_name.to_string());
         let operation = AsyncSchemaOperation::RenameIndex {
-            callback: self.transaction.create_abort_callback(),
             index_id: index,
             new_name: new_name.to_string(),
         };
@@ -636,12 +632,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             IDBRequest::execute_async(
                 cx,
                 self,
-                |callback| {
-                    AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
-                        callback,
-                        key_range,
-                    })
-                },
+                AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem { key_range }),
                 None,
                 None,
             )
@@ -664,7 +655,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         IDBRequest::execute_async(
             cx,
             self,
-            |callback| AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear(callback)),
+            AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear),
             None,
             None,
         )
@@ -689,12 +680,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             IDBRequest::execute_async(
                 cx,
                 self,
-                |callback| {
-                    AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
-                        callback,
-                        key_range: q,
-                    })
-                },
+                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem { key_range: q }),
                 None,
                 None,
             )
@@ -721,12 +707,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             IDBRequest::execute_async(
                 cx,
                 self,
-                |callback| {
-                    AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey {
-                        callback,
-                        key_range: q,
-                    })
-                },
+                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey { key_range: q }),
                 None,
                 None,
             )
@@ -758,13 +739,10 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             IDBRequest::execute_async(
                 cx,
                 self,
-                |callback| {
-                    AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
-                        callback,
-                        key_range: q,
-                        count,
-                    })
-                },
+                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
+                    key_range: q,
+                    count,
+                }),
                 None,
                 None,
             )
@@ -796,13 +774,10 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             IDBRequest::execute_async(
                 cx,
                 self,
-                |callback| {
-                    AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
-                        callback,
-                        key_range: q,
-                        count,
-                    })
-                },
+                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
+                    key_range: q,
+                    count,
+                }),
                 None,
                 None,
             )
@@ -828,12 +803,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             IDBRequest::execute_async(
                 cx,
                 self,
-                |callback| {
-                    AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
-                        callback,
-                        key_range: q,
-                    })
-                },
+                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count { key_range: q }),
                 None,
                 None,
             )
@@ -901,7 +871,6 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             .get_db()
             .rename_object_store(self.id, name.to_string());
         self.send_schema_operation(AsyncSchemaOperation::RenameObjectStore {
-            callback: transaction.create_abort_callback(),
             new_name: name.to_string(),
         })?;
 
@@ -986,7 +955,6 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             multi_entry: options.multiEntry,
         };
         self.send_schema_operation(AsyncSchemaOperation::CreateIndex {
-            callback: self.transaction.create_abort_callback(),
             index_id: index.id,
             name: index.name.clone(),
             key_path: index.key_path.clone(),
@@ -1027,7 +995,6 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         // Step 8. Destroy index.
         self.transaction.get_db().remove_index(self.id, index.id());
         self.send_schema_operation(AsyncSchemaOperation::DeleteIndex {
-            callback: self.transaction.create_abort_callback(),
             index_id: index.id(),
         })
     }

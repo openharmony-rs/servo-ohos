@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 use profile::mem as profile_mem;
@@ -18,9 +20,10 @@ use storage::ClientStorageThreadFactory;
 use storage_traits::StorageThreads;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, ConnectionMsg, IndexedDBKeyRange, IndexedDBKeyType,
-    IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode,
-    IndexedDBValue, KeyPath, PutItemResult, StorageBottleSource, SyncOperation, TxnCompleteMsg,
+    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBKeyRange,
+    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnId,
+    IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput, StorageBottleSource,
+    SyncOperation, TransactionEvent,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -71,6 +74,12 @@ backend_tests!(
     test_indexeddb_abort_while_a_batch_runs_frees_the_next_writer,
     test_indexeddb_finished_transaction_without_commit_is_rolled_back,
     test_indexeddb_upgrade_waits_for_no_versionchange_of_a_closed_connection,
+    test_indexeddb_results_reach_the_connection_in_request_order,
+    test_indexeddb_requests_and_commit_of_an_unknown_transaction_fail,
+    test_indexeddb_connection_channel_goes_away_after_close_and_its_transactions,
+    test_indexeddb_transaction_of_a_dropped_connection_holds_back_no_one,
+    test_indexeddb_requests_outside_the_mode_or_scope_fail_the_transaction,
+    test_indexeddb_versionchange_follows_the_open_result_on_one_channel,
 );
 
 static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -182,18 +191,6 @@ impl Drop for IndexedDbTestContext {
     }
 }
 
-fn make_profile_callback<T>() -> (ProfileGenericCallback<T>, mpsc::Receiver<Option<T>>)
-where
-    T: for<'de> serde::Deserialize<'de> + serde::Serialize + Send + 'static,
-{
-    let (sender, receiver) = mpsc::channel();
-    let callback = ProfileGenericCallback::new(move |result| {
-        let _ = sender.send(result.ok());
-    })
-    .unwrap();
-    (callback, receiver)
-}
-
 fn recv_callback_timeout<T>(receiver: &mpsc::Receiver<Option<T>>, what: &str) -> T {
     receiver
         .recv_timeout(TIMEOUT)
@@ -201,31 +198,177 @@ fn recv_callback_timeout<T>(receiver: &mpsc::Receiver<Option<T>>, what: &str) ->
         .unwrap_or_else(|| panic!("{what} callback failed"))
 }
 
-/// Opens `db_name` and returns the receiver of the connection's messages, except
-/// `TxnMaybeCommit`: the tests commit their transactions explicitly, and the manager sends it
-/// when a batch ends before the commit arrives.
+type RequestRoute = Box<dyn FnOnce(BackendResult<RequestOutput>) + Send>;
+
+/// Where the results that the test connections' result channels carry go: request results by
+/// (connection, transaction serial, request id), commit results and schema operation failures by
+/// (connection, transaction serial). Results without a route are dropped.
+#[derive(Default)]
+struct Routes {
+    requests: HashMap<(Uuid, u64, u64), RequestRoute>,
+    commits: HashMap<(Uuid, u64), mpsc::Sender<Option<BackendResult<()>>>>,
+    schema_failures: HashMap<(Uuid, u64), mpsc::Sender<Option<BackendError>>>,
+    /// The transaction events of each connection, in the order they arrived, as (transaction
+    /// serial, request id or `None` for a commit result).
+    log: HashMap<Uuid, Vec<(u64, Option<u64>)>>,
+    /// The open request's messages and the versionchange events on each result channel, in the
+    /// order they arrived.
+    events: HashMap<Uuid, Vec<String>>,
+}
+
+static ROUTES: LazyLock<Mutex<Routes>> = LazyLock::new(Default::default);
+
+/// Serial numbers of the transactions that tests create, unique in the test process.
+static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+fn route(connection: Uuid, event: ConnectionEvent) {
+    let mut routes = ROUTES.lock().unwrap();
+    let (serial, event) = match event {
+        ConnectionEvent::Transaction { serial, event } => (serial, event),
+        other => {
+            let entry = routes.events.entry(connection).or_default();
+            return entry.push(format!("{other:?}"));
+        },
+    };
+    let entry = match event {
+        TransactionEvent::Request { request_id, .. } => Some(request_id),
+        _ => None,
+    };
+    routes
+        .log
+        .entry(connection)
+        .or_default()
+        .push((serial, entry));
+    match event {
+        TransactionEvent::Request { request_id, result } => {
+            if let Some(route) = routes.requests.remove(&(connection, serial, request_id)) {
+                drop(routes);
+                route(result);
+            }
+        },
+        TransactionEvent::Committed(result) => {
+            if let Some(sender) = routes.commits.remove(&(connection, serial)) {
+                let _ = sender.send(Some(result));
+            }
+        },
+        TransactionEvent::SchemaChangeFailed(error) => {
+            if let Some(sender) = routes.schema_failures.get(&(connection, serial)) {
+                let _ = sender.send(Some(error));
+            }
+        },
+    }
+}
+
+/// The result of a request, as the kind of operation reports it.
+trait TestReply: Sized + Send + 'static {
+    fn from_output(output: RequestOutput) -> Self;
+}
+
+macro_rules! test_reply {
+    ($type:ty, $variant:ident) => {
+        impl TestReply for $type {
+            fn from_output(output: RequestOutput) -> Self {
+                match output {
+                    RequestOutput::$variant(value) => value,
+                    other => panic!("unexpected request output {other:?}"),
+                }
+            }
+        }
+    };
+}
+test_reply!(Option<IndexedDBValue>, Value);
+test_reply!(Vec<IndexedDBValue>, Values);
+test_reply!(Vec<IndexedDBKeyType>, Keys);
+test_reply!(Vec<IndexedDBRecord>, Records);
+test_reply!(PutItemResult, Put);
+
+impl TestReply for () {
+    fn from_output(output: RequestOutput) -> Self {
+        assert_eq!(output, RequestOutput::Done);
+    }
+}
+
+/// Sends the request `request_id` of `txn` and returns the receiver of its result.
+fn send_request<T: TestReply>(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    store: i64,
+    txn: IndexedDBTxnId,
+    request_id: u64,
+    mode: IndexedDBTxnMode,
+    operation: AsyncOperation,
+) -> mpsc::Receiver<Option<BackendResult<T>>> {
+    let (sender, receiver) = mpsc::channel();
+    ROUTES.lock().unwrap().requests.insert(
+        (txn.connection, txn.serial, request_id),
+        Box::new(move |result| {
+            let _ = sender.send(Some(result.map(T::from_output)));
+        }),
+    );
+    GenericSend::send(
+        &ctx.private_threads,
+        IndexedDBThreadMsg::Async(
+            ctx.origin.clone(),
+            db_name.to_string(),
+            store,
+            txn,
+            request_id,
+            mode,
+            operation,
+        ),
+    )
+    .unwrap();
+    receiver
+}
+
+/// Opens `db_name` and returns the receiver of the open request's messages. The results of the
+/// connection's transactions go to [`ROUTES`].
 fn open_database(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     version: Option<u64>,
 ) -> mpsc::Receiver<Option<ConnectionMsg>> {
+    open_database_with(ctx, db_name, version, ())
+}
+
+/// [`open_database`], whose result channel keeps `owned` until the backend drops the channel.
+fn open_database_with(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    version: Option<u64>,
+    owned: impl Send + 'static,
+) -> mpsc::Receiver<Option<ConnectionMsg>> {
     let (forward, receiver) = mpsc::channel();
-    let sender = ProfileGenericCallback::new(move |result| {
-        let message = result.ok();
-        if !matches!(message, Some(ConnectionMsg::TxnMaybeCommit { .. })) {
-            let _ = forward.send(message);
+    let id = Uuid::new_v4();
+    let results = ProfileGenericCallback::new(move |event| {
+        let _ = &owned;
+        match event {
+            Ok(ConnectionEvent::Open(message)) => {
+                ROUTES
+                    .lock()
+                    .unwrap()
+                    .events
+                    .entry(id)
+                    .or_default()
+                    .push(format!("{message:?}"));
+                let _ = forward.send(Some(message));
+            },
+            Ok(event) => route(id, event),
+            Err(_) => {
+                let _ = forward.send(None);
+            },
         }
     })
     .unwrap();
     GenericSend::send(
         &ctx.private_threads,
         IndexedDBThreadMsg::Sync(SyncOperation::OpenDatabase(
-            sender,
             ctx.origin.clone(),
             db_name.to_string(),
             version,
-            Uuid::new_v4(),
+            id,
             ctx.bottle_source.clone(),
+            results,
         )),
     )
     .unwrap();
@@ -239,15 +382,22 @@ const A: i64 = 1;
 const B: i64 = 2;
 
 /// Schema operations run through the versionchange transaction, exactly like
-/// script does (`idbdatabase.rs`). Their callback only ever carries an error,
-/// so a receiver that stays empty means the operation succeeded.
+/// script does (`idbdatabase.rs`). Only a failure is reported, so a receiver
+/// that stays empty means the operation succeeded. The failures of all the
+/// transaction's schema operations go to the receiver returned last.
 fn send_schema_operation(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     store: i64,
     transaction: IndexedDBTxnId,
     operation: AsyncSchemaOperation,
-) {
+) -> mpsc::Receiver<Option<BackendError>> {
+    let (sender, receiver) = mpsc::channel();
+    ROUTES
+        .lock()
+        .unwrap()
+        .schema_failures
+        .insert((transaction.connection, transaction.serial), sender);
     GenericSend::send(
         &ctx.private_threads,
         IndexedDBThreadMsg::AsyncSchemaOperation {
@@ -259,6 +409,7 @@ fn send_schema_operation(
         },
     )
     .unwrap();
+    receiver
 }
 
 /// Creates the store `store_name` with the id `store`, as script does.
@@ -271,20 +422,17 @@ fn create_object_store(
     key_path: Option<KeyPath>,
     auto_increment: bool,
 ) -> mpsc::Receiver<Option<BackendError>> {
-    let (callback, receiver) = make_profile_callback();
     send_schema_operation(
         ctx,
         db_name,
         store,
         transaction,
         AsyncSchemaOperation::CreateObjectStore {
-            callback,
             name: store_name.to_owned(),
             key_path,
             auto_increment,
         },
-    );
-    receiver
+    )
 }
 
 fn create_index(
@@ -298,22 +446,19 @@ fn create_index(
     unique: bool,
     multi_entry: bool,
 ) -> mpsc::Receiver<Option<BackendError>> {
-    let (callback, receiver) = make_profile_callback();
     send_schema_operation(
         ctx,
         db_name,
         store,
         transaction,
         AsyncSchemaOperation::CreateIndex {
-            callback,
             index_id,
             name: index_name.to_string(),
             key_path,
             unique,
             multi_entry,
         },
-    );
-    receiver
+    )
 }
 
 /// The names of `stores`.
@@ -341,16 +486,18 @@ fn committed_metadata(
     }
 }
 
-/// Creates a transaction, as script does without waiting for a reply, and returns its id.
+/// Creates a transaction of the open connection `connection`, as script does without waiting
+/// for a reply, and returns its id.
 fn create_transaction(
     ctx: &IndexedDbTestContext,
     db_name: &str,
+    connection: Uuid,
     mode: IndexedDBTxnMode,
     scope: Vec<i64>,
 ) -> IndexedDBTxnId {
     let txn = IndexedDBTxnId {
-        connection: Uuid::new_v4(),
-        serial: 1,
+        connection,
+        serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
     };
     GenericSend::send(
         &ctx.private_threads,
@@ -366,20 +513,27 @@ fn create_transaction(
     txn
 }
 
+/// Asks the backend to commit `txn` and returns the receiver of the commit result. Script sends
+/// the commit once the results of all requests have arrived; the tests send it earlier too, as
+/// the backend commits after the requests it was handed anyway.
 fn commit_transaction(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     txn: IndexedDBTxnId,
-) -> mpsc::Receiver<Option<TxnCompleteMsg>> {
-    let (sender, receiver) = make_profile_callback();
+) -> mpsc::Receiver<Option<BackendResult<()>>> {
+    let (sender, receiver) = mpsc::channel();
+    ROUTES
+        .lock()
+        .unwrap()
+        .commits
+        .insert((txn.connection, txn.serial), sender);
     GenericSend::send(
         &ctx.private_threads,
-        IndexedDBThreadMsg::Sync(SyncOperation::Commit(
-            sender,
-            ctx.origin.clone(),
-            db_name.to_string(),
+        IndexedDBThreadMsg::Sync(SyncOperation::Commit {
+            origin: ctx.origin.clone(),
+            db_name: db_name.to_string(),
             txn,
-        )),
+        }),
     )
     .unwrap();
     receiver
@@ -395,23 +549,20 @@ fn commit_upgrade_transaction(
 ) {
     let receiver = commit_transaction(ctx, db_name, transaction);
     recv_callback_timeout(&receiver, "upgrade commit reply")
-        .result
         .expect("the upgrade transaction failed to commit");
     finish_upgrade_transaction(ctx, transaction, db_name, true);
     finish_transaction(ctx, db_name, transaction);
 }
 
 /// Mirror script's abort choreography for a versionchange transaction
-/// (`idbtransaction.rs`): the backend abort is requested first and only its
-/// reply — which waits out a running batch — releases the upgrade. Reporting
-/// the upgrade finished without it would race the queued schema batch.
+/// (`idbtransaction.rs`): the backend abort is sent first, so the engine rolls
+/// back after the transaction's requests and before the upgrade is finished.
 fn abort_upgrade_transaction(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     transaction: IndexedDBTxnId,
 ) {
-    let receiver = abort_transaction(ctx, db_name, transaction);
-    recv_callback_timeout(&receiver, "upgrade abort reply");
+    abort_transaction(ctx, db_name, transaction);
     finish_upgrade_transaction(ctx, transaction, db_name, false);
     finish_transaction(ctx, db_name, transaction);
 }
@@ -441,24 +592,6 @@ fn finish_upgrade_transaction(
             db_name: db_name.to_string(),
             origin: ctx.origin.clone(),
             committed,
-        }),
-    )
-    .unwrap();
-}
-
-fn mark_request_handled(
-    ctx: &IndexedDbTestContext,
-    db_name: &str,
-    txn: IndexedDBTxnId,
-    request_id: u64,
-) {
-    GenericSend::send(
-        &ctx.private_threads,
-        IndexedDBThreadMsg::Sync(SyncOperation::RequestHandled {
-            origin: ctx.origin.clone(),
-            db_name: db_name.to_string(),
-            txn,
-            request_id,
         }),
     )
     .unwrap();
@@ -497,26 +630,19 @@ fn put_item_request(
     value: Vec<u8>,
     should_overwrite: bool,
 ) -> mpsc::Receiver<Option<BackendResult<PutItemResult>>> {
-    let (sender, receiver) = make_profile_callback();
-    GenericSend::send(
-        &ctx.private_threads,
-        IndexedDBThreadMsg::Async(
-            ctx.origin.clone(),
-            db_name.to_string(),
-            store,
-            txn,
-            request_id,
-            IndexedDBTxnMode::Readwrite,
-            AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
-                callback: sender,
-                key,
-                value,
-                should_overwrite,
-            }),
-        ),
+    send_request(
+        ctx,
+        db_name,
+        store,
+        txn,
+        request_id,
+        IndexedDBTxnMode::Readwrite,
+        AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
+            key,
+            value,
+            should_overwrite,
+        }),
     )
-    .unwrap();
-    receiver
 }
 
 fn get_all_keys_request(
@@ -527,25 +653,18 @@ fn get_all_keys_request(
     key_range: IndexedDBKeyRange,
     request_id: u64,
 ) -> mpsc::Receiver<Option<BackendResult<Vec<IndexedDBKeyType>>>> {
-    let (sender, receiver) = make_profile_callback();
-    GenericSend::send(
-        &ctx.private_threads,
-        IndexedDBThreadMsg::Async(
-            ctx.origin.clone(),
-            db_name.to_string(),
-            store,
-            txn,
-            request_id,
-            IndexedDBTxnMode::Readonly,
-            AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
-                callback: sender,
-                key_range,
-                count: None,
-            }),
-        ),
+    send_request(
+        ctx,
+        db_name,
+        store,
+        txn,
+        request_id,
+        IndexedDBTxnMode::Readonly,
+        AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
+            key_range,
+            count: None,
+        }),
     )
-    .unwrap();
-    receiver
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -559,26 +678,19 @@ fn iterate_request(
     reverse: bool,
     request_id: u64,
 ) -> mpsc::Receiver<Option<BackendResult<Vec<IndexedDBRecord>>>> {
-    let (sender, receiver) = make_profile_callback();
-    GenericSend::send(
-        &ctx.private_threads,
-        IndexedDBThreadMsg::Async(
-            ctx.origin.clone(),
-            db_name.to_string(),
-            store,
-            txn,
-            request_id,
-            IndexedDBTxnMode::Readonly,
-            AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
-                callback: sender,
-                key_range,
-                count,
-                reverse,
-            }),
-        ),
+    send_request(
+        ctx,
+        db_name,
+        store,
+        txn,
+        request_id,
+        IndexedDBTxnMode::Readonly,
+        AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+            key_range,
+            count,
+            reverse,
+        }),
     )
-    .unwrap();
-    receiver
 }
 
 fn get_item(
@@ -588,25 +700,17 @@ fn get_item(
     txn: IndexedDBTxnId,
     key: IndexedDBKeyType,
 ) -> mpsc::Receiver<Option<BackendResult<Option<IndexedDBValue>>>> {
-    let request_id = 1;
-    let (sender, receiver) = make_profile_callback();
-    GenericSend::send(
-        &ctx.private_threads,
-        IndexedDBThreadMsg::Async(
-            ctx.origin.clone(),
-            db_name.to_string(),
-            store,
-            txn,
-            request_id,
-            IndexedDBTxnMode::Readonly,
-            AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
-                callback: sender,
-                key_range: IndexedDBKeyRange::only(key),
-            }),
-        ),
+    send_request(
+        ctx,
+        db_name,
+        store,
+        txn,
+        1,
+        IndexedDBTxnMode::Readonly,
+        AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+            key_range: IndexedDBKeyRange::only(key),
+        }),
     )
-    .unwrap();
-    receiver
 }
 
 fn remove_item(
@@ -616,25 +720,7 @@ fn remove_item(
     txn: IndexedDBTxnId,
     key: IndexedDBKeyType,
 ) -> mpsc::Receiver<Option<BackendResult<()>>> {
-    let request_id = 1;
-    let (sender, receiver) = make_profile_callback();
-    GenericSend::send(
-        &ctx.private_threads,
-        IndexedDBThreadMsg::Async(
-            ctx.origin.clone(),
-            db_name.to_string(),
-            store,
-            txn,
-            request_id,
-            IndexedDBTxnMode::Readwrite,
-            AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
-                callback: sender,
-                key_range: IndexedDBKeyRange::only(key),
-            }),
-        ),
-    )
-    .unwrap();
-    receiver
+    remove_item_request(ctx, db_name, store, txn, IndexedDBKeyRange::only(key))
 }
 
 fn remove_item_request(
@@ -644,25 +730,15 @@ fn remove_item_request(
     txn: IndexedDBTxnId,
     key_range: IndexedDBKeyRange,
 ) -> mpsc::Receiver<Option<BackendResult<()>>> {
-    let request_id = 1;
-    let (sender, receiver) = make_profile_callback();
-    GenericSend::send(
-        &ctx.private_threads,
-        IndexedDBThreadMsg::Async(
-            ctx.origin.clone(),
-            db_name.to_string(),
-            store,
-            txn,
-            request_id,
-            IndexedDBTxnMode::Readwrite,
-            AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
-                callback: sender,
-                key_range,
-            }),
-        ),
+    send_request(
+        ctx,
+        db_name,
+        store,
+        txn,
+        1,
+        IndexedDBTxnMode::Readwrite,
+        AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem { key_range }),
     )
-    .unwrap();
-    receiver
 }
 
 fn expect_upgrade_and_initialize_database(
@@ -781,7 +857,13 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
     );
     assert!(!store.indexes[0].multi_entry);
     assert!(!store.indexes[0].unique);
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![STORE],
+    );
     let put_result = put_item(
         &ctx,
         db_name,
@@ -792,17 +874,21 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let put_msg = recv_callback_timeout(&put_result, "put item reply").unwrap();
-    mark_request_handled(&ctx, db_name, txn, 1);
     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
     assert_eq!(
         put_msg,
         PutItemResult::Key(IndexedDBKeyType::String("book-1".to_string()))
     );
-    assert_eq!(commit_msg.txn, txn);
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readonly, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readonly,
+        vec![STORE],
+    );
     let roundtrip = get_item(
         &ctx,
         db_name,
@@ -812,7 +898,6 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let roundtrip_msg = recv_callback_timeout(&roundtrip, "get item reply").unwrap();
-    mark_request_handled(&ctx, db_name, txn, 1);
     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
     assert_eq!(
         roundtrip_msg,
@@ -821,10 +906,16 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
             value: b"Moby Dick".to_vec(),
         })
     );
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![STORE],
+    );
     let remove_result = remove_item(
         &ctx,
         db_name,
@@ -834,13 +925,18 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let remove_msg = recv_callback_timeout(&remove_result, "remove item reply");
-    mark_request_handled(&ctx, db_name, txn, 1);
     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
     assert!(remove_msg.is_ok());
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readonly, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readonly,
+        vec![STORE],
+    );
     let deleted = get_item(
         &ctx,
         db_name,
@@ -850,10 +946,9 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let deleted_msg = recv_callback_timeout(&deleted, "get deleted item reply").unwrap();
-    mark_request_handled(&ctx, db_name, txn, 1);
     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
     assert_eq!(deleted_msg, None);
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
     close_database(&ctx, connection_id, db_name);
@@ -977,11 +1072,7 @@ fn test_indexeddb_duplicate_store_fails_the_upgrade() {
                 false,
             );
             let commit = commit_transaction(&ctx, db_name, transaction);
-            assert!(
-                recv_callback_timeout(&commit, "upgrade commit reply")
-                    .result
-                    .is_err()
-            );
+            assert!(recv_callback_timeout(&commit, "upgrade commit reply").is_err());
             assert!(matches!(
                 recv_callback_timeout(&duplicate, "duplicate store error"),
                 BackendError::DbErr(_)
@@ -1000,23 +1091,17 @@ fn test_indexeddb_duplicate_store_fails_the_upgrade() {
     ctx.shutdown();
 }
 
-fn abort_transaction(
-    ctx: &IndexedDbTestContext,
-    db_name: &str,
-    txn: IndexedDBTxnId,
-) -> mpsc::Receiver<Option<TxnCompleteMsg>> {
-    let (sender, receiver) = make_profile_callback();
+/// Aborts `txn`, which reports nothing.
+fn abort_transaction(ctx: &IndexedDbTestContext, db_name: &str, txn: IndexedDBTxnId) {
     GenericSend::send(
         &ctx.private_threads,
-        IndexedDBThreadMsg::Sync(SyncOperation::Abort(
-            sender,
-            ctx.origin.clone(),
-            db_name.to_string(),
+        IndexedDBThreadMsg::Sync(SyncOperation::Abort {
+            origin: ctx.origin.clone(),
+            db_name: db_name.to_string(),
             txn,
-        )),
+        }),
     )
     .unwrap();
-    receiver
 }
 
 fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
@@ -1036,8 +1121,20 @@ fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
     // so its queued request never runs and gets no reply. A put that has run is
     // rolled back instead, see
     // test_indexeddb_aborted_put_that_succeeded_leaves_no_record.
-    let blocking_txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![STORE]);
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![STORE]);
+    let blocking_txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![STORE],
+    );
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![STORE],
+    );
     let _put_result = put_item(
         &ctx,
         db_name,
@@ -1046,15 +1143,7 @@ fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
         IndexedDBKeyType::String("book-aborted".to_string()),
         b"Never Committed".to_vec(),
     );
-    let abort_result = abort_transaction(&ctx, db_name, txn);
-    let abort_msg = recv_callback_timeout(&abort_result, "abort reply");
-    assert_eq!(abort_msg.txn, txn);
-    // An aborted transaction completes with Err(Abort); that error IS the
-    // abort signal script uses to fire the abort event, not a failure.
-    assert!(matches!(
-        abort_msg.result,
-        Err(storage_traits::indexeddb::BackendError::Abort)
-    ));
+    abort_transaction(&ctx, db_name, txn);
     finish_transaction(&ctx, db_name, txn);
     finish_transaction(&ctx, db_name, blocking_txn);
 
@@ -1062,7 +1151,13 @@ fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
     // "... the implementation must undo (roll back) any changes that were
     // made to the database during that transaction."
     // The pre-transaction state is restored: the key is absent.
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readonly, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readonly,
+        vec![STORE],
+    );
     let lookup = get_item(
         &ctx,
         db_name,
@@ -1072,10 +1167,9 @@ fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let lookup_msg = recv_callback_timeout(&lookup, "get aborted item reply").unwrap();
-    mark_request_handled(&ctx, db_name, txn, 1);
     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
     assert_eq!(lookup_msg, None);
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
     close_database(&ctx, connection_id, db_name);
@@ -1095,7 +1189,13 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
     );
 
     // Commit one row so the aborted upgrade can be shown to leave data intact.
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![STORE],
+    );
     let put_result = put_item(
         &ctx,
         db_name,
@@ -1106,9 +1206,8 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     recv_callback_timeout(&put_result, "put item reply").unwrap();
-    mark_request_handled(&ctx, db_name, txn, 1);
     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
     close_database(&ctx, connection_id, db_name);
 
@@ -1141,13 +1240,12 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
                     None,
                     false,
                 );
-                let (callback, _deleted) = make_profile_callback();
                 send_schema_operation(
                     &ctx,
                     db_name,
                     STORE,
                     transaction,
-                    AsyncSchemaOperation::DeleteObjectStore { callback },
+                    AsyncSchemaOperation::DeleteObjectStore,
                 );
                 abort_upgrade_transaction(&ctx, db_name, transaction);
             },
@@ -1166,7 +1264,13 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
     assert_eq!(committed_metadata(&ctx, db_name).0, 1);
     let connection_id = reopen_database(&ctx, db_name, store_name);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readonly, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readonly,
+        vec![STORE],
+    );
     let lookup = get_item(
         &ctx,
         db_name,
@@ -1176,13 +1280,12 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let lookup_msg = recv_callback_timeout(&lookup, "get preserved item reply").unwrap();
-    mark_request_handled(&ctx, db_name, txn, 1);
     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
     assert_eq!(
         lookup_msg.map(|value| value.value),
         Some(b"Moby Dick".to_vec())
     );
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
     close_database(&ctx, connection_id, db_name);
@@ -1196,7 +1299,13 @@ fn test_indexeddb_cross_type_key_sort_order() {
     let connection_id =
         expect_upgrade_and_initialize_database(&ctx, db_name, store_name, "by_author", None);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![STORE],
+    );
     let mut receivers = Vec::new();
     for (request_id, key, value) in [
         (1, IndexedDBKeyType::Number(1.0), b"number".to_vec()),
@@ -1231,19 +1340,23 @@ fn test_indexeddb_cross_type_key_sort_order() {
     for (request_id, receiver) in receivers {
         let result = recv_callback_timeout(&receiver, "sorted put reply");
         assert!(result.is_ok(), "request {request_id} should succeed");
-        mark_request_handled(&ctx, db_name, txn, request_id);
     }
     let commit_msg = recv_callback_timeout(&commit_result, "sorted commit reply");
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readonly, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readonly,
+        vec![STORE],
+    );
     let keys = get_all_keys_request(&ctx, db_name, STORE, txn, IndexedDBKeyRange::default(), 1);
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let keys = recv_callback_timeout(&keys, "sorted keys reply").unwrap();
-    mark_request_handled(&ctx, db_name, txn, 1);
     let commit_msg = recv_callback_timeout(&commit_result, "sorted read commit reply");
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
     assert_eq!(
@@ -1268,7 +1381,13 @@ fn test_indexeddb_iterate_count_and_reverse() {
     let connection_id =
         expect_upgrade_and_initialize_database(&ctx, db_name, store_name, "by_author", None);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![STORE],
+    );
     let mut receivers = Vec::new();
     for request_id in 1..=5 {
         let key = IndexedDBKeyType::Number(request_id as f64);
@@ -1290,10 +1409,9 @@ fn test_indexeddb_iterate_count_and_reverse() {
     for (request_id, receiver) in receivers {
         let result = recv_callback_timeout(&receiver, "iterate put reply");
         assert!(result.is_ok(), "request {request_id} should succeed");
-        mark_request_handled(&ctx, db_name, txn, request_id);
     }
     let commit_msg = recv_callback_timeout(&commit_result, "iterate commit reply");
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
     let number = |n: f64| IndexedDBKeyType::Number(n);
@@ -1336,7 +1454,13 @@ fn test_indexeddb_iterate_count_and_reverse() {
         ),
     ];
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readonly, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readonly,
+        vec![STORE],
+    );
     let receivers: Vec<_> = cases
         .iter()
         .zip(1..)
@@ -1354,11 +1478,8 @@ fn test_indexeddb_iterate_count_and_reverse() {
         })
         .collect();
     let commit_result = commit_transaction(&ctx, db_name, txn);
-    for ((receiver, (key_range, count, reverse, expected)), request_id) in
-        receivers.iter().zip(&cases).zip(1..)
-    {
+    for (receiver, (key_range, count, reverse, expected)) in receivers.iter().zip(&cases) {
         let records = recv_callback_timeout(receiver, "iterate reply").unwrap();
-        mark_request_handled(&ctx, db_name, txn, request_id);
         let keys: Vec<_> = records.iter().map(|record| record.key.clone()).collect();
         let values: Vec<_> = records.iter().map(|record| record.value.clone()).collect();
         assert_eq!(
@@ -1375,7 +1496,7 @@ fn test_indexeddb_iterate_count_and_reverse() {
         );
     }
     let commit_msg = recv_callback_timeout(&commit_result, "iterate read commit reply");
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
     close_database(&ctx, connection_id, db_name);
@@ -1392,13 +1513,20 @@ fn test_indexeddb_delete_item_range_respects_open_bounds() {
     fn remaining_keys_after_delete(
         ctx: &IndexedDbTestContext,
         db_name: &str,
+        connection: Uuid,
         store: i64,
         lower: i32,
         upper: i32,
         lower_open: bool,
         upper_open: bool,
     ) -> Vec<i32> {
-        let txn = create_transaction(ctx, db_name, IndexedDBTxnMode::Readwrite, vec![store]);
+        let txn = create_transaction(
+            ctx,
+            db_name,
+            connection,
+            IndexedDBTxnMode::Readwrite,
+            vec![store],
+        );
         let mut receivers = Vec::new();
         for key in 1..=10 {
             receivers.push((
@@ -1419,13 +1547,18 @@ fn test_indexeddb_delete_item_range_respects_open_bounds() {
         for (request_id, receiver) in receivers {
             let result = recv_callback_timeout(&receiver, "seed put reply");
             assert!(result.is_ok(), "seed request {request_id} should succeed");
-            mark_request_handled(ctx, db_name, txn, request_id as u64);
         }
         let commit_msg = recv_callback_timeout(&commit_result, "seed commit reply");
-        assert!(commit_msg.result.is_ok());
+        assert!(commit_msg.is_ok());
         finish_transaction(ctx, db_name, txn);
 
-        let txn = create_transaction(ctx, db_name, IndexedDBTxnMode::Readwrite, vec![store]);
+        let txn = create_transaction(
+            ctx,
+            db_name,
+            connection,
+            IndexedDBTxnMode::Readwrite,
+            vec![store],
+        );
         let delete = remove_item_request(
             ctx,
             db_name,
@@ -1441,18 +1574,22 @@ fn test_indexeddb_delete_item_range_respects_open_bounds() {
         let commit_result = commit_transaction(ctx, db_name, txn);
         let delete_msg = recv_callback_timeout(&delete, "range delete reply");
         assert!(delete_msg.is_ok());
-        mark_request_handled(ctx, db_name, txn, 1);
         let commit_msg = recv_callback_timeout(&commit_result, "range delete commit reply");
-        assert!(commit_msg.result.is_ok());
+        assert!(commit_msg.is_ok());
         finish_transaction(ctx, db_name, txn);
 
-        let txn = create_transaction(ctx, db_name, IndexedDBTxnMode::Readonly, vec![store]);
+        let txn = create_transaction(
+            ctx,
+            db_name,
+            connection,
+            IndexedDBTxnMode::Readonly,
+            vec![store],
+        );
         let keys = get_all_keys_request(ctx, db_name, store, txn, IndexedDBKeyRange::default(), 1);
         let commit_result = commit_transaction(ctx, db_name, txn);
         let keys = recv_callback_timeout(&keys, "remaining keys reply").unwrap();
-        mark_request_handled(ctx, db_name, txn, 1);
         let commit_msg = recv_callback_timeout(&commit_result, "remaining keys commit reply");
-        assert!(commit_msg.result.is_ok());
+        assert!(commit_msg.is_ok());
         finish_transaction(ctx, db_name, txn);
 
         keys.into_iter()
@@ -1464,19 +1601,19 @@ fn test_indexeddb_delete_item_range_respects_open_bounds() {
     }
 
     assert_eq!(
-        remaining_keys_after_delete(&ctx, db_name, STORE, 3, 8, false, false),
+        remaining_keys_after_delete(&ctx, db_name, connection_id, STORE, 3, 8, false, false),
         vec![1, 2, 9, 10]
     );
     assert_eq!(
-        remaining_keys_after_delete(&ctx, db_name, STORE, 3, 8, true, false),
+        remaining_keys_after_delete(&ctx, db_name, connection_id, STORE, 3, 8, true, false),
         vec![1, 2, 3, 9, 10]
     );
     assert_eq!(
-        remaining_keys_after_delete(&ctx, db_name, STORE, 3, 8, false, true),
+        remaining_keys_after_delete(&ctx, db_name, connection_id, STORE, 3, 8, false, true),
         vec![1, 2, 8, 9, 10]
     );
     assert_eq!(
-        remaining_keys_after_delete(&ctx, db_name, STORE, 3, 8, true, true),
+        remaining_keys_after_delete(&ctx, db_name, connection_id, STORE, 3, 8, true, true),
         vec![1, 2, 3, 8, 9, 10]
     );
 
@@ -1504,30 +1641,39 @@ fn test_indexeddb_auto_increment_assigns_sequential_keys() {
         }
     };
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![STORE],
+    );
     let first = put_item_request(&ctx, db_name, STORE, txn, 1, None, b"first".to_vec(), true);
     let second = put_item_request(&ctx, db_name, STORE, txn, 2, None, b"second".to_vec(), true);
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let first_msg = recv_callback_timeout(&first, "first auto-increment put reply").unwrap();
     let second_msg = recv_callback_timeout(&second, "second auto-increment put reply").unwrap();
-    mark_request_handled(&ctx, db_name, txn, 1);
-    mark_request_handled(&ctx, db_name, txn, 2);
     let commit_msg = recv_callback_timeout(&commit_result, "auto-increment commit reply");
     assert_eq!(first_msg, PutItemResult::Key(IndexedDBKeyType::Number(1.0)));
     assert_eq!(
         second_msg,
         PutItemResult::Key(IndexedDBKeyType::Number(2.0))
     );
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readonly, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readonly,
+        vec![STORE],
+    );
     let keys = get_all_keys_request(&ctx, db_name, STORE, txn, IndexedDBKeyRange::default(), 1);
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let keys = recv_callback_timeout(&keys, "auto-increment keys reply").unwrap();
-    mark_request_handled(&ctx, db_name, txn, 1);
     let commit_msg = recv_callback_timeout(&commit_result, "auto-increment read commit reply");
-    assert!(commit_msg.result.is_ok());
+    assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
     assert_eq!(
@@ -1546,7 +1692,13 @@ fn test_indexeddb_batch_commit_failure_surfaces_an_error() {
     let connection_id =
         expect_upgrade_and_initialize_database(&ctx, db_name, store_name, "by_author", None);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![STORE],
+    );
     let failing = put_item_request(
         &ctx,
         db_name,
@@ -1560,7 +1712,6 @@ fn test_indexeddb_batch_commit_failure_surfaces_an_error() {
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let failing_msg = recv_callback_timeout(&failing, "missing key batch put reply");
     assert!(failing_msg.is_err());
-    mark_request_handled(&ctx, db_name, txn, 1);
     let _ = recv_callback_timeout(&commit_result, "batch commit reply");
     finish_transaction(&ctx, db_name, txn);
 
@@ -1571,21 +1722,23 @@ fn test_indexeddb_batch_commit_failure_surfaces_an_error() {
 fn get_item_in_new_readonly_transaction(
     ctx: &IndexedDbTestContext,
     db_name: &str,
+    connection: Uuid,
     store: i64,
     key: IndexedDBKeyType,
 ) -> Option<Vec<u8>> {
-    let txn = create_transaction(ctx, db_name, IndexedDBTxnMode::Readonly, vec![store]);
+    let txn = create_transaction(
+        ctx,
+        db_name,
+        connection,
+        IndexedDBTxnMode::Readonly,
+        vec![store],
+    );
     let lookup = get_item(ctx, db_name, store, txn, key);
     let commit_result = commit_transaction(ctx, db_name, txn);
     let value = recv_callback_timeout(&lookup, "get item reply")
         .unwrap()
         .map(|value| value.value);
-    mark_request_handled(ctx, db_name, txn, 1);
-    assert!(
-        recv_callback_timeout(&commit_result, "readonly commit reply")
-            .result
-            .is_ok()
-    );
+    assert!(recv_callback_timeout(&commit_result, "readonly commit reply").is_ok());
     finish_transaction(ctx, db_name, txn);
     value
 }
@@ -1601,7 +1754,13 @@ fn test_indexeddb_aborted_put_that_succeeded_leaves_no_record() {
     let connection_id =
         expect_upgrade_and_initialize_database(&ctx, db_name, store_name, "by_author", None);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![STORE]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![STORE],
+    );
     let put_result = put_item(
         &ctx,
         db_name,
@@ -1614,17 +1773,15 @@ fn test_indexeddb_aborted_put_that_succeeded_leaves_no_record() {
         recv_callback_timeout(&put_result, "put item reply").unwrap(),
         PutItemResult::Key(IndexedDBKeyType::String("book-aborted".to_string()))
     );
-    mark_request_handled(&ctx, db_name, txn, 1);
 
-    let abort_result = abort_transaction(&ctx, db_name, txn);
-    let abort_msg = recv_callback_timeout(&abort_result, "abort reply");
-    assert!(matches!(abort_msg.result, Err(BackendError::Abort)));
+    abort_transaction(&ctx, db_name, txn);
     finish_transaction(&ctx, db_name, txn);
 
     assert_eq!(
         get_item_in_new_readonly_transaction(
             &ctx,
             db_name,
+            connection_id,
             STORE,
             IndexedDBKeyType::String("book-aborted".to_string()),
         ),
@@ -1655,12 +1812,23 @@ fn test_indexeddb_writers_with_disjoint_scopes_run_one_after_another() {
         }
     };
 
-    let first = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![A]);
-    let second = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![B]);
+    let first = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![A],
+    );
+    let second = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![B],
+    );
     let key = || IndexedDBKeyType::Number(1.0);
     let first_put = put_item(&ctx, db_name, A, first, key(), b"first".to_vec());
     recv_callback_timeout(&first_put, "first writer put reply").unwrap();
-    mark_request_handled(&ctx, db_name, first, 1);
 
     let second_put = put_item(&ctx, db_name, B, second, key(), b"second".to_vec());
     assert!(
@@ -1669,26 +1837,17 @@ fn test_indexeddb_writers_with_disjoint_scopes_run_one_after_another() {
     );
 
     let commit_result = commit_transaction(&ctx, db_name, first);
-    assert!(
-        recv_callback_timeout(&commit_result, "first writer commit reply")
-            .result
-            .is_ok()
-    );
+    assert!(recv_callback_timeout(&commit_result, "first writer commit reply").is_ok());
     finish_transaction(&ctx, db_name, first);
 
     recv_callback_timeout(&second_put, "second writer put reply").unwrap();
-    mark_request_handled(&ctx, db_name, second, 1);
     let commit_result = commit_transaction(&ctx, db_name, second);
-    assert!(
-        recv_callback_timeout(&commit_result, "second writer commit reply")
-            .result
-            .is_ok()
-    );
+    assert!(recv_callback_timeout(&commit_result, "second writer commit reply").is_ok());
     finish_transaction(&ctx, db_name, second);
 
     for (store, value) in [(A, &b"first"[..]), (B, &b"second"[..])] {
         assert_eq!(
-            get_item_in_new_readonly_transaction(&ctx, db_name, store, key()),
+            get_item_in_new_readonly_transaction(&ctx, db_name, connection_id, store, key()),
             Some(value.to_vec())
         );
     }
@@ -1714,9 +1873,15 @@ fn open_database_with_two_stores(ctx: &IndexedDbTestContext, db_name: &str) -> U
     }
 }
 
-/// Runs a put into `store` in a new readwrite transaction and commits it.
-fn put_and_commit(ctx: &IndexedDbTestContext, db_name: &str, store: i64) {
-    let txn = create_transaction(ctx, db_name, IndexedDBTxnMode::Readwrite, vec![store]);
+/// Runs a put into `store` in a new readwrite transaction of `connection` and commits it.
+fn put_and_commit(ctx: &IndexedDbTestContext, db_name: &str, connection: Uuid, store: i64) {
+    let txn = create_transaction(
+        ctx,
+        db_name,
+        connection,
+        IndexedDBTxnMode::Readwrite,
+        vec![store],
+    );
     let put = put_item(
         ctx,
         db_name,
@@ -1729,13 +1894,8 @@ fn put_and_commit(ctx: &IndexedDbTestContext, db_name: &str, store: i64) {
         recv_callback_timeout(&put, "next writer put reply").is_ok(),
         "The next writer's put must not meet the earlier writer's SQL transaction"
     );
-    mark_request_handled(ctx, db_name, txn, 1);
     let commit_result = commit_transaction(ctx, db_name, txn);
-    assert!(
-        recv_callback_timeout(&commit_result, "next writer commit reply")
-            .result
-            .is_ok()
-    );
+    assert!(recv_callback_timeout(&commit_result, "next writer commit reply").is_ok());
     finish_transaction(ctx, db_name, txn);
 }
 
@@ -1764,14 +1924,26 @@ fn test_indexeddb_abort_while_a_batch_runs_frees_the_next_writer() {
     let db_name = "indexeddb-abort-running-batch";
     let connection_id = open_database_with_two_stores(&ctx, db_name);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![A]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![A],
+    );
     send_puts(&ctx, db_name, txn, 2000);
-    let _abort_result = abort_transaction(&ctx, db_name, txn);
+    abort_transaction(&ctx, db_name, txn);
     finish_transaction(&ctx, db_name, txn);
 
-    put_and_commit(&ctx, db_name, B);
+    put_and_commit(&ctx, db_name, connection_id, B);
     assert_eq!(
-        get_item_in_new_readonly_transaction(&ctx, db_name, A, IndexedDBKeyType::Number(0.0)),
+        get_item_in_new_readonly_transaction(
+            &ctx,
+            db_name,
+            connection_id,
+            A,
+            IndexedDBKeyType::Number(0.0)
+        ),
         None
     );
 
@@ -1786,7 +1958,13 @@ fn test_indexeddb_finished_transaction_without_commit_is_rolled_back() {
     let db_name = "indexeddb-finished-without-commit";
     let connection_id = open_database_with_two_stores(&ctx, db_name);
 
-    let txn = create_transaction(&ctx, db_name, IndexedDBTxnMode::Readwrite, vec![A]);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![A],
+    );
     let put = put_item(
         &ctx,
         db_name,
@@ -1798,9 +1976,15 @@ fn test_indexeddb_finished_transaction_without_commit_is_rolled_back() {
     recv_callback_timeout(&put, "dead writer put reply").unwrap();
     finish_transaction(&ctx, db_name, txn);
 
-    put_and_commit(&ctx, db_name, B);
+    put_and_commit(&ctx, db_name, connection_id, B);
     assert_eq!(
-        get_item_in_new_readonly_transaction(&ctx, db_name, A, IndexedDBKeyType::Number(0.0)),
+        get_item_in_new_readonly_transaction(
+            &ctx,
+            db_name,
+            connection_id,
+            A,
+            IndexedDBKeyType::Number(0.0)
+        ),
         None
     );
 
@@ -1855,6 +2039,399 @@ fn test_indexeddb_upgrade_waits_for_no_versionchange_of_a_closed_connection() {
         other => panic!("unexpected upgrade message: {other:?}"),
     };
 
+    close_database(&ctx, upgraded, db_name);
+    ctx.shutdown();
+}
+
+/// The results of a connection's requests reach its result channel in request order, also a
+/// large result before the small results of later requests, and each commit result after the
+/// results of its transaction.
+fn test_indexeddb_results_reach_the_connection_in_request_order() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-result-order";
+    let connection_id = open_database_with_two_stores(&ctx, db_name);
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![A, B],
+    );
+    let puts: Vec<_> = (0..8)
+        .map(|key| {
+            put_item_request(
+                &ctx,
+                db_name,
+                A,
+                txn,
+                key,
+                Some(IndexedDBKeyType::Number(key as f64)),
+                vec![key as u8; 512 * 1024],
+                true,
+            )
+        })
+        .collect();
+    let small_put = put_item_request(
+        &ctx,
+        db_name,
+        B,
+        txn,
+        8,
+        Some(IndexedDBKeyType::Number(1.0)),
+        b"small".to_vec(),
+        true,
+    );
+    let commit = commit_transaction(&ctx, db_name, txn);
+    for put in puts.iter().chain([&small_put]) {
+        recv_callback_timeout(put, "put reply").unwrap();
+    }
+    recv_callback_timeout(&commit, "commit reply").unwrap();
+    finish_transaction(&ctx, db_name, txn);
+
+    let reads = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readonly,
+        vec![A, B],
+    );
+    let large = send_request::<Vec<IndexedDBValue>>(
+        &ctx,
+        db_name,
+        A,
+        reads,
+        0,
+        IndexedDBTxnMode::Readonly,
+        AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
+            key_range: IndexedDBKeyRange::default(),
+            count: None,
+        }),
+    );
+    let small = get_item(&ctx, db_name, B, reads, IndexedDBKeyType::Number(1.0));
+    let keys = get_all_keys_request(&ctx, db_name, B, reads, IndexedDBKeyRange::default(), 2);
+    let commit = commit_transaction(&ctx, db_name, reads);
+    recv_callback_timeout(&commit, "readonly commit reply").unwrap();
+    let values = recv_callback_timeout(&large, "large getAll reply").unwrap();
+    assert_eq!(values.len(), 8);
+    assert!(values.iter().all(|value| value.value.len() == 512 * 1024));
+    assert!(recv_callback_timeout(&small, "small get reply").is_ok());
+    assert!(recv_callback_timeout(&keys, "keys reply").is_ok());
+    finish_transaction(&ctx, db_name, reads);
+
+    let mut log = ROUTES.lock().unwrap().log.remove(&connection_id).unwrap();
+    log.retain(|(serial, _)| *serial != 0);
+    let mut expected: Vec<_> = (0..9).map(|request| (txn.serial, Some(request))).collect();
+    expected.push((txn.serial, None));
+    expected.extend([
+        (reads.serial, Some(0)),
+        (reads.serial, Some(1)),
+        (reads.serial, Some(2)),
+        (reads.serial, None),
+    ]);
+    assert_eq!(log, expected);
+
+    close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+/// A request and the commit of a transaction that the backend doesn't know, such as one created
+/// while the database didn't exist, fail on its connection's result channel instead of waiting
+/// forever.
+fn test_indexeddb_requests_and_commit_of_an_unknown_transaction_fail() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-unknown-transaction";
+    let connection_id = open_database_with_two_stores(&ctx, db_name);
+
+    let unknown = IndexedDBTxnId {
+        connection: connection_id,
+        serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
+    };
+    let get = get_item(&ctx, db_name, A, unknown, IndexedDBKeyType::Number(1.0));
+    assert_eq!(
+        recv_callback_timeout(&get, "unknown transaction reply"),
+        Err(BackendError::DbNotFound)
+    );
+    let commit = commit_transaction(&ctx, db_name, unknown);
+    assert_eq!(
+        recv_callback_timeout(&commit, "unknown transaction commit reply"),
+        Err(BackendError::DbNotFound)
+    );
+
+    close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+/// Sends `()` on its sender when dropped.
+struct DropSignal(mpsc::Sender<()>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// The backend keeps a connection's result channel while the connection is open or one of its
+/// transactions hasn't finished, and drops it then, which removes its route in multiprocess
+/// mode and releases what script's callback holds.
+fn test_indexeddb_connection_channel_goes_away_after_close_and_its_transactions() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-channel-teardown";
+    open_database_with_two_stores(&ctx, db_name);
+
+    let (dropped_sender, dropped) = mpsc::channel();
+    let receiver = open_database_with(&ctx, db_name, None, DropSignal(dropped_sender));
+    let connection_id = match recv_callback_timeout(&receiver, "second open") {
+        ConnectionMsg::Connection { id, .. } => id,
+        other => panic!("unexpected open message: {other:?}"),
+    };
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![A],
+    );
+    close_database(&ctx, connection_id, db_name);
+    let put = put_item(
+        &ctx,
+        db_name,
+        A,
+        txn,
+        IndexedDBKeyType::Number(1.0),
+        b"after close".to_vec(),
+    );
+    assert!(
+        recv_callback_timeout(&put, "put after close").is_ok(),
+        "A transaction of a closed connection still gets its results"
+    );
+    let commit = commit_transaction(&ctx, db_name, txn);
+    recv_callback_timeout(&commit, "commit after close").unwrap();
+    assert!(
+        dropped.recv_timeout(Duration::from_millis(200)).is_err(),
+        "The channel stays while a transaction of the connection is live"
+    );
+
+    finish_transaction(&ctx, db_name, txn);
+    dropped
+        .recv_timeout(TIMEOUT)
+        .expect("The backend drops the channel of a closed connection without transactions");
+    ctx.shutdown();
+}
+
+/// A transaction created on a connection that the backend dropped, as script could do with the
+/// connection of an aborted upgrade, isn't registered: it holds back no other transaction, and
+/// its request and commit fail with no one to tell. Registered without a result channel, its
+/// readwrite SQL transaction started and was never finished, which blocked every later writer
+/// and every reader of its scope.
+fn test_indexeddb_transaction_of_a_dropped_connection_holds_back_no_one() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-dropped-connection";
+    let first = open_database_with_two_stores(&ctx, db_name);
+    close_database(&ctx, first, db_name);
+
+    let upgrade = open_database(&ctx, db_name, Some(2));
+    let (dropped, transaction) = match recv_callback_timeout(&upgrade, "upgrade") {
+        ConnectionMsg::Upgrade {
+            id, transaction, ..
+        } => (id, transaction),
+        other => panic!("unexpected upgrade message: {other:?}"),
+    };
+    abort_upgrade_transaction(&ctx, db_name, transaction);
+    assert!(matches!(
+        recv_callback_timeout(&upgrade, "aborted open reply"),
+        ConnectionMsg::AbortError { .. }
+    ));
+
+    let stale = create_transaction(&ctx, db_name, dropped, IndexedDBTxnMode::Readwrite, vec![A]);
+    let stale_put = put_item(
+        &ctx,
+        db_name,
+        A,
+        stale,
+        IndexedDBKeyType::Number(2.0),
+        b"stale".to_vec(),
+    );
+    let stale_commit = commit_transaction(&ctx, db_name, stale);
+
+    let fresh = match recv_callback_timeout(&open_database(&ctx, db_name, None), "fresh open") {
+        ConnectionMsg::Connection { id, version, .. } => {
+            assert_eq!(version, 1);
+            id
+        },
+        other => panic!("unexpected open message: {other:?}"),
+    };
+    put_and_commit(&ctx, db_name, fresh, A);
+    assert_eq!(
+        get_item_in_new_readonly_transaction(
+            &ctx,
+            db_name,
+            fresh,
+            A,
+            IndexedDBKeyType::Number(2.0)
+        ),
+        None
+    );
+    assert!(stale_put.recv_timeout(Duration::from_millis(200)).is_err());
+    assert!(stale_commit.try_recv().is_err());
+
+    close_database(&ctx, fresh, db_name);
+    ctx.shutdown();
+}
+
+/// Script sends a request only if its transaction's mode and scope allow it, and a schema
+/// operation only in an upgrade transaction. The backend checks too: a request that breaks
+/// these rules fails and aborts its transaction, whose later requests and commit fail.
+fn test_indexeddb_requests_outside_the_mode_or_scope_fail_the_transaction() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-mode-and-scope";
+    let connection_id = open_database_with_two_stores(&ctx, db_name);
+
+    let reads = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readonly,
+        vec![A],
+    );
+    let put = put_item(
+        &ctx,
+        db_name,
+        A,
+        reads,
+        IndexedDBKeyType::Number(1.0),
+        b"readonly".to_vec(),
+    );
+    assert!(matches!(
+        recv_callback_timeout(&put, "put in a readonly transaction"),
+        Err(BackendError::DbErr(_))
+    ));
+    let get = get_item(&ctx, db_name, A, reads, IndexedDBKeyType::Number(1.0));
+    assert_eq!(
+        recv_callback_timeout(&get, "get in the aborted transaction"),
+        Err(BackendError::Abort)
+    );
+    let commit = commit_transaction(&ctx, db_name, reads);
+    assert_eq!(
+        recv_callback_timeout(&commit, "commit of the aborted transaction"),
+        Err(BackendError::Abort)
+    );
+    finish_transaction(&ctx, db_name, reads);
+
+    let writes = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![A],
+    );
+    let put = put_item(
+        &ctx,
+        db_name,
+        B,
+        writes,
+        IndexedDBKeyType::Number(1.0),
+        b"out of scope".to_vec(),
+    );
+    assert!(matches!(
+        recv_callback_timeout(&put, "put outside the scope"),
+        Err(BackendError::DbErr(_))
+    ));
+    finish_transaction(&ctx, db_name, writes);
+
+    let writes = create_transaction(
+        &ctx,
+        db_name,
+        connection_id,
+        IndexedDBTxnMode::Readwrite,
+        vec![A],
+    );
+    let create = create_object_store(&ctx, db_name, B + 1, "c", writes, None, false);
+    assert!(matches!(
+        recv_callback_timeout(&create, "schema operation outside an upgrade"),
+        BackendError::DbErr(_)
+    ));
+    finish_transaction(&ctx, db_name, writes);
+
+    for store in [A, B] {
+        assert_eq!(
+            get_item_in_new_readonly_transaction(
+                &ctx,
+                db_name,
+                connection_id,
+                store,
+                IndexedDBKeyType::Number(1.0)
+            ),
+            None
+        );
+    }
+    put_and_commit(&ctx, db_name, connection_id, B);
+    close_database(&ctx, connection_id, db_name);
+    let (_, stores) = committed_metadata(&ctx, db_name);
+    assert_eq!(names(&stores), vec!["a", "b"]);
+    ctx.shutdown();
+}
+
+/// Waits until the result channel of `connection` has carried `count` open request messages
+/// and versionchange events, and returns them.
+fn wait_for_events(connection: Uuid, count: usize) -> Vec<String> {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        let events = ROUTES
+            .lock()
+            .unwrap()
+            .events
+            .get(&connection)
+            .cloned()
+            .unwrap_or_default();
+        if events.len() >= count {
+            return events;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Only {events:?} arrived on the result channel"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Of two opens sent back to back, the first succeeds without an upgrade, and the second makes
+/// the backend fire versionchange at the first's connection right after. Both go on the first
+/// request's result channel, so the success, which creates the connection in script, comes
+/// first; on two channels, the event could overtake it under multiprocess and be lost.
+fn test_indexeddb_versionchange_follows_the_open_result_on_one_channel() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-versionchange-order";
+    let first = open_database_with_two_stores(&ctx, db_name);
+    close_database(&ctx, first, db_name);
+
+    let opened = open_database(&ctx, db_name, None);
+    let upgrade = open_database(&ctx, db_name, Some(2));
+    let connection_id = match recv_callback_timeout(&opened, "first open") {
+        ConnectionMsg::Connection { id, .. } => id,
+        other => panic!("unexpected open message: {other:?}"),
+    };
+    let events = wait_for_events(connection_id, 2);
+    assert!(events[0].starts_with("Connection {"), "{events:?}");
+    assert!(
+        events[1].starts_with("VersionChange { old_version: 1, new_version: 2 }"),
+        "{events:?}"
+    );
+
+    close_database(&ctx, connection_id, db_name);
+    let transaction = match recv_callback_timeout(&upgrade, "upgrade") {
+        ConnectionMsg::Upgrade { transaction, .. } => transaction,
+        other => panic!("unexpected upgrade message: {other:?}"),
+    };
+    commit_upgrade_transaction(&ctx, db_name, transaction);
+    let upgraded = match recv_callback_timeout(&upgrade, "upgraded connection") {
+        ConnectionMsg::Connection { id, version, .. } => {
+            assert_eq!(version, 2);
+            id
+        },
+        other => panic!("unexpected upgrade message: {other:?}"),
+    };
     close_database(&ctx, upgraded, db_name);
     ctx.shutdown();
 }

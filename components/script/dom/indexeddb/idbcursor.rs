@@ -11,12 +11,11 @@ use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, NullValue, UndefinedValue};
 use js::rust::{HandleValue, MutableHandleValue};
-use profile_traits::generic_callback::GenericCallback;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use storage_traits::indexeddb::{
-    AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, BackendResult,
-    IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
+    AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, IndexedDBKeyRange,
+    IndexedDBKeyType, IndexedDBRecord,
 };
 
 use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::{
@@ -219,7 +218,6 @@ impl IDBCursor {
     /// records, so only those are read.
     pub(crate) fn iterate_operation(
         &self,
-        callback: GenericCallback<BackendResult<Vec<IndexedDBRecord>>>,
         key: Option<&IndexedDBKeyType>,
         count: u32,
     ) -> AsyncOperation {
@@ -253,7 +251,6 @@ impl IDBCursor {
             },
         };
         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
-            callback,
             key_range,
             count,
             reverse,
@@ -382,7 +379,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         IDBRequest::execute_async(
             cx,
             &self.effective_object_store(),
-            |callback| self.iterate_operation(callback, None, count),
+            self.iterate_operation(None, count),
             Some(request),
             Some(iteration_param),
         )?;
@@ -471,7 +468,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         IDBRequest::execute_async(
             cx,
             &self.effective_object_store(),
-            |callback| self.iterate_operation(callback, operation_key.as_ref(), 1),
+            self.iterate_operation(operation_key.as_ref(), 1),
             Some(request),
             Some(iteration_param),
         )?;
@@ -612,7 +609,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         IDBRequest::execute_async(
             cx,
             &self.effective_object_store(),
-            |callback| self.iterate_operation(callback, Some(&operation_key), 1),
+            self.iterate_operation(Some(&operation_key), 1),
             Some(request),
             Some(iteration_param),
         )?;
@@ -705,14 +702,11 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         IDBRequest::execute_async(
             cx,
             &effective_object_store,
-            |callback| {
-                AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
-                    callback,
-                    key: self.effective_key(),
-                    value: serialized_value,
-                    should_overwrite: true,
-                })
-            },
+            AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
+                key: self.effective_key(),
+                value: serialized_value,
+                should_overwrite: true,
+            }),
             None,
             None,
         )
@@ -760,12 +754,9 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         IDBRequest::execute_async(
             cx,
             &effective_object_store,
-            |callback| {
-                AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
-                    callback,
-                    key_range: IndexedDBKeyRange::only(effective_key),
-                })
-            },
+            AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
+                key_range: IndexedDBKeyRange::only(effective_key),
+            }),
             None,
             None,
         )

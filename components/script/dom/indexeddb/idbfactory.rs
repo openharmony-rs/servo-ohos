@@ -9,15 +9,13 @@ use js::jsval::UndefinedValue;
 use js::rust::HandleValue;
 use profile_traits::generic_callback::GenericCallback;
 use script_bindings::cell::DomRefCell;
-use script_bindings::inheritance::Castable;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::generic_channel::GenericSend;
 use servo_url::origin::ImmutableOrigin;
 use storage_traits::indexeddb::{
-    BackendResult, ConnectionMsg, DatabaseInfo, IndexedDBThreadMsg, IndexedDBTxnId,
-    StorageBottleSource, SyncOperation,
+    BackendResult, ConnectionEvent, DatabaseInfo, IndexedDBThreadMsg, StorageBottleSource,
+    SyncOperation,
 };
-use stylo_atoms::Atom;
 use uuid::Uuid;
 
 use crate::dom::RootedPromise;
@@ -30,7 +28,6 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::HashMapTracedValues;
-use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbopendbrequest::IDBOpenDBRequest;
 use crate::dom::indexeddb::key::{convert_value_to_key, map_backend_error_to_dom_error};
@@ -54,9 +51,6 @@ pub struct IDBFactory {
     /// <https://www.w3.org/TR/IndexedDB-3/#transaction>
     /// Active transactions associated with this factory's global.
     indexeddb_transactions: DomRefCell<HashMapTracedValues<DBName, Vec<Dom<IDBTransaction>>>>,
-
-    #[no_trace]
-    callback: DomRefCell<Option<GenericCallback<ConnectionMsg>>>,
 }
 
 impl IDBFactory {
@@ -65,7 +59,6 @@ impl IDBFactory {
             reflector_: Reflector::new(),
             connections: Default::default(),
             indexeddb_transactions: Default::default(),
-            callback: Default::default(),
         }
     }
 
@@ -157,24 +150,6 @@ impl IDBFactory {
         true
     }
 
-    pub(crate) fn maybe_commit_txn(&self, cx: &mut JSContext, db_name: &str, txn: IndexedDBTxnId) {
-        let key = DBName(db_name.to_string());
-        let snapshot: Vec<DomRoot<IDBTransaction>> = {
-            let map = self.indexeddb_transactions.borrow();
-            let Some(bucket) = map.get(&key) else {
-                return;
-            };
-            bucket.iter().map(|t| DomRoot::from_ref(&**t)).collect()
-        };
-
-        for transaction in snapshot {
-            if transaction.id() == txn {
-                transaction.maybe_commit(cx);
-                break;
-            }
-        }
-    }
-
     /// <https://w3c.github.io/IndexedDB/#dom-idbrequest-transaction>
     /// Clear IDBOpenDBRequest.transaction once the upgrade transaction is finished.
     pub(crate) fn clear_open_request_transaction_for_txn(&self, transaction: &IDBTransaction) {
@@ -201,253 +176,6 @@ impl IDBFactory {
         reflect_dom_object(cx, Box::new(IDBFactory::new_inherited()), global)
     }
 
-    /// Setup the callback to the backend service, if this hasn't been done already.
-    fn get_or_setup_callback(&self) -> GenericCallback<ConnectionMsg> {
-        if let Some(cb) = self.callback.borrow().as_ref() {
-            return cb.clone();
-        }
-
-        let global = self.global();
-        let response_listener = Trusted::new(self);
-
-        let task_source = global
-            .task_manager()
-            .database_access_task_source()
-            .to_sendable();
-        let callback = GenericCallback::new(move |message| {
-            let response_listener = response_listener.clone();
-            let response = match message {
-                Ok(inner) => inner,
-                Err(err) => return error!("Error in IndexedDB factory callback {:?}.", err),
-            };
-            // Step 5.3: Queue a database task to run these steps:
-            task_source.queue(task!(set_request_result_to_database: move |cx| {
-                let factory = response_listener.root();
-                factory.handle_connection_message(cx, response)
-            }));
-        })
-        .expect("Could not create open database callback");
-
-        *self.callback.borrow_mut() = Some(callback.clone());
-
-        callback
-    }
-
-    fn get_request(&self, name: String, request_id: &Uuid) -> Option<DomRoot<IDBOpenDBRequest>> {
-        let name = DBName(name);
-        let mut pending = self.connections.borrow_mut();
-        let Some(entry) = pending.get_mut(&name) else {
-            debug_assert!(false, "There should be a pending connection for {:?}", name);
-            return None;
-        };
-        let Some(request) = entry.get_mut(request_id) else {
-            debug_assert!(
-                false,
-                "There should be a pending connection for {:?}",
-                request_id
-            );
-            return None;
-        };
-        Some(request.as_rooted())
-    }
-
-    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
-    /// The steps that continue on the script-thread.
-    /// This covers interacting with the current open request,
-    /// as well as with other open connections preventing the request from making progress.
-    fn handle_connection_message(&self, cx: &mut JSContext, response: ConnectionMsg) {
-        match response {
-            ConnectionMsg::Connection {
-                name,
-                id,
-                version,
-                upgraded,
-                object_stores,
-            } => {
-                let Some(request) = self.get_request(name.clone(), &id) else {
-                    return debug_assert!(
-                        false,
-                        "There should be a request to handle ConnectionMsg::Connection."
-                    );
-                };
-
-                // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps
-                // Step 3. Set transaction’s scope to connection’s object store set.
-                let connection = request.get_or_init_connection(
-                    cx,
-                    &self.global(),
-                    name,
-                    version,
-                    object_stores,
-                    upgraded,
-                );
-
-                // Step 2.2: Otherwise,
-                // set request’s result to result,
-                // set request’s done flag,
-                // and fire an event named success at request.
-                request.dispatch_success(cx, &connection);
-            },
-            ConnectionMsg::Upgrade {
-                name,
-                id,
-                version,
-                old_version,
-                transaction,
-                object_stores,
-            } => {
-                let global = self.global();
-
-                let Some(request) = self.get_request(name.clone(), &id) else {
-                    return debug_assert!(
-                        false,
-                        "There should be a request to handle ConnectionMsg::Upgrade."
-                    );
-                };
-
-                let connection = request.get_or_init_connection(
-                    cx,
-                    &global,
-                    name,
-                    version,
-                    object_stores,
-                    false,
-                );
-                // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps
-                // Step 3. Set transaction’s scope to connection’s object store set.
-                request.upgrade_db_version(cx, &connection, old_version, version, transaction);
-            },
-            ConnectionMsg::VersionError { name, id } => {
-                // Step 2.1 If result is an error, see dispatch_error().
-                self.dispatch_error(cx, name, id, Error::Version(None));
-            },
-            ConnectionMsg::AbortError { name, id } => {
-                // Step 2.1 If result is an error, see dispatch_error().
-                self.dispatch_error(cx, name, id, Error::Abort(None));
-            },
-            ConnectionMsg::DatabaseError { name, id, error } => {
-                // Step 2.1 If result is an error, see dispatch_error().
-                self.dispatch_error(cx, name, id, map_backend_error_to_dom_error(error));
-            },
-            ConnectionMsg::VersionChange {
-                name,
-                id,
-                version,
-                old_version,
-            } => {
-                let global = self.global();
-                let Some(request) = self.get_request(name.clone(), &id) else {
-                    return debug_assert!(
-                        false,
-                        "There should be a request to handle ConnectionMsg::VersionChange."
-                    );
-                };
-                let connection = request.connection();
-
-                // Step 10.2: fire a version change event named versionchange at entry with db’s version and version.
-                connection.dispatch_versionchange(cx, old_version, Some(version));
-
-                // Step 10.3: Wait for all of the events to be fired.
-                // Note: backend is at this step; sending a message to continue algo there.
-                let operation = SyncOperation::NotifyEndOfVersionChange {
-                    id,
-                    name,
-                    old_version,
-                    origin: global.origin().immutable().clone(),
-                };
-                if global
-                    .storage_threads()
-                    .send(IndexedDBThreadMsg::Sync(operation))
-                    .is_err()
-                {
-                    error!("Failed to send SyncOperation::NotifyEndOfVersionChange.");
-                }
-            },
-            ConnectionMsg::Blocked {
-                name,
-                id,
-                version,
-                old_version,
-            } => {
-                let Some(request) = self.get_request(name, &id) else {
-                    return debug_assert!(
-                        false,
-                        "There should be a request to handle ConnectionMsg::VersionChange."
-                    );
-                };
-
-                // Step 10.4: fire a version change event named blocked at request with db’s version and version.
-                request.dispatch_blocked(cx, old_version, Some(version));
-            },
-            ConnectionMsg::TxnMaybeCommit { db_name, txn } => {
-                let factory = Trusted::new(self);
-                self.global()
-                    .task_manager()
-                    .dom_manipulation_task_source()
-                    .queue(task!(indexeddb_maybe_commit_txn: move |cx| {
-                        let factory = factory.root();
-                        factory.maybe_commit_txn(cx, &db_name, txn);
-                    }));
-            },
-        }
-    }
-
-    /// <https://w3c.github.io/IndexedDB/#dom-idbfactory-open>
-    /// The error dispatching part from within a task part.
-    fn dispatch_error(
-        &self,
-        cx: &mut JSContext,
-        name: String,
-        request_id: Uuid,
-        dom_exception: Error,
-    ) {
-        let name = DBName(name);
-
-        // Step 5.3.1: If result is an error, then:
-        let request = {
-            let mut pending = self.connections.safe_borrow_mut(cx.no_gc());
-            let Some(entry) = pending.get_mut(&name) else {
-                return debug_assert!(false, "There should be a pending connection for {:?}", name);
-            };
-            let Some(request) = entry.get_mut(&request_id) else {
-                return debug_assert!(
-                    false,
-                    "There should be a pending connection for {:?}",
-                    request_id
-                );
-            };
-            request.as_rooted()
-        };
-        let global = request.global();
-
-        // Step 5.3.1.1: Set request’s result to undefined.
-        request.set_result(HandleValue::undefined());
-
-        // Step 5.3.1.2: Set request’s error to result.
-        request.set_error(cx, Some(dom_exception));
-        // Open requests expose a transaction only while `upgradeneeded` is being dispatched;
-        // otherwise `IDBOpenDBRequest.transaction` must be null.
-        // https://w3c.github.io/IndexedDB/#dom-idbrequest-transaction
-        // https://w3c.github.io/IndexedDB/#open-a-database-connection
-        // Open requests that have completed with an error must not retain an upgrade transaction.
-        request.clear_transaction();
-
-        // Step 5.3.1.3: Set request’s done flag to true.
-        request.set_ready_state_done();
-
-        // Step 5.3.1.4: Fire an event named error at request
-        // with its bubbles
-        // and cancelable attributes initialized to true.
-        let event = Event::new(
-            cx,
-            &global,
-            Atom::from("error"),
-            EventBubbles::Bubbles,
-            EventCancelable::Cancelable,
-        );
-        event.fire(cx, request.upcast());
-    }
-
     /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
     fn open_database(
         &self,
@@ -465,18 +193,18 @@ impl IDBFactory {
             outer.insert(request_id, Dom::from_ref(request));
         }
 
-        let callback = self.get_or_setup_callback();
+        let results = Self::connection_result_channel(&global, request);
 
         // Step 5: Run these steps in parallel:
         // Step 5.1: Let result be the result of opening a database connection,
         // with storageKey, name, version if given and undefined otherwise, and request.
         let open_operation = SyncOperation::OpenDatabase(
-            callback,
             storage_key,
             String::from(name),
             version,
             request.get_id(),
             Self::storage_bottle_source(&global),
+            results,
         );
 
         // Note: algo continues in parallel.
@@ -488,6 +216,34 @@ impl IDBFactory {
             return Err(());
         }
         Ok(())
+    }
+
+    /// The result channel of `request` and of the connection it opens. The backend keeps it
+    /// while the request is pending, and while the connection or one of its transactions is
+    /// alive. Script keeps no sender, so the channel and its route go away once the request
+    /// failed, or the connection is closed and its transactions have finished.
+    fn connection_result_channel(
+        global: &GlobalScope,
+        request: &IDBOpenDBRequest,
+    ) -> GenericCallback<ConnectionEvent> {
+        let request = Trusted::new(request);
+        let task_source = global
+            .task_manager()
+            .database_access_task_source()
+            .to_sendable();
+        GenericCallback::new(move |message| {
+            let event = match message {
+                Ok(event) => event,
+                Err(err) => return error!("Error in IndexedDB connection channel {:?}.", err),
+            };
+            let request = request.clone();
+            // https://w3c.github.io/IndexedDB/#dom-idbfactory-open
+            // Step 5.3: Queue a database task to run these steps:
+            task_source.queue(task!(handle_indexeddb_connection_event: move |cx| {
+                request.root().handle_connection_event(cx, event);
+            }));
+        })
+        .expect("Could not create the connection's result channel")
     }
 
     pub(crate) fn abort_pending_upgrades_and_close_databases(&self) {

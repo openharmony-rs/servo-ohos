@@ -172,7 +172,7 @@ impl IDBIndex {
         IDBRequest::execute_async(
             cx,
             &self.object_store,
-            |callback| cursor.iterate_operation(callback, None, 1),
+            cursor.iterate_operation(None, 1),
             None,
             Some(iteration_param),
         )

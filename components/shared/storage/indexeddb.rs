@@ -312,7 +312,7 @@ pub struct IndexedDBValue {
 }
 
 /// <https://w3c.github.io/IndexedDB/#record-snapshot>
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub struct IndexedDBRecord {
     pub key: IndexedDBKeyType,
     pub primary_key: IndexedDBKeyType,
@@ -363,50 +363,31 @@ pub enum PutItemResult {
 pub enum AsyncReadOnlyOperation {
     /// Gets the value associated with the given key in the associated idb data
     GetKey {
-        callback: GenericCallback<BackendResult<Option<IndexedDBKeyType>>>,
         key_range: IndexedDBKeyRange,
     },
     GetItem {
-        callback: GenericCallback<BackendResult<Option<IndexedDBValue>>>,
         key_range: IndexedDBKeyRange,
     },
 
     GetAllKeys {
-        callback: GenericCallback<BackendResult<Vec<IndexedDBKeyType>>>,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
     },
     GetAllItems {
-        callback: GenericCallback<BackendResult<Vec<IndexedDBValue>>>,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
     },
 
     Count {
-        callback: GenericCallback<BackendResult<u64>>,
         key_range: IndexedDBKeyRange,
     },
     /// Gets the records in `key_range` in ascending key order: the first `count` of them, or the
     /// last `count` if `reverse` is set, or all of them if `count` is `None`.
     Iterate {
-        callback: GenericCallback<BackendResult<Vec<IndexedDBRecord>>>,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
         reverse: bool,
     },
-}
-
-impl AsyncReadOnlyOperation {
-    fn notify_error(&self, error: BackendError) {
-        let _ = match self {
-            Self::GetKey { callback, .. } => callback.send(Err(error)),
-            Self::GetItem { callback, .. } => callback.send(Err(error)),
-            Self::GetAllKeys { callback, .. } => callback.send(Err(error)),
-            Self::GetAllItems { callback, .. } => callback.send(Err(error)),
-            Self::Count { callback, .. } => callback.send(Err(error)),
-            Self::Iterate { callback, .. } => callback.send(Err(error)),
-        };
-    }
 }
 
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -414,55 +395,34 @@ pub enum AsyncReadWriteOperation {
     /// Sets the value of the given key in the associated idb data, or of a key from the store's
     /// key generator if `key` is `None`.
     PutItem {
-        callback: GenericCallback<BackendResult<PutItemResult>>,
         key: Option<IndexedDBKeyType>,
         value: Vec<u8>,
         should_overwrite: bool,
     },
 
     /// Removes the key/value pair for the given key in the associated idb data
-    RemoveItem {
-        callback: GenericCallback<BackendResult<()>>,
-        key_range: IndexedDBKeyRange,
-    },
+    RemoveItem { key_range: IndexedDBKeyRange },
     /// Clears all key/value pairs in the associated idb data
-    Clear(GenericCallback<BackendResult<()>>),
-}
-
-impl AsyncReadWriteOperation {
-    fn notify_error(&self, error: BackendError) {
-        let _ = match self {
-            Self::PutItem { callback, .. } => callback.send(Err(error)),
-            Self::RemoveItem { callback, .. } => callback.send(Err(error)),
-            Self::Clear(callback) => callback.send(Err(error)),
-        };
-    }
+    Clear,
 }
 
 /// A change to the object stores and indexes in an upgrade transaction, of the object store that
-/// [`IndexedDBThreadMsg::AsyncSchemaOperation`] names. Script doesn't wait for it: the callback
-/// is only called if the operation failed, which fails the transaction.
+/// [`IndexedDBThreadMsg::AsyncSchemaOperation`] names. Script doesn't wait for it: only a failure
+/// is reported, as [`TransactionEvent::SchemaChangeFailed`], and it fails the transaction.
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum AsyncSchemaOperation {
     /// Creates the object store, with its id from script.
     CreateObjectStore {
-        callback: GenericCallback<BackendError>,
         name: String,
         key_path: Option<KeyPath>,
         auto_increment: bool,
     },
     /// Deletes the object store and its records and indexes.
-    DeleteObjectStore {
-        callback: GenericCallback<BackendError>,
-    },
+    DeleteObjectStore,
     /// Renames the object store, which keeps its records and indexes.
-    RenameObjectStore {
-        callback: GenericCallback<BackendError>,
-        new_name: String,
-    },
+    RenameObjectStore { new_name: String },
     /// Creates an index of the object store, with its id from script.
     CreateIndex {
-        callback: GenericCallback<BackendError>,
         index_id: IndexedDBIndexId,
         name: String,
         key_path: KeyPath,
@@ -471,29 +431,11 @@ pub enum AsyncSchemaOperation {
     },
     /// Renames an index of the object store.
     RenameIndex {
-        callback: GenericCallback<BackendError>,
         index_id: IndexedDBIndexId,
         new_name: String,
     },
     /// Deletes an index of the object store.
-    DeleteIndex {
-        callback: GenericCallback<BackendError>,
-        index_id: IndexedDBIndexId,
-    },
-}
-
-impl AsyncSchemaOperation {
-    pub fn notify_error(&self, error: BackendError) {
-        let callback = match self {
-            Self::CreateObjectStore { callback, .. } |
-            Self::DeleteObjectStore { callback } |
-            Self::RenameObjectStore { callback, .. } |
-            Self::CreateIndex { callback, .. } |
-            Self::RenameIndex { callback, .. } |
-            Self::DeleteIndex { callback, .. } => callback,
-        };
-        let _ = callback.send(error);
-    }
+    DeleteIndex { index_id: IndexedDBIndexId },
 }
 
 /// Operations that are not executed instantly, but rather added to a
@@ -505,14 +447,59 @@ pub enum AsyncOperation {
     Schema(AsyncSchemaOperation),
 }
 
-impl AsyncOperation {
-    pub fn notify_error(&self, error: BackendError) {
-        match self {
-            Self::ReadOnly(operation) => operation.notify_error(error),
-            Self::ReadWrite(operation) => operation.notify_error(error),
-            Self::Schema(operation) => operation.notify_error(error),
-        }
-    }
+/// The result of a request that the backend ran, by kind of operation.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum RequestOutput {
+    /// Of [`AsyncReadOnlyOperation::GetKey`].
+    Key(Option<IndexedDBKeyType>),
+    /// Of [`AsyncReadOnlyOperation::GetItem`].
+    Value(Option<IndexedDBValue>),
+    /// Of [`AsyncReadOnlyOperation::GetAllKeys`].
+    Keys(Vec<IndexedDBKeyType>),
+    /// Of [`AsyncReadOnlyOperation::GetAllItems`].
+    Values(Vec<IndexedDBValue>),
+    /// Of [`AsyncReadOnlyOperation::Count`].
+    Count(u64),
+    /// Of [`AsyncReadOnlyOperation::Iterate`].
+    Records(Vec<IndexedDBRecord>),
+    /// Of [`AsyncReadWriteOperation::PutItem`].
+    Put(PutItemResult),
+    /// Of [`AsyncReadWriteOperation::RemoveItem`] and [`AsyncReadWriteOperation::Clear`].
+    Done,
+}
+
+/// What the backend reports about a transaction to its connection.
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum TransactionEvent {
+    /// The result of the request `request_id` of the transaction.
+    Request {
+        request_id: u64,
+        result: BackendResult<RequestOutput>,
+    },
+    /// A schema operation failed, which fails the transaction.
+    SchemaChangeFailed(BackendError),
+    /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>: the changes of the transaction
+    /// were written, or writing them failed and they were rolled back.
+    Committed(BackendResult<()>),
+}
+
+/// A message on the result channel of a connection, which script creates for each open request
+/// and which the backend uses for everything it reports about the open request and, once it
+/// opened, the connection. The backend sends the messages in the order the work ran, and the
+/// channel keeps that order, so the results of a transaction's requests reach script in request
+/// order, and the open request's outcome comes before the connection's events.
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum ConnectionEvent {
+    /// About the open request: its outcome, or that it is blocked.
+    Open(ConnectionMsg),
+    /// Something happened to the transaction of the connection with the serial number `serial`.
+    Transaction {
+        serial: u64,
+        event: TransactionEvent,
+    },
+    /// <https://w3c.github.io/IndexedDB/#eventdef-idbdatabase-versionchange>: another
+    /// connection waits for this one to close, to open the database with `new_version`.
+    VersionChange { old_version: u64, new_version: u64 },
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -543,15 +530,6 @@ pub enum ConnectionMsg {
         /// is also the scope of the upgrade transaction.
         object_stores: Vec<IndexedDBObjectStore>,
     },
-    /// A `versionchange` event should be fired for a connection.
-    VersionChange {
-        /// The id of the connection.
-        id: Uuid,
-        /// The name of the connection.
-        name: String,
-        version: u64,
-        old_version: u64,
-    },
     /// A `blocked` event should be fired for a connection.
     Blocked {
         name: String,
@@ -565,19 +543,6 @@ pub enum ConnectionMsg {
         id: Uuid,
         error: BackendError,
     },
-    /// Ask script to recheck whether a transaction can commit now.
-    TxnMaybeCommit {
-        db_name: String,
-        txn: IndexedDBTxnId,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
-pub struct TxnCompleteMsg {
-    pub origin: ImmutableOrigin,
-    pub db_name: String,
-    pub txn: IndexedDBTxnId,
-    pub result: BackendResult<()>,
 }
 
 /// What the IndexedDB manager needs to obtain a global's local storage bottle map
@@ -602,39 +567,28 @@ pub enum SyncOperation {
         GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
         ImmutableOrigin,
     ),
-    /// Commits changes of a transaction to the database
-    Commit(
-        GenericCallback<TxnCompleteMsg>,
-        ImmutableOrigin,
-        String, // Database
-        IndexedDBTxnId,
-    ),
-    /// Aborts a transaction in the backend
-    Abort(
-        GenericCallback<TxnCompleteMsg>,
-        ImmutableOrigin,
-        String, // Database
-        IndexedDBTxnId,
-    ),
+    /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>: commits the transaction once its
+    /// requests have run, and reports [`TransactionEvent::Committed`]. Script sends it once the
+    /// results of all the transaction's requests have been delivered.
+    Commit {
+        origin: ImmutableOrigin,
+        db_name: String,
+        txn: IndexedDBTxnId,
+    },
+    /// <https://w3c.github.io/IndexedDB/#abort-a-transaction>: rolls the transaction back, after
+    /// the work handed over before. Nothing is reported: script has aborted the transaction
+    /// already, and results that arrive after this are discarded.
+    Abort {
+        origin: ImmutableOrigin,
+        db_name: String,
+        txn: IndexedDBTxnId,
+    },
     /// Upgrade transaction finished after its event was fired in script.
     UpgradeTransactionFinished {
         origin: ImmutableOrigin,
         db_name: String,
         txn: IndexedDBTxnId,
         committed: bool,
-    },
-    /// <https://w3c.github.io/IndexedDB/#transaction-lifetime
-    /// Step 3:
-    /// When each request associated with a transaction is processed,
-    /// a success or error event will be fired. While the event is
-    /// being dispatched, the transaction state is set to active, allowing
-    /// additional requests to be made against the transaction. Once the
-    /// event dispatch is complete, the transaction’s state is set to inactive again.
-    RequestHandled {
-        origin: ImmutableOrigin,
-        db_name: String,
-        txn: IndexedDBTxnId,
-        request_id: u64,
     },
     /// <https://w3c.github.io/IndexedDB/#dom-idbdatabase-transaction>: a transaction was created
     /// with the id script gave it. Transactions are created before each other in the order in
@@ -646,12 +600,6 @@ pub enum SyncOperation {
         txn: IndexedDBTxnId,
         mode: IndexedDBTxnMode,
         scope: Vec<IndexedDBObjectStoreId>,
-    },
-    /// Request script to recheck transaction commit eligibility.
-    TxnMaybeCommit {
-        origin: ImmutableOrigin,
-        db_name: String,
-        txn: IndexedDBTxnId,
     },
     TransactionFinished {
         origin: ImmutableOrigin,
@@ -666,8 +614,6 @@ pub enum SyncOperation {
     ),
 
     OpenDatabase(
-        // Callback for the result.
-        GenericCallback<ConnectionMsg>,
         // Origin of the request.
         ImmutableOrigin,
         // Name of the database.
@@ -678,6 +624,8 @@ pub enum SyncOperation {
         Uuid,
         // Where to obtain the storage proxy map.
         StorageBottleSource,
+        // The result channel of the open request and of the connection, if it opens.
+        GenericCallback<ConnectionEvent>,
     ),
 
     /// Deletes the database

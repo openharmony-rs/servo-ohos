@@ -27,13 +27,15 @@ use servo_base::threadpool::ThreadPool;
 use servo_url::origin::ImmutableOrigin;
 use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
 use storage_traits::indexeddb::{
-    AsyncOperation, BackendError, BackendResult, ConnectionMsg, DatabaseInfo, IndexedDBObjectStore,
-    IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode,
-    StorageBottleSource, SyncOperation, TxnCompleteMsg,
+    AsyncOperation, BackendError, BackendResult, ConnectionEvent, ConnectionMsg, DatabaseInfo,
+    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId,
+    IndexedDBTxnMode, StorageBottleSource, SyncOperation, TransactionEvent,
 };
 use uuid::Uuid;
 
-use crate::indexeddb::engines::{ActiveKvsEngine, KvsEngine, KvsOperation, KvsTransaction};
+use crate::indexeddb::engines::{
+    ActiveKvsEngine, KvsEngine, KvsOperation, KvsTransaction, TransactionResults,
+};
 #[cfg(feature = "sqlite-backend")]
 use crate::shared::is_sqlite_disk_full_error;
 
@@ -82,6 +84,8 @@ struct TxnInfo {
     live: bool,
     /// Whether the engine has been handed a batch of this transaction.
     started: bool,
+    /// The result channel of the transaction's connection.
+    results: GenericCallback<ConnectionEvent>,
 }
 
 #[derive(MallocSizeOf)]
@@ -98,10 +102,9 @@ struct IndexedDBEnvironment<E: KvsEngine> {
     queued_readonly_set: FxHashSet<IndexedDBTxnId>,
     running_readwrite: Option<IndexedDBTxnId>,
     running_readonly: HashSet<IndexedDBTxnId>,
-    handled_next_unhandled_request_id: FxHashMap<IndexedDBTxnId, u64>,
-    handled_pending: FxHashMap<IndexedDBTxnId, HashSet<u64>>,
-    pending_commit_callbacks: FxHashMap<IndexedDBTxnId, Vec<GenericCallback<TxnCompleteMsg>>>,
-    pending_abort_callbacks: FxHashMap<IndexedDBTxnId, Vec<GenericCallback<TxnCompleteMsg>>>,
+    /// Transactions that script asked to commit, which commit once they can start and all their
+    /// requests have been handed to the engine.
+    pending_commits: FxHashSet<IndexedDBTxnId>,
 }
 
 impl<E: KvsEngine> IndexedDBEnvironment<E> {
@@ -121,18 +124,17 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             queued_readonly_set: FxHashSet::default(),
             running_readwrite: None,
             running_readonly: HashSet::new(),
-            handled_next_unhandled_request_id: FxHashMap::default(),
-            handled_pending: FxHashMap::default(),
-            pending_commit_callbacks: FxHashMap::default(),
-            pending_abort_callbacks: FxHashMap::default(),
+            pending_commits: FxHashSet::default(),
         }
     }
 
+    /// Registers the transaction `txn`, whose results go to `results`.
     fn register_transaction(
         &mut self,
         txn: IndexedDBTxnId,
         mode: IndexedDBTxnMode,
         scope: Vec<IndexedDBObjectStoreId>,
+        results: GenericCallback<ConnectionEvent>,
     ) {
         if self.txn_info.contains_key(&txn) {
             return;
@@ -148,6 +150,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 scope: scope.into_iter().collect(),
                 live: true,
                 started: false,
+                results,
             },
         );
         self.transactions
@@ -156,6 +159,51 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 requests: VecDeque::new(),
                 mode,
             });
+    }
+
+    fn knows_transaction(&self, txn: IndexedDBTxnId) -> bool {
+        self.txn_info.contains_key(&txn)
+    }
+
+    /// Why `operation` can't run in `txn`, if it can't: DbNotFound for a transaction that isn't
+    /// registered, Abort for one that was aborted, and DbErr for an operation that its mode or
+    /// scope doesn't allow, which script never sends.
+    fn check_operation(
+        &self,
+        txn: IndexedDBTxnId,
+        operation: &KvsOperation,
+    ) -> Result<(), BackendError> {
+        let info = self.check_usable(txn)?;
+        let allowed = match (&info.mode, &operation.operation) {
+            (IndexedDBTxnMode::Versionchange, _) => true,
+            (_, AsyncOperation::Schema(_)) => false,
+            (IndexedDBTxnMode::Readonly, AsyncOperation::ReadWrite(_)) => false,
+            _ => info.scope.contains(&operation.store),
+        };
+        if !allowed {
+            return Err(BackendError::DbErr(format!(
+                "A {:?} transaction can't run this request on store {}",
+                info.mode, operation.store
+            )));
+        }
+        Ok(())
+    }
+
+    /// The scheduling state of `txn`, if it is registered and wasn't aborted.
+    fn check_usable(&self, txn: IndexedDBTxnId) -> Result<&TxnInfo, BackendError> {
+        let info = self.txn_info.get(&txn).ok_or(BackendError::DbNotFound)?;
+        if !self.transactions.contains_key(&txn) {
+            return Err(BackendError::Abort);
+        }
+        Ok(info)
+    }
+
+    /// Where the results of `txn` go.
+    fn results(&self, txn: IndexedDBTxnId) -> TransactionResults {
+        TransactionResults::new(
+            txn,
+            self.txn_info.get(&txn).map(|info| info.results.clone()),
+        )
     }
 
     fn scopes_overlap(a: &TxnInfo, b: &TxnInfo) -> bool {
@@ -237,10 +285,9 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
 
     fn queue_operation(
         &mut self,
-        store: IndexedDBObjectStoreId,
         serial_number: IndexedDBTxnId,
         mode: IndexedDBTxnMode,
-        operation: AsyncOperation,
+        operation: KvsOperation,
     ) {
         let mut enqueue_mode = None;
         match self.transactions.entry(serial_number) {
@@ -248,9 +295,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 let transaction = entry.get_mut();
                 let transaction_mode = transaction.mode.clone();
                 let was_empty = transaction.requests.is_empty();
-                transaction
-                    .requests
-                    .push_back(KvsOperation { operation, store });
+                transaction.requests.push_back(operation);
                 if was_empty {
                     // If the queue was empty and we just added work, we must enqueue the txn
                     // even if it is currently running a prior batch. The next batch will run
@@ -265,7 +310,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                         mode: mode.clone(),
                     })
                     .requests
-                    .push_back(KvsOperation { operation, store });
+                    .push_back(operation);
                 enqueue_mode = Some(mode);
             },
         };
@@ -393,6 +438,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
         self.engine.process_transaction(
             txn,
             KvsTransaction { mode, requests },
+            self.results(txn),
             Box::new(move || {
                 // Notify the manager thread when the engine finishes so it can:
                 // - clear running_readonly / running_readwrite
@@ -419,32 +465,8 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
         );
     }
 
-    fn mark_request_handled(&mut self, txn: IndexedDBTxnId, request_id: u64) {
-        let current = self
-            .handled_next_unhandled_request_id
-            .get(&txn)
-            .copied()
-            .unwrap_or(0);
-        if request_id == current {
-            let mut next = current + 1;
-            if let Some(pending) = self.handled_pending.get_mut(&txn) {
-                while pending.remove(&next) {
-                    next += 1;
-                }
-                if pending.is_empty() {
-                    self.handled_pending.remove(&txn);
-                }
-            }
-            self.handled_next_unhandled_request_id.insert(txn, next);
-        } else if request_id > current {
-            self.handled_pending
-                .entry(txn)
-                .or_default()
-                .insert(request_id);
-        }
-    }
-
-    fn can_notify_txn_maybe_commit(&self, txn: IndexedDBTxnId) -> bool {
+    /// Whether no request of `txn` waits to be handed to the engine or runs.
+    fn is_idle(&self, txn: IndexedDBTxnId) -> bool {
         if self.running_readwrite == Some(txn) || self.running_readonly.contains(&txn) {
             return false;
         }
@@ -459,34 +481,17 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
     }
 
     fn can_commit_now(&self, txn: IndexedDBTxnId) -> bool {
-        self.can_start_by_spec(txn) && self.can_notify_txn_maybe_commit(txn)
+        self.can_start_by_spec(txn) && self.is_idle(txn)
     }
 
-    fn queue_pending_commit_callback(
-        &mut self,
-        txn: IndexedDBTxnId,
-        callback: GenericCallback<TxnCompleteMsg>,
-    ) {
-        self.pending_commit_callbacks
-            .entry(txn)
-            .or_default()
-            .push(callback);
-    }
-
-    fn take_pending_commit_callbacks(
-        &mut self,
-        txn: IndexedDBTxnId,
-    ) -> Vec<GenericCallback<TxnCompleteMsg>> {
-        self.pending_commit_callbacks
-            .remove(&txn)
-            .unwrap_or_default()
-    }
-
-    fn maybe_commit_candidates(&self) -> Vec<IndexedDBTxnId> {
+    /// The transactions that script asked to commit and that can commit now, in the order they
+    /// were created.
+    fn commit_candidates(&self) -> Vec<IndexedDBTxnId> {
         let mut candidates: Vec<(IndexedDBTxnId, u64)> = self
-            .txn_info
+            .pending_commits
             .iter()
-            .filter_map(|(txn, info)| {
+            .filter_map(|txn| {
+                let info = self.txn_info.get(txn)?;
                 if !info.live || !self.can_commit_now(*txn) {
                     return None;
                 }
@@ -495,6 +500,14 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             .collect();
         candidates.sort_by_key(|(_, created_seq)| *created_seq);
         candidates.into_iter().map(|(txn, _)| txn).collect()
+    }
+
+    /// Commits the transactions that script asked to commit and that can commit now.
+    fn commit_ready_transactions(&mut self) {
+        for txn in self.commit_candidates() {
+            self.pending_commits.remove(&txn);
+            self.commit(txn);
+        }
     }
 
     fn finish_transaction(&mut self, txn: IndexedDBTxnId) {
@@ -511,9 +524,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             self.running_readwrite = None;
         }
         self.running_readonly.remove(&txn);
-        self.handled_next_unhandled_request_id.remove(&txn);
-        self.handled_pending.remove(&txn);
-        self.pending_commit_callbacks.remove(&txn);
+        self.pending_commits.remove(&txn);
     }
 
     fn abort_transaction(&mut self, txn: IndexedDBTxnId) {
@@ -528,39 +539,18 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             self.running_readwrite = None;
         }
         self.running_readonly.remove(&txn);
-        self.handled_next_unhandled_request_id.remove(&txn);
-        self.handled_pending.remove(&txn);
-        self.pending_commit_callbacks.remove(&txn);
+        self.pending_commits.remove(&txn);
     }
 
     /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>
     ///
-    /// Sends the result to `callbacks` once the engine has written the transaction's changes,
-    /// or failed to.
-    fn commit(
-        &self,
-        origin: ImmutableOrigin,
-        db_name: String,
-        txn: IndexedDBTxnId,
-        callbacks: Vec<GenericCallback<TxnCompleteMsg>>,
-    ) {
+    /// Reports the result to the transaction's connection once the engine has written the
+    /// transaction's changes, or failed to.
+    fn commit(&self, txn: IndexedDBTxnId) {
+        let results = self.results(txn);
         self.engine.commit(
             txn,
-            Box::new(move |result| {
-                for callback in callbacks {
-                    if callback
-                        .send(TxnCompleteMsg {
-                            origin: origin.clone(),
-                            db_name: db_name.clone(),
-                            txn,
-                            result: result.clone(),
-                        })
-                        .is_err()
-                    {
-                        error!("Failed to send commit completion for db '{db_name}' txn {txn}.");
-                    }
-                }
-            }),
+            Box::new(move |result| results.send(TransactionEvent::Committed(result))),
         );
     }
 
@@ -578,53 +568,19 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
     /// > When a transaction is aborted the implementation must undo (roll back) any changes that
     /// > were made to the database during that transaction.
     ///
-    /// This only aborts the transaction if one was previously queued by adding an abort
-    /// callback to [`Self::pending_abort_callbacks`]. The callbacks are told once the engine has
-    /// rolled the transaction back, which also reverts the key generators and, for an upgrade
-    /// transaction, the version and the object stores and indexes.
+    /// The engine rolls the transaction back after the work handed over before, which also
+    /// reverts the key generators and, for an upgrade transaction, the version and the object
+    /// stores and indexes. A commit that script asked for and that hasn't been handed over is
+    /// dropped.
     fn abort(
         &mut self,
         origin: &ImmutableOrigin,
         database_name: &str,
         transaction: IndexedDBTxnId,
-    ) -> bool {
-        let Some(abort_callbacks) = self.pending_abort_callbacks.remove(&transaction) else {
-            return false;
-        };
-        if abort_callbacks.is_empty() {
-            return false;
-        }
-
-        let callbacks: Vec<_> = self
-            .take_pending_commit_callbacks(transaction)
-            .into_iter()
-            .chain(abort_callbacks)
-            .collect();
-        let origin_for_callbacks = origin.clone();
-        let db_name = database_name.to_owned();
-        self.engine.rollback(
-            transaction,
-            Box::new(move || {
-                for callback in callbacks {
-                    let message = TxnCompleteMsg {
-                        origin: origin_for_callbacks.clone(),
-                        db_name: db_name.clone(),
-                        txn: transaction,
-                        result: Err(BackendError::Abort),
-                    };
-                    if callback.send(message).is_err() {
-                        error!(
-                            "Failed to send deferred abort completion for \
-                            database '{db_name}' transaction {transaction}.",
-                        );
-                    }
-                }
-            }),
-        );
-
+    ) {
+        self.engine.rollback(transaction, Box::new(|| {}));
         self.abort_transaction(transaction);
         self.schedule_transactions(origin.clone(), database_name);
-        true
     }
 }
 
@@ -671,9 +627,6 @@ fn obtain_a_local_storage_bottle_map(
 #[derive(MallocSizeOf)]
 enum OpenRequest {
     Open {
-        /// The callback used to send a result to script.
-        sender: GenericCallback<ConnectionMsg>,
-
         /// The name of the database.
         db_name: String,
 
@@ -700,6 +653,10 @@ enum OpenRequest {
 
         /// <https://storage.spec.whatwg.org/#storage-proxy-map>
         proxy_map: StorageProxyMap,
+
+        /// The result channel of the request and of the connection it opens: the request's
+        /// outcome and, once it opened, everything about the connection go there, in order.
+        results: GenericCallback<ConnectionEvent>,
     },
     Delete {
         /// The callback used to send a result to script.
@@ -725,7 +682,6 @@ impl OpenRequest {
     fn get_id(&self) -> Uuid {
         let id = match self {
             OpenRequest::Open {
-                sender: _,
                 db_name: _,
                 version: _,
                 processed: _,
@@ -734,6 +690,7 @@ impl OpenRequest {
                 pending_versionchange: _,
                 id,
                 proxy_map: _,
+                results: _,
             } => id,
             OpenRequest::Delete {
                 sender: _,
@@ -758,7 +715,6 @@ impl OpenRequest {
     fn is_open(&self) -> bool {
         match self {
             OpenRequest::Open {
-                sender: _,
                 db_name: _,
                 version: _,
                 processed: _,
@@ -767,6 +723,7 @@ impl OpenRequest {
                 pending_versionchange: _,
                 id: _,
                 proxy_map: _,
+                results: _,
             } => true,
             OpenRequest::Delete {
                 sender: _,
@@ -784,7 +741,6 @@ impl OpenRequest {
     fn is_pending(&self) -> bool {
         match self {
             OpenRequest::Open {
-                sender: _,
                 db_name: _,
                 version: _,
                 processed,
@@ -793,6 +749,7 @@ impl OpenRequest {
                 pending_versionchange,
                 id: _,
                 proxy_map: _,
+                results: _,
             } => {
                 !processed ||
                     pending_upgrade.is_some() ||
@@ -815,7 +772,6 @@ impl OpenRequest {
     fn abort(&self) -> Option<VersionUpgrade> {
         match self {
             OpenRequest::Open {
-                sender,
                 db_name,
                 version: _,
                 processed: _,
@@ -824,12 +780,13 @@ impl OpenRequest {
                 pending_upgrade,
                 id,
                 proxy_map: _,
+                results,
             } => {
-                if sender
-                    .send(ConnectionMsg::AbortError {
+                if results
+                    .send(ConnectionEvent::Open(ConnectionMsg::AbortError {
                         name: db_name.clone(),
                         id: *id,
-                    })
+                    }))
                     .is_err()
                 {
                     error!("Failed to send ConnectionMsg::Connection to script.");
@@ -866,8 +823,8 @@ struct Connection {
     /// <https://w3c.github.io/IndexedDB/#connection-close-pending-flag>
     close_pending: bool,
 
-    /// The callback used to send a result to script.
-    sender: GenericCallback<ConnectionMsg>,
+    /// The result channel of the connection, for its transactions and versionchange events.
+    results: GenericCallback<ConnectionEvent>,
 }
 
 struct IndexedDBManager {
@@ -929,55 +886,41 @@ impl IndexedDBManager {
                     db_name,
                     store,
                     txn,
-                    _request_id,
+                    request_id,
                     mode,
                     operation,
                 ) => {
-                    if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
-                        // Queues an operation for a transaction without starting it
-                        db.queue_operation(store, txn, mode, operation);
-                        db.schedule_transactions(origin, &db_name);
-                    } else {
-                        operation.notify_error(BackendError::DbNotFound);
-                    }
+                    let operation = KvsOperation {
+                        store,
+                        request_id: Some(request_id),
+                        operation,
+                    };
+                    self.queue_operation(origin, db_name, txn, mode, operation);
                 },
                 IndexedDBThreadMsg::EngineTxnBatchComplete {
                     origin,
                     db_name,
                     txn,
                 } => {
-                    let should_notify = self
-                        .get_database_mut(origin.clone(), db_name.clone())
-                        .is_some_and(|db| {
-                            // Decide which running flag to clear based on txn mode.
-                            let mode = db.transactions.get(&txn).map(|t| t.mode.clone());
+                    if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
+                        // Decide which running flag to clear based on txn mode.
+                        match db.transactions.get(&txn).map(|t| t.mode.clone()) {
+                            Some(IndexedDBTxnMode::Readonly) => {
+                                db.running_readonly.remove(&txn);
+                            },
+                            Some(_) if db.running_readwrite == Some(txn) => {
+                                db.running_readwrite = None;
+                            },
+                            Some(_) => {},
+                            None => {
+                                // txn might have been aborted/removed; nothing to clear
+                            },
+                        }
 
-                            match mode {
-                                Some(IndexedDBTxnMode::Readonly) => {
-                                    db.running_readonly.remove(&txn);
-                                },
-                                Some(_) if db.running_readwrite == Some(txn) => {
-                                    db.running_readwrite = None;
-                                },
-                                Some(_) => {},
-                                None => {
-                                    // txn might have been aborted/removed; nothing to clear
-                                },
-                            }
-
-                            // If more requests were queued while this batch was running,
-                            // schedule again now.
-                            db.schedule_transactions(origin.clone(), &db_name);
-                            // An aborted transaction has nothing left to commit.
-                            mode.is_some() && db.can_notify_txn_maybe_commit(txn)
-                        });
-
-                    if should_notify {
-                        self.handle_sync_operation(SyncOperation::TxnMaybeCommit {
-                            origin,
-                            db_name,
-                            txn,
-                        });
+                        // If more requests were queued while this batch was running,
+                        // schedule again now.
+                        db.schedule_transactions(origin, &db_name);
+                        db.commit_ready_transactions();
                     }
                 },
                 IndexedDBThreadMsg::CollectMemoryReport(sender) => {
@@ -991,71 +934,84 @@ impl IndexedDBManager {
                     operation,
                     transaction,
                 } => {
-                    if let Some(database) =
-                        self.get_database_mut(origin.clone(), database_name.clone())
-                    {
-                        // Queues an operation for a transaction without starting it
-                        database.queue_operation(
-                            store_id,
-                            transaction,
-                            IndexedDBTxnMode::Versionchange,
-                            AsyncOperation::Schema(operation),
-                        );
-                        database.schedule_transactions(origin, &database_name);
-                    } else {
-                        operation.notify_error(BackendError::DbNotFound);
-                    }
+                    let operation = KvsOperation {
+                        store: store_id,
+                        request_id: None,
+                        operation: AsyncOperation::Schema(operation),
+                    };
+                    self.queue_operation(
+                        origin,
+                        database_name,
+                        transaction,
+                        IndexedDBTxnMode::Versionchange,
+                        operation,
+                    );
                 },
             }
         }
     }
 
-    fn dispatch_txn_maybe_commit(
-        &self,
-        origin: ImmutableOrigin,
-        db_name: String,
-        txn: IndexedDBTxnId,
-    ) {
-        let key = IndexedDBDescription {
-            origin,
-            name: db_name.clone(),
-        };
-        let Some(connections) = self.connections.get(&key) else {
-            return;
-        };
-        for connection in connections.values() {
-            if connection.close_pending {
-                continue;
-            }
-            let _ = connection.sender.send(ConnectionMsg::TxnMaybeCommit {
-                db_name: db_name.clone(),
-                txn,
-            });
-        }
-    }
-
-    fn handle_txn_maybe_commit(
+    /// Queues `operation` for `txn` and schedules it. An operation for a database or a
+    /// transaction the backend doesn't know fails with DbNotFound, and one of an aborted
+    /// transaction with Abort. An operation that the transaction's mode or scope doesn't allow
+    /// fails and aborts the transaction.
+    fn queue_operation(
         &mut self,
         origin: ImmutableOrigin,
         db_name: String,
         txn: IndexedDBTxnId,
+        mode: IndexedDBTxnMode,
+        operation: KvsOperation,
     ) {
         let key = IndexedDBDescription {
-            origin: origin.clone(),
-            name: db_name.clone(),
+            origin,
+            name: db_name,
         };
-        let Some(db) = self.databases.get_mut(&key) else {
-            return;
+        let check = self
+            .databases
+            .get(&key)
+            .map_or(Err(BackendError::DbNotFound), |db| {
+                db.check_operation(txn, &operation)
+            });
+        let error = match check {
+            Ok(()) => {
+                let db = self.databases.get_mut(&key).expect("Checked above");
+                // Queues an operation for a transaction without starting it
+                db.queue_operation(txn, mode, operation);
+                db.schedule_transactions(key.origin, &key.name);
+                return;
+            },
+            Err(error) => error,
         };
-        if !db.can_commit_now(txn) {
-            return;
+        self.transaction_results(&key, txn)
+            .send(operation.failure_event(error.clone()));
+        if let BackendError::DbErr(reason) = error &&
+            let Some(db) = self.databases.get_mut(&key)
+        {
+            warn!("Aborting IndexedDB transaction {txn}: {reason}");
+            db.abort(&key.origin, &key.name, txn);
         }
-        let callbacks = db.take_pending_commit_callbacks(txn);
-        if callbacks.is_empty() {
-            self.dispatch_txn_maybe_commit(origin, db_name, txn);
-            return;
+    }
+
+    /// Where the results of `txn` go: the result channel it was registered with, or for a
+    /// transaction the database doesn't know, the result channel of its connection, if the
+    /// connection is open.
+    fn transaction_results(
+        &self,
+        key: &IndexedDBDescription,
+        txn: IndexedDBTxnId,
+    ) -> TransactionResults {
+        if let Some(db) = self.databases.get(key) &&
+            db.knows_transaction(txn)
+        {
+            return db.results(txn);
         }
-        db.commit(origin, db_name, txn, callbacks);
+        let channel = self
+            .connections
+            .get(key)
+            .and_then(|connections| connections.get(&txn.connection))
+            .map(|connection| connection.results.clone());
+        TransactionResults::new(txn, channel)
     }
 
     /// Handle when an upgrade transaction finishes in script.
@@ -1093,7 +1049,6 @@ impl IndexedDBManager {
                 return;
             };
             let OpenRequest::Open {
-                sender,
                 db_name,
                 version: _,
                 processed: _,
@@ -1102,6 +1057,7 @@ impl IndexedDBManager {
                 pending_versionchange: _,
                 id,
                 proxy_map: _,
+                results,
             } = open_request
             else {
                 return;
@@ -1112,14 +1068,14 @@ impl IndexedDBManager {
                 .get(&key)
                 .map(|db| db.object_stores())
                 .unwrap_or_default();
-            if sender
-                .send(ConnectionMsg::Connection {
+            if results
+                .send(ConnectionEvent::Open(ConnectionMsg::Connection {
                     id,
                     name: db_name,
                     version: new,
                     upgraded: true,
                     object_stores,
-                })
+                }))
                 .is_err()
             {
                 error!("Failed to send ConnectionMsg::Connection to script.");
@@ -1356,22 +1312,22 @@ impl IndexedDBManager {
     /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
     fn open_a_database_connection(
         &mut self,
-        sender: GenericCallback<ConnectionMsg>,
         origin: ImmutableOrigin,
         db_name: String,
         version: Option<u64>,
         id: Uuid,
         bottle_source: StorageBottleSource,
+        results: GenericCallback<ConnectionEvent>,
     ) {
         let proxy_map = match obtain_a_local_storage_bottle_map(&bottle_source, &origin) {
             Ok(proxy_map) => proxy_map,
             Err(error) => {
-                if sender
-                    .send(ConnectionMsg::DatabaseError {
+                if results
+                    .send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
                         name: db_name,
                         id,
                         error,
-                    })
+                    }))
                     .is_err()
                 {
                     debug!("Script exit during indexeddb database open");
@@ -1384,7 +1340,6 @@ impl IndexedDBManager {
             origin,
         };
         let open_request = OpenRequest::Open {
-            sender,
             db_name,
             version,
             processed: false,
@@ -1393,6 +1348,7 @@ impl IndexedDBManager {
             pending_upgrade: None,
             id,
             proxy_map,
+            results,
         };
         let should_continue = {
             // Step 1: Let queue be the connection queue for storageKey and name.
@@ -1434,7 +1390,6 @@ impl IndexedDBManager {
             return debug_assert!(false, "An open request should be in the queue.");
         };
         let OpenRequest::Open {
-            sender,
             db_name,
             version: _,
             processed,
@@ -1443,6 +1398,7 @@ impl IndexedDBManager {
             pending_versionchange: _,
             pending_upgrade,
             proxy_map: _,
+            results,
         } = open_request
         else {
             return;
@@ -1463,7 +1419,12 @@ impl IndexedDBManager {
 
         // Step 4: Set db’s upgrade transaction to transaction.
         // Backend tracks the active upgrade transaction in `pending_upgrade` below.
-        db.register_transaction(transaction, IndexedDBTxnMode::Versionchange, scope);
+        db.register_transaction(
+            transaction,
+            IndexedDBTxnMode::Versionchange,
+            scope,
+            results.clone(),
+        );
 
         // Step 5: Set transaction’s state to inactive.
         // Step 6: Start transaction.
@@ -1486,15 +1447,15 @@ impl IndexedDBManager {
         });
 
         // Step 10: Queue a database task to run these steps.
-        if sender
-            .send(ConnectionMsg::Upgrade {
+        if results
+            .send(ConnectionEvent::Open(ConnectionMsg::Upgrade {
                 id: *id,
                 name: db_name.clone(),
                 version: new_version,
                 old_version,
                 transaction,
                 object_stores,
-            })
+            }))
             .is_err()
         {
             error!("Couldn't queue task for indexeddb upgrade event.");
@@ -1524,7 +1485,6 @@ impl IndexedDBManager {
                 return debug_assert!(false, "An open request should be in the queue.");
             };
             let OpenRequest::Open {
-                sender,
                 db_name: _,
                 version,
                 id,
@@ -1533,6 +1493,7 @@ impl IndexedDBManager {
                 pending_versionchange,
                 pending_close,
                 proxy_map: _,
+                results,
             } = open_request
             else {
                 return debug_assert!(
@@ -1561,13 +1522,13 @@ impl IndexedDBManager {
             // queue a database task to fire a version change event named blocked
             // at request with db’s version and version.
             if !pending_close.is_empty() &&
-                sender
-                    .send(ConnectionMsg::Blocked {
+                results
+                    .send(ConnectionEvent::Open(ConnectionMsg::Blocked {
                         name,
                         id: *id,
                         version,
                         old_version,
-                    })
+                    }))
                     .is_err()
             {
                 return debug!("Script exit during indexeddb database open");
@@ -1599,7 +1560,6 @@ impl IndexedDBManager {
             return debug_assert!(false, "An open request should be in the queue.");
         };
         let OpenRequest::Open {
-            sender,
             db_name,
             version,
             id,
@@ -1608,6 +1568,7 @@ impl IndexedDBManager {
             pending_close,
             pending_versionchange,
             proxy_map,
+            results,
         } = open_request
         else {
             return debug_assert!(
@@ -1634,13 +1595,15 @@ impl IndexedDBManager {
                     .create_database(proxy_map.bottle_id, db_name.clone())
                     .recv()
                 else {
-                    if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
-                        id: *id,
-                        name: db_name.clone(),
-                        error: BackendError::DbErr(
-                            "Failed to communicate with client storage.".to_string(),
-                        ),
-                    }) {
+                    if let Err(e) =
+                        results.send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
+                            id: *id,
+                            name: db_name.clone(),
+                            error: BackendError::DbErr(
+                                "Failed to communicate with client storage.".to_string(),
+                            ),
+                        }))
+                    {
                         debug!("Script exit during indexeddb database open {:?}", e);
                     }
                     return;
@@ -1648,11 +1611,13 @@ impl IndexedDBManager {
                 let (path, created) = match response {
                     Ok((path, created)) => (path, created),
                     Err(err) => {
-                        if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
-                            id: *id,
-                            name: db_name.clone(),
-                            error: BackendError::DbErr(format!("{err:?}")),
-                        }) {
+                        if let Err(e) =
+                            results.send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
+                                id: *id,
+                                name: db_name.clone(),
+                                error: BackendError::DbErr(format!("{err:?}")),
+                            }))
+                        {
                             debug!("Script exit during indexeddb database open {:?}", e);
                         }
                         return;
@@ -1663,11 +1628,13 @@ impl IndexedDBManager {
                         Ok(engine) => engine,
                         Err(err) => {
                             let error = backend_error_from_storage_error(err);
-                            if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
-                                id: *id,
-                                name: db_name.clone(),
-                                error,
-                            }) {
+                            if let Err(e) =
+                                results.send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
+                                    id: *id,
+                                    name: db_name.clone(),
+                                    error,
+                                }))
+                            {
                                 debug!("Script exit during indexeddb database open {:?}", e);
                             }
                             *processed = true;
@@ -1680,11 +1647,13 @@ impl IndexedDBManager {
                     Ok(version) => version,
                     Err(err) => {
                         let error = backend_error_from_storage_error(err);
-                        if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
-                            id: *id,
-                            name: db_name.clone(),
-                            error,
-                        }) {
+                        if let Err(e) =
+                            results.send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
+                                id: *id,
+                                name: db_name.clone(),
+                                error,
+                            }))
+                        {
                             debug!("Script exit during indexeddb database open {:?}", e);
                         }
                         *processed = true;
@@ -1706,11 +1675,13 @@ impl IndexedDBManager {
                     Ok(version) => version,
                     Err(err) => {
                         let error = backend_error_from_storage_error(err);
-                        if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
-                            id: *id,
-                            name: db_name.clone(),
-                            error,
-                        }) {
+                        if let Err(e) =
+                            results.send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
+                                id: *id,
+                                name: db_name.clone(),
+                                error,
+                            }))
+                        {
                             debug!("Script exit during indexeddb database open {:?}", e);
                         }
                         *processed = true;
@@ -1734,11 +1705,11 @@ impl IndexedDBManager {
         // return a newly created "VersionError" DOMException
         // and abort these steps.
         if version < db_version {
-            if sender
-                .send(ConnectionMsg::VersionError {
+            if results
+                .send(ConnectionEvent::Open(ConnectionMsg::VersionError {
                     name: db_name.clone(),
                     id: *id,
-                })
+                }))
                 .is_err()
             {
                 debug!("Script exit during indexeddb database open");
@@ -1751,7 +1722,7 @@ impl IndexedDBManager {
         // Step 9: Set connection’s version to version.
         let connection = Connection {
             close_pending: false,
-            sender: sender.clone(),
+            results: results.clone(),
         };
         let entry = self.connections.entry(key.clone()).or_default();
         entry.insert(*id, connection);
@@ -1768,16 +1739,14 @@ impl IndexedDBManager {
                 // queue a database task to fire a version change event
                 // named versionchange at entry with db’s version and version.
                 if conn
-                    .sender
-                    .send(ConnectionMsg::VersionChange {
-                        name: db_name.clone(),
-                        id: *id_to_close,
-                        version,
+                    .results
+                    .send(ConnectionEvent::VersionChange {
                         old_version: db_version,
+                        new_version: version,
                     })
                     .is_err()
                 {
-                    error!("Failed to send ConnectionMsg::Connection to script.");
+                    error!("Failed to send ConnectionEvent::VersionChange to script.");
                 };
                 pending_close.insert(*id_to_close);
                 pending_versionchange.insert(*id_to_close);
@@ -1799,14 +1768,14 @@ impl IndexedDBManager {
             .map(|db| db.object_stores())
             .unwrap_or_default();
         *processed = true;
-        if sender
-            .send(ConnectionMsg::Connection {
+        if results
+            .send(ConnectionEvent::Open(ConnectionMsg::Connection {
                 name: db_name.clone(),
                 id: *id,
                 version: db_version,
                 upgraded: false,
                 object_stores,
-            })
+            }))
             .is_err()
         {
             error!("Failed to send ConnectionMsg::Connection to script.");
@@ -1973,7 +1942,6 @@ impl IndexedDBManager {
                 return;
             };
             if let OpenRequest::Open {
-                sender,
                 db_name: _,
                 version,
                 id: request_id,
@@ -1982,6 +1950,7 @@ impl IndexedDBManager {
                 pending_versionchange,
                 pending_close,
                 proxy_map: _,
+                results,
             } = open_request
             {
                 pending_close.remove(&id);
@@ -2000,13 +1969,13 @@ impl IndexedDBManager {
                         .get(&key)
                         .and_then(|db| db.version().ok())
                         .unwrap_or_default();
-                    if sender
-                        .send(ConnectionMsg::Blocked {
+                    if results
+                        .send(ConnectionEvent::Open(ConnectionMsg::Blocked {
                             name: key.name.clone(),
                             id: *request_id,
                             version,
                             old_version,
-                        })
+                        }))
                         .is_err()
                     {
                         debug!("Script exit during indexeddb database open");
@@ -2098,14 +2067,14 @@ impl IndexedDBManager {
             SyncOperation::CloseDatabase(origin, id, db_name) => {
                 self.close_database(origin, id, db_name);
             },
-            SyncOperation::OpenDatabase(sender, origin, db_name, version, id, bottle_source) => {
+            SyncOperation::OpenDatabase(origin, db_name, version, id, bottle_source, results) => {
                 self.open_a_database_connection(
-                    sender,
                     origin,
                     db_name,
                     version,
                     id,
                     bottle_source,
+                    results,
                 );
             },
             SyncOperation::AbortPendingUpgrades {
@@ -2130,35 +2099,54 @@ impl IndexedDBManager {
                 };
                 self.start_delete_database(idb_description, id, proxy_map, callback);
             },
-            SyncOperation::Commit(callback, origin, db_name, txn) => {
+            SyncOperation::Commit {
+                origin,
+                db_name,
+                txn,
+            } => {
                 // https://w3c.github.io/IndexedDB/#commit-a-transaction
                 // The reply follows the engine's COMMIT, or its failure.
-                if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
-                    if db.can_commit_now(txn) {
-                        db.commit(origin.clone(), db_name.clone(), txn, vec![callback]);
-                    } else {
-                        db.queue_pending_commit_callback(txn, callback);
-                    }
-                    db.schedule_transactions(origin, &db_name);
-                } else if callback
-                    .send(TxnCompleteMsg {
-                        origin,
-                        db_name: db_name.clone(),
-                        txn,
+                let key = IndexedDBDescription {
+                    origin: origin.clone(),
+                    name: db_name.clone(),
+                };
+                match self
+                    .databases
+                    .get(&key)
+                    .map(|db| db.check_usable(txn).map(|_| ()))
+                {
+                    Some(Ok(())) => {
+                        let db = self.databases.get_mut(&key).expect("Checked above");
+                        if db.can_commit_now(txn) {
+                            db.commit(txn);
+                        } else {
+                            db.pending_commits.insert(txn);
+                        }
+                        db.schedule_transactions(origin, &db_name);
+                    },
+                    Some(Err(error)) => {
+                        debug!("Commit of IndexedDB transaction {txn} failed: {error}");
+                        self.transaction_results(&key, txn)
+                            .send(TransactionEvent::Committed(Err(error)));
+                    },
+                    None => {
                         // If the database entry has already been removed, treat commit as a
                         // no-op success so script side completion does not spuriously abort.
-                        result: Ok(()),
-                    })
-                    .is_err()
-                {
-                    error!(
-                        "Failed to send commit completion for missing db '{}' txn {}.",
-                        db_name, txn
-                    );
+                        self.transaction_results(&key, txn)
+                            .send(TransactionEvent::Committed(Ok(())));
+                    },
                 }
             },
-            SyncOperation::Abort(abort_callback, origin, db_name, txn) => {
-                self.handle_abort(abort_callback, origin, db_name, txn);
+            SyncOperation::Abort {
+                origin,
+                db_name,
+                txn,
+            } => {
+                // Done at once, also while a batch of the transaction runs: the engine runs the
+                // rollback after it, and before any batch the scheduler hands over later.
+                if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
+                    db.abort(&origin, &db_name, txn);
+                }
             },
             SyncOperation::UpgradeTransactionFinished {
                 origin,
@@ -2168,59 +2156,19 @@ impl IndexedDBManager {
             } => {
                 self.handle_upgrade_transaction_finished(db_name, origin, txn, committed);
             },
-            SyncOperation::RequestHandled {
-                origin,
-                db_name,
-                txn,
-                request_id,
-            } => {
-                // https://w3c.github.io/IndexedDB/#transaction-lifecycl
-                // The implementation must attempt to commit an inactive transaction
-                // when all requests placed against the transaction have completed
-                // and their returned results handled, no new requests have been
-                // placed against the transaction, and the transaction has not been aborted
-
-                let should_notify =
-                    if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
-                        db.mark_request_handled(txn, request_id);
-                        db.can_notify_txn_maybe_commit(txn)
-                    } else {
-                        false
-                    };
-                if should_notify {
-                    self.handle_sync_operation(SyncOperation::TxnMaybeCommit {
-                        origin,
-                        db_name,
-                        txn,
-                    });
-                }
-            },
-            SyncOperation::TxnMaybeCommit {
-                origin,
-                db_name,
-                txn,
-            } => {
-                self.handle_txn_maybe_commit(origin, db_name, txn);
-            },
             SyncOperation::TransactionFinished {
                 origin,
                 db_name,
                 txn,
             } => {
-                let maybe_commit_txns =
-                    if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
-                        db.finish_transaction(txn);
-                        // A no-op after a commit or an abort, but a transaction that finished
-                        // otherwise, such as one whose global went away, must not leave its SQL
-                        // transaction open.
-                        db.engine.rollback(txn, Box::new(|| {}));
-                        db.schedule_transactions(origin.clone(), &db_name);
-                        db.maybe_commit_candidates()
-                    } else {
-                        Vec::new()
-                    };
-                for candidate in maybe_commit_txns {
-                    self.handle_txn_maybe_commit(origin.clone(), db_name.clone(), candidate);
+                if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
+                    db.finish_transaction(txn);
+                    // A no-op after a commit or an abort, but a transaction that finished
+                    // otherwise, such as one whose global went away, must not leave its SQL
+                    // transaction open.
+                    db.engine.rollback(txn, Box::new(|| {}));
+                    db.schedule_transactions(origin, &db_name);
+                    db.commit_ready_transactions();
                 }
             },
             SyncOperation::CreateTransaction {
@@ -2235,8 +2183,24 @@ impl IndexedDBManager {
                 // before transaction() returns, and every global's messages reach this thread
                 // through the one channel, so of two transactions whose creations are ordered,
                 // in one global or across globals, the earlier one is registered first.
-                if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
-                    db.register_transaction(txn, mode, scope);
+                let key = IndexedDBDescription {
+                    origin: origin.clone(),
+                    name: db_name.clone(),
+                };
+                // A transaction of a connection that isn't open isn't registered, so that it
+                // holds back no other transaction; its requests and its commit fail, and with no
+                // channel to report on, the failures are dropped. Script doesn't create such
+                // transactions: a connection is closed before the backend drops it.
+                let Some(results) = self
+                    .connections
+                    .get(&key)
+                    .and_then(|connections| connections.get(&txn.connection))
+                    .map(|connection| connection.results.clone())
+                else {
+                    return warn!("Transaction {txn} created for a connection that isn't open.");
+                };
+                if let Some(db) = self.databases.get_mut(&key) {
+                    db.register_transaction(txn, mode, scope, results);
                     db.schedule_transactions(origin, &db_name);
                 } else {
                     // Its requests fail with DbNotFound, see `IndexedDBThreadMsg::Async`.
@@ -2257,42 +2221,6 @@ impl IndexedDBManager {
         }
     }
 
-    /// Handling for the `Abort` message, which calls [`IndexedDBEnvironment::abort`] at once,
-    /// also while a batch of the transaction runs: the engine runs the rollback after it, and
-    /// before any batch the scheduler hands over later.
-    fn handle_abort(
-        &mut self,
-        abort_callback: GenericCallback<TxnCompleteMsg>,
-        origin: ImmutableOrigin,
-        database_name: String,
-        transaction: IndexedDBTxnId,
-    ) {
-        let message = || TxnCompleteMsg {
-            origin: origin.clone(),
-            db_name: database_name.clone(),
-            txn: transaction,
-            result: Err(BackendError::Abort),
-        };
-
-        let Some(database) = self.get_database_mut(origin.clone(), database_name.clone()) else {
-            // We didn't find the database, so just treat the transaction as aborted.
-            if abort_callback.send(message()).is_err() {
-                error!(
-                    "Failed to send abort completion for database \
-                    '{database_name}' transaction {transaction}.",
-                );
-            }
-            return;
-        };
-
-        database
-            .pending_abort_callbacks
-            .entry(transaction)
-            .or_default()
-            .push(abort_callback);
-        database.abort(&origin, &database_name, transaction);
-    }
-
     fn collect_memory_reports(&self) -> Vec<Report> {
         let mut reports = vec![];
         perform_memory_report(|ops| {
@@ -2310,6 +2238,8 @@ impl IndexedDBManager {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -2318,8 +2248,8 @@ mod tests {
     use servo_base::threadpool::ThreadPool;
     use servo_url::ImmutableOrigin;
     use storage_traits::indexeddb::{
-        AsyncOperation, AsyncReadWriteOperation, AsyncSchemaOperation, BackendError,
-        IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath, TxnCompleteMsg,
+        AsyncOperation, AsyncReadWriteOperation, AsyncSchemaOperation, BackendError, BackendResult,
+        ConnectionEvent, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath, TransactionEvent,
     };
     use url::Host;
 
@@ -2329,7 +2259,7 @@ mod tests {
     use crate::indexeddb::backend::tests::{
         Faulty, executor_tests, faults_for, stored_version_and_store_names, txn,
     };
-    use crate::indexeddb::engines::KvsEngine;
+    use crate::indexeddb::engines::{KvsEngine, KvsOperation};
 
     executor_tests!(
         test_aborted_upgrade_rolls_back_created_store_and_index,
@@ -2369,6 +2299,62 @@ mod tests {
         (IndexedDBEnvironment::new(engine, sender), receiver)
     }
 
+    thread_local! {
+        /// The receivers of the result channels of the test's transactions, by serial number.
+        static RESULTS: RefCell<HashMap<u64, mpsc::Receiver<ConnectionEvent>>> =
+            Default::default();
+    }
+
+    /// Registers the transaction `serial` with a result channel that the test reads.
+    fn register<X: SqlExecutor>(
+        env: &mut IndexedDBEnvironment<SqlEngine<X>>,
+        serial: u64,
+        mode: IndexedDBTxnMode,
+        scope: &[i64],
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let channel = GenericCallback::new(move |event| {
+            let _ = sender.send(event.unwrap());
+        })
+        .unwrap();
+        RESULTS.with(|results| results.borrow_mut().insert(serial, receiver));
+        env.register_transaction(txn(serial), mode, scope.to_vec(), channel);
+    }
+
+    /// The next thing the backend reports about the transaction `serial`.
+    fn next_event(serial: u64) -> TransactionEvent {
+        let event = RESULTS.with(|results| {
+            results.borrow()[&serial]
+                .recv_timeout(Duration::from_secs(10))
+                .expect("The transaction should report")
+        });
+        match event {
+            ConnectionEvent::Transaction {
+                serial: reported,
+                event,
+            } => {
+                assert_eq!(reported, serial);
+                event
+            },
+            other => panic!("unexpected connection event {other:?}"),
+        }
+    }
+
+    /// Commits `serial` and returns the result the backend reports.
+    fn commit_result<X: SqlExecutor>(
+        env: &mut IndexedDBEnvironment<SqlEngine<X>>,
+        serial: u64,
+    ) -> BackendResult<()> {
+        env.commit(txn(serial));
+        loop {
+            match next_event(serial) {
+                TransactionEvent::Committed(result) => return result,
+                TransactionEvent::Request { .. } => {},
+                other => panic!("expected the commit result, got {other:?}"),
+            }
+        }
+    }
+
     /// Queues `operation` for `txn`, runs it, and waits until it has run.
     fn run<X: SqlExecutor>(
         env: &mut IndexedDBEnvironment<SqlEngine<X>>,
@@ -2378,7 +2364,16 @@ mod tests {
         store: i64,
         operation: AsyncOperation,
     ) {
-        env.queue_operation(store, txn(serial), mode, operation);
+        let request_id = match operation {
+            AsyncOperation::Schema(_) => None,
+            _ => Some(0),
+        };
+        let operation = KvsOperation {
+            store,
+            request_id,
+            operation,
+        };
+        env.queue_operation(txn(serial), mode, operation);
         env.schedule_transactions(test_origin(), "test_db");
         match batches.recv().unwrap() {
             IndexedDBThreadMsg::EngineTxnBatchComplete { txn: done, .. } => {
@@ -2390,48 +2385,29 @@ mod tests {
         }
     }
 
-    fn txn_complete_callback() -> (
-        GenericCallback<TxnCompleteMsg>,
-        mpsc::Receiver<TxnCompleteMsg>,
-    ) {
-        let (sender, receiver) = mpsc::channel();
-        let callback = GenericCallback::new(move |message| {
-            let _ = sender.send(message.unwrap());
-        })
-        .unwrap();
-        (callback, receiver)
-    }
-
+    /// Aborts `serial` and waits until the engine has rolled it back.
     fn abort<X: SqlExecutor>(env: &mut IndexedDBEnvironment<SqlEngine<X>>, serial: u64) {
-        let (callback, aborted) = txn_complete_callback();
-        env.pending_abort_callbacks
-            .entry(txn(serial))
-            .or_default()
-            .push(callback);
-        assert!(env.abort(&test_origin(), "test_db", txn(serial)));
-        let message = aborted.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(message.result.is_err());
+        env.abort(&test_origin(), "test_db", txn(serial));
+        let (sender, rolled_back) = mpsc::channel();
+        // A second rollback is a no-op, which the engine runs after the first.
+        env.engine.rollback(
+            txn(serial),
+            Box::new(move || {
+                let _ = sender.send(());
+            }),
+        );
+        rolled_back.recv_timeout(Duration::from_secs(10)).unwrap();
         env.finish_transaction(txn(serial));
     }
 
     fn commit<X: SqlExecutor>(env: &mut IndexedDBEnvironment<SqlEngine<X>>, serial: u64) {
-        let (callback, committed) = txn_complete_callback();
         assert!(env.can_commit_now(txn(serial)));
-        env.commit(
-            test_origin(),
-            "test_db".to_owned(),
-            txn(serial),
-            vec![callback],
-        );
-        let message = committed.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(message.result.is_ok());
+        assert_eq!(commit_result(env, serial), Ok(()));
         env.finish_transaction(txn(serial));
     }
 
     fn create_store_operation(name: &str, auto_increment: bool) -> AsyncOperation {
         AsyncOperation::Schema(AsyncSchemaOperation::CreateObjectStore {
-            callback: GenericCallback::new(|_| panic!("creating the store should not fail"))
-                .unwrap(),
             name: name.to_owned(),
             key_path: None,
             auto_increment,
@@ -2450,7 +2426,7 @@ mod tests {
         let (mut env, batches) = open_environment::<X>(&base_dir);
         assert!(store_names(&env).is_empty());
 
-        env.register_transaction(txn(1), IndexedDBTxnMode::Versionchange, vec![]);
+        register(&mut env, 1, IndexedDBTxnMode::Versionchange, &[]);
         env.engine.upgrade_version(txn(1), 1);
         let mode = IndexedDBTxnMode::Versionchange;
         run(
@@ -2468,8 +2444,6 @@ mod tests {
             mode,
             1,
             AsyncOperation::Schema(AsyncSchemaOperation::CreateIndex {
-                callback: GenericCallback::new(|_| panic!("creating the index should not fail"))
-                    .unwrap(),
                 index_id: 1,
                 name: "not_by_author".to_string(),
                 key_path: KeyPath::String("author".to_string()),
@@ -2499,7 +2473,7 @@ mod tests {
         env: &mut IndexedDBEnvironment<SqlEngine<X>>,
         batches: &GenericReceiver<IndexedDBThreadMsg>,
     ) {
-        env.register_transaction(txn(1), IndexedDBTxnMode::Versionchange, vec![]);
+        register(env, 1, IndexedDBTxnMode::Versionchange, &[]);
         env.engine.upgrade_version(txn(1), 1);
         run(
             env,
@@ -2512,7 +2486,7 @@ mod tests {
         commit(env, 1);
         assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(1));
 
-        env.register_transaction(txn(2), IndexedDBTxnMode::Readwrite, vec![BOOKS]);
+        register(env, 2, IndexedDBTxnMode::Readwrite, &[BOOKS]);
         run(
             env,
             batches,
@@ -2520,7 +2494,6 @@ mod tests {
             IndexedDBTxnMode::Readwrite,
             BOOKS,
             AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
-                callback: GenericCallback::new(|_| {}).unwrap(),
                 key: None,
                 value: vec![1],
                 should_overwrite: false,
@@ -2545,29 +2518,15 @@ mod tests {
         put_generated_key_in_new_store(&mut env, &batches);
 
         faults_for(base_dir.path()).lock().unwrap().commit = true;
-        let (callback, committed) = txn_complete_callback();
-        env.commit(test_origin(), "test_db".to_owned(), txn(2), vec![callback]);
-        let message = committed.recv_timeout(Duration::from_secs(10)).unwrap();
+        let result = commit_result(&mut env, 2);
         faults_for(base_dir.path()).lock().unwrap().commit = false;
 
-        assert_eq!(message.txn, txn(2));
-        assert!(matches!(message.result, Err(BackendError::DbErr(_))));
+        assert!(matches!(result, Err(BackendError::DbErr(_))));
         assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(1));
     }
 
-    fn register<X: SqlExecutor>(
-        env: &mut IndexedDBEnvironment<SqlEngine<X>>,
-        serial: u64,
-        mode: IndexedDBTxnMode,
-        scope: &[i64],
-    ) {
-        env.register_transaction(txn(serial), mode, scope.to_vec());
-    }
-
     fn clear_operation() -> AsyncOperation {
-        AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear(
-            GenericCallback::new(|_| {}).unwrap(),
-        ))
+        AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear)
     }
 
     /// Writers start one at a time, also with disjoint scopes, since each is the one SQL

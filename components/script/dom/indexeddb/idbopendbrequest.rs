@@ -12,7 +12,8 @@ use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::GenericSend;
 use servo_url::origin::ImmutableOrigin;
 use storage_traits::indexeddb::{
-    BackendResult, IndexedDBObjectStore, IndexedDBThreadMsg, IndexedDBTxnId, SyncOperation,
+    BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBObjectStore, IndexedDBThreadMsg,
+    IndexedDBTxnId, SyncOperation,
 };
 use stylo_atoms::Atom;
 use uuid::Uuid;
@@ -129,12 +130,6 @@ impl IDBOpenDBRequest {
         self.id
     }
 
-    pub(crate) fn connection(&self) -> DomRoot<IDBDatabase> {
-        self.pending_connection
-            .get()
-            .expect("A connection should exist for the db.")
-    }
-
     pub(crate) fn get_or_init_connection(
         &self,
         cx: &mut JSContext,
@@ -220,8 +215,7 @@ impl IDBOpenDBRequest {
             // Step 10.6.2: If didThrow is true, run abort a transaction with
             // transaction and a newly created "AbortError" DOMException.
             if did_throw {
-                transaction.initiate_abort(cx, Error::Abort(None));
-                transaction.request_backend_abort();
+                transaction.abort(cx, Error::Abort(None));
             } else {
                 // The upgrade transaction auto-commits once inactive and quiescent.
                 transaction.maybe_commit(cx);
@@ -231,6 +225,133 @@ impl IDBOpenDBRequest {
 
     pub(crate) fn pending_connection(&self) -> Option<DomRoot<IDBDatabase>> {
         self.pending_connection.get()
+    }
+
+    /// Handles a message on the result channel of this request and the connection it opens.
+    pub(crate) fn handle_connection_event(&self, cx: &mut JSContext, event: ConnectionEvent) {
+        if let ConnectionEvent::Open(message) = event {
+            return self.handle_open_message(cx, message);
+        }
+        let Some(connection) = self.pending_connection.get() else {
+            return debug!("IndexedDB connection event before the connection exists");
+        };
+        connection.handle_connection_event(cx, event);
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
+    /// The steps that continue on the script-thread.
+    /// This covers interacting with the current open request,
+    /// as well as with other open connections preventing the request from making progress.
+    fn handle_open_message(&self, cx: &mut JSContext, message: ConnectionMsg) {
+        let global = self.global();
+        match message {
+            ConnectionMsg::Connection {
+                name,
+                id: _,
+                version,
+                upgraded,
+                object_stores,
+            } => {
+                // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps
+                // Step 3. Set transaction’s scope to connection’s object store set.
+                let connection = self.get_or_init_connection(
+                    cx,
+                    &global,
+                    name,
+                    version,
+                    object_stores,
+                    upgraded,
+                );
+
+                // Step 2.2: Otherwise,
+                // set request’s result to result,
+                // set request’s done flag,
+                // and fire an event named success at request.
+                self.dispatch_success(cx, &connection);
+            },
+            ConnectionMsg::Upgrade {
+                name,
+                id: _,
+                version,
+                old_version,
+                transaction,
+                object_stores,
+            } => {
+                let connection =
+                    self.get_or_init_connection(cx, &global, name, version, object_stores, false);
+                // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps
+                // Step 3. Set transaction’s scope to connection’s object store set.
+                self.upgrade_db_version(cx, &connection, old_version, version, transaction);
+            },
+            ConnectionMsg::VersionError { .. } => {
+                // Step 2.1 If result is an error, see dispatch_error().
+                self.dispatch_error(cx, Error::Version(None));
+            },
+            ConnectionMsg::AbortError { .. } => {
+                // Step 2.1 If result is an error, see dispatch_error().
+                self.dispatch_error(cx, Error::Abort(None));
+            },
+            ConnectionMsg::DatabaseError { error, .. } => {
+                // Step 2.1 If result is an error, see dispatch_error().
+                self.dispatch_error(cx, map_backend_error_to_dom_error(error));
+            },
+            ConnectionMsg::Blocked {
+                version,
+                old_version,
+                ..
+            } => {
+                // Step 10.4: fire a version change event named blocked at request with db’s version and version.
+                self.dispatch_blocked(cx, old_version, Some(version));
+            },
+        }
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#dom-idbfactory-open>
+    /// The error dispatching part from within a task part.
+    fn dispatch_error(&self, cx: &mut JSContext, dom_exception: Error) {
+        let global = self.global();
+
+        // https://w3c.github.io/IndexedDB/#open-a-database-connection
+        // Step 10.7: If connection was closed, return a newly created "AbortError" DOMException
+        // and abort these steps.
+        // Step 10.8: If request’s error is set, run the steps to close a database connection
+        // with connection, return a newly created "AbortError" DOMException and abort these
+        // steps.
+        // Note: an aborted upgrade transaction closed the connection already, see
+        // `IDBTransaction::abort`.
+        if let Some(connection) = self.pending_connection.get() &&
+            !connection.is_close_pending()
+        {
+            connection.close_a_database_connection(false);
+        }
+
+        // Step 5.3.1: If result is an error, then:
+        // Step 5.3.1.1: Set request’s result to undefined.
+        self.set_result(HandleValue::undefined());
+
+        // Step 5.3.1.2: Set request’s error to result.
+        self.set_error(cx, Some(dom_exception));
+        // Open requests expose a transaction only while `upgradeneeded` is being dispatched;
+        // otherwise `IDBOpenDBRequest.transaction` must be null.
+        // https://w3c.github.io/IndexedDB/#dom-idbrequest-transaction
+        // https://w3c.github.io/IndexedDB/#open-a-database-connection
+        // Open requests that have completed with an error must not retain an upgrade transaction.
+        self.clear_transaction();
+
+        // Step 5.3.1.3: Set request’s done flag to true.
+        self.set_ready_state_done();
+
+        // Step 5.3.1.4: Fire an event named error at request
+        // with its bubbles
+        // and cancelable attributes initialized to true.
+        let event = Event::new(
+            cx,
+            &global,
+            Atom::from("error"),
+            EventBubbles::Bubbles,
+            EventCancelable::Cancelable,
+        );
+        event.fire(cx, self.upcast());
     }
 
     pub(crate) fn delete_database(
