@@ -8,7 +8,9 @@
 
 use std::path::Path;
 
-use super::executor::{Connector, OnRow, SqlError, SqlExecutor, SqlParam, TransactionBehavior};
+#[cfg(test)]
+use super::executor::Connector;
+use super::executor::{OnRow, SqlError, SqlExecutor, SqlParam, TransactionBehavior};
 use super::rdb::RdbExecutor;
 use super::sqlite::SqliteExecutor;
 use crate::shared::use_ohos_rdb_backend;
@@ -36,6 +38,7 @@ impl SqlExecutor for TwinExecutor {
         }
     }
 
+    #[cfg(test)]
     fn connector(&self) -> Connector<Self> {
         match self {
             Self::Sqlite(executor) => {

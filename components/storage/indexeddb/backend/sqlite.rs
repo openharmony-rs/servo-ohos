@@ -8,9 +8,9 @@ use std::{fs, io};
 use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Connection, ErrorCode, ToSql, ffi};
 
-use super::executor::{
-    Connector, OnRow, SqlError, SqlExecutor, SqlParam, SqlRow, TransactionBehavior,
-};
+#[cfg(test)]
+use super::executor::Connector;
+use super::executor::{OnRow, SqlError, SqlExecutor, SqlParam, SqlRow, TransactionBehavior};
 use crate::shared::DB_PRAGMAS;
 
 const DATABASE_FILE_NAME: &str = "indexeddb.sqlite";
@@ -138,6 +138,7 @@ impl SqlExecutor for SqliteExecutor {
         Self::open_file(directory.join(DATABASE_FILE_NAME))
     }
 
+    #[cfg(test)]
     fn connector(&self) -> Connector<Self> {
         let path = self.path.clone();
         Box::new(move || Self::open_file(path.clone()))

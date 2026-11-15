@@ -56,6 +56,7 @@ pub(crate) trait SqlRow {
 pub(crate) type OnRow<'a> = dyn FnMut(&dyn SqlRow) -> Result<ControlFlow<()>, SqlError> + 'a;
 
 /// Makes executors on the database of an executor, from any thread.
+#[cfg(test)]
 pub(crate) type Connector<X> = Box<dyn Fn() -> Result<X, SqlError> + Send + Sync>;
 
 /// One connection to the SQLite database of an IndexedDB database, which the IndexedDB-on-SQL
@@ -70,9 +71,10 @@ pub(crate) trait SqlExecutor: Send + Sized + 'static {
     /// Opens the database stored in `directory`, creating its file if there is none.
     fn open(directory: &Path) -> Result<Self, SqlError>;
 
-    /// Makes further executors on the same database, for work on other threads. The SQLite
-    /// executor opens a connection for each; the RDB executor shares its store handle, whose
-    /// connection pool runs the statements.
+    /// Makes further executors on the same database, for tests that look at it from another
+    /// connection. The SQLite executor opens a connection for each; the RDB executor shares its
+    /// store handle, whose connection pool runs the statements.
+    #[cfg(test)]
     fn connector(&self) -> Connector<Self>;
 
     /// Closes this connection and deletes the database with all its files. No other connection

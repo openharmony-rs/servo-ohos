@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use ohos_rdb_sys::rdb_transaction::OH_RDB_TransType;
 use ohos_rdb_sys::relational_store_error_code::OH_Rdb_ErrCode;
 
-use super::executor::{
-    Connector, OnRow, SqlError, SqlExecutor, SqlParam, SqlRow, TransactionBehavior,
-};
+#[cfg(test)]
+use super::executor::Connector;
+use super::executor::{OnRow, SqlError, SqlExecutor, SqlParam, SqlRow, TransactionBehavior};
 use crate::ohos_rdb::{
     OhosRdbCursor, OhosRdbError, OhosRdbStore, OhosRdbTransaction, OhosRdbValues,
 };
@@ -30,8 +30,8 @@ pub(crate) struct RdbExecutor {
     directory: PathBuf,
     /// Declared before the store, so that it is dropped, and rolled back, first.
     transaction: Option<OhosRdbTransaction>,
-    /// Shared with the executors of [`SqlExecutor::connector`]. The lock serializes the calls on
-    /// the store handle; an open transaction doesn't hold it.
+    /// Shared with the executors that tests make with `connector`. The lock serializes the calls
+    /// on the store handle; an open transaction doesn't hold it.
     store: Arc<Mutex<OhosRdbStore>>,
 }
 
@@ -154,6 +154,7 @@ impl SqlExecutor for RdbExecutor {
         })
     }
 
+    #[cfg(test)]
     fn connector(&self) -> Connector<Self> {
         let directory = self.directory.clone();
         let store = self.store.clone();

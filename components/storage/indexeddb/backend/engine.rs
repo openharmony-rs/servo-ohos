@@ -2,10 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 
 use log::warn;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
@@ -25,35 +24,32 @@ use super::schema;
 use crate::indexeddb::IndexedDBDescription;
 use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction};
 
-/// The IndexedDB engine on a [`SqlExecutor`].
-///
-/// The manager thread's calls run on one connection, each in its own storage transaction. Each
-/// batch of requests runs on a new connection from the thread pool, in one storage transaction;
-/// the batches run one at a time, in the order the manager hands them over.
+/// The IndexedDB engine on a [`SqlExecutor`]: an actor that owns the database's only connection
+/// and runs everything on it one job at a time, on the thread pool, in the order the manager
+/// hands the work over: the manager thread's metadata calls, each in a storage transaction of its
+/// own, and the batches of requests, each in one storage transaction.
 pub(crate) struct SqlEngine<X: SqlExecutor> {
-    connection: RefCell<X>,
-    connector: Arc<dyn Fn() -> Result<X, SqlError> + Send + Sync>,
-    batches: Arc<Mutex<BatchQueue>>,
-    read_pool: Arc<ThreadPool>,
-    write_pool: Arc<ThreadPool>,
+    actor: Arc<Actor<X>>,
     created_db_path: bool,
 }
 
 impl<X: SqlExecutor> SqlEngine<X> {
-    // TODO: intake dual pools
     pub(crate) fn new(
         path: PathBuf,
         created: bool,
         db_info: &IndexedDBDescription,
         pool: Arc<ThreadPool>,
     ) -> Result<Self, SqlError> {
-        let (connection, created_database) = schema::open_database::<X>(&path, db_info)?;
+        let (executor, created_database) = schema::open_database::<X>(&path, db_info)?;
         Ok(Self {
-            connector: Arc::from(connection.connector()),
-            connection: RefCell::new(connection),
-            batches: Default::default(),
-            read_pool: pool.clone(),
-            write_pool: pool,
+            actor: Arc::new(Actor {
+                pool,
+                jobs: Mutex::new(Jobs {
+                    waiting: VecDeque::new(),
+                    running: false,
+                }),
+                database: Mutex::new(Some(Database { executor })),
+            }),
             created_db_path: created || created_database,
         })
     }
@@ -64,45 +60,186 @@ impl<X: SqlExecutor> SqlEngine<X> {
         self.created_db_path
     }
 
-    /// Runs `f` on the manager thread's connection, in a transaction of its own.
-    fn run<T>(
+    /// Runs `f` on the connection in a transaction of its own, after the work handed over before,
+    /// and waits for it.
+    fn run<T: Send + 'static>(
         &self,
         behavior: TransactionBehavior,
-        f: impl FnOnce(&mut X) -> Result<T, SqlError>,
+        f: impl FnOnce(&mut X) -> Result<T, SqlError> + Send + 'static,
     ) -> Result<T, SqlError> {
-        with_transaction(&mut *self.connection.borrow_mut(), behavior, f)
+        self.actor
+            .call(move |database| with_transaction(&mut database.executor, behavior, f))?
     }
 
+    /// The connection, for tests to use while no work is handed over.
     #[cfg(test)]
-    pub(super) fn connection(&self) -> std::cell::RefMut<'_, X> {
-        self.connection.borrow_mut()
+    pub(super) fn connection(&self) -> TestConnection<'_, X> {
+        TestConnection(lock(&self.actor.database))
     }
 }
 
-/// A batch that waits for its turn, with what to call when it has run.
-type QueuedBatch = (KvsTransaction, Box<dyn FnOnce() + Send + 'static>);
+impl<X: SqlExecutor> Drop for SqlEngine<X> {
+    /// Closes the connection once the work handed over has run, so that the database files can
+    /// be deleted right after.
+    fn drop(&mut self) {
+        self.actor.close();
+    }
+}
 
-/// The batches of an engine that wait for their turn. Running them one at a time keeps the
-/// results of overlapping readonly transactions in the order the transactions began, which
-/// parallel batches on separate connections didn't (idbtransaction-oncomplete).
-#[derive(Default)]
-struct BatchQueue {
-    waiting: VecDeque<QueuedBatch>,
-    /// Whether a pool task is running the batches.
+/// The connection of a [`SqlEngine`], borrowed by a test.
+#[cfg(test)]
+pub(super) struct TestConnection<'a, X>(MutexGuard<'a, Option<Database<X>>>);
+
+#[cfg(test)]
+impl<X> std::ops::Deref for TestConnection<'_, X> {
+    type Target = X;
+
+    fn deref(&self) -> &X {
+        &self.0.as_ref().expect("The database is open").executor
+    }
+}
+
+#[cfg(test)]
+impl<X> std::ops::DerefMut for TestConnection<'_, X> {
+    fn deref_mut(&mut self) -> &mut X {
+        &mut self.0.as_mut().expect("The database is open").executor
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+type Work<X> = Box<dyn FnOnce(&mut Database<X>) + Send>;
+
+/// Work handed over to an [`Actor`].
+enum Job<X> {
+    Run(Work<X>),
+    /// Closes the connection and reports when it is closed. Later jobs are dropped unrun.
+    Close(mpsc::Sender<()>),
+}
+
+struct Jobs<X> {
+    waiting: VecDeque<Job<X>>,
+    /// Whether a thread is running jobs. No job waits while none is.
     running: bool,
 }
 
-/// Takes the next batch, or marks the queue as not running if there is none.
-fn next_batch(batches: &Mutex<BatchQueue>) -> Option<QueuedBatch> {
-    let mut queue = batches.lock().unwrap_or_else(PoisonError::into_inner);
-    let batch = queue.waiting.pop_front();
-    queue.running = batch.is_some();
-    batch
+/// Runs the jobs of one database one at a time, in the order they were handed over. A pool task
+/// runs them while there are any, so an idle database holds no thread.
+struct Actor<X> {
+    pool: Arc<ThreadPool>,
+    jobs: Mutex<Jobs<X>>,
+    /// `None` once closed.
+    database: Mutex<Option<Database<X>>>,
+}
+
+impl<X: SqlExecutor> Actor<X> {
+    /// Hands `job` over. It runs on the pool after every job handed over before it, or, if
+    /// `inline` is set and there is no such job, right away on this thread.
+    fn submit(self: &Arc<Self>, job: Job<X>, inline: bool) {
+        {
+            let mut jobs = lock(&self.jobs);
+            if jobs.running || !inline {
+                jobs.waiting.push_back(job);
+                if !jobs.running {
+                    jobs.running = true;
+                    self.start();
+                }
+                return;
+            }
+            jobs.running = true;
+        }
+        self.run(job);
+        let mut jobs = lock(&self.jobs);
+        if jobs.waiting.is_empty() {
+            jobs.running = false;
+        } else {
+            self.start();
+        }
+    }
+
+    fn start(self: &Arc<Self>) {
+        let actor = self.clone();
+        self.pool.spawn(move || {
+            loop {
+                let job = {
+                    let mut jobs = lock(&actor.jobs);
+                    let Some(job) = jobs.waiting.pop_front() else {
+                        jobs.running = false;
+                        return;
+                    };
+                    job
+                };
+                actor.run(job);
+            }
+        });
+    }
+
+    fn run(&self, job: Job<X>) {
+        let mut database = lock(&self.database);
+        match job {
+            Job::Run(job) => {
+                if let Some(database) = database.as_mut() {
+                    job(database);
+                }
+            },
+            Job::Close(closed) => {
+                database.take();
+                let _ = closed.send(());
+            },
+        }
+    }
+
+    fn spawn(self: &Arc<Self>, job: impl FnOnce(&mut Database<X>) + Send + 'static) {
+        self.submit(Job::Run(Box::new(job)), false);
+    }
+
+    /// Runs `job` after the work handed over before, and waits for its result. Runs it on this
+    /// thread if the actor is idle, which saves the manager thread a round trip for its
+    /// metadata reads.
+    fn call<T: Send + 'static>(
+        self: &Arc<Self>,
+        job: impl FnOnce(&mut Database<X>) -> T + Send + 'static,
+    ) -> Result<T, SqlError> {
+        let (sender, receiver) = mpsc::channel();
+        let job = move |database: &mut Database<X>| {
+            let _ = sender.send(job(database));
+        };
+        self.submit(Job::Run(Box::new(job)), true);
+        receiver
+            .recv()
+            .map_err(|_| SqlError::TransactionState("the database is closed"))
+    }
+
+    fn close(self: &Arc<Self>) {
+        let (sender, receiver) = mpsc::channel();
+        self.submit(Job::Close(sender), true);
+        let _ = receiver.recv();
+    }
+
+    /// The connection's memory, unless a job is using it.
+    fn heap_size(&self) -> usize {
+        self.database
+            .try_lock()
+            .ok()
+            .and_then(|database| {
+                database
+                    .as_ref()
+                    .map(|database| database.executor.heap_size())
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// The connection of a database, which only the jobs of its actor touch.
+pub(super) struct Database<X> {
+    executor: X,
 }
 
 impl<X: SqlExecutor> MallocSizeOf for SqlEngine<X> {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
-        self.created_db_path.size_of(ops) + self.connection.borrow().heap_size()
+        self.created_db_path.size_of(ops) + self.actor.heap_size()
     }
 }
 
@@ -115,14 +252,16 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
         key_path: Option<KeyPath>,
         auto_increment: bool,
     ) -> Result<CreateObjectResult, Self::Error> {
-        self.run(TransactionBehavior::Immediate, |connection| {
-            queries::create_object_store(connection, store_name, key_path.as_ref(), auto_increment)
+        let store_name = store_name.to_owned();
+        self.run(TransactionBehavior::Immediate, move |connection| {
+            queries::create_object_store(connection, &store_name, key_path.as_ref(), auto_increment)
         })
     }
 
     fn delete_store(&self, store_name: &str) -> Result<(), Self::Error> {
-        self.run(TransactionBehavior::Immediate, |connection| {
-            queries::delete_object_store(connection, store_name)
+        let store_name = store_name.to_owned();
+        self.run(TransactionBehavior::Immediate, move |connection| {
+            queries::delete_object_store(connection, &store_name)
         })
     }
 
@@ -136,41 +275,16 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
         transaction: KvsTransaction,
         on_complete: Box<dyn FnOnce() + Send + 'static>,
     ) {
-        let spawning_pool = if transaction.mode == IndexedDBTxnMode::Readonly {
-            self.read_pool.clone()
-        } else {
-            self.write_pool.clone()
-        };
-        {
-            let mut queue = self.batches.lock().unwrap_or_else(PoisonError::into_inner);
-            queue.waiting.push_back((transaction, on_complete));
-            if queue.running {
-                return;
-            }
-            queue.running = true;
-        }
-        let batches = self.batches.clone();
-        let connector = self.connector.clone();
-        spawning_pool.spawn(move || {
-            while let Some((transaction, on_complete)) = next_batch(&batches) {
-                match connector() {
-                    Ok(mut connection) => run_batch(&mut connection, transaction),
-                    Err(error) => {
-                        for request in transaction.requests {
-                            request
-                                .operation
-                                .notify_error(BackendError::DbErr(format!("{error:?}")));
-                        }
-                    },
-                }
-                on_complete();
-            }
+        self.actor.spawn(move |database| {
+            run_batch(&mut database.executor, transaction);
+            on_complete();
         });
     }
 
     fn key_generator_current_number(&self, store_name: &str) -> Option<i64> {
-        self.run(TransactionBehavior::Deferred, |connection| {
-            queries::key_generator_current_number(connection, store_name)
+        let store_name = store_name.to_owned();
+        self.run(TransactionBehavior::Deferred, move |connection| {
+            queries::key_generator_current_number(connection, &store_name)
         })
         .unwrap_or_else(|error| {
             warn!("IndexedDB key generator lookup failed: {error:?}");
@@ -183,14 +297,16 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
         store_name: &str,
         current_number: i64,
     ) -> Result<(), Self::Error> {
-        self.run(TransactionBehavior::Immediate, |connection| {
-            queries::set_key_generator_current_number(connection, store_name, current_number)
+        let store_name = store_name.to_owned();
+        self.run(TransactionBehavior::Immediate, move |connection| {
+            queries::set_key_generator_current_number(connection, &store_name, current_number)
         })
     }
 
     fn key_path(&self, store_name: &str) -> Option<KeyPath> {
-        self.run(TransactionBehavior::Deferred, |connection| {
-            queries::key_path(connection, store_name)
+        let store_name = store_name.to_owned();
+        self.run(TransactionBehavior::Deferred, move |connection| {
+            queries::key_path(connection, &store_name)
         })
         .unwrap_or_else(|error| {
             warn!("IndexedDB key path lookup failed: {error:?}");
@@ -203,8 +319,9 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
     }
 
     fn indexes(&self, store_name: &str) -> Result<Vec<IndexedDBIndex>, Self::Error> {
-        self.run(TransactionBehavior::Deferred, |connection| {
-            queries::indexes(connection, store_name)
+        let store_name = store_name.to_owned();
+        self.run(TransactionBehavior::Deferred, move |connection| {
+            queries::indexes(connection, &store_name)
         })
     }
 
@@ -216,10 +333,11 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
         unique: bool,
         multi_entry: bool,
     ) -> Result<CreateObjectResult, Self::Error> {
-        self.run(TransactionBehavior::Immediate, |connection| {
+        let store_name = store_name.to_owned();
+        self.run(TransactionBehavior::Immediate, move |connection| {
             queries::create_index(
                 connection,
-                store_name,
+                &store_name,
                 &index_name,
                 &key_path,
                 unique,
@@ -229,8 +347,9 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
     }
 
     fn delete_index(&self, store_name: &str, index_name: String) -> Result<(), Self::Error> {
-        self.run(TransactionBehavior::Immediate, |connection| {
-            queries::delete_index(connection, store_name, &index_name)
+        let store_name = store_name.to_owned();
+        self.run(TransactionBehavior::Immediate, move |connection| {
+            queries::delete_index(connection, &store_name, &index_name)
         })
     }
 
@@ -239,7 +358,7 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
     }
 
     fn set_version(&self, version: u64) -> Result<(), Self::Error> {
-        self.run(TransactionBehavior::Immediate, |connection| {
+        self.run(TransactionBehavior::Immediate, move |connection| {
             queries::set_version(connection, version)
         })
     }
