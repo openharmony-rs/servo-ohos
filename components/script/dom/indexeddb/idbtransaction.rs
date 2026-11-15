@@ -16,8 +16,8 @@ use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::{GenericSend, GenericSender, SendError};
 use servo_base::id::ScriptEventLoopId;
 use storage_traits::indexeddb::{
-    BackendError, IndexedDBIndex, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath, SyncOperation,
-    TxnCompleteMsg,
+    BackendError, IndexedDBIndex, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode, KeyPath,
+    SyncOperation, TxnCompleteMsg,
 };
 use stylo_atoms::Atom;
 
@@ -84,9 +84,9 @@ pub struct IDBTransaction {
     next_unhandled_request_id: Cell<u64>,
     handled_pending: DomRefCell<HashSet<u64>>,
 
-    // An unique identifier, used to commit and revert this transaction
-    // FIXME:(rasviitanen) Replace this with a channel
-    serial_number: u64,
+    /// The id the backend knows this transaction by.
+    #[no_trace]
+    id: IndexedDBTxnId,
 }
 
 impl IDBTransaction {
@@ -95,7 +95,7 @@ impl IDBTransaction {
         mode: IDBTransactionMode,
         durability: IDBTransactionDurability,
         scope: &DOMStringList,
-        serial_number: u64,
+        id: IndexedDBTxnId,
     ) -> IDBTransaction {
         IDBTransaction {
             eventtarget: EventTarget::new_inherited(),
@@ -129,11 +129,12 @@ impl IDBTransaction {
             next_request_id: Cell::new(0),
             next_unhandled_request_id: Cell::new(0),
             handled_pending: Default::default(),
-            serial_number,
+            id,
         }
     }
 
-    /// Does a blocking call to create a backend transaction and get its id.
+    /// Creates a readonly or readwrite transaction of `connection`, and tells the backend about
+    /// it without waiting for a reply.
     pub fn new(
         cx: &mut JSContext,
         global: &GlobalScope,
@@ -142,70 +143,51 @@ impl IDBTransaction {
         durability: IDBTransactionDurability,
         scope: &DOMStringList,
     ) -> DomRoot<IDBTransaction> {
-        let serial_number =
-            IDBTransaction::create_transaction(global, connection.get_name(), mode, scope);
-        IDBTransaction::new_with_serial(
-            cx,
-            global,
-            connection,
-            mode,
-            durability,
-            scope,
-            serial_number,
-        )
+        let id = connection.allocate_transaction_id();
+        let backend_mode = match mode {
+            IDBTransactionMode::Readonly => IndexedDBTxnMode::Readonly,
+            IDBTransactionMode::Readwrite => IndexedDBTxnMode::Readwrite,
+            IDBTransactionMode::Versionchange => IndexedDBTxnMode::Versionchange,
+        };
+        let backend_scope = (0..scope.Length())
+            .filter_map(|i| scope.Item(i))
+            .map(String::from)
+            .collect();
+        // https://w3c.github.io/IndexedDB/#transaction-scheduling
+        // The backend orders transactions by the arrival of this message, which is sent before
+        // any other message about the transaction.
+        if global
+            .storage_threads()
+            .send(IndexedDBThreadMsg::Sync(SyncOperation::CreateTransaction {
+                origin: global.origin().immutable().clone(),
+                db_name: String::from(connection.get_name()),
+                txn: id,
+                mode: backend_mode,
+                scope: backend_scope,
+            }))
+            .is_err()
+        {
+            error!("Failed to send SyncOperation::CreateTransaction");
+        }
+        IDBTransaction::new_with_id(cx, global, connection, mode, durability, scope, id)
     }
 
-    pub(crate) fn new_with_serial(
+    pub(crate) fn new_with_id(
         cx: &mut JSContext,
         global: &GlobalScope,
         connection: &IDBDatabase,
         mode: IDBTransactionMode,
         durability: IDBTransactionDurability,
         scope: &DOMStringList,
-        serial_number: u64,
+        id: IndexedDBTxnId,
     ) -> DomRoot<IDBTransaction> {
         reflect_dom_object(
             cx,
             Box::new(IDBTransaction::new_inherited(
-                connection,
-                mode,
-                durability,
-                scope,
-                serial_number,
+                connection, mode, durability, scope, id,
             )),
             global,
         )
-    }
-
-    fn create_transaction(
-        global: &GlobalScope,
-        db_name: DOMString,
-        mode: IDBTransactionMode,
-        scope: &DOMStringList,
-    ) -> u64 {
-        let backend_mode = match mode {
-            IDBTransactionMode::Readonly => IndexedDBTxnMode::Readonly,
-            IDBTransactionMode::Readwrite => IndexedDBTxnMode::Readwrite,
-            IDBTransactionMode::Versionchange => IndexedDBTxnMode::Versionchange,
-        };
-        let scope: Vec<String> = (0..scope.Length())
-            .filter_map(|i| scope.Item(i))
-            .map(String::from)
-            .collect();
-        let (sender, receiver) = channel(global.time_profiler_chan().clone()).unwrap();
-
-        global
-            .storage_threads()
-            .send(IndexedDBThreadMsg::Sync(SyncOperation::CreateTransaction {
-                sender,
-                origin: global.origin().immutable().clone(),
-                db_name: String::from(db_name),
-                mode: backend_mode,
-                scope,
-            }))
-            .expect("Failed to send IndexedDBThreadMsg::Sync");
-
-        receiver.recv().unwrap().expect("CreateTransaction failed")
     }
 
     /// <https://w3c.github.io/IndexedDB/#transaction-lifecycle>
@@ -357,7 +339,7 @@ impl IDBTransaction {
             callback,
             global.origin().immutable().clone(),
             String::from(self.db.get_name()),
-            self.serial_number,
+            self.id,
         );
 
         // https://w3c.github.io/IndexedDB/#transaction-lifecycle
@@ -435,8 +417,8 @@ impl IDBTransaction {
         &self.db
     }
 
-    pub fn get_serial_number(&self) -> u64 {
-        self.serial_number
+    pub(crate) fn id(&self) -> IndexedDBTxnId {
+        self.id
     }
 
     pub(crate) fn issued_count(&self) -> u64 {
@@ -551,7 +533,7 @@ impl IDBTransaction {
             callback,
             global.origin().immutable().clone(),
             String::from(self.db.get_name()),
-            self.serial_number,
+            self.id,
         );
         let _ = self
             .get_idb_thread()
@@ -574,7 +556,7 @@ impl IDBTransaction {
                 callback,
                 self.global().origin().immutable().clone(),
                 String::from(self.db.get_name()),
-                self.serial_number,
+                self.id,
             )));
         self.notify_backend_transaction_finished();
     }
@@ -585,7 +567,7 @@ impl IDBTransaction {
             SyncOperation::TransactionFinished {
                 origin: global.origin().immutable().clone(),
                 db_name: String::from(self.db.get_name()),
-                txn: self.serial_number,
+                txn: self.id,
             },
         ));
     }
@@ -628,7 +610,7 @@ impl IDBTransaction {
                         .clear_open_request_transaction_for_txn(&this);
                     let origin = this.global().origin().immutable().clone();
                     let db_name = String::from(this.db.get_name());
-                    let txn = this.serial_number;
+                    let txn = this.id;
                     let _ = this.get_idb_thread().send(IndexedDBThreadMsg::Sync(
                         SyncOperation::UpgradeTransactionFinished {
                             origin,
@@ -698,7 +680,7 @@ impl IDBTransaction {
                         .clear_open_request_transaction_for_txn(&this);
                     let origin = this.global().origin().immutable().clone();
                     let db_name = String::from(this.db.get_name());
-                    let txn = this.serial_number;
+                    let txn = this.id;
                     let _ = this.get_idb_thread().send(IndexedDBThreadMsg::Sync(
                         SyncOperation::UpgradeTransactionFinished {
                             origin,

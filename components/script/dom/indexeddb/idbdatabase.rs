@@ -10,7 +10,9 @@ use script_bindings::cell::DomRefCell;
 use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::{GenericSend, GenericSender};
-use storage_traits::indexeddb::{AsyncSchemaOperation, IndexedDBThreadMsg, KeyPath, SyncOperation};
+use storage_traits::indexeddb::{
+    AsyncSchemaOperation, IndexedDBThreadMsg, IndexedDBTxnId, KeyPath, SyncOperation,
+};
 use stylo_atoms::Atom;
 use uuid::Uuid;
 
@@ -46,6 +48,9 @@ pub struct IDBDatabase {
 
     #[no_trace]
     id: Uuid,
+    /// The serial number of the next transaction this connection creates; 0 is its upgrade
+    /// transaction's.
+    next_transaction_serial: Cell<u64>,
 
     // Flags
     /// <https://w3c.github.io/IndexedDB/#connection-close-pending-flag>
@@ -68,6 +73,7 @@ impl IDBDatabase {
                 object_store_names.into_iter().map(Into::into).collect(),
             ),
             upgrade_transaction: Default::default(),
+            next_transaction_serial: Cell::new(1),
             close_pending: Cell::new(false),
         }
     }
@@ -98,6 +104,16 @@ impl IDBDatabase {
 
     pub fn get_name(&self) -> DOMString {
         self.name.clone().root()
+    }
+
+    /// The id of a new transaction of this connection, unique among them.
+    pub(crate) fn allocate_transaction_id(&self) -> IndexedDBTxnId {
+        let serial = self.next_transaction_serial.get();
+        self.next_transaction_serial.set(serial + 1);
+        IndexedDBTxnId {
+            connection: self.id,
+            serial,
+        }
     }
 
     pub fn object_stores(&self, cx: &mut JSContext) -> DomRoot<DOMStringList> {
@@ -376,7 +392,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
                 database_name: self.name.to_string(),
                 store_name: name.to_string(),
                 operation,
-                transaction_serial_number: transaction.get_serial_number(),
+                transaction: transaction.id(),
             })
             .unwrap();
 
@@ -426,7 +442,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
                 database_name: self.name.to_string(),
                 store_name: name.to_string(),
                 operation,
-                transaction_serial_number: transaction.get_serial_number(),
+                transaction: transaction.id(),
             })
             .unwrap();
 

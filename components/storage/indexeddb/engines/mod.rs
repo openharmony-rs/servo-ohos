@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use malloc_size_of::MallocSizeOf;
 use malloc_size_of_derive::MallocSizeOf;
 use storage_traits::indexeddb::{
-    AsyncOperation, BackendResult, IndexedDBIndex, IndexedDBTxnMode, KeyPath,
+    AsyncOperation, BackendResult, IndexedDBIndex, IndexedDBTxnId, IndexedDBTxnMode, KeyPath,
 };
 
 pub(crate) use crate::indexeddb::backend::ActiveKvsEngine;
@@ -39,22 +39,26 @@ pub trait KvsEngine: MallocSizeOf {
     /// `on_complete` once they have run.
     fn process_transaction(
         &self,
-        transaction: u64,
+        transaction: IndexedDBTxnId,
         batch: KvsTransaction,
         on_complete: Box<dyn FnOnce() + Send + 'static>,
     );
 
     /// Makes the database's version `version` as part of the upgrade `transaction`, so that
     /// aborting the transaction reverts it.
-    fn upgrade_version(&self, transaction: u64, version: u64);
+    fn upgrade_version(&self, transaction: IndexedDBTxnId, version: u64);
 
     /// Commits `transaction` after all work handed over before, and calls `on_done` with the
     /// result once it is durable or has failed.
-    fn commit(&self, transaction: u64, on_done: Box<dyn FnOnce(BackendResult<()>) + Send>);
+    fn commit(
+        &self,
+        transaction: IndexedDBTxnId,
+        on_done: Box<dyn FnOnce(BackendResult<()>) + Send>,
+    );
 
     /// Undoes everything `transaction` changed, after all work handed over before, and calls
     /// `on_done` once it is undone.
-    fn rollback(&self, transaction: u64, on_done: Box<dyn FnOnce() + Send>);
+    fn rollback(&self, transaction: IndexedDBTxnId, on_done: Box<dyn FnOnce() + Send>);
 
     // The metadata reads answer as of the last commit, without waiting for the work handed over.
     fn has_key_generator(&self, store_name: &str) -> bool;

@@ -14,8 +14,8 @@ use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::generic_channel::GenericSend;
 use servo_url::origin::ImmutableOrigin;
 use storage_traits::indexeddb::{
-    BackendResult, ConnectionMsg, DatabaseInfo, IndexedDBThreadMsg, StorageBottleSource,
-    SyncOperation,
+    BackendResult, ConnectionMsg, DatabaseInfo, IndexedDBThreadMsg, IndexedDBTxnId,
+    StorageBottleSource, SyncOperation,
 };
 use stylo_atoms::Atom;
 use uuid::Uuid;
@@ -157,7 +157,7 @@ impl IDBFactory {
         true
     }
 
-    pub(crate) fn maybe_commit_txn(&self, cx: &mut JSContext, db_name: &str, txn_serial: u64) {
+    pub(crate) fn maybe_commit_txn(&self, cx: &mut JSContext, db_name: &str, txn: IndexedDBTxnId) {
         let key = DBName(db_name.to_string());
         let snapshot: Vec<DomRoot<IDBTransaction>> = {
             let map = self.indexeddb_transactions.borrow();
@@ -167,9 +167,9 @@ impl IDBFactory {
             bucket.iter().map(|t| DomRoot::from_ref(&**t)).collect()
         };
 
-        for txn in snapshot {
-            if txn.get_serial_number() == txn_serial {
-                txn.maybe_commit(cx);
+        for transaction in snapshot {
+            if transaction.id() == txn {
+                transaction.maybe_commit(cx);
                 break;
             }
         }

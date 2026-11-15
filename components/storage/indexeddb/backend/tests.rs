@@ -16,10 +16,11 @@ use servo_url::ImmutableOrigin;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
     BackendError, BackendResult, CreateObjectResult, IndexedDBKeyRange, IndexedDBKeyType,
-    IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
+    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
 };
 use tempfile::TempDir;
 use url::Host;
+use uuid::Uuid;
 
 use super::engine::SqlEngine;
 use super::executor::{
@@ -109,6 +110,14 @@ executor_tests!(
 );
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The transaction numbered `serial` of a test connection.
+pub(crate) fn txn(serial: u64) -> IndexedDBTxnId {
+    IndexedDBTxnId {
+        connection: Uuid::nil(),
+        serial,
+    }
+}
 
 fn test_origin() -> ImmutableOrigin {
     ImmutableOrigin::Tuple(
@@ -876,7 +885,7 @@ fn run_batch<X: SqlExecutor>(
 ) {
     let (done_sender, done_receiver) = mpsc::channel();
     db.process_transaction(
-        transaction,
+        txn(transaction),
         KvsTransaction {
             mode,
             requests: VecDeque::from(requests),
@@ -895,7 +904,7 @@ fn commit<X: SqlExecutor>(db: &SqlEngine<X>, transaction: u64) -> BackendResult<
     let (sender, receiver) = mpsc::channel();
     KvsEngine::commit(
         db,
-        transaction,
+        txn(transaction),
         Box::new(move |result| {
             let _ = sender.send(result);
         }),
@@ -909,7 +918,7 @@ fn commit<X: SqlExecutor>(db: &SqlEngine<X>, transaction: u64) -> BackendResult<
 fn abort<X: SqlExecutor>(db: &SqlEngine<X>, transaction: u64) {
     let (sender, receiver) = mpsc::channel();
     db.rollback(
-        transaction,
+        txn(transaction),
         Box::new(move || {
             let _ = sender.send(());
         }),
@@ -1538,7 +1547,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
     let schema =
         |store_name: &str, operation| request(store_name, AsyncOperation::Schema(operation));
     let put = get_callback();
-    db.upgrade_version(2, 2);
+    db.upgrade_version(txn(2), 2);
     run_batch(
         &db,
         2,
@@ -1751,7 +1760,7 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
     for (transaction, mode, requests) in batches {
         let done_sender = done_sender.clone();
         db.process_transaction(
-            transaction,
+            txn(transaction),
             KvsTransaction {
                 mode,
                 requests: VecDeque::from(requests),
@@ -1824,7 +1833,7 @@ fn test_two_databases_progress_independently<X: SqlExecutor>() {
     });
     let get = get_callback();
     busy.process_transaction(
-        2,
+        txn(2),
         KvsTransaction {
             mode: IndexedDBTxnMode::Readonly,
             requests: VecDeque::from([get_request(get.0, 1.0)]),
@@ -2198,7 +2207,7 @@ fn test_batches_reply_in_dispatch_order<X: SqlExecutor>() {
     for id in 0..8 {
         let done_sender = done_sender.clone();
         db.process_transaction(
-            id.into(),
+            txn(id.into()),
             KvsTransaction {
                 mode: IndexedDBTxnMode::Readonly,
                 requests: VecDeque::from([get_request(tagged(&order_sender, id), 1.0)]),
@@ -2284,12 +2293,12 @@ fn test_metadata_reads_do_not_wait_for_the_connection<X: SqlExecutor>() {
 fn test_upgrade_without_requests_sets_the_version_at_commit<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
-    db.upgrade_version(1, 2);
+    db.upgrade_version(txn(1), 2);
     assert_eq!(commit(&db, 1), Ok(()));
     assert_eq!(queries::version(&mut *db.connection()).unwrap(), 2);
     assert_eq!(db.version().unwrap(), 2);
 
-    db.upgrade_version(2, 3);
+    db.upgrade_version(txn(2), 3);
     abort(&db, 2);
     assert_eq!(db.version().unwrap(), 2);
     let mut connection = db.connection();

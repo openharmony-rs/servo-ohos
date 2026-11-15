@@ -565,7 +565,7 @@ impl IDBObjectStore {
                 database_name: self.db_name.to_string(),
                 store_name: self.name.borrow().clone().into(),
                 operation,
-                transaction_serial_number: self.transaction.get_serial_number(),
+                transaction: self.transaction.id(),
             })
             .is_err()
         {
@@ -987,7 +987,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
                 database_name: self.db_name.to_string(),
                 store_name: self.name.borrow().clone().into(),
                 operation,
-                transaction_serial_number: self.transaction.get_serial_number(),
+                transaction: self.transaction.id(),
             })
             .is_err()
         {
@@ -1030,7 +1030,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
                 database_name: self.db_name.to_string(),
                 store_name: self.name.borrow().clone().into(),
                 operation,
-                transaction_serial_number: self.transaction.get_serial_number(),
+                transaction: self.transaction.id(),
             })
             .is_err()
         {

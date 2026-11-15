@@ -19,8 +19,8 @@ use storage_traits::StorageThreads;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
     BackendError, BackendResult, ConnectionMsg, IndexedDBKeyRange, IndexedDBKeyType,
-    IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, IndexedDBValue,
-    KeyPath, PutItemResult, StorageBottleSource, SyncOperation, TxnCompleteMsg,
+    IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode,
+    IndexedDBValue, KeyPath, PutItemResult, StorageBottleSource, SyncOperation, TxnCompleteMsg,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -238,7 +238,7 @@ fn send_schema_operation(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     store_name: &str,
-    transaction: u64,
+    transaction: IndexedDBTxnId,
     operation: AsyncSchemaOperation,
 ) {
     GenericSend::send(
@@ -248,7 +248,7 @@ fn send_schema_operation(
             database_name: db_name.to_string(),
             store_name: store_name.to_string(),
             operation,
-            transaction_serial_number: transaction,
+            transaction,
         },
     )
     .unwrap();
@@ -258,7 +258,7 @@ fn create_object_store(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     store_name: &str,
-    transaction: u64,
+    transaction: IndexedDBTxnId,
     key_path: Option<KeyPath>,
     auto_increment: bool,
 ) -> mpsc::Receiver<Option<BackendError>> {
@@ -281,7 +281,7 @@ fn create_index(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     store_name: &str,
-    transaction: u64,
+    transaction: IndexedDBTxnId,
     index_name: &str,
     key_path: KeyPath,
     unique: bool,
@@ -345,31 +345,35 @@ fn get_version(ctx: &IndexedDbTestContext, db_name: &str) -> u64 {
     recv_timeout(&receiver, "version reply").unwrap()
 }
 
+/// Creates a transaction, as script does without waiting for a reply, and returns its id.
 fn create_transaction(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     mode: IndexedDBTxnMode,
     scope: Vec<String>,
-) -> u64 {
-    let (sender, receiver) = generic_channel::channel().unwrap();
+) -> IndexedDBTxnId {
+    let txn = IndexedDBTxnId {
+        connection: Uuid::new_v4(),
+        serial: 1,
+    };
     GenericSend::send(
         &ctx.private_threads,
         IndexedDBThreadMsg::Sync(SyncOperation::CreateTransaction {
-            sender,
             origin: ctx.origin.clone(),
             db_name: db_name.to_string(),
+            txn,
             mode,
             scope,
         }),
     )
     .unwrap();
-    recv_timeout(&receiver, "create transaction reply").unwrap()
+    txn
 }
 
 fn commit_transaction(
     ctx: &IndexedDbTestContext,
     db_name: &str,
-    txn: u64,
+    txn: IndexedDBTxnId,
 ) -> mpsc::Receiver<Option<TxnCompleteMsg>> {
     let (sender, receiver) = make_profile_callback();
     GenericSend::send(
@@ -388,7 +392,11 @@ fn commit_transaction(
 /// Mirror script's commit choreography for a versionchange transaction
 /// (`idbtransaction.rs`): the upgrade is only reported finished once the
 /// backend has confirmed the queued schema batch is durable.
-fn commit_upgrade_transaction(ctx: &IndexedDbTestContext, db_name: &str, transaction: u64) {
+fn commit_upgrade_transaction(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    transaction: IndexedDBTxnId,
+) {
     let receiver = commit_transaction(ctx, db_name, transaction);
     recv_callback_timeout(&receiver, "upgrade commit reply")
         .result
@@ -401,7 +409,11 @@ fn commit_upgrade_transaction(ctx: &IndexedDbTestContext, db_name: &str, transac
 /// (`idbtransaction.rs`): the backend abort is requested first and only its
 /// reply — which waits out a running batch — releases the upgrade. Reporting
 /// the upgrade finished without it would race the queued schema batch.
-fn abort_upgrade_transaction(ctx: &IndexedDbTestContext, db_name: &str, transaction: u64) {
+fn abort_upgrade_transaction(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    transaction: IndexedDBTxnId,
+) {
     let receiver = abort_transaction(ctx, db_name, transaction);
     recv_callback_timeout(&receiver, "upgrade abort reply");
     finish_upgrade_transaction(ctx, transaction, db_name, false);
@@ -422,7 +434,7 @@ fn close_database(ctx: &IndexedDbTestContext, id: Uuid, db_name: &str) {
 
 fn finish_upgrade_transaction(
     ctx: &IndexedDbTestContext,
-    txn: u64,
+    txn: IndexedDBTxnId,
     db_name: &str,
     committed: bool,
 ) {
@@ -438,7 +450,12 @@ fn finish_upgrade_transaction(
     .unwrap();
 }
 
-fn mark_request_handled(ctx: &IndexedDbTestContext, db_name: &str, txn: u64, request_id: u64) {
+fn mark_request_handled(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    txn: IndexedDBTxnId,
+    request_id: u64,
+) {
     GenericSend::send(
         &ctx.private_threads,
         IndexedDBThreadMsg::Sync(SyncOperation::RequestHandled {
@@ -451,7 +468,7 @@ fn mark_request_handled(ctx: &IndexedDbTestContext, db_name: &str, txn: u64, req
     .unwrap();
 }
 
-fn finish_transaction(ctx: &IndexedDbTestContext, db_name: &str, txn: u64) {
+fn finish_transaction(ctx: &IndexedDbTestContext, db_name: &str, txn: IndexedDBTxnId) {
     GenericSend::send(
         &ctx.private_threads,
         IndexedDBThreadMsg::Sync(SyncOperation::TransactionFinished {
@@ -467,7 +484,7 @@ fn put_item(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     store_name: &str,
-    txn: u64,
+    txn: IndexedDBTxnId,
     key: IndexedDBKeyType,
     value: Vec<u8>,
 ) -> mpsc::Receiver<Option<BackendResult<PutItemResult>>> {
@@ -478,7 +495,7 @@ fn put_item_request(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     store_name: &str,
-    txn: u64,
+    txn: IndexedDBTxnId,
     request_id: u64,
     key: Option<IndexedDBKeyType>,
     value: Vec<u8>,
@@ -510,7 +527,7 @@ fn get_all_keys_request(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     store_name: &str,
-    txn: u64,
+    txn: IndexedDBTxnId,
     key_range: IndexedDBKeyRange,
     request_id: u64,
 ) -> mpsc::Receiver<Option<BackendResult<Vec<IndexedDBKeyType>>>> {
@@ -540,7 +557,7 @@ fn iterate_request(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     store_name: &str,
-    txn: u64,
+    txn: IndexedDBTxnId,
     key_range: IndexedDBKeyRange,
     count: Option<u32>,
     reverse: bool,
@@ -572,7 +589,7 @@ fn get_item(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     store_name: &str,
-    txn: u64,
+    txn: IndexedDBTxnId,
     key: IndexedDBKeyType,
 ) -> mpsc::Receiver<Option<BackendResult<Option<IndexedDBValue>>>> {
     let request_id = 1;
@@ -600,7 +617,7 @@ fn remove_item(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     store_name: &str,
-    txn: u64,
+    txn: IndexedDBTxnId,
     key: IndexedDBKeyType,
 ) -> mpsc::Receiver<Option<BackendResult<()>>> {
     let request_id = 1;
@@ -628,7 +645,7 @@ fn remove_item_request(
     ctx: &IndexedDbTestContext,
     db_name: &str,
     store_name: &str,
-    txn: u64,
+    txn: IndexedDBTxnId,
     key_range: IndexedDBKeyRange,
 ) -> mpsc::Receiver<Option<BackendResult<()>>> {
     let request_id = 1;
@@ -1000,7 +1017,7 @@ fn test_indexeddb_duplicate_store_is_not_an_error() {
 fn abort_transaction(
     ctx: &IndexedDbTestContext,
     db_name: &str,
-    txn: u64,
+    txn: IndexedDBTxnId,
 ) -> mpsc::Receiver<Option<TxnCompleteMsg>> {
     let (sender, receiver) = make_profile_callback();
     GenericSend::send(
@@ -1869,7 +1886,7 @@ fn put_and_commit(ctx: &IndexedDbTestContext, db_name: &str, store_name: &str) {
 
 /// Sends `count` puts into `a` in the readwrite transaction `txn`, which keep the engine busy
 /// with a batch of them.
-fn send_puts(ctx: &IndexedDbTestContext, db_name: &str, txn: u64, count: u64) {
+fn send_puts(ctx: &IndexedDbTestContext, db_name: &str, txn: IndexedDBTxnId, count: u64) {
     for key in 0..count {
         let _ = put_item_request(
             ctx,

@@ -67,6 +67,32 @@ pub enum KeyPath {
     Sequence(Vec<String>),
 }
 
+/// A transaction: its connection, and a serial number that is unique among the transactions of
+/// the connection. The backend numbers the upgrade transaction of an open request 0
+/// ([`IndexedDBTxnId::upgrade`]); script numbers the transactions it creates from 1.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
+pub struct IndexedDBTxnId {
+    /// The id of the connection, which is also the id of the request that opened it.
+    pub connection: Uuid,
+    pub serial: u64,
+}
+
+impl IndexedDBTxnId {
+    /// The upgrade transaction of the connection `connection`.
+    pub fn upgrade(connection: Uuid) -> Self {
+        Self {
+            connection,
+            serial: 0,
+        }
+    }
+}
+
+impl Display for IndexedDBTxnId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.connection, self.serial)
+    }
+}
+
 // https://www.w3.org/TR/IndexedDB-3/#enumdef-idbtransactionmode
 #[derive(Clone, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
 pub enum IndexedDBTxnMode {
@@ -495,7 +521,7 @@ pub enum ConnectionMsg {
         id: Uuid,
         version: u64,
         old_version: u64,
-        transaction: u64,
+        transaction: IndexedDBTxnId,
         // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps
         // Step 3. Set transaction’s scope to connection’s object store set.
         object_store_names: Vec<String>,
@@ -523,14 +549,17 @@ pub enum ConnectionMsg {
         error: BackendError,
     },
     /// Ask script to recheck whether a transaction can commit now.
-    TxnMaybeCommit { db_name: String, txn: u64 },
+    TxnMaybeCommit {
+        db_name: String,
+        txn: IndexedDBTxnId,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct TxnCompleteMsg {
     pub origin: ImmutableOrigin,
     pub db_name: String,
-    pub txn: u64,
+    pub txn: IndexedDBTxnId,
     pub result: BackendResult<()>,
 }
 
@@ -556,15 +585,6 @@ pub enum SyncOperation {
         GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
         ImmutableOrigin,
     ),
-    /// Upgrades the version of the database
-    UpgradeVersion(
-        /// Sender to send new version as the result of the operation
-        GenericSender<BackendResult<u64>>,
-        ImmutableOrigin,
-        String, // Database
-        u64,    // Serial number for the transaction
-        u64,    // Version to upgrade to
-    ),
     /// Get object store info
     GetObjectStore(
         GenericSender<BackendResult<IndexedDBObjectStore>>,
@@ -577,20 +597,20 @@ pub enum SyncOperation {
         GenericCallback<TxnCompleteMsg>,
         ImmutableOrigin,
         String, // Database
-        u64,    // Transaction serial number
+        IndexedDBTxnId,
     ),
     /// Aborts a transaction in the backend
     Abort(
         GenericCallback<TxnCompleteMsg>,
         ImmutableOrigin,
         String, // Database
-        u64,    // Transaction serial number
+        IndexedDBTxnId,
     ),
     /// Upgrade transaction finished after its event was fired in script.
     UpgradeTransactionFinished {
         origin: ImmutableOrigin,
         db_name: String,
-        txn: u64,
+        txn: IndexedDBTxnId,
         committed: bool,
     },
     /// <https://w3c.github.io/IndexedDB/#transaction-lifetime
@@ -603,13 +623,17 @@ pub enum SyncOperation {
     RequestHandled {
         origin: ImmutableOrigin,
         db_name: String,
-        txn: u64,
+        txn: IndexedDBTxnId,
         request_id: u64,
     },
+    /// <https://w3c.github.io/IndexedDB/#dom-idbdatabase-transaction>: a transaction was created
+    /// with the id script gave it. Transactions are created before each other in the order in
+    /// which their messages reach the backend, see
+    /// <https://w3c.github.io/IndexedDB/#transaction-scheduling>.
     CreateTransaction {
-        sender: GenericSender<BackendResult<u64>>,
         origin: ImmutableOrigin,
         db_name: String,
+        txn: IndexedDBTxnId,
         mode: IndexedDBTxnMode,
         scope: Vec<String>,
     },
@@ -617,12 +641,12 @@ pub enum SyncOperation {
     TxnMaybeCommit {
         origin: ImmutableOrigin,
         db_name: String,
-        txn: u64,
+        txn: IndexedDBTxnId,
     },
     TransactionFinished {
         origin: ImmutableOrigin,
         db_name: String,
-        txn: u64,
+        txn: IndexedDBTxnId,
     },
 
     CloseDatabase(
@@ -688,8 +712,8 @@ pub enum IndexedDBThreadMsg {
         ImmutableOrigin,
         String, // Database
         String, // ObjectStore
-        u64,    // Serial number of the transaction that requests this operation
-        u64,    // Monotonic request id in the transaction
+        IndexedDBTxnId,
+        u64, // Monotonic request id in the transaction
         IndexedDBTxnMode,
         AsyncOperation,
     ),
@@ -698,12 +722,12 @@ pub enum IndexedDBThreadMsg {
         database_name: String,
         store_name: String,
         operation: AsyncSchemaOperation,
-        transaction_serial_number: u64,
+        transaction: IndexedDBTxnId,
     },
     EngineTxnBatchComplete {
         origin: ImmutableOrigin,
         db_name: String,
-        txn: u64,
+        txn: IndexedDBTxnId,
     },
 
     /// Measure memory used by this thread and send the report over the provided channel.

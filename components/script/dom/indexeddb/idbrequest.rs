@@ -137,7 +137,7 @@ impl RequestListener {
             SyncOperation::RequestHandled {
                 origin: global.origin().immutable().clone(),
                 db_name: String::from(transaction.get_db_name()),
-                txn: transaction.get_serial_number(),
+                txn: transaction.id(),
                 request_id,
             },
         ));
@@ -562,7 +562,7 @@ impl IDBRequest {
                 global.origin().immutable().clone(),
                 String::from(transaction.get_db_name()),
                 String::from(source.get_name()),
-                transaction.get_serial_number(),
+                transaction.id(),
                 request_id,
                 transaction_mode,
                 operation,

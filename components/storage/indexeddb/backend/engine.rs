@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use servo_base::threadpool::ThreadPool;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, IndexedDBIndex, IndexedDBTxnMode, KeyPath,
+    BackendError, BackendResult, IndexedDBIndex, IndexedDBTxnId, IndexedDBTxnMode, KeyPath,
 };
 
 use super::executor::{SqlError, SqlExecutor, TransactionBehavior};
@@ -275,21 +275,21 @@ impl<X: SqlExecutor> Actor<X> {
 pub(super) struct Database<X> {
     executor: X,
     /// The readwrite or versionchange transaction whose SQL transaction is open.
-    writer: Option<u64>,
+    writer: Option<IndexedDBTxnId>,
     /// The upgrade transaction that hasn't begun yet, and the version it sets when it begins.
-    upgrade: Option<(u64, u64)>,
+    upgrade: Option<(IndexedDBTxnId, u64)>,
     /// The upgrade transaction, whose commit changes the metadata.
-    versionchange: Option<u64>,
+    versionchange: Option<IndexedDBTxnId>,
     /// The metadata as of the last commit, which the [`SqlEngine`] reads.
     metadata: Arc<Mutex<Metadata>>,
     /// Transactions whose changes were rolled back by a failure, with the error that their later
     /// requests and their commit report, until the transaction aborts.
-    failed: FxHashMap<u64, BackendError>,
+    failed: FxHashMap<IndexedDBTxnId, BackendError>,
 }
 
 impl<X: SqlExecutor> Database<X> {
     /// Runs the requests of a batch in order and replies to each as it has run.
-    fn run_batch(&mut self, transaction: u64, batch: KvsTransaction) {
+    fn run_batch(&mut self, transaction: IndexedDBTxnId, batch: KvsTransaction) {
         let writes = batch.mode != IndexedDBTxnMode::Readonly;
         for request in batch.requests {
             if let Some(error) = self.failed.get(&transaction) {
@@ -329,7 +329,7 @@ impl<X: SqlExecutor> Database<X> {
     /// Begins the SQL transaction of the readwrite or versionchange `transaction`, unless it is
     /// open already. An upgrade transaction sets the database's version when it begins. On
     /// failure, the transaction has failed.
-    fn begin(&mut self, transaction: u64) -> Result<(), BackendError> {
+    fn begin(&mut self, transaction: IndexedDBTxnId) -> Result<(), BackendError> {
         self.notice_ended_transaction(ended_early);
         if let Some(error) = self.failed.get(&transaction) {
             return Err(error.clone());
@@ -363,7 +363,7 @@ impl<X: SqlExecutor> Database<X> {
     }
 
     /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>
-    fn commit(&mut self, transaction: u64) -> BackendResult<()> {
+    fn commit(&mut self, transaction: IndexedDBTxnId) -> BackendResult<()> {
         let changes_metadata = self
             .versionchange
             .take_if(|versionchange| *versionchange == transaction)
@@ -410,7 +410,7 @@ impl<X: SqlExecutor> Database<X> {
     }
 
     /// <https://w3c.github.io/IndexedDB/#abort-a-transaction>
-    fn abort(&mut self, transaction: u64) {
+    fn abort(&mut self, transaction: IndexedDBTxnId) {
         self.failed.remove(&transaction);
         if self
             .upgrade
@@ -428,12 +428,12 @@ impl<X: SqlExecutor> Database<X> {
     }
 
     /// Rolls back `transaction`, and fails its later requests and its commit with `error`.
-    fn fail(&mut self, transaction: u64, error: BackendError) {
+    fn fail(&mut self, transaction: IndexedDBTxnId, error: BackendError) {
         self.roll_back(transaction);
         self.failed.insert(transaction, error);
     }
 
-    fn roll_back(&mut self, transaction: u64) {
+    fn roll_back(&mut self, transaction: IndexedDBTxnId) {
         if self.writer != Some(transaction) {
             return;
         }
@@ -460,7 +460,7 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
 
     fn process_transaction(
         &self,
-        transaction: u64,
+        transaction: IndexedDBTxnId,
         batch: KvsTransaction,
         on_complete: Box<dyn FnOnce() + Send + 'static>,
     ) {
@@ -470,19 +470,23 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
         });
     }
 
-    fn upgrade_version(&self, transaction: u64, version: u64) {
+    fn upgrade_version(&self, transaction: IndexedDBTxnId, version: u64) {
         self.actor.spawn(move |database| {
             database.upgrade = Some((transaction, version));
             database.versionchange = Some(transaction);
         });
     }
 
-    fn commit(&self, transaction: u64, on_done: Box<dyn FnOnce(BackendResult<()>) + Send>) {
+    fn commit(
+        &self,
+        transaction: IndexedDBTxnId,
+        on_done: Box<dyn FnOnce(BackendResult<()>) + Send>,
+    ) {
         self.actor
             .spawn(move |database| on_done(database.commit(transaction)));
     }
 
-    fn rollback(&self, transaction: u64, on_done: Box<dyn FnOnce() + Send>) {
+    fn rollback(&self, transaction: IndexedDBTxnId, on_done: Box<dyn FnOnce() + Send>) {
         self.actor.spawn(move |database| {
             database.abort(transaction);
             on_done();

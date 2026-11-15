@@ -11,7 +11,7 @@ use profile_traits::generic_callback::GenericCallback;
 use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::GenericSend;
 use servo_url::origin::ImmutableOrigin;
-use storage_traits::indexeddb::{BackendResult, IndexedDBThreadMsg, SyncOperation};
+use storage_traits::indexeddb::{BackendResult, IndexedDBThreadMsg, IndexedDBTxnId, SyncOperation};
 use stylo_atoms::Atom;
 use uuid::Uuid;
 
@@ -164,13 +164,13 @@ impl IDBOpenDBRequest {
         connection: &IDBDatabase,
         old_version: u64,
         version: u64,
-        transaction: u64,
+        transaction: IndexedDBTxnId,
     ) {
         let global = self.global();
 
         let scope = connection.object_stores(cx);
 
-        let transaction = IDBTransaction::new_with_serial(
+        let transaction = IDBTransaction::new_with_id(
             cx,
             &global,
             connection,
