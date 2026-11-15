@@ -1278,11 +1278,14 @@ impl IndexedDBManager {
             for id in ids.iter() {
                 self.remove_connection(&key, id);
             }
-            {
-                let is_empty = {
+            let front_removed = {
+                let (is_empty, front_removed) = {
                     let Some(queue) = self.connection_queues.get_mut(&key) else {
                         continue;
                     };
+                    let front_removed = queue
+                        .front()
+                        .is_some_and(|open_request| ids.contains(&open_request.get_id()));
                     queue.retain_mut(|open_request| {
                         if ids.contains(&open_request.get_id()) {
                             let upgrade = open_request.abort();
@@ -1297,14 +1300,19 @@ impl IndexedDBManager {
                             true
                         }
                     });
-                    queue.is_empty()
+                    (queue.is_empty(), front_removed)
                 };
                 if is_empty {
                     self.connection_queues.remove(&key);
                 }
-            }
+                front_removed
+            };
             if let Some((upgrade, proxy_map)) = upgrade_to_revert {
                 self.revert_aborted_upgrade(&key, &upgrade, &proxy_map);
+            }
+            // The requests queued behind a removed request that was running go on.
+            if front_removed {
+                self.advance_connection_queue(key);
             }
         }
     }

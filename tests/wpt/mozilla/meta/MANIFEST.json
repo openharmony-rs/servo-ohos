@@ -8570,6 +8570,10 @@
      "removed-iframe-writer.html": [
       "728c70ad75c2804ca49320cd69afec1026e7fad8",
       []
+     ],
+     "upgrade-frame.html": [
+      "3e3e64899775946887e3efbfcc6d5e6bf5d3de24",
+      []
      ]
     }
    },
@@ -11893,6 +11897,15 @@
      [
       null,
       {}
+     ]
+    ],
+    "removed-iframe-during-upgrade.html": [
+     "faeb433113f2502f2f3141ded3cdf4c2afb3934a",
+     [
+      null,
+      {
+       "timeout": "long"
+      }
      ]
     ],
     "request-result-order.any.js": [

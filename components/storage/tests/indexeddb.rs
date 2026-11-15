@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock, mpsc};
 use std::time::Duration;
@@ -82,6 +82,7 @@ backend_tests!(
     test_indexeddb_requests_outside_the_mode_or_scope_fail_the_transaction,
     test_indexeddb_versionchange_follows_the_open_result_on_one_channel,
     test_indexeddb_create_index_population_runs_before_later_requests,
+    test_indexeddb_aborted_pending_upgrade_lets_the_next_open_run,
 );
 
 static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2616,6 +2617,47 @@ fn test_indexeddb_create_index_population_runs_before_later_requests() {
         panic!("expected the connection");
     };
     assert_eq!(object_stores[0].indexes.len(), 1);
+    close_database(&ctx, id, db_name);
+    ctx.shutdown();
+}
+
+/// When the global of an open request whose upgrade runs goes away, the open requests queued
+/// behind it go on.
+fn test_indexeddb_aborted_pending_upgrade_lets_the_next_open_run() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-aborted-pending-upgrade";
+    let first = open_database(&ctx, db_name, Some(1));
+    let ConnectionMsg::Upgrade { id, .. } = recv_callback_timeout(&first, "first upgrade") else {
+        panic!("expected an upgrade");
+    };
+    let second = open_database(&ctx, db_name, None);
+    assert!(
+        second.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the second open waits for the first"
+    );
+
+    GenericSend::send(
+        &ctx.private_threads,
+        IndexedDBThreadMsg::Sync(SyncOperation::AbortPendingUpgrades {
+            pending_upgrades: HashMap::from([(db_name.into(), HashSet::from([id]))]),
+            origin: ctx.origin.clone(),
+        }),
+    )
+    .unwrap();
+    let ConnectionMsg::Upgrade {
+        version,
+        old_version,
+        transaction,
+        ..
+    } = recv_callback_timeout(&second, "second upgrade")
+    else {
+        panic!("expected an upgrade of the database that the first upgrade didn't create");
+    };
+    assert_eq!((version, old_version), (1, 0));
+    commit_upgrade_transaction(&ctx, db_name, transaction);
+    let ConnectionMsg::Connection { id, .. } = recv_callback_timeout(&second, "connection") else {
+        panic!("expected the connection");
+    };
     close_database(&ctx, id, db_name);
     ctx.shutdown();
 }
