@@ -16,9 +16,10 @@ use servo_base::threadpool::ThreadPool;
 use servo_url::ImmutableOrigin;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, ConnectionEvent, IndexedDBIndex, IndexedDBKeyRange,
-    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBTxnId, IndexedDBTxnMode,
-    IndexedDBValue, KeyPath, PutItemResult, RequestOutput, TransactionEvent, Utf16String,
+    BackendError, BackendResult, ConnectionEvent, IndexedDBIndex, IndexedDBIndexKey,
+    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord,
+    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput,
+    TransactionEvent, Utf16String,
 };
 use tempfile::TempDir;
 use url::Host;
@@ -114,6 +115,13 @@ executor_tests!(
     test_job_that_ends_the_sql_transaction_fails_the_writer,
     test_metadata_reads_do_not_wait_for_the_connection,
     test_upgrade_without_requests_sets_the_version_at_commit,
+    test_index_records_follow_puts_and_overwrites,
+    test_deleted_records_take_their_index_records_along,
+    test_deleted_indexes_take_their_records_along,
+    test_unique_index_conflict_changes_nothing,
+    test_placeholders_become_the_record_key,
+    test_abort_reverts_index_records,
+    test_index_keys_for_other_indexes_fail_the_transaction,
 );
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -842,9 +850,17 @@ fn test_unpaired_surrogates_in_names_and_keys<X: SqlExecutor>() {
         units(&[0xDC00, 0xD800]),
     ]
     .into_iter()
-    .map(|key| (Some(IndexedDBKeyType::String(key)), vec![]))
+    .map(|key| {
+        let key = IndexedDBKeyType::String(key);
+        let index_keys = vec![index_keys(1, [key.clone()]), index_keys(2, [])];
+        (Some(key), vec![], index_keys)
+    })
     .collect();
-    assert!(run_puts(&db, 1, 1, puts, false).iter().all(Result::is_ok));
+    assert!(
+        run_indexed_puts(&db, 1, 1, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
     assert!(commit(&db, 1).is_ok());
     let sorted: Vec<_> = [
         &[0x61, 0xDFFF][..],
@@ -859,6 +875,11 @@ fn test_unpaired_surrogates_in_names_and_keys<X: SqlExecutor>() {
     .collect();
     assert!(sorted.is_sorted_by(|a, b| a < b));
     assert_eq!(stored_keys(&db, 1), sorted);
+    let by_trail: Vec<_> = sorted
+        .iter()
+        .map(|key| (key.clone(), key.clone()))
+        .collect();
+    assert_eq!(index_records_of(&db, 1, 1), by_trail);
     let range = IndexedDBKeyRange::new(
         Some(IndexedDBKeyType::String(lead.clone())),
         Some(IndexedDBKeyType::String(trail.clone())),
@@ -996,17 +1017,11 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
 
     in_own_transaction(&db, |executor| {
         let store = queries::object_store(executor, books)?.unwrap();
-        queries::put_record(executor, &store, None, &[7], false)?;
-        executor.execute(
-            "INSERT INTO index_data (index_id, value, object_data_key, object_store_id) \
-             VALUES (?, ?, ?, ?)",
-            &[
-                SqlParam::Integer(by_author),
-                SqlParam::Blob(&[1]),
-                SqlParam::Blob(&encoding::serialize(&IndexedDBKeyType::Number(1.0))),
-                SqlParam::Integer(books),
-            ],
-        )?;
+        let index_keys = vec![
+            index_keys(by_title, []),
+            index_keys(by_author, [IndexedDBKeyType::Number(1.0)]),
+        ];
+        queries::put_record(executor, &store, None, &[7], false, index_keys)?;
         Ok(())
     })
     .unwrap();
@@ -1136,6 +1151,7 @@ fn test_delete_store_removes_store_records<X: SqlExecutor>() {
             Some(IndexedDBKeyType::Number(1.0)),
             &[1, 2, 3],
             true,
+            vec![],
         )
         .expect("Failed to insert item");
         assert_eq!(record_count(&mut *connection, object_store.id), 1);
@@ -1270,6 +1286,7 @@ fn schema(store: i64, operation: AsyncSchemaOperation) -> KvsOperation {
     }
 }
 
+/// A put into a store without indexes.
 fn put_request(
     store: i64,
     request_id: ReplyId<PutReply>,
@@ -1277,19 +1294,54 @@ fn put_request(
     value: Vec<u8>,
     should_overwrite: bool,
 ) -> KvsOperation {
+    indexed_put_request(
+        store,
+        request_id,
+        Some(key),
+        value,
+        should_overwrite,
+        vec![],
+    )
+}
+
+/// A put under `key`, or under a generated key if it is `None`, with the record's keys in the
+/// store's indexes.
+fn indexed_put_request(
+    store: i64,
+    request_id: ReplyId<PutReply>,
+    key: Option<IndexedDBKeyType>,
+    value: Vec<u8>,
+    should_overwrite: bool,
+    index_keys: Vec<IndexedDBIndexKeys>,
+) -> KvsOperation {
     request(
         store,
         request_id,
         AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
-            key: Some(key),
+            key,
             value,
             should_overwrite,
+            index_keys,
         }),
     )
 }
 
+/// The keys `keys` of a record in the index `index`.
+fn index_keys(index: i64, keys: impl IntoIterator<Item = IndexedDBKeyType>) -> IndexedDBIndexKeys {
+    IndexedDBIndexKeys {
+        index_id: index,
+        keys: keys.into_iter().map(IndexedDBIndexKey::Key).collect(),
+    }
+}
+
+/// No keys in each of the indexes `indexes`.
+fn no_index_keys(indexes: &[i64]) -> Vec<IndexedDBIndexKeys> {
+    indexes.iter().map(|index| index_keys(*index, [])).collect()
+}
+
 /// Runs `puts` (an explicit key or `None` for a generated one, and the value) in order as one
-/// batch of the readwrite `transaction` on `store`, and returns their replies.
+/// batch of the readwrite `transaction` on `store`, which has no indexes, and returns their
+/// replies.
 fn run_puts<X: SqlExecutor>(
     db: &SqlEngine<X>,
     transaction: u64,
@@ -1297,16 +1349,27 @@ fn run_puts<X: SqlExecutor>(
     puts: Vec<(Option<IndexedDBKeyType>, Vec<u8>)>,
     should_overwrite: bool,
 ) -> Vec<BackendResult<PutItemResult>> {
+    let puts = puts
+        .into_iter()
+        .map(|(key, value)| (key, value, vec![]))
+        .collect();
+    run_indexed_puts(db, transaction, store, puts, should_overwrite)
+}
+
+/// Like [`run_puts`], with the keys of each record in the store's indexes.
+fn run_indexed_puts<X: SqlExecutor>(
+    db: &SqlEngine<X>,
+    transaction: u64,
+    store: i64,
+    puts: Vec<(Option<IndexedDBKeyType>, Vec<u8>, Vec<IndexedDBIndexKeys>)>,
+    should_overwrite: bool,
+) -> Vec<BackendResult<PutItemResult>> {
     let (requests, receivers): (Vec<_>, Vec<_>) = puts
         .into_iter()
-        .map(|(key, value)| {
+        .map(|(key, value, index_keys)| {
             let (id, receiver) = get_callback();
-            let operation = AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
-                key,
-                value,
-                should_overwrite,
-            });
-            (request(store, id, operation), receiver)
+            let put = indexed_put_request(store, id, key, value, should_overwrite, index_keys);
+            (put, receiver)
         })
         .unzip();
     run_batch(db, transaction, IndexedDBTxnMode::Readwrite, requests);
@@ -1567,6 +1630,7 @@ fn test_delete_item_range_respects_open_bounds<X: SqlExecutor>() {
                 Some(IndexedDBKeyType::Number(key as f64)),
                 &[key as u8],
                 false,
+                vec![],
             )
             .expect("Failed to seed object store");
         }
@@ -1664,12 +1728,13 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
         1,
         IndexedDBTxnMode::Versionchange,
         vec![
-            put_request(
+            indexed_put_request(
                 store_id,
                 put.0,
-                IndexedDBKeyType::Number(1.0),
+                Some(IndexedDBKeyType::Number(1.0)),
                 vec![1],
                 false,
+                no_index_keys(&index_ids),
             ),
             // Index names are unique per store, so this fails in the database.
             schema(
@@ -1679,12 +1744,13 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
                     new_name: "b".into(),
                 },
             ),
-            put_request(
+            indexed_put_request(
                 store_id,
                 put_after.0,
-                IndexedDBKeyType::Number(2.0),
+                Some(IndexedDBKeyType::Number(2.0)),
                 vec![2],
                 false,
+                no_index_keys(&index_ids),
             ),
         ],
     );
@@ -1700,12 +1766,13 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
         &db,
         1,
         IndexedDBTxnMode::Versionchange,
-        vec![put_request(
+        vec![indexed_put_request(
             store_id,
             put_later.0,
-            IndexedDBKeyType::Number(3.0),
+            Some(IndexedDBKeyType::Number(3.0)),
             vec![3],
             false,
+            no_index_keys(&index_ids),
         )],
     );
     assert!(recv(&put_later.1).is_err());
@@ -1975,7 +2042,13 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
             .into_iter()
             .zip(&seeds)
             .map(|(store, seed)| {
-                put_request(store, seed.0, IndexedDBKeyType::Number(1.0), vec![1], false)
+                let index_keys = if store == kept {
+                    no_index_keys(&[by_a])
+                } else {
+                    vec![]
+                };
+                let key = Some(IndexedDBKeyType::Number(1.0));
+                indexed_put_request(store, seed.0, key, vec![1], false, index_keys)
             })
             .collect(),
     );
@@ -1989,7 +2062,14 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
         2,
         IndexedDBTxnMode::Versionchange,
         vec![
-            put_request(kept, put.0, IndexedDBKeyType::Number(2.0), vec![2], false),
+            indexed_put_request(
+                kept,
+                put.0,
+                Some(IndexedDBKeyType::Number(2.0)),
+                vec![2],
+                false,
+                no_index_keys(&[by_a]),
+            ),
             schema(
                 created,
                 AsyncSchemaOperation::CreateObjectStore {
@@ -2036,6 +2116,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
                 key: None,
                 value: vec![3],
                 should_overwrite: false,
+                index_keys: vec![],
             }),
         )],
     );
@@ -2903,6 +2984,593 @@ fn key_path_round_trip() {
 #[test]
 fn key_path_decode_rejects_invalid_bytes() {
     assert!(queries::decode_key_path(&[0xff]).is_err());
+}
+
+/// A string key.
+fn string(string: &str) -> IndexedDBKeyType {
+    IndexedDBKeyType::String(string.into())
+}
+
+fn number(number: f64) -> IndexedDBKeyType {
+    IndexedDBKeyType::Number(number)
+}
+
+/// The records of the index `index` of `store`, as (key, primary key), in the index's order.
+fn index_records_of<X: SqlExecutor>(
+    db: &SqlEngine<X>,
+    store: i64,
+    index: i64,
+) -> Vec<(IndexedDBKeyType, IndexedDBKeyType)> {
+    let mut connection = db.connection();
+    let index = queries::object_store(&mut *connection, store)
+        .unwrap()
+        .unwrap()
+        .index(index)
+        .unwrap();
+    let sql = format!(
+        "SELECT value, object_data_key FROM {} WHERE index_id = ? \
+         ORDER BY value, object_data_key",
+        index.table()
+    );
+    query_rows(
+        &mut *connection,
+        &sql,
+        &[SqlParam::Integer(index.id)],
+        |row| {
+            Ok((
+                encoding::deserialize(&row.blob(0)?).unwrap(),
+                encoding::deserialize(&row.blob(1)?).unwrap(),
+            ))
+        },
+    )
+    .unwrap()
+}
+
+/// The number of records of the index `index` in both index tables.
+fn index_record_count<X: SqlExecutor>(db: &SqlEngine<X>, index: i64) -> i64 {
+    query_row(
+        &mut *db.connection(),
+        "SELECT (SELECT COUNT(*) FROM index_data WHERE index_id = ?) + \
+         (SELECT COUNT(*) FROM unique_index_data WHERE index_id = ?)",
+        &[SqlParam::Integer(index), SqlParam::Integer(index)],
+        |row| row.integer(0),
+    )
+    .unwrap()
+    .unwrap()
+}
+
+/// The number of index records whose record isn't in the store. The host's SQLite rejects them
+/// with its foreign keys; RDB doesn't check them in transactions.
+fn dangling_index_records<X: SqlExecutor>(db: &SqlEngine<X>) -> i64 {
+    query_row(
+        &mut *db.connection(),
+        "SELECT \
+         (SELECT COUNT(*) FROM index_data AS i WHERE NOT EXISTS (SELECT 1 FROM object_data AS o \
+         WHERE o.object_store_id = i.object_store_id AND o.key = i.object_data_key)) + \
+         (SELECT COUNT(*) FROM unique_index_data AS i WHERE NOT EXISTS (SELECT 1 FROM object_data \
+         AS o WHERE o.object_store_id = i.object_store_id AND o.key = i.object_data_key))",
+        &[],
+        |row| row.integer(0),
+    )
+    .unwrap()
+    .unwrap()
+}
+
+/// `(key, primary key)` index records with string keys and number primary keys.
+fn string_records(records: &[(&str, f64)]) -> Vec<(IndexedDBKeyType, IndexedDBKeyType)> {
+    records
+        .iter()
+        .map(|(key, primary_key)| (string(key), number(*primary_key)))
+        .collect()
+}
+
+fn remove_request(
+    store: i64,
+    request_id: ReplyId<BackendResult<()>>,
+    key_range: IndexedDBKeyRange,
+) -> KvsOperation {
+    request(
+        store,
+        request_id,
+        AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem { key_range }),
+    )
+}
+
+/// A put stores a record in each index for each of the record's keys there, a put that replaces a
+/// record replaces its index records, and an index without keys for the record gets none.
+fn test_index_records_follow_puts_and_overwrites<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "people", None, false).unwrap();
+    let index = |name: &str, unique, multi_entry| {
+        let key_path = KeyPath::String(name.to_owned());
+        create_index(&db, store, name.to_owned(), key_path, unique, multi_entry).unwrap()
+    };
+    let (by_name, by_email, by_tag) = (
+        index("name", false, false),
+        index("email", true, false),
+        index("tag", false, true),
+    );
+    let keys = |name: Option<&str>, email: &str, tags: &[&str]| {
+        vec![
+            index_keys(by_name, name.map(string)),
+            index_keys(by_email, [string(email)]),
+            index_keys(by_tag, tags.iter().map(|tag| string(tag))),
+        ]
+    };
+    let puts = vec![
+        (
+            Some(number(1.0)),
+            vec![1],
+            keys(Some("ann"), "a@x", &["red", "blue"]),
+        ),
+        (
+            Some(number(2.0)),
+            vec![2],
+            keys(Some("ann"), "b@x", &["blue"]),
+        ),
+        (Some(number(3.0)), vec![3], keys(None, "c@x", &[])),
+    ];
+    assert_eq!(
+        run_indexed_puts(&db, 1, store, puts, true),
+        vec![key_reply(1.0), key_reply(2.0), key_reply(3.0)]
+    );
+    let emails = string_records(&[("a@x", 1.0), ("b@x", 2.0), ("c@x", 3.0)]);
+    assert_eq!(
+        index_records_of(&db, store, by_name),
+        string_records(&[("ann", 1.0), ("ann", 2.0)])
+    );
+    assert_eq!(index_records_of(&db, store, by_email), emails);
+    assert_eq!(
+        index_records_of(&db, store, by_tag),
+        string_records(&[("blue", 1.0), ("blue", 2.0), ("red", 1.0)])
+    );
+
+    // Record 1 gets another name, keeps its own email, and loses its tags.
+    let puts = vec![(Some(number(1.0)), vec![4], keys(Some("bea"), "a@x", &[]))];
+    assert_eq!(
+        run_indexed_puts(&db, 1, store, puts, true),
+        vec![key_reply(1.0)]
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+    assert_eq!(
+        index_records_of(&db, store, by_name),
+        string_records(&[("ann", 2.0), ("bea", 1.0)])
+    );
+    assert_eq!(index_records_of(&db, store, by_email), emails);
+    assert_eq!(
+        index_records_of(&db, store, by_tag),
+        string_records(&[("blue", 2.0)])
+    );
+    // A unique index's records are only in `unique_index_data`.
+    assert_eq!(index_record_count(&db, by_email), 3);
+    assert_eq!(dangling_index_records(&db), 0);
+}
+
+/// Deleting a record, a range of records or all of them deletes their index records, and only
+/// theirs.
+fn test_deleted_records_take_their_index_records_along<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let other = create_store(&db, "other", None, false).unwrap();
+    let index = |store, name: &str, unique| {
+        let key_path = KeyPath::String(name.to_owned());
+        create_index(&db, store, name.to_owned(), key_path, unique, false).unwrap()
+    };
+    let (by_parity, by_tenfold, by_other) = (
+        index(store, "parity", false),
+        index(store, "tenfold", true),
+        index(other, "parity", false),
+    );
+    let puts = (1..=6)
+        .map(|key| {
+            let key = f64::from(key);
+            let index_keys = vec![
+                index_keys(by_parity, [number(key % 2.0)]),
+                index_keys(by_tenfold, [number(key * 10.0)]),
+            ];
+            (Some(number(key)), vec![], index_keys)
+        })
+        .collect();
+    assert!(
+        run_indexed_puts(&db, 1, store, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    let puts = vec![(
+        Some(number(2.0)),
+        vec![],
+        vec![index_keys(by_other, [number(0.0)])],
+    )];
+    assert_eq!(
+        run_indexed_puts(&db, 1, other, puts, false),
+        vec![key_reply(2.0)]
+    );
+
+    let removals: Vec<_> = (0..2).map(|_| get_callback()).collect();
+    let lower_open = IndexedDBKeyRange::new(Some(number(3.0)), Some(number(5.0)), true, false);
+    run_batch(
+        &db,
+        1,
+        IndexedDBTxnMode::Readwrite,
+        vec![
+            remove_request(store, removals[0].0, IndexedDBKeyRange::only(number(2.0))),
+            remove_request(store, removals[1].0, lower_open),
+        ],
+    );
+    assert!(removals.iter().all(|removal| recv(&removal.1).is_ok()));
+    assert_eq!(stored_keys(&db, store), number_keys([1, 3, 6]));
+    let records = |pairs: &[(f64, f64)]| -> Vec<_> {
+        pairs
+            .iter()
+            .map(|(key, primary_key)| (number(*key), number(*primary_key)))
+            .collect()
+    };
+    assert_eq!(
+        index_records_of(&db, store, by_parity),
+        records(&[(0.0, 6.0), (1.0, 1.0), (1.0, 3.0)])
+    );
+    assert_eq!(
+        index_records_of(&db, store, by_tenfold),
+        records(&[(10.0, 1.0), (30.0, 3.0), (60.0, 6.0)])
+    );
+
+    let clear = get_callback::<BackendResult<()>>();
+    run_batch(
+        &db,
+        1,
+        IndexedDBTxnMode::Readwrite,
+        vec![request(
+            store,
+            clear.0,
+            AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear),
+        )],
+    );
+    assert_eq!(recv(&clear.1), Ok(()));
+    assert_eq!(commit(&db, 1), Ok(()));
+    assert_eq!(index_record_count(&db, by_parity), 0);
+    assert_eq!(index_record_count(&db, by_tenfold), 0);
+    assert_eq!(
+        index_records_of(&db, other, by_other),
+        records(&[(0.0, 2.0)])
+    );
+    assert_eq!(dangling_index_records(&db), 0);
+}
+
+/// Deleting an index deletes its records, and deleting a store those of all its indexes, so an
+/// index that gets the id of a deleted one in a later transaction starts empty.
+fn test_deleted_indexes_take_their_records_along<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    set_version(&db, 1).unwrap();
+    let kept = create_store(&db, "kept", None, false).unwrap();
+    let deleted = create_store(&db, "deleted", None, false).unwrap();
+    let key_path = KeyPath::String("a".to_owned());
+    let index = |store, name: &str, unique| {
+        create_index(&db, store, name.to_owned(), key_path.clone(), unique, false).unwrap()
+    };
+    let (stays, goes, goes_with_store) = (
+        index(kept, "stays", false),
+        index(kept, "goes", true),
+        index(deleted, "goes_with_store", false),
+    );
+    let puts = vec![(
+        Some(number(1.0)),
+        vec![],
+        vec![
+            index_keys(stays, [string("a")]),
+            index_keys(goes, [string("a")]),
+        ],
+    )];
+    assert!(run_indexed_puts(&db, 1, kept, puts, false)[0].is_ok());
+    let puts = vec![(
+        Some(number(1.0)),
+        vec![],
+        vec![index_keys(goes_with_store, [string("a")])],
+    )];
+    assert!(run_indexed_puts(&db, 1, deleted, puts, false)[0].is_ok());
+    assert_eq!(commit(&db, 1), Ok(()));
+    assert_eq!(
+        [stays, goes, goes_with_store].map(|index| index_record_count(&db, index)),
+        [1, 1, 1]
+    );
+
+    db.upgrade_version(txn(2), 2);
+    let failures = run_batch(
+        &db,
+        2,
+        IndexedDBTxnMode::Versionchange,
+        vec![
+            schema(kept, AsyncSchemaOperation::DeleteIndex { index_id: goes }),
+            schema(deleted, AsyncSchemaOperation::DeleteObjectStore),
+        ],
+    );
+    assert_eq!(failures, vec![]);
+    assert_eq!(commit(&db, 2), Ok(()));
+    assert_eq!(
+        [stays, goes, goes_with_store].map(|index| index_record_count(&db, index)),
+        [1, 0, 0]
+    );
+
+    // The largest index id is `stays`'s now, so the ids of the deleted indexes come back.
+    db.upgrade_version(txn(3), 3);
+    let failures = run_batch(
+        &db,
+        3,
+        IndexedDBTxnMode::Versionchange,
+        vec![schema(
+            kept,
+            AsyncSchemaOperation::CreateIndex {
+                index_id: goes,
+                name: "comes".into(),
+                key_path: key_path.clone(),
+                unique: false,
+                multi_entry: false,
+            },
+        )],
+    );
+    assert_eq!(failures, vec![]);
+    assert_eq!(commit(&db, 3), Ok(()));
+    assert_eq!(index_records_of(&db, kept, goes), vec![]);
+    assert_eq!(index_record_count(&db, goes), 0);
+    assert_eq!(dangling_index_records(&db), 0);
+}
+
+/// A put with a key that a unique index has for another record fails without any effect: not on
+/// the record it would replace, on the other indexes or on the key generator, and the transaction
+/// goes on. A replaced record doesn't conflict with its own keys, and each key of a multiEntry
+/// unique index must be unique.
+fn test_unique_index_conflict_changes_nothing<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "users", None, true).unwrap();
+    let index = |name: &str, unique, multi_entry| {
+        let key_path = KeyPath::String(name.to_owned());
+        create_index(&db, store, name.to_owned(), key_path, unique, multi_entry).unwrap()
+    };
+    let (by_email, by_name, by_tag) = (
+        index("email", true, false),
+        index("name", false, false),
+        index("tag", true, true),
+    );
+    let put = |key: Option<f64>, value: u8, email: &str, name: &str, tags: &[&str]| {
+        let index_keys = vec![
+            index_keys(by_email, [string(email)]),
+            index_keys(by_name, [string(name)]),
+            index_keys(by_tag, tags.iter().map(|tag| string(tag))),
+        ];
+        (key.map(number), vec![value], index_keys)
+    };
+    let conflict = |index| Ok(PutItemResult::UniqueIndexKeyExists(index));
+    let replies = run_indexed_puts(
+        &db,
+        1,
+        store,
+        vec![
+            put(None, 1, "a", "ann", &["t1", "t2"]),
+            put(None, 2, "b", "bob", &["t3"]),
+            put(None, 3, "a", "cat", &[]),
+            put(Some(10.0), 4, "x", "cat", &["t5", "t2"]),
+            put(Some(1.0), 5, "b", "cat", &[]),
+            put(Some(1.0), 6, "a", "ann", &["t2", "t1"]),
+            put(None, 7, "c", "dan", &["t4", "t4"]),
+        ],
+        true,
+    );
+    assert_eq!(
+        replies,
+        vec![
+            key_reply(1.0),
+            key_reply(2.0),
+            conflict(by_email),
+            conflict(by_tag),
+            conflict(by_email),
+            key_reply(1.0),
+            key_reply(3.0),
+        ]
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+    assert_eq!(db.key_generator_current_number(store), Some(4));
+    assert_eq!(stored_keys(&db, store), number_keys([1, 2, 3]));
+    let get = get_callback::<GetReply>();
+    run_batch(
+        &db,
+        2,
+        IndexedDBTxnMode::Readonly,
+        vec![request(
+            store,
+            get.0,
+            AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+                key_range: IndexedDBKeyRange::only(number(1.0)),
+            }),
+        )],
+    );
+    assert_eq!(recv(&get.1), Ok(Some(stored_value(1.0, vec![6]))));
+    assert_eq!(
+        index_records_of(&db, store, by_email),
+        string_records(&[("a", 1.0), ("b", 2.0), ("c", 3.0)])
+    );
+    assert_eq!(
+        index_records_of(&db, store, by_name),
+        string_records(&[("ann", 1.0), ("bob", 2.0), ("dan", 3.0)])
+    );
+    assert_eq!(
+        index_records_of(&db, store, by_tag),
+        string_records(&[("t1", 1.0), ("t2", 1.0), ("t3", 2.0), ("t4", 3.0)])
+    );
+    assert_eq!(dangling_index_records(&db), 0);
+}
+
+/// The parts of index keys that come from a generated key become the record's key, as a whole
+/// key and inside an array key.
+fn test_placeholders_become_the_record_key<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let id = KeyPath::String("id".to_owned());
+    let store = create_store(&db, "items", Some(id.clone()), true).unwrap();
+    let pair = KeyPath::Sequence(vec!["x".to_owned(), "id".to_owned()]);
+    let by_id = create_index(&db, store, "by_id".to_owned(), id.clone(), true, false).unwrap();
+    let by_ids = create_index(&db, store, "by_ids".to_owned(), id, false, true).unwrap();
+    let by_pair = create_index(&db, store, "by_pair".to_owned(), pair, true, false).unwrap();
+    let placeholders = |x: f64| {
+        vec![
+            IndexedDBIndexKeys {
+                index_id: by_id,
+                keys: vec![IndexedDBIndexKey::PrimaryKey],
+            },
+            IndexedDBIndexKeys {
+                index_id: by_ids,
+                keys: vec![IndexedDBIndexKey::PrimaryKey],
+            },
+            IndexedDBIndexKeys {
+                index_id: by_pair,
+                keys: vec![IndexedDBIndexKey::Array(vec![
+                    IndexedDBIndexKey::Key(number(x)),
+                    IndexedDBIndexKey::PrimaryKey,
+                ])],
+            },
+        ]
+    };
+    let explicit = vec![
+        index_keys(by_id, [number(5.0)]),
+        index_keys(by_ids, [number(5.0)]),
+        index_keys(
+            by_pair,
+            [IndexedDBKeyType::Array(vec![number(0.0), number(5.0)])],
+        ),
+    ];
+    let replies = run_indexed_puts(
+        &db,
+        1,
+        store,
+        vec![
+            (None, vec![1], placeholders(0.0)),
+            (None, vec![2], placeholders(0.0)),
+            (Some(number(5.0)), vec![3], explicit),
+            (None, vec![4], placeholders(1.0)),
+        ],
+        false,
+    );
+    assert_eq!(
+        replies,
+        vec![
+            key_reply(1.0),
+            key_reply(2.0),
+            key_reply(5.0),
+            key_reply(6.0)
+        ]
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+    let same: Vec<_> = [1.0, 2.0, 5.0, 6.0]
+        .into_iter()
+        .map(|key| (number(key), number(key)))
+        .collect();
+    assert_eq!(index_records_of(&db, store, by_id), same);
+    assert_eq!(index_records_of(&db, store, by_ids), same);
+    let pairs: Vec<_> = [(0.0, 1.0), (0.0, 2.0), (0.0, 5.0), (1.0, 6.0)]
+        .into_iter()
+        .map(|(x, key)| {
+            (
+                IndexedDBKeyType::Array(vec![number(x), number(key)]),
+                number(key),
+            )
+        })
+        .collect();
+    assert_eq!(index_records_of(&db, store, by_pair), pairs);
+}
+
+/// Aborting a transaction reverts what it did to index records, in both index tables.
+fn test_abort_reverts_index_records<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let key_path = KeyPath::String("a".to_owned());
+    let plain = create_index(
+        &db,
+        store,
+        "plain".to_owned(),
+        key_path.clone(),
+        false,
+        false,
+    )
+    .unwrap();
+    let unique = create_index(&db, store, "unique".to_owned(), key_path, true, false).unwrap();
+    let put = |key: f64, index_key: &str| {
+        let index_keys = vec![
+            index_keys(plain, [string(index_key)]),
+            index_keys(unique, [string(index_key)]),
+        ];
+        (Some(number(key)), vec![], index_keys)
+    };
+    assert!(run_indexed_puts(&db, 1, store, vec![put(1.0, "a")], true)[0].is_ok());
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    let replies = run_indexed_puts(&db, 2, store, vec![put(1.0, "b"), put(2.0, "c")], true);
+    assert!(replies.iter().all(Result::is_ok));
+    let removal = get_callback();
+    run_batch(
+        &db,
+        2,
+        IndexedDBTxnMode::Readwrite,
+        vec![remove_request(
+            store,
+            removal.0,
+            IndexedDBKeyRange::only(number(1.0)),
+        )],
+    );
+    assert_eq!(recv(&removal.1), Ok(()));
+    assert_eq!(
+        index_records_of(&db, store, unique),
+        string_records(&[("c", 2.0)])
+    );
+    abort(&db, 2);
+
+    let before = string_records(&[("a", 1.0)]);
+    assert_eq!(index_records_of(&db, store, plain), before);
+    assert_eq!(index_records_of(&db, store, unique), before);
+    // The aborted put's unique key is free again.
+    assert_eq!(
+        run_indexed_puts(&db, 3, store, vec![put(2.0, "b")], true),
+        vec![key_reply(2.0)]
+    );
+    assert_eq!(commit(&db, 3), Ok(()));
+}
+
+/// Index keys for other indexes than exactly the store's mean that script's metadata isn't the
+/// database's, so the put fails its transaction, which rolls back.
+fn test_index_keys_for_other_indexes_fail_the_transaction<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let other = create_store(&db, "other", None, false).unwrap();
+    let key_path = KeyPath::String("a".to_owned());
+    let index = create_index(&db, store, "a".to_owned(), key_path.clone(), false, false).unwrap();
+    let other_index = create_index(&db, other, "a".to_owned(), key_path, false, false).unwrap();
+    let mismatches = [
+        vec![],
+        no_index_keys(&[index, index]),
+        no_index_keys(&[index, other_index]),
+        no_index_keys(&[other_index]),
+    ];
+    for (transaction, index_keys) in (1..).zip(mismatches) {
+        let replies = run_indexed_puts(
+            &db,
+            transaction,
+            store,
+            vec![
+                (Some(number(1.0)), vec![], no_index_keys(&[index])),
+                (Some(number(2.0)), vec![], index_keys),
+                (Some(number(3.0)), vec![], no_index_keys(&[index])),
+            ],
+            false,
+        );
+        assert_eq!(replies[0], key_reply(1.0));
+        assert!(matches!(replies[1], Err(BackendError::DbErr(_))));
+        assert!(replies[2].is_err());
+        assert!(commit(&db, transaction).is_err());
+        assert_eq!(stored_keys(&db, store), vec![]);
+    }
 }
 
 #[test]

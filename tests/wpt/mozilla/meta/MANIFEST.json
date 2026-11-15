@@ -11742,6 +11742,69 @@
       }
      ]
     ],
+    "index-keys-page-code.any.js": [
+     "5a4fccd09b72cd07b55ce718e89055880f891ce9",
+     [
+      "IndexedDB/index-keys-page-code.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: page code reached while computing index keys can't make requests"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-keys-page-code.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: page code reached while computing index keys can't make requests"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-keys-page-code.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: page code reached while computing index keys can't make requests"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-keys-page-code.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: page code reached while computing index keys can't make requests"
+        ]
+       ]
+      }
+     ]
+    ],
     "removed-iframe-aborts-its-transactions.html": [
      "4c72fe0190142520f2e483e292f0997bd6dc924b",
      [
@@ -11890,6 +11953,69 @@
         [
          "title",
          "IndexedDB: string keys are their code units, unpaired surrogates included"
+        ]
+       ]
+      }
+     ]
+    ],
+    "unique-index-keys.any.js": [
+     "da058697baaf17203097f408822472199a02b144",
+     [
+      "IndexedDB/unique-index-keys.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/unique-index-keys.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/unique-index-keys.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/unique-index-keys.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
         ]
        ]
       }

@@ -697,6 +697,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
 
         // Step 10. Let operation be an algorithm to run store a record into an object store with
         // this's effective object store, clone, this's effective key, and false.
+        let index_keys = effective_object_store.index_keys(cx, cloned_js_value.handle(), false);
         // Step 11. Return the result (an IDBRequest) of running asynchronously execute a request
         // with this and operation.
         IDBRequest::execute_async(
@@ -706,6 +707,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
                 key: self.effective_key(),
                 value: serialized_value,
                 should_overwrite: true,
+                index_keys,
             }),
             None,
             None,

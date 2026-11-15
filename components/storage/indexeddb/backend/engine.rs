@@ -664,13 +664,14 @@ fn run_read_write<X: SqlExecutor>(
             key,
             value,
             should_overwrite,
+            index_keys,
         } => {
             if key.is_none() && store.auto_increment == 0 {
                 let error = BackendError::DbErr("Missing key for PutItem request".into());
                 return (Err(error), None);
             }
             outcome(
-                queries::put_record(executor, store, key, &value, should_overwrite),
+                queries::put_record(executor, store, key, &value, should_overwrite, index_keys),
                 RequestOutput::Put,
                 Failure::Write,
             )

@@ -4,20 +4,72 @@
 
 //! The IndexedDB operations on the tables of `schema.rs`.
 
+use std::collections::BTreeSet;
+
 use storage_traits::indexeddb::{
-    IndexedDBIndex, IndexedDBIndexId, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore,
-    IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBValue, KeyPath, PutItemResult, Utf16String,
+    IndexedDBIndex, IndexedDBIndexId, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
+    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBValue, KeyPath,
+    PutItemResult, Utf16String,
 };
 
 use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
 use crate::indexeddb::engines::encoding;
 
-/// A row of `object_store`.
+/// A row of `object_store`, with the indexes of the store.
 #[derive(Clone, Debug)]
 pub(crate) struct ObjectStore {
     pub(crate) id: i64,
     /// The key generator's current number, or 0 for a store without a key generator.
     pub(crate) auto_increment: i64,
+    /// In the order of their ids.
+    pub(crate) indexes: Vec<StoreIndex>,
+}
+
+impl ObjectStore {
+    pub(crate) fn index(&self, id: IndexedDBIndexId) -> Option<StoreIndex> {
+        self.indexes.iter().copied().find(|index| index.id == id)
+    }
+
+    /// The tables that hold the records of the store's indexes.
+    fn index_tables(&self) -> impl Iterator<Item = &'static str> {
+        let has = |unique| self.indexes.iter().any(|index| index.unique == unique);
+        [(has(false), "index_data"), (has(true), "unique_index_data")]
+            .into_iter()
+            .filter_map(|(has, table)| has.then_some(table))
+    }
+}
+
+/// An index of an object store, as reading and writing its records needs it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StoreIndex {
+    pub(crate) id: IndexedDBIndexId,
+    pub(crate) unique: bool,
+}
+
+impl StoreIndex {
+    /// The table of the index's records, `(index_id, value, object_data_key, object_store_id)`,
+    /// where `value` is the encoded index key and `object_data_key` the encoded primary key of
+    /// the record in the store. `unique_index_data`'s primary key `(index_id, value)` allows one
+    /// record per key; `index_data`'s is `(index_id, value, object_data_key)`. Both read in
+    /// (key, primary key) order.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn table(&self) -> &'static str {
+        if self.unique {
+            "unique_index_data"
+        } else {
+            "index_data"
+        }
+    }
+
+    fn insert_statement(&self) -> &'static str {
+        if self.unique {
+            "INSERT INTO unique_index_data (index_id, value, object_data_key, object_store_id) \
+             VALUES (?, ?, ?, ?)"
+        } else {
+            "INSERT INTO index_data (index_id, value, object_data_key, object_store_id) \
+             VALUES (?, ?, ?, ?)"
+        }
+    }
 }
 
 pub(crate) fn encode_key_path(key_path: &KeyPath) -> Result<Vec<u8>, SqlError> {
@@ -48,17 +100,33 @@ pub(crate) fn object_store<X: SqlExecutor>(
     executor: &mut X,
     store_id: IndexedDBObjectStoreId,
 ) -> Result<Option<ObjectStore>, SqlError> {
-    query_row(
+    let rows = query_rows(
         executor,
-        "SELECT id, auto_increment FROM object_store WHERE id = ?",
+        "SELECT s.id, s.auto_increment, i.id, i.unique_index FROM object_store AS s \
+         LEFT JOIN object_store_index AS i ON i.object_store_id = s.id \
+         WHERE s.id = ? ORDER BY i.id",
         &[SqlParam::Integer(store_id)],
         |row| {
-            Ok(ObjectStore {
-                id: row.integer(0)?,
-                auto_increment: row.integer(1)?,
-            })
+            let index = row
+                .optional_integer(2)?
+                .map(|id| {
+                    Ok::<_, SqlError>(StoreIndex {
+                        id,
+                        unique: row.integer(3)? != 0,
+                    })
+                })
+                .transpose()?;
+            Ok((row.integer(0)?, row.integer(1)?, index))
         },
-    )
+    )?;
+    let Some(&(id, auto_increment, _)) = rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(ObjectStore {
+        id,
+        auto_increment,
+        indexes: rows.into_iter().filter_map(|(_, _, index)| index).collect(),
+    }))
 }
 
 fn required_object_store<X: SqlExecutor>(
@@ -334,10 +402,11 @@ pub(crate) fn set_version<X: SqlExecutor>(executor: &mut X, version: u64) -> Res
     Ok(())
 }
 
-/// The `key` conditions for a key range, to append to a `WHERE` clause, and the encoded bounds
-/// to bind for their placeholders, in order.
+/// The conditions of a key range on an encoded key column, to append to a `WHERE` clause, and
+/// the encoded bounds to bind for their placeholders, in order.
 #[derive(Default)]
 struct RangeCondition {
+    /// The conditions, with `{}` for the column.
     sql: String,
     bounds: Vec<Vec<u8>>,
 }
@@ -346,6 +415,19 @@ impl RangeCondition {
     fn push(&mut self, sql: &str, bound: &IndexedDBKeyType) {
         self.sql.push_str(sql);
         self.bounds.push(encoding::serialize(bound));
+    }
+
+    /// The range of the one encoded key `key`.
+    fn only(key: Vec<u8>) -> Self {
+        Self {
+            sql: " AND {} = ?".to_owned(),
+            bounds: vec![key],
+        }
+    }
+
+    /// The conditions on the column `column`.
+    fn on(&self, column: &str) -> String {
+        self.sql.replace("{}", column)
     }
 
     /// The parameters for `object_store_id = ?` followed by this condition.
@@ -359,22 +441,22 @@ impl RangeCondition {
 fn range_condition(range: &IndexedDBKeyRange) -> RangeCondition {
     let mut condition = RangeCondition::default();
     if let Some(singleton) = range.as_singleton() {
-        condition.push(" AND key = ?", singleton);
+        condition.push(" AND {} = ?", singleton);
         return condition;
     }
     if let Some(lower) = range.lower.as_ref() {
         let sql = if range.lower_open {
-            " AND key > ?"
+            " AND {} > ?"
         } else {
-            " AND key >= ?"
+            " AND {} >= ?"
         };
         condition.push(sql, lower);
     }
     if let Some(upper) = range.upper.as_ref() {
         let sql = if range.upper_open {
-            " AND key < ?"
+            " AND {} < ?"
         } else {
-            " AND key <= ?"
+            " AND {} <= ?"
         };
         condition.push(sql, upper);
     }
@@ -395,7 +477,7 @@ fn select_records<X: SqlExecutor, T>(
     let condition = range_condition(range);
     let mut sql = format!(
         "SELECT {columns} FROM object_data WHERE object_store_id = ?{} ORDER BY key {}",
-        condition.sql,
+        condition.on("key"),
         if reverse { "DESC" } else { "ASC" }
     );
     let mut params = condition.params(store);
@@ -502,7 +584,7 @@ pub(crate) fn count<X: SqlExecutor>(
     let condition = range_condition(range);
     let sql = format!(
         "SELECT COUNT(*) FROM object_data WHERE object_store_id = ?{}",
-        condition.sql
+        condition.on("key")
     );
     let params = condition.params(store);
     let count = query_row(executor, &sql, &params, |row| row.integer(0))?.unwrap_or_default();
@@ -544,15 +626,124 @@ fn possibly_update_the_key_generator(current_number: i64, key: &IndexedDBKeyType
     (value >= current_number).then_some(value + 1)
 }
 
+/// The encoded keys of the records that an index gets for a record, without duplicates.
+pub(crate) struct IndexRecords {
+    pub(crate) index: StoreIndex,
+    pub(crate) keys: BTreeSet<Vec<u8>>,
+}
+
+/// The index records of the record with the key `primary_key` in `store`, from the keys that
+/// script computed for each index of the store, with `primary_key` in place of each placeholder.
+/// Keys for other indexes than exactly the store's mean that script's metadata isn't the
+/// database's.
+pub(crate) fn index_records(
+    store: &ObjectStore,
+    primary_key: &IndexedDBKeyType,
+    index_keys: Vec<IndexedDBIndexKeys>,
+) -> Result<Vec<IndexRecords>, SqlError> {
+    let mut records: Vec<IndexRecords> = Vec::with_capacity(index_keys.len());
+    for IndexedDBIndexKeys { index_id, keys } in index_keys {
+        let index = store.index(index_id).ok_or(SqlError::InvalidMetadata(
+            "index keys for an index the store doesn't have",
+        ))?;
+        if records.iter().any(|records| records.index == index) {
+            return Err(SqlError::InvalidMetadata("index keys given twice"));
+        }
+        let keys = keys
+            .into_iter()
+            .map(|key| encoding::serialize(&key.with_primary_key(primary_key)))
+            .collect();
+        records.push(IndexRecords { index, keys });
+    }
+    if records.len() != store.indexes.len() {
+        return Err(SqlError::InvalidMetadata("index keys missing for an index"));
+    }
+    Ok(records)
+}
+
+/// The first of the unique indexes in `records` that has one of its keys for another record
+/// than the one with the encoded key `primary_key`.
+pub(crate) fn unique_index_conflict<X: SqlExecutor>(
+    executor: &mut X,
+    records: &[IndexRecords],
+    primary_key: &[u8],
+) -> Result<Option<IndexedDBIndexId>, SqlError> {
+    for records in records.iter().filter(|records| records.index.unique) {
+        for key in &records.keys {
+            let taken = query_row(
+                executor,
+                "SELECT 1 FROM unique_index_data \
+                 WHERE index_id = ? AND value = ? AND object_data_key != ?",
+                &[
+                    SqlParam::Integer(records.index.id),
+                    SqlParam::Blob(key),
+                    SqlParam::Blob(primary_key),
+                ],
+                |_| Ok(()),
+            )?
+            .is_some();
+            if taken {
+                return Ok(Some(records.index.id));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Stores `records`, the index records of the record of `store` with the encoded key
+/// `primary_key`. The record must be stored already. A unique index's primary key rejects a key
+/// that another record has: callers check with [`unique_index_conflict`] first, and the failed
+/// statement fails the transaction.
+pub(crate) fn insert_index_records<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    primary_key: &[u8],
+    records: &[IndexRecords],
+) -> Result<(), SqlError> {
+    for records in records {
+        for key in &records.keys {
+            executor.execute(
+                records.index.insert_statement(),
+                &[
+                    SqlParam::Integer(records.index.id),
+                    SqlParam::Blob(key),
+                    SqlParam::Blob(primary_key),
+                    SqlParam::Integer(store.id),
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes the index records of the records of `store` whose keys meet `condition`.
+fn delete_index_records<X: SqlExecutor>(
+    executor: &mut X,
+    store: &ObjectStore,
+    condition: &RangeCondition,
+) -> Result<(), SqlError> {
+    let params = condition.params(store);
+    for table in store.index_tables() {
+        let sql = format!(
+            "DELETE FROM {table} WHERE object_store_id = ?{}",
+            condition.on("object_data_key")
+        );
+        executor.execute(&sql, &params)?;
+    }
+    Ok(())
+}
+
 /// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store>: stores `value` under
 /// `key`, or under a key from the store's key generator if `key` is `None`, which requires that
-/// the store has one. A record that can't be stored changes nothing, not even the key generator.
+/// the store has one, with `index_keys`, the keys script computed for each index of the store. A
+/// record that can't be stored changes nothing, not even the key generator.
 pub(crate) fn put_record<X: SqlExecutor>(
     executor: &mut X,
     store: &ObjectStore,
     key: Option<IndexedDBKeyType>,
     value: &[u8],
     overwrite: bool,
+    index_keys: Vec<IndexedDBIndexKeys>,
 ) -> Result<PutItemResult, SqlError> {
     let has_key_generator = store.auto_increment != 0;
     debug_assert!(key.is_some() || has_key_generator);
@@ -569,7 +760,7 @@ pub(crate) fn put_record<X: SqlExecutor>(
             // Step 1.1.3. If store also uses in-line keys, then run inject a key into a value
             // using a key path with value, key and store’s key path.
             // NOTE: The value is stored without the key; script injects it when it reads the
-            // value.
+            // value. The index keys that come from the key are placeholders.
             (key, Some(store.auto_increment + 1))
         },
         // Step 1.2. Otherwise, run possibly update the key generator for store with key.
@@ -595,6 +786,27 @@ pub(crate) fn put_record<X: SqlExecutor>(
         return Ok(PutItemResult::CannotOverwrite);
     }
 
+    // Step 5. For each index which references store:
+    // Step 5.1. Let index key be the result of extracting a key from a value using a key path
+    // with value, index’s key path, and index’s multiEntry flag.
+    // Step 5.2. If index key is an exception, or invalid, or failure, take no further actions for
+    // index, and continue these steps for the next index.
+    // NOTE: Script ran these steps.
+    let index_records = index_records(store, &key, index_keys)?;
+    // Step 5.3. If index’s multiEntry flag is false, or if index key is not an array key, and if
+    // index already contains a record with key equal to index key, and index’s unique flag is
+    // true, then this operation failed with a "ConstraintError" DOMException. Abort this
+    // algorithm without taking any further steps.
+    // Step 5.4. If index’s multiEntry flag is true and index key is an array key, and if index
+    // already contains a record with key equal to any of the subkeys of index key, and index’s
+    // unique flag is true, then this operation failed with a "ConstraintError" DOMException.
+    // Abort this algorithm without taking any further steps.
+    // NOTE: These checks run before anything is written, so that a failed request has no effects.
+    // Step 3 removes the index records of the record that is replaced, so they don't count.
+    if let Some(index) = unique_index_conflict(executor, &index_records, &encoded_key)? {
+        return Ok(PutItemResult::UniqueIndexKeyExists(index));
+    }
+
     // Step 3. If a record already exists in store with its key equal to key, then remove the
     // record from store using delete records from an object store.
     // Step 4. Store a record in store containing key as its key and !
@@ -602,6 +814,7 @@ pub(crate) fn put_record<X: SqlExecutor>(
     // store’s list of records such that the list is sorted according to the key of the records in
     // ascending order.
     if exists {
+        delete_index_records(executor, store, &RangeCondition::only(encoded_key.clone()))?;
         executor.execute(
             "UPDATE object_data SET data = ? WHERE object_store_id = ? AND key = ?",
             &[
@@ -620,6 +833,18 @@ pub(crate) fn put_record<X: SqlExecutor>(
             ],
         )?;
     }
+
+    // Step 5.5. If index’s multiEntry flag is false, or if index key is not an array key then
+    // store a record in index containing index key as its key and key as its value. The record is
+    // stored in index’s list of records such that the list is sorted primarily on the records keys,
+    // and secondarily on the records values, in ascending order.
+    // Step 5.6. If index’s multiEntry flag is true and index key is an array key, then for each
+    // subkey of the subkeys of index key store a record in index containing subkey as its key and
+    // key as its value. The records are stored in index’s list of records such that the list is
+    // sorted primarily on the records keys, and secondarily on the records values, in ascending
+    // order.
+    insert_index_records(executor, store, &encoded_key, &index_records)?;
+
     if let Some(current_number) = new_current_number {
         executor.execute(
             "UPDATE object_store SET auto_increment = ? WHERE id = ?",
@@ -634,25 +859,37 @@ pub(crate) fn put_record<X: SqlExecutor>(
     Ok(PutItemResult::Key(key))
 }
 
+/// <https://w3c.github.io/IndexedDB/#delete-records-from-an-object-store>
 pub(crate) fn delete_records<X: SqlExecutor>(
     executor: &mut X,
     store: &ObjectStore,
     range: &IndexedDBKeyRange,
 ) -> Result<(), SqlError> {
     let condition = range_condition(range);
+    // Step 2. For each index which references store, remove every record from index’s list of
+    // records whose value is in range, if any such records exist.
+    // NOTE: Before step 1, as index records refer to the store's records.
+    delete_index_records(executor, store, &condition)?;
+    // Step 1. Remove all records, if any, from store’s list of records with key in range.
     let sql = format!(
         "DELETE FROM object_data WHERE object_store_id = ?{}",
-        condition.sql
+        condition.on("key")
     );
-    let params = condition.params(store);
-    executor.execute(&sql, &params)?;
+    executor.execute(&sql, &condition.params(store))?;
+    // Step 3. Return undefined.
     Ok(())
 }
 
+/// <https://w3c.github.io/IndexedDB/#clear-an-object-store>
 pub(crate) fn clear<X: SqlExecutor>(executor: &mut X, store: &ObjectStore) -> Result<(), SqlError> {
+    // Step 2. In all indexes which reference store, remove all records.
+    // NOTE: Before step 1, as index records refer to the store's records.
+    delete_index_records(executor, store, &RangeCondition::default())?;
+    // Step 1. Remove all records from store.
     executor.execute(
         "DELETE FROM object_data WHERE object_store_id = ?",
         &[SqlParam::Integer(store.id)],
     )?;
+    // Step 3. Return undefined.
     Ok(())
 }

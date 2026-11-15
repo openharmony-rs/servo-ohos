@@ -17,7 +17,7 @@ use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::generic_channel::{GenericSend, GenericSender};
 use storage_traits::indexeddb::{
     self, AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    IndexedDBIndex, IndexedDBIndexId, IndexedDBKeyType, IndexedDBObjectStore,
+    IndexedDBIndex, IndexedDBIndexId, IndexedDBIndexKeys, IndexedDBKeyType, IndexedDBObjectStore,
     IndexedDBObjectStoreId, IndexedDBThreadMsg, Utf16String,
 };
 
@@ -43,8 +43,8 @@ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::key::{
     EvaluationResult, ExtractionResult, can_inject_key_into_value, convert_value_to_key,
     convert_value_to_key_range, dom_string_from_name, evaluate_key_path_on_value, extract_key,
-    inject_key_into_value, injected_key_is_stored, is_valid_key_path, name_from_dom_string,
-    sorted_name_list,
+    index_keys, inject_key_into_value, injected_key_is_stored, is_valid_key_path,
+    name_from_dom_string, sorted_name_list,
 };
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
@@ -229,6 +229,17 @@ impl IDBObjectStore {
         result
     }
 
+    /// Runs `f` with the transaction inactive, as cloning a value does: computing index keys
+    /// runs in the page's realm, where a getter reached through a hole of an array or a
+    /// prototype could otherwise make requests that overtake the one being made.
+    fn with_transaction_inactive<T>(&self, f: impl FnOnce() -> T) -> T {
+        let active = self.transaction.is_active();
+        self.transaction.set_active_flag(false);
+        let result = f();
+        self.transaction.set_active_flag(active);
+        result
+    }
+
     fn has_key_generator(&self) -> bool {
         self.has_key_generator
     }
@@ -275,6 +286,33 @@ impl IDBObjectStore {
             )));
         }
         Ok(())
+    }
+
+    /// The keys of the records that storing `value`, a clone, gives in each index of the store,
+    /// for the backend to store with the record: steps 5.1 and 5.2 of
+    /// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store>. If
+    /// `key_is_generated`, the backend generates the record's key, and the parts of the index
+    /// keys that come from the key are placeholders.
+    pub(crate) fn index_keys(
+        &self,
+        cx: &mut JSContext,
+        value: HandleValue,
+        key_is_generated: bool,
+    ) -> Vec<IndexedDBIndexKeys> {
+        let generated_key_path = match &self.key_path {
+            Some(KeyPath::String(key_path)) if key_is_generated => Some(key_path.str()),
+            _ => None,
+        };
+        let indexes = self.transaction.get_db().indexes(self.id);
+        self.with_transaction_inactive(|| {
+            indexes
+                .iter()
+                .map(|index| IndexedDBIndexKeys {
+                    index_id: index.id,
+                    keys: index_keys(cx, value, index, generated_key_path.as_deref()),
+                })
+                .collect()
+        })
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#object-store-in-line-keys>
@@ -408,7 +446,9 @@ impl IDBObjectStore {
         // Step 12. Let operation be an algorithm to run store a record into an object store with
         // store, clone, key, and no-overwrite flag.
         // NOTE: The backend generates the key if none was given, and the value is stored without
-        // it: reading the value injects the key, see `deserialize_value`.
+        // it: reading the value injects the key, see `deserialize_value`. The index keys that the
+        // operation's step 5 extracts from the clone are computed here.
+        let index_keys = self.index_keys(cx, cloned_js_value.handle(), serialized_key.is_none());
         // Step 13. Return the result (an IDBRequest) of running asynchronously execute a request
         // with handle and operation.
         IDBRequest::execute_async(
@@ -418,6 +458,7 @@ impl IDBObjectStore {
                 key: serialized_key,
                 value: serialized_value,
                 should_overwrite: !no_overwrite,
+                index_keys,
             }),
             None,
             None,

@@ -15,13 +15,16 @@ use crate::shared::DB_INIT_PRAGMAS;
 /// The version of the tables below and of how records are stored in them, kept in the database
 /// file's `user_version`. Bump it with every change to either: a database stored with another
 /// version is deleted and created anew when it is opened, as there are no migrations.
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 // Adapted from:
 // https://github.com/mozilla-firefox/firefox/blob/ee102e926521b3e460293b0aea6b54b1a03f6f74/dom/indexedDB/DBSchema.cpp#L78
 // Names are BLOBs of UTF-16 code units (`Utf16String::to_be_bytes`), which, unlike text, hold
-// any DOMString.
-const CREATE_TABLES: [&str; 6] = [
+// any DOMString. A unique index keeps its records in `unique_index_data`, whose primary key allows
+// one record per key, any other index in `index_data`; both are read in (key, primary key) order.
+// Their indexes on the record's key find the index records of the records a write replaces or
+// deletes.
+const CREATE_TABLES: [&str; 8] = [
     r#"
 CREATE TABLE IF NOT EXISTS database (
     name    blob             not null
@@ -83,6 +86,12 @@ CREATE TABLE IF NOT EXISTS unique_index_data (
     FOREIGN KEY (object_store_id, object_data_key)
     REFERENCES object_data(object_store_id, key)
 ) WITHOUT ROWID;"#,
+    r#"
+CREATE INDEX IF NOT EXISTS index_data_object_data_key_index
+    ON index_data (object_store_id, object_data_key);"#,
+    r#"
+CREATE INDEX IF NOT EXISTS unique_index_data_object_data_key_index
+    ON unique_index_data (object_store_id, object_data_key);"#,
 ];
 
 /// Opens the database in `directory`, creating its tables if it is new. A database stored with

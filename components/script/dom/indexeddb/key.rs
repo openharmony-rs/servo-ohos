@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cmp::Ordering;
 use std::ffi::CString;
 use std::{ptr, slice};
 
@@ -15,15 +16,18 @@ use js::jsapi::{
 };
 use js::jsval::{DoubleValue, ObjectValue, StringValue, UndefinedValue};
 use js::rust::wrappers2::{
-    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_AtomizeUCStringN, JS_DefinePropertyById2,
-    JS_GetLatin1StringCharsAndLength, JS_GetTwoByteStringCharsAndLength, JS_HasOwnPropertyById,
-    JS_IndexToId, JS_IsIdentifier, JS_NewUCStringCopyN, JS_StringToId, NewDateObject, ObjectIsDate,
-    SameValue,
+    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_AtomizeUCStringN, JS_ClearPendingException,
+    JS_DefinePropertyById2, JS_GetLatin1StringCharsAndLength, JS_GetTwoByteStringCharsAndLength,
+    JS_HasOwnPropertyById, JS_IndexToId, JS_IsIdentifier, JS_NewUCStringCopyN, JS_StringToId,
+    NewDateObject, ObjectIsDate, SameValue,
 };
 use js::rust::{HandleId, HandleObject, HandleValue, MutableHandleId, MutableHandleValue};
 use js::typedarray::{ArrayBuffer, ArrayBufferU8, ArrayBufferView};
-use script_bindings::js::{JS_GetPropertyById, JS_NewObject, PropertyFlags};
-use storage_traits::indexeddb::{BackendError, IndexedDBKeyRange, IndexedDBKeyType, Utf16String};
+use script_bindings::js::{JS_GetPropertyById, JS_IsExceptionPending, JS_NewObject, PropertyFlags};
+use storage_traits::indexeddb::{
+    BackendError, IndexedDBIndex, IndexedDBIndexKey, IndexedDBKeyRange, IndexedDBKeyType,
+    Utf16String,
+};
 
 use crate::dom::bindings::buffer_source::create_buffer_source;
 use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
@@ -507,6 +511,78 @@ pub fn convert_value_to_key(
     Ok(ConversionResult::Invalid)
 }
 
+/// <https://w3c.github.io/IndexedDB/#convert-a-value-to-a-multientry-key>, except that the keys
+/// of an array key are in key order rather than in the order of the array: each becomes a record
+/// of a multiEntry index, so their order isn't observable.
+#[expect(unsafe_code)]
+pub(crate) fn convert_value_to_multientry_key(
+    cx: &mut JSContext,
+    input: HandleValue,
+) -> Result<ConversionResult, Error> {
+    // Step 1. If input is an Array exotic object, then:
+    let mut is_array = false;
+    // SAFETY: `input` is rooted.
+    if !unsafe { IsArrayObject(cx, input, &mut is_array) } {
+        return Err(Error::JSFailed);
+    }
+    if !is_array {
+        // Step 2. Otherwise, return the result of converting a value to a key with argument
+        // input. Rethrow any exceptions.
+        return convert_value_to_key(cx, input, None);
+    }
+    rooted!(&in(cx) let object = input.to_object());
+
+    // Step 1.1. Let len be ? ToLength( ? Get(input, "length")).
+    let mut len = 0;
+    // SAFETY: `object` is rooted.
+    if !unsafe { GetArrayLength(cx, object.handle(), &mut len) } {
+        return Err(Error::JSFailed);
+    }
+    // Step 1.2. Let seen be a new set containing only input.
+    // Step 1.3. Let keys be a new empty list.
+    let mut keys = vec![];
+    // Step 1.4. Let index be 0.
+    // Step 1.5. While index is less than len:
+    for index in 0..len {
+        // Step 1.5.1. Let entry be Get(input, index).
+        rooted!(&in(cx) let mut id: PropertyKey);
+        rooted!(&in(cx) let mut entry = UndefinedValue());
+        // SAFETY: `id` is rooted.
+        let got = unsafe { JS_IndexToId(cx, index, id.handle_mut()) } &&
+            JS_GetPropertyById(cx, object.handle(), id.handle(), entry.handle_mut());
+        // Step 1.5.2. If entry is not an abrupt completion, then:
+        if !got {
+            clear_pending_exception(cx);
+            continue;
+        }
+        // Step 1.5.2.1. Let key be the result of converting a value to a key with arguments entry
+        // and seen.
+        // Step 1.5.2.2. If key is not "invalid value" or "invalid type" or an abrupt completion,
+        // and there is no item in keys equal to key, then append key to keys.
+        match convert_value_to_key(cx, entry.handle(), Some(vec![input])) {
+            Ok(ConversionResult::Valid(key)) => keys.push(key),
+            Ok(ConversionResult::Invalid) => {},
+            Err(_) => clear_pending_exception(cx),
+        }
+        // Step 1.5.3. Increase index by 1.
+    }
+    // NOTE: Removing the duplicates after sorting takes O(n log n) comparisons rather than the
+    // spec's O(n²). Valid keys never compare as unordered.
+    keys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    keys.dedup();
+    // Step 1.6. Return a new array key with value set to keys.
+    Ok(ConversionResult::Valid(IndexedDBKeyType::Array(keys)))
+}
+
+/// Clears the exception of a failed JavaScript operation whose failure is ignored.
+#[expect(unsafe_code)]
+fn clear_pending_exception(cx: &mut JSContext) {
+    if JS_IsExceptionPending(cx) {
+        // SAFETY: `cx` is the context the exception is pending on.
+        unsafe { JS_ClearPendingException(cx) };
+    }
+}
+
 /// <https://www.w3.org/TR/IndexedDB-3/#convert-a-value-to-a-key-range>
 pub fn convert_value_to_key_range(
     cx: &mut JSContext,
@@ -959,17 +1035,141 @@ pub(crate) fn extract_key(
     // multiEntry flag is unset, and the result of running the steps to convert a value to a
     // multiEntry key with r otherwise. Rethrow any exceptions.
     let key = match multi_entry {
-        Some(true) => {
-            // TODO: implement convert_value_to_multientry_key
-            unimplemented!("multiEntry keys are not yet supported");
+        Some(true) => convert_value_to_multientry_key(cx, r.handle())?,
+        _ => convert_value_to_key(cx, r.handle(), None)?,
+    };
+    match key {
+        // Step 4. If key is "invalid value" or "invalid type", return invalid.
+        ConversionResult::Invalid => Ok(ExtractionResult::Invalid),
+        // Step 5. Return key.
+        ConversionResult::Valid(key) => Ok(ExtractionResult::Key(key)),
+    }
+}
+
+/// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store> steps 5.1 and 5.2 for
+/// `index`, where `value` is the clone being stored: the keys of the records that `index` gets,
+/// without duplicates.
+///
+/// `generated_key_path` is the store's key path when the backend generates the record's key, which
+/// step 1.1.3 injects into the value at that key path before step 5. Script doesn't know the key,
+/// so the parts of the index key that come from it are placeholders, and the keys are those that
+/// the key path gives on the value with the key injected.
+pub(crate) fn index_keys(
+    cx: &mut JSContext,
+    value: HandleValue,
+    index: &IndexedDBIndex,
+    generated_key_path: Option<&str>,
+) -> Vec<IndexedDBIndexKey> {
+    // Step 5.1. Let index key be the result of extracting a key from a value using a key path
+    // with value, index’s key path, and index’s multiEntry flag.
+    let key_path = KeyPath::from(index.key_path.clone());
+    let index_key = match generated_key_path {
+        Some(store_key_path) => {
+            index_key_with_generated_key(cx, value, &key_path, index.multi_entry, store_key_path)
         },
-        _ => match convert_value_to_key(cx, r.handle(), None)? {
-            ConversionResult::Valid(key) => key,
-            // Step 4. If key is invalid, return invalid.
-            ConversionResult::Invalid => return Ok(ExtractionResult::Invalid),
+        None => extracted_index_key(cx, value, &key_path, index.multi_entry),
+    };
+    // Step 5.2. If index key is an exception, or invalid, or failure, take no further actions for
+    // index, and continue these steps for the next index.
+    // NOTE: An exception thrown in this step is not rethrown.
+    let index_key = match index_key {
+        Ok(Some(index_key)) => index_key,
+        Ok(None) => return vec![],
+        Err(_) => {
+            clear_pending_exception(cx);
+            return vec![];
         },
     };
+    // Step 5.5 and 5.6: a multiEntry index gets a record for each subkey of an array key, any
+    // other index one for the key.
+    match index_key {
+        IndexedDBIndexKey::Key(IndexedDBKeyType::Array(subkeys)) if index.multi_entry => {
+            subkeys.into_iter().map(IndexedDBIndexKey::Key).collect()
+        },
+        index_key => vec![index_key],
+    }
+}
 
-    // Step 5. Return key.
-    Ok(ExtractionResult::Key(key))
+/// The index key that extracting a key from `value` with `key_path` gives, `None` for invalid or
+/// failure.
+fn extracted_index_key(
+    cx: &mut JSContext,
+    value: HandleValue,
+    key_path: &KeyPath,
+    multi_entry: bool,
+) -> Result<Option<IndexedDBIndexKey>, Error> {
+    Ok(match extract_key(cx, value, key_path, Some(multi_entry))? {
+        ExtractionResult::Key(key) => Some(IndexedDBIndexKey::Key(key)),
+        ExtractionResult::Invalid | ExtractionResult::Failure => None,
+    })
+}
+
+/// What evaluating a key path item gives on a value into which a generated key was injected at
+/// the store's key path.
+enum OnInjectedKey {
+    /// The key.
+    Key,
+    /// Failure: the item goes below the key, which is a number.
+    Failure,
+    /// The same index key as on the value without the key, or likewise none. The injection only
+    /// adds the key's property and possibly ordinary objects on the way to it: an item that
+    /// reaches such an object gets an invalid key instead of failure, and an existing object
+    /// converts to the same key with the added property.
+    Unchanged,
+}
+
+fn on_injected_key(item: &str, store_key_path: &str) -> OnInjectedKey {
+    match item.strip_prefix(store_key_path) {
+        Some("") => OnInjectedKey::Key,
+        Some(rest) if rest.starts_with('.') => OnInjectedKey::Failure,
+        _ => OnInjectedKey::Unchanged,
+    }
+}
+
+/// The index key that extracting a key with `key_path` gives on `value` once a generated key is
+/// injected into it at `store_key_path`, with the key as a placeholder.
+fn index_key_with_generated_key(
+    cx: &mut JSContext,
+    value: HandleValue,
+    key_path: &KeyPath,
+    multi_entry: bool,
+    store_key_path: &str,
+) -> Result<Option<IndexedDBIndexKey>, Error> {
+    match key_path {
+        KeyPath::String(path) => match on_injected_key(&path.str(), store_key_path) {
+            // The key is a number, which a multiEntry index also gets as it is.
+            OnInjectedKey::Key => Ok(Some(IndexedDBIndexKey::PrimaryKey)),
+            OnInjectedKey::Failure => Ok(None),
+            OnInjectedKey::Unchanged => extracted_index_key(cx, value, key_path, multi_entry),
+        },
+        KeyPath::StringSequence(items) => {
+            let on_key: Vec<OnInjectedKey> = items
+                .iter()
+                .map(|item| on_injected_key(&item.str(), store_key_path))
+                .collect();
+            if on_key
+                .iter()
+                .all(|on_key| matches!(on_key, OnInjectedKey::Unchanged))
+            {
+                return extracted_index_key(cx, value, key_path, multi_entry);
+            }
+            // Evaluating a sequence fails if an item fails, and converting the array of the items'
+            // values gives invalid if one of them is invalid.
+            let mut parts = Vec::with_capacity(items.len());
+            for (item, on_key) in items.iter().zip(on_key) {
+                match on_key {
+                    OnInjectedKey::Key => parts.push(IndexedDBIndexKey::PrimaryKey),
+                    OnInjectedKey::Failure => return Ok(None),
+                    OnInjectedKey::Unchanged => {
+                        let item = KeyPath::String(item.clone());
+                        match extracted_index_key(cx, value, &item, false)? {
+                            Some(part) => parts.push(part),
+                            None => return Ok(None),
+                        }
+                    },
+                }
+            }
+            Ok(Some(IndexedDBIndexKey::Array(parts)))
+        },
+    }
 }

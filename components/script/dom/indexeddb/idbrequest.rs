@@ -81,6 +81,9 @@ impl From<PutItemResult> for IdbResult {
             PutItemResult::CannotOverwrite | PutItemResult::KeyGeneratorExhausted => {
                 Self::Error(Error::Constraint(None))
             },
+            PutItemResult::UniqueIndexKeyExists(_) => Self::Error(Error::Constraint(Some(
+                "A unique index already has one of the value's keys for another record".to_owned(),
+            ))),
         }
     }
 }

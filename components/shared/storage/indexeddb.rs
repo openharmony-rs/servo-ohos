@@ -438,12 +438,54 @@ pub struct IndexedDBObjectStore {
     pub indexes: Vec<IndexedDBIndex>,
 }
 
+/// The key of an index record for a value that script stores, as script computes it
+/// (<https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store> step 5.1). When the
+/// backend generates the record's key and step 1.1.3 injects it into the value, script doesn't
+/// know the parts of the index key that come from it: where the index's key path, or an item of
+/// a sequence key path, is the store's key path. Those parts are
+/// [`IndexedDBIndexKey::PrimaryKey`], which the backend replaces with the record's key.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum IndexedDBIndexKey {
+    Key(IndexedDBKeyType),
+    /// The primary key of the record.
+    PrimaryKey,
+    /// An array key of these items.
+    Array(Vec<IndexedDBIndexKey>),
+}
+
+impl IndexedDBIndexKey {
+    /// The key, with each [`IndexedDBIndexKey::PrimaryKey`] replaced by `primary_key`.
+    pub fn with_primary_key(self, primary_key: &IndexedDBKeyType) -> IndexedDBKeyType {
+        match self {
+            Self::Key(key) => key,
+            Self::PrimaryKey => primary_key.clone(),
+            Self::Array(items) => IndexedDBKeyType::Array(
+                items
+                    .into_iter()
+                    .map(|item| item.with_primary_key(primary_key))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// The keys of the records that the index `index_id` gets for a value that script stores: none
+/// if extracting a key from the value failed or gave an invalid key, the subkeys of an array key
+/// for a multiEntry index, and the key otherwise. Script removes duplicates.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct IndexedDBIndexKeys {
+    pub index_id: IndexedDBIndexId,
+    pub keys: Vec<IndexedDBIndexKey>,
+}
+
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum PutItemResult {
     Key(IndexedDBKeyType),
     CannotOverwrite,
     /// The store's key generator can't generate another key.
     KeyGeneratorExhausted,
+    /// The unique index `0` has one of the value's keys for another record.
+    UniqueIndexKeyExists(IndexedDBIndexId),
 }
 
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -485,6 +527,8 @@ pub enum AsyncReadWriteOperation {
         key: Option<IndexedDBKeyType>,
         value: Vec<u8>,
         should_overwrite: bool,
+        /// The keys of the record in each index of the store, one entry per index.
+        index_keys: Vec<IndexedDBIndexKeys>,
     },
 
     /// Removes the key/value pair for the given key in the associated idb data

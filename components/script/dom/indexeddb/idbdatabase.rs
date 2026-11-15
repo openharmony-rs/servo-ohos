@@ -244,6 +244,16 @@ impl IDBDatabase {
         })
     }
 
+    /// The indexes of the object store `store`, in the order they were created.
+    pub(crate) fn indexes(&self, store: IndexedDBObjectStoreId) -> Vec<IndexedDBIndex> {
+        self.object_stores
+            .borrow()
+            .iter()
+            .find(|object_store| object_store.id == store)
+            .map(|object_store| object_store.indexes.clone())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn object_stores_snapshot(&self) -> Vec<IndexedDBObjectStore> {
         self.object_stores.borrow().clone()
     }

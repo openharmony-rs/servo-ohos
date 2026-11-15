@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock, mpsc};
@@ -20,10 +20,10 @@ use storage::ClientStorageThreadFactory;
 use storage_traits::StorageThreads;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBKeyRange,
-    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnId,
-    IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput, StorageBottleSource,
-    SyncOperation, TransactionEvent,
+    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBIndexKeys,
+    IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg,
+    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput,
+    StorageBottleSource, SyncOperation, TransactionEvent,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -146,6 +146,9 @@ struct IndexedDbTestContext {
     bottle_source: StorageBottleSource,
     origin: ImmutableOrigin,
     shutdown: Cell<bool>,
+    /// The indexes that [`create_index`] created, by database and store, for which puts send
+    /// index keys, as script's metadata has them.
+    indexes: RefCell<HashMap<(String, i64), Vec<i64>>>,
 }
 
 impl IndexedDbTestContext {
@@ -172,6 +175,7 @@ impl IndexedDbTestContext {
             bottle_source,
             origin,
             shutdown: Cell::new(false),
+            indexes: Default::default(),
         }
     }
 
@@ -446,6 +450,11 @@ fn create_index(
     unique: bool,
     multi_entry: bool,
 ) -> mpsc::Receiver<Option<BackendError>> {
+    ctx.indexes
+        .borrow_mut()
+        .entry((db_name.to_owned(), store))
+        .or_default()
+        .push(index_id);
     send_schema_operation(
         ctx,
         db_name,
@@ -630,6 +639,43 @@ fn put_item_request(
     value: Vec<u8>,
     should_overwrite: bool,
 ) -> mpsc::Receiver<Option<BackendResult<PutItemResult>>> {
+    let index_keys = ctx
+        .indexes
+        .borrow()
+        .get(&(db_name.to_owned(), store))
+        .into_iter()
+        .flatten()
+        .map(|&index_id| IndexedDBIndexKeys {
+            index_id,
+            keys: vec![],
+        })
+        .collect();
+    indexed_put_request(
+        ctx,
+        db_name,
+        store,
+        txn,
+        request_id,
+        key,
+        value,
+        should_overwrite,
+        index_keys,
+    )
+}
+
+/// A put with the record's keys in the store's indexes.
+#[allow(clippy::too_many_arguments)]
+fn indexed_put_request(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    store: i64,
+    txn: IndexedDBTxnId,
+    request_id: u64,
+    key: Option<IndexedDBKeyType>,
+    value: Vec<u8>,
+    should_overwrite: bool,
+    index_keys: Vec<IndexedDBIndexKeys>,
+) -> mpsc::Receiver<Option<BackendResult<PutItemResult>>> {
     send_request(
         ctx,
         db_name,
@@ -641,6 +687,7 @@ fn put_item_request(
             key,
             value,
             should_overwrite,
+            index_keys,
         }),
     )
 }

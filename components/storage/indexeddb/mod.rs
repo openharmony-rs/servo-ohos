@@ -2497,6 +2497,7 @@ mod tests {
                 key: None,
                 value: vec![1],
                 should_overwrite: false,
+                index_keys: vec![],
             }),
         );
         assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(2));
