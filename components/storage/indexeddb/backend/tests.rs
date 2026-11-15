@@ -104,7 +104,7 @@ executor_tests!(
     test_commit_failure_rolls_back,
     test_batches_reply_in_dispatch_order,
     test_job_that_ends_the_sql_transaction_fails_the_writer,
-    test_manager_read_that_ends_the_sql_transaction_fails_the_writer,
+    test_metadata_reads_do_not_wait_for_the_connection,
     test_upgrade_without_requests_sets_the_version_at_commit,
 );
 
@@ -155,7 +155,9 @@ fn in_own_transaction<X: SqlExecutor, T>(
     db: &SqlEngine<X>,
     f: impl FnOnce(&mut X) -> Result<T, SqlError>,
 ) -> Result<T, SqlError> {
-    with_transaction(&mut *db.connection(), TransactionBehavior::Immediate, f)
+    let result = with_transaction(&mut *db.connection(), TransactionBehavior::Immediate, f);
+    db.reload_metadata();
+    result
 }
 
 fn create_store<X: SqlExecutor>(
@@ -1165,6 +1167,18 @@ fn stored_keys<X: SqlExecutor>(db: &SqlEngine<X>, store_name: &str) -> Vec<Index
     keys_of(&mut *db.connection(), store_name)
 }
 
+/// The version and the object store names in the database, also inside its open SQL
+/// transaction, unlike the engine's metadata reads, which answer as of the last commit.
+pub(crate) fn stored_version_and_store_names<X: SqlExecutor>(
+    db: &SqlEngine<X>,
+) -> (u64, Vec<String>) {
+    let mut connection = db.connection();
+    (
+        queries::version(&mut *connection).unwrap(),
+        queries::object_store_names(&mut *connection).unwrap(),
+    )
+}
+
 /// A write that fails in the database aborts the transaction: everything it wrote is rolled back,
 /// and its later requests and its commit fail.
 fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
@@ -1587,22 +1601,40 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
     );
     assert!(schema_errors.try_recv().is_err());
     let index_names = |db: &SqlEngine<X>| -> Vec<String> {
-        db.indexes("kept")
+        queries::indexes(&mut *db.connection(), "kept")
             .unwrap()
             .into_iter()
             .map(|index| index.name)
             .collect()
     };
-    assert_eq!(db.version().unwrap(), 2);
-    assert_eq!(db.object_store_names().unwrap(), vec!["kept", "created"]);
+    let before = (1, vec!["kept".to_owned(), "deleted".to_owned()]);
+    assert_eq!(
+        stored_version_and_store_names(&db),
+        (2, vec!["kept".to_owned(), "created".to_owned()])
+    );
     assert_eq!(index_names(&db), vec!["by_c", "by_b"]);
     assert_eq!(stored_keys(&db, "kept"), number_keys([1, 2]));
+    assert_eq!(
+        (db.version().unwrap(), db.object_store_names().unwrap()),
+        before
+    );
 
     abort(&db, 2);
 
-    assert_eq!(db.version().unwrap(), 1);
-    assert_eq!(db.object_store_names().unwrap(), vec!["kept", "deleted"]);
+    assert_eq!(stored_version_and_store_names(&db), before);
+    assert_eq!(
+        (db.version().unwrap(), db.object_store_names().unwrap()),
+        before
+    );
     assert_eq!(index_names(&db), vec!["by_a"]);
+    assert_eq!(
+        db.indexes("kept")
+            .unwrap()
+            .into_iter()
+            .map(|index| index.name)
+            .collect::<Vec<_>>(),
+        vec!["by_a"]
+    );
     assert_eq!(stored_keys(&db, "kept"), number_keys([1]));
     assert_eq!(stored_keys(&db, "deleted"), number_keys([1]));
 }
@@ -2222,11 +2254,29 @@ fn test_job_that_ends_the_sql_transaction_fails_the_writer<X: SqlExecutor>() {
     });
 }
 
-/// The manager's metadata reads run on the connection between the writer's batches.
-fn test_manager_read_that_ends_the_sql_transaction_fails_the_writer<X: SqlExecutor>() {
-    check_writer_fails_after::<X>(|db| {
-        let _ = db.key_path("test_store");
+/// The manager's metadata reads answer from the committed metadata, so they neither wait for
+/// the work handed over before nor run statements inside the writer's SQL transaction.
+fn test_metadata_reads_do_not_wait_for_the_connection<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let key_path = Some(KeyPath::String("id".to_owned()));
+    create_store(&db, "test_store", key_path.clone(), true).unwrap();
+    let (release, released) = mpsc::channel::<()>();
+    let (timed_out_sender, timed_out) = mpsc::channel();
+    db.spawn_on_connection(move |_| {
+        let _ = timed_out_sender.send(released.recv_timeout(TIMEOUT).is_err());
     });
+
+    assert_eq!(db.version().unwrap(), 0);
+    assert_eq!(db.object_store_names().unwrap(), vec!["test_store"]);
+    assert_eq!(db.key_path("test_store"), key_path);
+    assert!(db.has_key_generator("test_store"));
+    assert!(db.indexes("test_store").unwrap().is_empty());
+    release.send(()).unwrap();
+    assert!(
+        !timed_out.recv().unwrap(),
+        "A metadata read waited for the busy connection"
+    );
 }
 
 /// An upgrade transaction without requests sets the version when it commits, and one that
@@ -2237,9 +2287,11 @@ fn test_upgrade_without_requests_sets_the_version_at_commit<X: SqlExecutor>() {
     db.upgrade_version(1, 2);
     assert_eq!(commit(&db, 1), Ok(()));
     assert_eq!(queries::version(&mut *db.connection()).unwrap(), 2);
+    assert_eq!(db.version().unwrap(), 2);
 
     db.upgrade_version(2, 3);
     abort(&db, 2);
+    assert_eq!(db.version().unwrap(), 2);
     let mut connection = db.connection();
     assert_eq!(queries::version(&mut *connection).unwrap(), 2);
     assert!(!connection.in_transaction());

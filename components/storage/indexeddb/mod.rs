@@ -560,8 +560,8 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
         );
     }
 
-    fn key_generator_current_number(&self, store_name: &str) -> Option<i64> {
-        self.engine.key_generator_current_number(store_name)
+    fn has_key_generator(&self, store_name: &str) -> bool {
+        self.engine.has_key_generator(store_name)
     }
 
     fn key_path(&self, store_name: &str) -> Option<KeyPath> {
@@ -2036,6 +2036,7 @@ impl IndexedDBManager {
                 let info_list: Vec<DatabaseInfo> = self
                     .databases
                     .iter()
+                    .filter(|(description, _)| description.origin == origin)
                     .filter_map(|(description, info)| {
                         // Step 4.3: For each db of databases:
                         if let Ok(version) = info.version() {
@@ -2047,14 +2048,10 @@ impl IndexedDBManager {
                                 // Step 4.3.6: Set info’s name dictionary member to db’s name.
                                 // Step 4.3.7: Set info’s version dictionary member to db’s version.
                                 // Step 4.3.8: Append info to result.
-                                if description.origin == origin {
-                                    Some(DatabaseInfo {
-                                        name: description.name.clone(),
-                                        version,
-                                    })
-                                } else {
-                                    None
-                                }
+                                Some(DatabaseInfo {
+                                    name: description.name.clone(),
+                                    version,
+                                })
                             }
                         } else {
                             None
@@ -2098,7 +2095,7 @@ impl IndexedDBManager {
                     .get_database(origin, db_name)
                     .map(|db| IndexedDBObjectStore {
                         key_path: db.key_path(&store_name),
-                        has_key_generator: db.key_generator_current_number(&store_name).is_some(),
+                        has_key_generator: db.has_key_generator(&store_name),
                         indexes: db.indexes(&store_name).unwrap_or_default(),
                         name: store_name,
                     });
@@ -2314,7 +2311,9 @@ mod tests {
     use super::{IndexedDBDescription, IndexedDBEnvironment};
     use crate::indexeddb::backend::SqlEngine;
     use crate::indexeddb::backend::executor::SqlExecutor;
-    use crate::indexeddb::backend::tests::{Faulty, executor_tests, faults_for};
+    use crate::indexeddb::backend::tests::{
+        Faulty, executor_tests, faults_for, stored_version_and_store_names,
+    };
     use crate::indexeddb::engines::KvsEngine;
 
     executor_tests!(
@@ -2449,11 +2448,15 @@ mod tests {
                 multi_entry: false,
             }),
         );
-        assert_eq!(env.object_store_names().unwrap(), vec!["not_books"]);
-        assert_eq!(env.version().unwrap(), 1);
+        assert_eq!(
+            stored_version_and_store_names(&env.engine),
+            (1, vec!["not_books".to_owned()])
+        );
+        assert!(env.object_store_names().unwrap().is_empty());
 
         abort(&mut env, 1);
 
+        assert_eq!(stored_version_and_store_names(&env.engine), (0, vec![]));
         assert_eq!(env.object_store_names().unwrap(), Vec::<String>::new());
         assert_eq!(env.version().unwrap(), 0);
     }
@@ -2475,7 +2478,7 @@ mod tests {
             create_store_operation(true),
         );
         commit(env, 1);
-        assert_eq!(env.key_generator_current_number("books"), Some(1));
+        assert_eq!(env.engine.key_generator_current_number("books"), Some(1));
 
         env.register_transaction(2, IndexedDBTxnMode::Readwrite, vec!["books".to_string()]);
         run(
@@ -2491,7 +2494,7 @@ mod tests {
                 should_overwrite: false,
             }),
         );
-        assert_eq!(env.key_generator_current_number("books"), Some(2));
+        assert_eq!(env.engine.key_generator_current_number("books"), Some(2));
     }
 
     fn test_abort_transaction_restores_readwrite_key_generator_current_number<X: SqlExecutor>() {
@@ -2501,7 +2504,7 @@ mod tests {
 
         abort(&mut env, 2);
 
-        assert_eq!(env.key_generator_current_number("books"), Some(1));
+        assert_eq!(env.engine.key_generator_current_number("books"), Some(1));
     }
 
     fn test_failed_commit_reports_the_error_and_rolls_back<X: SqlExecutor>() {
@@ -2517,7 +2520,7 @@ mod tests {
 
         assert_eq!(message.txn, 2);
         assert!(matches!(message.result, Err(BackendError::DbErr(_))));
-        assert_eq!(env.key_generator_current_number("books"), Some(1));
+        assert_eq!(env.engine.key_generator_current_number("books"), Some(1));
     }
 
     fn register<X: SqlExecutor>(
