@@ -15,13 +15,14 @@ use js::jsapi::{
 };
 use js::jsval::{DoubleValue, ObjectValue, StringValue, UndefinedValue};
 use js::rust::wrappers2::{
-    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_GetLatin1StringCharsAndLength,
-    JS_GetTwoByteStringCharsAndLength, JS_HasOwnPropertyById, JS_IndexToId, JS_IsIdentifier,
-    JS_NewUCStringCopyN, NewDateObject, ObjectIsDate, SameValue,
+    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_AtomizeUCStringN, JS_DefinePropertyById2,
+    JS_GetLatin1StringCharsAndLength, JS_GetTwoByteStringCharsAndLength, JS_HasOwnPropertyById,
+    JS_IndexToId, JS_IsIdentifier, JS_NewUCStringCopyN, JS_StringToId, NewDateObject, ObjectIsDate,
+    SameValue,
 };
-use js::rust::{HandleValue, MutableHandleValue};
+use js::rust::{HandleId, HandleObject, HandleValue, MutableHandleId, MutableHandleValue};
 use js::typedarray::{ArrayBuffer, ArrayBufferU8, ArrayBufferView};
-use script_bindings::js::{JS_GetPropertyById, JS_NewObject};
+use script_bindings::js::{JS_GetPropertyById, JS_NewObject, PropertyFlags};
 use storage_traits::indexeddb::{BackendError, IndexedDBKeyRange, IndexedDBKeyType, Utf16String};
 
 use crate::dom::bindings::buffer_source::create_buffer_source;
@@ -32,7 +33,7 @@ use crate::dom::bindings::conversions::{get_property_jsval, root_from_handlevalu
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::utils::{define_dictionary_property, has_own_property};
+use crate::dom::bindings::utils::define_dictionary_property;
 use crate::dom::blob::Blob;
 use crate::dom::domstringlist::DOMStringList;
 use crate::dom::file::File;
@@ -74,6 +75,67 @@ fn utf16_string_to_jsval(cx: &mut JSContext, string: &Utf16String, mut result: M
     );
     // SAFETY: `js_string` is a new, non-null string.
     result.set(StringValue(unsafe { &*js_string }));
+}
+
+/// Sets `id` to the property key of the key path identifier `identifier`, made from its code
+/// units: the property functions that take a C string read it as Latin-1 on SpiderMonkey, which
+/// changes a non-ASCII identifier.
+#[expect(unsafe_code)]
+fn identifier_id(cx: &mut JSContext, identifier: &str, id: MutableHandleId) -> Result<(), Error> {
+    let units: Vec<u16> = identifier.encode_utf16().collect();
+    // SAFETY: `units` is valid for `units.len()` code units, which the call copies.
+    rooted!(&in(cx) let string = unsafe { JS_AtomizeUCStringN(cx, units.as_ptr(), units.len()) });
+    // SAFETY: `string` is rooted and not null.
+    if string.is_null() || !unsafe { JS_StringToId(cx, string.handle(), id) } {
+        return Err(Error::JSFailed);
+    }
+    Ok(())
+}
+
+/// ? HasOwnProperty(object, id).
+#[expect(unsafe_code)]
+fn has_own_identifier(
+    cx: &mut JSContext,
+    object: HandleObject,
+    id: HandleId,
+) -> Result<bool, Error> {
+    let mut found = false;
+    // SAFETY: `object` and `id` are rooted.
+    if !unsafe { JS_HasOwnPropertyById(cx, object, id, &mut found) } {
+        return Err(Error::JSFailed);
+    }
+    Ok(found)
+}
+
+/// ? Get(object, id).
+fn get_identifier(
+    cx: &mut JSContext,
+    object: HandleObject,
+    id: HandleId,
+    value: MutableHandleValue,
+) -> Result<(), Error> {
+    if !JS_GetPropertyById(cx, object, id, value) {
+        return Err(Error::JSFailed);
+    }
+    Ok(())
+}
+
+/// CreateDataProperty(object, id, value).
+#[expect(unsafe_code)]
+fn create_identifier(
+    cx: &mut JSContext,
+    object: HandleObject,
+    id: HandleId,
+    value: HandleValue,
+) -> Result<(), Error> {
+    let attributes =
+        (PropertyFlags::ENUMERABLE | PropertyFlags::WRITABLE | PropertyFlags::CONFIGURABLE)
+            .as_jsprop_flags();
+    // SAFETY: `object`, `id` and `value` are rooted.
+    if !unsafe { JS_DefinePropertyById2(cx, object, id, value, attributes) } {
+        return Err(Error::JSFailed);
+    }
+    Ok(())
 }
 
 /// The name (<https://w3c.github.io/IndexedDB/#name>) that the DOMString `name` gives.
@@ -658,12 +720,11 @@ pub(crate) fn evaluate_key_path_on_value(
                 }
 
                 rooted!(&in(cx) let object = current_value.to_object());
-                let identifier_name =
-                    CString::new(identifier).expect("Failed to convert str to CString");
+                rooted!(&in(cx) let mut id: PropertyKey);
+                identifier_id(cx, identifier, id.handle_mut())?;
 
                 // Let hop be ! HasOwnProperty(value, identifier).
-                let hop = has_own_property(cx, object.handle(), identifier_name.as_c_str())
-                    .map_err(|_| Error::JSFailed)?;
+                let hop = has_own_identifier(cx, object.handle(), id.handle())?;
 
                 // If hop is false, return failure.
                 if !hop {
@@ -671,12 +732,7 @@ pub(crate) fn evaluate_key_path_on_value(
                 }
 
                 // Let value be ! Get(value, identifier).
-                get_property_jsval(
-                    cx,
-                    object.handle(),
-                    identifier_name.as_c_str(),
-                    current_value.handle_mut(),
-                )?;
+                get_identifier(cx, object.handle(), id.handle(), current_value.handle_mut())?;
 
                 // If value is undefined, return failure.
                 if current_value.get().is_undefined() {
@@ -728,12 +784,11 @@ pub(crate) fn can_inject_key_into_value(
         }
 
         rooted!(&in(cx) let current_object = current_value.to_object());
-        let identifier_name =
-            CString::new(identifier).expect("Failed to convert key path identifier to CString");
+        rooted!(&in(cx) let mut id: PropertyKey);
+        identifier_id(cx, identifier, id.handle_mut())?;
 
         // Step 3.2. Let hop be ? HasOwnProperty(value, identifier).
-        let hop = has_own_property(cx, current_object.handle(), identifier_name.as_c_str())
-            .map_err(|_| Error::JSFailed)?;
+        let hop = has_own_identifier(cx, current_object.handle(), id.handle())?;
 
         // Step 3.3. If hop is false, set value to a new Object created as if by the expression
         // ({}).
@@ -744,10 +799,10 @@ pub(crate) fn can_inject_key_into_value(
         }
 
         // Step 3.4. Set value to ? Get(value, identifier).
-        get_property_jsval(
+        get_identifier(
             cx,
             current_object.handle(),
-            identifier_name.as_c_str(),
+            id.handle(),
             current_value.handle_mut(),
         )?;
     }
@@ -785,16 +840,12 @@ pub(crate) fn injected_key_is_stored(
         if identifiers.peek().is_none() {
             break;
         }
-        let name = CString::new(identifier).expect("Failed to convert key path identifier");
-        if !has_own_property(cx, object.handle(), name.as_c_str()).map_err(|_| Error::JSFailed)? {
+        rooted!(&in(cx) let mut id: PropertyKey);
+        identifier_id(cx, identifier, id.handle_mut())?;
+        if !has_own_identifier(cx, object.handle(), id.handle())? {
             break;
         }
-        get_property_jsval(
-            cx,
-            object.handle(),
-            name.as_c_str(),
-            current_value.handle_mut(),
-        )?;
+        get_identifier(cx, object.handle(), id.handle(), current_value.handle_mut())?;
     }
     Ok(true)
 }
@@ -828,12 +879,11 @@ pub(crate) fn inject_key_into_value(
         }
 
         rooted!(&in(cx) let current_object = current_value.to_object());
-        let identifier_name =
-            CString::new(identifier).expect("Failed to convert key path identifier to CString");
+        rooted!(&in(cx) let mut id: PropertyKey);
+        identifier_id(cx, identifier, id.handle_mut())?;
 
         // Step 4.2 Let hop be ! HasOwnProperty(value, identifier).
-        let hop = has_own_property(cx, current_object.handle(), identifier_name.as_c_str())
-            .map_err(|_| Error::JSFailed)?;
+        let hop = has_own_identifier(cx, current_object.handle(), id.handle())?;
 
         // Step 4.3 If hop is false, then:
         if !hop {
@@ -843,22 +893,16 @@ pub(crate) fn inject_key_into_value(
             o.to_jsval(cx, o_value.handle_mut());
 
             // Step 4.3.2 Let status be CreateDataProperty(value, identifier, o).
-            define_dictionary_property(
-                cx,
-                current_object.handle(),
-                identifier_name.as_c_str(),
-                o_value.handle(),
-            )
-            .map_err(|_| Error::JSFailed)?;
+            create_identifier(cx, current_object.handle(), id.handle(), o_value.handle())?;
 
             // Step 4.3.3 Assert: status is true.
         }
 
         // Step 4.3 Let value be ! Get(value, identifier).
-        get_property_jsval(
+        get_identifier(
             cx,
             current_object.handle(),
-            identifier_name.as_c_str(),
+            id.handle(),
             current_value.handle_mut(),
         )?;
 
@@ -877,16 +921,16 @@ pub(crate) fn inject_key_into_value(
         return Ok(false);
     }
     rooted!(&in(cx) let parent_object = current_value.to_object());
-    let last_name = CString::new(last).expect("Failed to convert final key path identifier");
+    rooted!(&in(cx) let mut last_id: PropertyKey);
+    identifier_id(cx, last, last_id.handle_mut())?;
 
     // Step 7. Let status be CreateDataProperty(value, last, keyValue).
-    define_dictionary_property(
+    create_identifier(
         cx,
         parent_object.handle(),
-        last_name.as_c_str(),
+        last_id.handle(),
         key_value.handle(),
-    )
-    .map_err(|_| Error::JSFailed)?;
+    )?;
 
     // Step 8. Assert: status is true.
     // The JS_DefineProperty success check above enforces this assertion.
