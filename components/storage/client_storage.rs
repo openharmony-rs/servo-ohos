@@ -26,6 +26,7 @@ use storage_traits::client_storage::{
     ClientStorageErrorr, ClientStorageThreadHandle, ClientStorageThreadMessage, Mode,
     StorageIdentifier, StorageProxyMap, StorageType,
 };
+use storage_traits::indexeddb::Utf16String;
 #[cfg(feature = "sqlite-backend")]
 use uuid::Uuid;
 
@@ -36,17 +37,45 @@ use uuid::Uuid;
 #[cfg(feature = "sqlite-backend")]
 const STORAGE_SHELF_QUOTA_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
+/// How the `databases` registry table holds a database name: as text, or, for a name with an
+/// unpaired surrogate, which text can't hold, as a BLOB of its code units
+/// ([`Utf16String::to_be_bytes`]). SQLite never finds a BLOB equal to a text value, so such a name
+/// can't take another's entry, and every other name keeps the entry it had.
+enum RegistryDatabaseName {
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl From<&Utf16String> for RegistryDatabaseName {
+    fn from(name: &Utf16String) -> Self {
+        match name.to_utf8() {
+            Some(text) => Self::Text(text),
+            None => Self::Blob(name.to_be_bytes()),
+        }
+    }
+}
+
+#[cfg(feature = "sqlite-backend")]
+impl From<RegistryDatabaseName> for rusqlite::types::Value {
+    fn from(name: RegistryDatabaseName) -> Self {
+        match name {
+            RegistryDatabaseName::Text(text) => Self::Text(text),
+            RegistryDatabaseName::Blob(blob) => Self::Blob(blob),
+        }
+    }
+}
+
 trait RegistryEngine {
     type Error: Debug;
     fn create_database(
         &mut self,
         bottle_id: i64,
-        name: String,
+        name: Utf16String,
     ) -> Result<(PathBuf, bool), ClientStorageErrorr<Self::Error>>;
     fn delete_database(
         &mut self,
         bottle_id: i64,
-        name: String,
+        name: Utf16String,
     ) -> Result<(), ClientStorageErrorr<Self::Error>>;
     fn obtain_a_storage_bottle_map(
         &mut self,
@@ -454,17 +483,21 @@ impl RegistryEngine for SqliteEngine {
     fn create_database(
         &mut self,
         bottle_id: i64,
-        name: String,
+        name: Utf16String,
     ) -> Result<(PathBuf, bool), ClientStorageErrorr<Self::Error>> {
         let tx = self.connection.transaction()?;
 
+        let args = [
+            rusqlite::types::Value::Integer(bottle_id),
+            RegistryDatabaseName::from(&name).into(),
+        ];
         // TODO: combine this into a single query (utilizing WITH and a join).
         let database_id: i64 = tx
             .query_row(
                 "INSERT INTO databases (bottle_id, name) VALUES (?1, ?2)
              ON CONFLICT(bottle_id, name) DO UPDATE SET name = excluded.name
             RETURNING id;",
-                (bottle_id, name),
+                rusqlite::params_from_iter(&args),
                 |row| row.get(0),
             )
             .map_err(ClientStorageErrorr::Internal)?;
@@ -514,13 +547,17 @@ impl RegistryEngine for SqliteEngine {
     fn delete_database(
         &mut self,
         bottle_id: i64,
-        name: String,
+        name: Utf16String,
     ) -> Result<(), ClientStorageErrorr<Self::Error>> {
         let tx = self.connection.transaction()?;
 
+        let args = [
+            rusqlite::types::Value::Integer(bottle_id),
+            RegistryDatabaseName::from(&name).into(),
+        ];
         let database_id: i64 = tx.query_row(
             "SELECT id FROM databases WHERE bottle_id = ?1 AND name = ?2;",
-            (bottle_id, name.clone()),
+            rusqlite::params_from_iter(&args),
             |row| row.get(0),
         )?;
 
@@ -532,7 +569,7 @@ impl RegistryEngine for SqliteEngine {
 
         tx.execute(
             "DELETE FROM databases WHERE bottle_id = ?1 AND name = ?2;",
-            (bottle_id, name),
+            rusqlite::params_from_iter(&args),
         )?;
 
         if tx.changes() == 0 {

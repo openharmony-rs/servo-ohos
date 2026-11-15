@@ -18,7 +18,7 @@ use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
     BackendError, BackendResult, ConnectionEvent, IndexedDBIndex, IndexedDBKeyRange,
     IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBTxnId, IndexedDBTxnMode,
-    IndexedDBValue, KeyPath, PutItemResult, RequestOutput, TransactionEvent,
+    IndexedDBValue, KeyPath, PutItemResult, RequestOutput, TransactionEvent, Utf16String,
 };
 use tempfile::TempDir;
 use url::Host;
@@ -86,6 +86,7 @@ executor_tests!(
     test_create_store,
     test_create_store_empty_name,
     test_injection,
+    test_unpaired_surrogates_in_names_and_keys,
     test_key_path,
     test_delete_store,
     test_delete_store_removes_store_records,
@@ -138,7 +139,7 @@ fn test_origin() -> ImmutableOrigin {
 
 fn test_description() -> IndexedDBDescription {
     IndexedDBDescription {
-        name: "test_db".to_string(),
+        name: "test_db".into(),
         origin: test_origin(),
     }
 }
@@ -200,7 +201,13 @@ fn create_store<X: SqlExecutor>(
 ) -> Result<i64, SqlError> {
     in_own_transaction(db, |executor| {
         let id = next_id(executor, "object_store")?;
-        queries::create_object_store(executor, id, store_name, key_path.as_ref(), auto_increment)?;
+        queries::create_object_store(
+            executor,
+            id,
+            &store_name.into(),
+            key_path.as_ref(),
+            auto_increment,
+        )?;
         Ok(id)
     })
 }
@@ -224,7 +231,7 @@ fn create_index<X: SqlExecutor>(
             executor,
             store,
             id,
-            &index_name,
+            &index_name.into(),
             &key_path,
             unique,
             multi_entry,
@@ -237,7 +244,7 @@ fn create_index<X: SqlExecutor>(
 fn store_names<X: SqlExecutor>(db: &SqlEngine<X>) -> Vec<String> {
     db.object_stores()
         .into_iter()
-        .map(|store| store.name)
+        .map(|store| store.name.to_string())
         .collect()
 }
 
@@ -732,7 +739,7 @@ fn test_create_store<X: SqlExecutor>() {
         Err(SqlError::InvalidMetadata(_))
     ));
     let reused_id = in_own_transaction(&db, |executor| {
-        queries::create_object_store(executor, store, "other", None, false)
+        queries::create_object_store(executor, store, &"other".into(), None, false)
     });
     assert!(matches!(reused_id, Err(SqlError::InvalidMetadata(_))));
     // Ensure store was not overwritten
@@ -760,6 +767,124 @@ fn test_injection<X: SqlExecutor>() {
         store_names(&db),
         vec![store_name1.to_owned(), store_name2.to_owned()]
     );
+}
+
+fn units(units: &[u16]) -> Utf16String {
+    Utf16String::from_units(units.to_vec())
+}
+
+/// Database, store and index names keep their unpaired surrogates, also after reopening, and so
+/// do string keys, which sort by code unit.
+fn test_unpaired_surrogates_in_names_and_keys<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let description = IndexedDBDescription {
+        name: units(&[0xDC00, 0xD800]),
+        origin: test_origin(),
+    };
+    let open = |created| {
+        SqlEngine::<X>::new(
+            dir.path().to_path_buf(),
+            created,
+            &description,
+            ThreadPool::global(),
+        )
+        .unwrap()
+    };
+    let db = open(true);
+    let lead = units(&[0xD800]);
+    let trail = units(&[0xDC00]);
+    let replacement = Utf16String::from("\u{FFFD}");
+    in_own_transaction(&db, |executor| {
+        // Names that are equal once each unpaired surrogate is replaced are different names.
+        for (name, id) in [&lead, &trail, &replacement].into_iter().zip(1..) {
+            queries::create_object_store(executor, id, name, None, false)?;
+        }
+        queries::rename_object_store(executor, 3, &units(&[0x61, 0xDFFF]))?;
+        let key_path = KeyPath::String("a".to_owned());
+        queries::create_index(executor, 1, 1, &trail, &key_path, false, false)?;
+        queries::create_index(executor, 1, 2, &replacement, &key_path, false, false)?;
+        queries::rename_index(executor, 1, 2, &lead)
+    })
+    .unwrap();
+    assert!(
+        in_own_transaction(&db, |executor| {
+            queries::create_object_store(executor, 4, &trail, None, false)
+        })
+        .is_err()
+    );
+    let names = |db: &SqlEngine<X>| {
+        let stores = db.object_stores();
+        let index_names: Vec<_> = stores[0]
+            .indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect();
+        (
+            stores
+                .into_iter()
+                .map(|store| store.name)
+                .collect::<Vec<_>>(),
+            index_names,
+        )
+    };
+    let expected = (
+        vec![lead.clone(), trail.clone(), units(&[0x61, 0xDFFF])],
+        vec![trail.clone(), lead.clone()],
+    );
+    assert_eq!(names(&db), expected);
+
+    let puts = [
+        units(&[0xDC00]),
+        units(&[0xD834, 0xDD1E]),
+        replacement,
+        units(&[0xD800]),
+        units(&[0x61, 0xDFFF]),
+        units(&[0xDC00, 0xD800]),
+    ]
+    .into_iter()
+    .map(|key| (Some(IndexedDBKeyType::String(key)), vec![]))
+    .collect();
+    assert!(run_puts(&db, 1, 1, puts, false).iter().all(Result::is_ok));
+    assert!(commit(&db, 1).is_ok());
+    let sorted: Vec<_> = [
+        &[0x61, 0xDFFF][..],
+        &[0xD800],
+        &[0xD834, 0xDD1E],
+        &[0xDC00],
+        &[0xDC00, 0xD800],
+        &[0xFFFD],
+    ]
+    .into_iter()
+    .map(|key| IndexedDBKeyType::String(units(key)))
+    .collect();
+    assert!(sorted.is_sorted_by(|a, b| a < b));
+    assert_eq!(stored_keys(&db, 1), sorted);
+    let range = IndexedDBKeyRange::new(
+        Some(IndexedDBKeyType::String(lead.clone())),
+        Some(IndexedDBKeyType::String(trail.clone())),
+        true,
+        false,
+    );
+    let mut connection = db.connection();
+    let store = queries::object_store(&mut *connection, 1).unwrap().unwrap();
+    assert_eq!(
+        queries::get_all_keys(&mut *connection, &store, &range, None).unwrap(),
+        vec![
+            IndexedDBKeyType::String(units(&[0xD834, 0xDD1E])),
+            IndexedDBKeyType::String(trail),
+        ]
+    );
+    let stored_name = query_row(&mut *connection, "SELECT name FROM database", &[], |row| {
+        row.blob(0)
+    })
+    .unwrap();
+    assert_eq!(stored_name, Some(description.name.to_be_bytes()));
+    drop(connection);
+    drop(db);
+
+    let db = open(false);
+    assert_eq!(names(&db), expected);
+    assert_eq!(stored_keys(&db, 1), sorted);
 }
 
 fn test_key_path<X: SqlExecutor>() {
@@ -823,7 +948,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
     assert_eq!((by_title, by_name, by_author), (1, 2, 3));
     let index = |id, name: &str, key_path: KeyPath, unique, multi_entry| IndexedDBIndex {
         id,
-        name: name.to_owned(),
+        name: name.into(),
         key_path,
         unique,
         multi_entry,
@@ -833,7 +958,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
         vec![
             IndexedDBObjectStore {
                 id: books,
-                name: "books".to_owned(),
+                name: "books".into(),
                 key_path: Some(KeyPath::String("isbn".to_owned())),
                 has_key_generator: true,
                 indexes: vec![
@@ -855,7 +980,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
             },
             IndexedDBObjectStore {
                 id: authors,
-                name: "authors".to_owned(),
+                name: "authors".into(),
                 key_path: None,
                 has_key_generator: false,
                 indexes: vec![index(
@@ -888,30 +1013,33 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
 
     // Swap the names of the two stores and of two indexes, as script does it.
     in_own_transaction(&db, |executor| {
-        queries::rename_object_store(executor, books, "tmp")?;
-        queries::rename_object_store(executor, authors, "books")?;
-        queries::rename_object_store(executor, books, "authors")?;
-        queries::rename_index(executor, books, by_title, "tmp")?;
-        queries::rename_index(executor, books, by_author, "by_title")?;
-        queries::rename_index(executor, books, by_title, "by_author")
+        queries::rename_object_store(executor, books, &"tmp".into())?;
+        queries::rename_object_store(executor, authors, &"books".into())?;
+        queries::rename_object_store(executor, books, &"authors".into())?;
+        queries::rename_index(executor, books, by_title, &"tmp".into())?;
+        queries::rename_index(executor, books, by_author, &"by_title".into())?;
+        queries::rename_index(executor, books, by_title, &"by_author".into())
     })
     .unwrap();
     let stores = db.object_stores();
     assert_eq!(
         (
             stores[0].id,
-            stores[0].name.as_str(),
-            stores[1].name.as_str()
+            stores[0].name.to_string(),
+            stores[1].name.to_string()
         ),
-        (books, "authors", "books")
+        (books, "authors".to_owned(), "books".to_owned())
     );
     assert_eq!(
         stores[0]
             .indexes
             .iter()
-            .map(|index| (index.id, index.name.as_str()))
+            .map(|index| (index.id, index.name.to_string()))
             .collect::<Vec<_>>(),
-        vec![(by_title, "by_author"), (by_author, "by_title")]
+        vec![
+            (by_title, "by_author".to_owned()),
+            (by_author, "by_title".to_owned())
+        ]
     );
     assert_eq!(stored_keys(&db, books), number_keys([1]));
     assert_eq!(db.key_generator_current_number(books), Some(2));
@@ -919,16 +1047,16 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
     // A name in use, a missing store or index, and an index of another store are refused.
     for result in [
         in_own_transaction(&db, |executor| {
-            queries::rename_object_store(executor, books, "books")
+            queries::rename_object_store(executor, books, &"books".into())
         }),
         in_own_transaction(&db, |executor| {
-            queries::rename_object_store(executor, 9, "other")
+            queries::rename_object_store(executor, 9, &"other".into())
         }),
         in_own_transaction(&db, |executor| {
-            queries::rename_index(executor, books, by_title, "by_title")
+            queries::rename_index(executor, books, by_title, &"by_title".into())
         }),
         in_own_transaction(&db, |executor| {
-            queries::rename_index(executor, authors, by_title, "other")
+            queries::rename_index(executor, authors, by_title, &"other".into())
         }),
         in_own_transaction(&db, |executor| {
             queries::delete_index(executor, authors, by_title)
@@ -938,7 +1066,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
                 executor,
                 books,
                 by_author,
-                "new",
+                &"new".into(),
                 &KeyPath::String("new".to_owned()),
                 false,
                 false,
@@ -949,7 +1077,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
                 executor,
                 9,
                 9,
-                "new",
+                &"new".into(),
                 &KeyPath::String("new".to_owned()),
                 false,
                 false,
@@ -1308,7 +1436,7 @@ fn test_async_operations<X: SqlExecutor>() {
             put_request(
                 store_id,
                 put2.0,
-                IndexedDBKeyType::String("2.0".to_string()),
+                IndexedDBKeyType::String("2.0".into()),
                 vec![4, 5, 6],
                 false,
             ),
@@ -1316,7 +1444,7 @@ fn test_async_operations<X: SqlExecutor>() {
                 store_id,
                 put3.0,
                 IndexedDBKeyType::Array(vec![
-                    IndexedDBKeyType::String("3".to_string()),
+                    IndexedDBKeyType::String("3".into()),
                     IndexedDBKeyType::Number(0.0),
                 ]),
                 vec![7, 8, 9],
@@ -1399,12 +1527,12 @@ fn test_async_operations<X: SqlExecutor>() {
     // Check that all three items are present
     assert!(all_items.contains(&stored_value(1.0, vec![13, 14, 15])));
     assert!(all_items.contains(&IndexedDBValue {
-        primary_key: IndexedDBKeyType::String("2.0".to_string()),
+        primary_key: IndexedDBKeyType::String("2.0".into()),
         value: vec![4, 5, 6],
     }));
     assert!(all_items.contains(&IndexedDBValue {
         primary_key: IndexedDBKeyType::Array(vec![
-            IndexedDBKeyType::String("3".to_string()),
+            IndexedDBKeyType::String("3".into()),
             IndexedDBKeyType::Number(0.0),
         ]),
         value: vec![7, 8, 9],
@@ -1503,7 +1631,7 @@ pub(crate) fn stored_version_and_store_names<X: SqlExecutor>(
         queries::object_stores(&mut *connection)
             .unwrap()
             .into_iter()
-            .map(|store| store.name)
+            .map(|store| store.name.to_string())
             .collect(),
     )
 }
@@ -1548,7 +1676,7 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
                 store_id,
                 AsyncSchemaOperation::RenameIndex {
                     index_id: index_ids[0],
-                    new_name: "b".to_owned(),
+                    new_name: "b".into(),
                 },
             ),
             put_request(
@@ -1587,7 +1715,7 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
     let index_names: Vec<String> = db.object_stores()[0]
         .indexes
         .iter()
-        .map(|index| index.name.clone())
+        .map(|index| index.name.to_string())
         .collect();
     assert_eq!(index_names, vec!["a".to_owned(), "b".to_owned()]);
 }
@@ -1649,7 +1777,7 @@ fn test_key_generator_follows_generated_and_explicit_keys<X: SqlExecutor>() {
             (None, vec![2]),
             (number(1000.0), vec![3]),
             (None, vec![4]),
-            (Some(IndexedDBKeyType::String("9999".to_owned())), vec![5]),
+            (Some(IndexedDBKeyType::String("9999".into())), vec![5]),
             (Some(IndexedDBKeyType::Date(9999.0)), vec![6]),
             (
                 Some(IndexedDBKeyType::Array(vec![IndexedDBKeyType::Number(
@@ -1865,7 +1993,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
             schema(
                 created,
                 AsyncSchemaOperation::CreateObjectStore {
-                    name: "created".to_owned(),
+                    name: "created".into(),
                     key_path: None,
                     auto_increment: true,
                 },
@@ -1874,7 +2002,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
                 kept,
                 AsyncSchemaOperation::CreateIndex {
                     index_id: 2,
-                    name: "by_b".to_owned(),
+                    name: "by_b".into(),
                     key_path: KeyPath::String("b".to_owned()),
                     unique: false,
                     multi_entry: false,
@@ -1884,14 +2012,14 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
                 kept,
                 AsyncSchemaOperation::RenameIndex {
                     index_id: by_a,
-                    new_name: "by_c".to_owned(),
+                    new_name: "by_c".into(),
                 },
             ),
             schema(deleted, AsyncSchemaOperation::DeleteObjectStore),
             schema(
                 kept,
                 AsyncSchemaOperation::RenameObjectStore {
-                    new_name: "renamed".to_owned(),
+                    new_name: "renamed".into(),
                 },
             ),
         ],
@@ -1925,7 +2053,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
             .unwrap()
             .indexes
             .into_iter()
-            .map(|index| index.name)
+            .map(|index| index.name.to_string())
             .collect()
     };
     let before = (1, vec!["kept".to_owned(), "deleted".to_owned()]);
@@ -1946,7 +2074,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
         db.object_stores()[0]
             .indexes
             .iter()
-            .map(|index| index.name.as_str())
+            .map(|index| index.name.to_string())
             .collect::<Vec<_>>(),
         vec!["by_a"]
     );
@@ -1965,7 +2093,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
             (
                 store,
                 AsyncSchemaOperation::CreateObjectStore {
-                    name: "other".to_owned(),
+                    name: "other".into(),
                     key_path: None,
                     auto_increment: false,
                 },
@@ -1974,7 +2102,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
                 store + 1,
                 AsyncSchemaOperation::CreateIndex {
                     index_id: 0,
-                    name: "index".to_owned(),
+                    name: "index".into(),
                     key_path: KeyPath::String("a".to_owned()),
                     unique: false,
                     multi_entry: false,
@@ -1984,7 +2112,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
                 store + 5,
                 AsyncSchemaOperation::CreateIndex {
                     index_id: 1,
-                    name: "index".to_owned(),
+                    name: "index".into(),
                     key_path: KeyPath::String("a".to_owned()),
                     unique: false,
                     multi_entry: false,
@@ -1995,19 +2123,19 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
                 store,
                 AsyncSchemaOperation::RenameIndex {
                     index_id: 1,
-                    new_name: "index".to_owned(),
+                    new_name: "index".into(),
                 },
             ),
             (
                 store,
                 AsyncSchemaOperation::RenameObjectStore {
-                    new_name: "created".to_owned(),
+                    new_name: "created".into(),
                 },
             ),
             (
                 store + 5,
                 AsyncSchemaOperation::RenameObjectStore {
-                    new_name: "other".to_owned(),
+                    new_name: "other".into(),
                 },
             ),
             (store + 5, AsyncSchemaOperation::DeleteObjectStore),
@@ -2024,7 +2152,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
                 schema(
                     store + 1,
                     AsyncSchemaOperation::CreateObjectStore {
-                        name: "created".to_owned(),
+                        name: "created".into(),
                         key_path: None,
                         auto_increment: false,
                     },

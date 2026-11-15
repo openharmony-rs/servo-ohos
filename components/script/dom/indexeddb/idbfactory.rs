@@ -14,7 +14,7 @@ use servo_base::generic_channel::GenericSend;
 use servo_url::origin::ImmutableOrigin;
 use storage_traits::indexeddb::{
     BackendResult, ConnectionEvent, DatabaseInfo, IndexedDBThreadMsg, StorageBottleSource,
-    SyncOperation,
+    SyncOperation, Utf16String,
 };
 use uuid::Uuid;
 
@@ -30,13 +30,16 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::HashMapTracedValues;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbopendbrequest::IDBOpenDBRequest;
-use crate::dom::indexeddb::key::{convert_value_to_key, map_backend_error_to_dom_error};
+use crate::dom::indexeddb::key::{
+    convert_value_to_key, dom_string_from_name, map_backend_error_to_dom_error,
+    name_from_dom_string,
+};
 use crate::dom::promise::Promise;
 use crate::dom::types::IDBTransaction;
 
 /// A non-jstraceable string wrapper for use in `HashMapTracedValues`.
 #[derive(Clone, Debug, Eq, Hash, MallocSizeOf, PartialEq)]
-pub(crate) struct DBName(pub(crate) String);
+pub(crate) struct DBName(pub(crate) Utf16String);
 
 #[dom_struct]
 pub struct IDBFactory {
@@ -63,7 +66,7 @@ impl IDBFactory {
     }
 
     pub(crate) fn register_indexeddb_transaction(&self, txn: &IDBTransaction) {
-        let db_name = DBName(String::from(txn.get_db_name()));
+        let db_name = DBName(txn.get_db_name());
         let mut map = self.indexeddb_transactions.borrow_mut();
         let bucket = map.entry(db_name).or_default();
         if !bucket.iter().any(|entry| &**entry == txn) {
@@ -73,7 +76,7 @@ impl IDBFactory {
     }
 
     pub(crate) fn unregister_indexeddb_transaction(&self, txn: &IDBTransaction) {
-        let db_name = DBName(String::from(txn.get_db_name()));
+        let db_name = DBName(txn.get_db_name());
         let mut map = self.indexeddb_transactions.borrow_mut();
         if let Some(bucket) = map.get_mut(&db_name) {
             bucket.retain(|entry| &**entry != txn);
@@ -180,7 +183,7 @@ impl IDBFactory {
     fn open_database(
         &self,
         storage_key: ImmutableOrigin,
-        name: DOMString,
+        name: Utf16String,
         version: Option<u64>,
         request: &IDBOpenDBRequest,
     ) -> Result<(), ()> {
@@ -189,7 +192,7 @@ impl IDBFactory {
 
         {
             let mut pending = self.connections.borrow_mut();
-            let outer = pending.entry(DBName(name.to_string())).or_default();
+            let outer = pending.entry(DBName(name.clone())).or_default();
             outer.insert(request_id, Dom::from_ref(request));
         }
 
@@ -200,7 +203,7 @@ impl IDBFactory {
         // with storageKey, name, version if given and undefined otherwise, and request.
         let open_operation = SyncOperation::OpenDatabase(
             storage_key,
-            String::from(name),
+            name,
             version,
             request.get_id(),
             Self::storage_bottle_source(&global),
@@ -337,7 +340,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
 
         // Step 5: Runs in parallel
         if self
-            .open_database(storage_key, name, version, &request)
+            .open_database(storage_key, name_from_dom_string(&name), version, &request)
             .is_err()
         {
             return Err(Error::Operation(None));
@@ -371,7 +374,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
 
         // Step 4: Runs in parallel
         if request
-            .delete_database(storage_key, String::from(name))
+            .delete_database(storage_key, name_from_dom_string(&name))
             .is_err()
         {
             return Err(Error::Operation(None));
@@ -431,7 +434,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
                         let info_list: Vec<IDBDatabaseInfo> = info_list
                             .into_iter()
                             .map(|info| IDBDatabaseInfo {
-                                name: Some(DOMString::from(info.name)),
+                                name: Some(dom_string_from_name(&info.name)),
                                 version: Some(info.version),
                         })
                         .collect();

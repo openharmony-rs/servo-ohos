@@ -14,9 +14,10 @@ use storage_traits::client_storage::{
     ClientStorageErrorr, ClientStorageThreadHandle, ClientStorageThreadMessage, Mode,
     StorageIdentifier, StorageProxyMap, StorageType,
 };
+use storage_traits::indexeddb::Utf16String;
 use uuid::Uuid;
 
-use super::RegistryEngine;
+use super::{RegistryDatabaseName, RegistryEngine};
 use crate::client_storage_shared::{self, StorageShelf};
 use crate::ohos_rdb::{
     OhosRdbError, OhosRdbStore, OhosRdbTransaction, OhosRdbValues, Result as OhosRdbResult,
@@ -47,6 +48,13 @@ impl OhosRdbEngine {
         // TODO: Delete expired and non-persistent buckets on startup
         tx.commit()?;
         Ok(())
+    }
+}
+
+fn push_database_name(args: &mut OhosRdbValues, name: &Utf16String) -> OhosRdbResult<()> {
+    match RegistryDatabaseName::from(name) {
+        RegistryDatabaseName::Text(text) => args.push_text(&text),
+        RegistryDatabaseName::Blob(blob) => args.push_blob(&blob),
     }
 }
 
@@ -150,7 +158,7 @@ impl RegistryEngine for OhosRdbEngine {
     fn create_database(
         &mut self,
         bottle_id: i64,
-        name: String,
+        name: Utf16String,
     ) -> Result<(PathBuf, bool), ClientStorageErrorr<Self::Error>> {
         let tx = self
             .store
@@ -160,8 +168,7 @@ impl RegistryEngine for OhosRdbEngine {
         let mut args = OhosRdbValues::new().map_err(ClientStorageErrorr::Internal)?;
         args.push_int(bottle_id)
             .map_err(ClientStorageErrorr::Internal)?;
-        args.push_text(name.as_str())
-            .map_err(ClientStorageErrorr::Internal)?;
+        push_database_name(&mut args, &name).map_err(ClientStorageErrorr::Internal)?;
         tx.execute(
             "INSERT INTO databases (bottle_id, name) VALUES (?1, ?2) ON CONFLICT(bottle_id, name) DO UPDATE SET name = excluded.name;",
             &args,
@@ -233,7 +240,7 @@ impl RegistryEngine for OhosRdbEngine {
     fn delete_database(
         &mut self,
         bottle_id: i64,
-        name: String,
+        name: Utf16String,
     ) -> Result<(), ClientStorageErrorr<Self::Error>> {
         let tx = self
             .store
@@ -244,9 +251,7 @@ impl RegistryEngine for OhosRdbEngine {
         lookup_args
             .push_int(bottle_id)
             .map_err(ClientStorageErrorr::Internal)?;
-        lookup_args
-            .push_text(name.as_str())
-            .map_err(ClientStorageErrorr::Internal)?;
+        push_database_name(&mut lookup_args, &name).map_err(ClientStorageErrorr::Internal)?;
 
         let database_id = crate::client_storage_shared::query_required_i64(
             &tx,
@@ -532,6 +537,55 @@ mod tests {
             Some("reg.rdb")
         );
         assert!(registry_path.exists());
+    }
+
+    /// A database name with an unpaired surrogate names its own database.
+    #[cfg(ohos_rdb)]
+    #[test]
+    fn test_ohos_registry_database_names_with_unpaired_surrogates() {
+        install_test_namespace();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let handle: ClientStorageThreadHandle =
+            ClientStorageThreadFactory::new(Some(tmp_dir.path().to_path_buf()), false);
+        let bottle_id = obtain_bottle_map(
+            &handle,
+            StorageType::Local,
+            Some(WebViewId::new(servo_base::id::TEST_PAINTER_ID)),
+            StorageIdentifier::IndexedDB,
+            ServoUrl::parse("https://example.com").unwrap().origin(),
+        )
+        .bottle_id;
+
+        let names = [
+            Utf16String::from_units(vec![0xD800]),
+            Utf16String::from_units(vec![0xDC00]),
+            Utf16String::from("\u{FFFD}"),
+        ];
+        let create = |name: &Utf16String| {
+            handle
+                .create_database(bottle_id, name.clone())
+                .recv()
+                .unwrap()
+                .unwrap()
+        };
+        let paths: Vec<PathBuf> = names
+            .iter()
+            .map(|name| {
+                let (path, created) = create(name);
+                assert!(created);
+                path
+            })
+            .collect();
+        assert!(paths[0] != paths[1] && paths[1] != paths[2] && paths[0] != paths[2]);
+        assert_eq!(create(&names[0]), (paths[0].clone(), false));
+
+        handle
+            .delete_database(bottle_id, names[0].clone())
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert!(!paths[0].exists());
+        assert!(paths[1].exists() && paths[2].exists());
     }
 
     #[cfg(ohos_rdb)]

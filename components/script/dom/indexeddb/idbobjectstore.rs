@@ -12,18 +12,16 @@ use js::rust::HandleValue;
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::IDBObjectStoreBinding::IDBIndexParameters;
 use script_bindings::codegen::GenericUnionTypes::StringOrStringSequence;
-use script_bindings::domstring::TracedDOMString;
 use script_bindings::error::ErrorResult;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::generic_channel::{GenericSend, GenericSender};
 use storage_traits::indexeddb::{
     self, AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
     IndexedDBIndex, IndexedDBIndexId, IndexedDBKeyType, IndexedDBObjectStore,
-    IndexedDBObjectStoreId, IndexedDBThreadMsg,
+    IndexedDBObjectStoreId, IndexedDBThreadMsg, Utf16String,
 };
 
 use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
-use crate::dom::bindings::codegen::Bindings::IDBIndexBinding::IDBIndexMethods;
 use crate::dom::bindings::codegen::Bindings::IDBObjectStoreBinding::IDBObjectStoreMethods;
 use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::{
     IDBTransactionMethods, IDBTransactionMode,
@@ -34,6 +32,7 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::structuredclone;
+use crate::dom::bindings::trace::NoTrace;
 use crate::dom::domstringlist::DOMStringList;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
@@ -43,8 +42,9 @@ use crate::dom::indexeddb::idbrequest::IDBRequest;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::key::{
     EvaluationResult, ExtractionResult, can_inject_key_into_value, convert_value_to_key,
-    convert_value_to_key_range, evaluate_key_path_on_value, extract_key, inject_key_into_value,
-    injected_key_is_stored, is_valid_key_path,
+    convert_value_to_key_range, dom_string_from_name, evaluate_key_path_on_value, extract_key,
+    inject_key_into_value, injected_key_is_stored, is_valid_key_path, name_from_dom_string,
+    sorted_name_list,
 };
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
@@ -89,9 +89,10 @@ pub struct IDBObjectStore {
     reflector_: Reflector,
     /// The id of the handle's object store.
     id: IndexedDBObjectStoreId,
-    name: DomRefCell<TracedDOMString>,
+    #[no_trace]
+    name: DomRefCell<Utf16String>,
     key_path: Option<KeyPath>,
-    index_set: DomRefCell<HashMap<TracedDOMString, Dom<IDBIndex>>>,
+    index_set: DomRefCell<HashMap<NoTrace<Utf16String>, Dom<IDBIndex>>>,
     /// Every index handle of this handle, also those of indexes deleted since, whose names an
     /// aborted upgrade transaction reverts.
     index_handles: DomRefCell<Vec<Dom<IDBIndex>>>,
@@ -100,44 +101,40 @@ pub struct IDBObjectStore {
 
     // We store the db name in the object store to address backend operations
     // that are keyed by (origin, database name, object store id).
-    db_name: TracedDOMString,
+    #[no_trace]
+    db_name: Utf16String,
 }
 
 impl IDBObjectStore {
-    fn new_inherited(
-        name: DOMString,
-        store: &IndexedDBObjectStore,
-        transaction: &IDBTransaction,
-    ) -> IDBObjectStore {
+    fn new_inherited(store: &IndexedDBObjectStore, transaction: &IDBTransaction) -> IDBObjectStore {
         IDBObjectStore {
             reflector_: Reflector::new(),
             id: store.id,
-            name: DomRefCell::new(name.traced()),
+            name: DomRefCell::new(store.name.clone()),
             key_path: store.key_path.clone().map(Into::into),
             index_set: DomRefCell::new(HashMap::new()),
             index_handles: Default::default(),
             transaction: Dom::from_ref(transaction),
             has_key_generator: store.has_key_generator,
-            db_name: transaction.get_db_name().traced(),
+            db_name: transaction.get_db_name(),
         }
     }
 
-    /// <https://w3c.github.io/IndexedDB/#object-store-handle>: a new handle, named `name`, of the
-    /// object store `store` in `transaction`, with a handle of each of its indexes.
+    /// <https://w3c.github.io/IndexedDB/#object-store-handle>: a new handle of the object store
+    /// `store` in `transaction`, with a handle of each of its indexes.
     pub fn new(
         cx: &mut JSContext,
         global: &GlobalScope,
-        name: DOMString,
         store: &IndexedDBObjectStore,
         transaction: &IDBTransaction,
     ) -> DomRoot<IDBObjectStore> {
         let handle = reflect_dom_object(
             cx,
-            Box::new(IDBObjectStore::new_inherited(name, store, transaction)),
+            Box::new(IDBObjectStore::new_inherited(store, transaction)),
             global,
         );
         for index in &store.indexes {
-            handle.add_index(cx, index.name.clone().into(), index);
+            handle.add_index(cx, index);
         }
         handle
     }
@@ -155,7 +152,7 @@ impl IDBObjectStore {
         // Step 5.1. If handle’s object store was not newly created during transaction,
         // set handle’s name to its object store’s name.
         if let Some(store) = &store {
-            *self.name.safe_borrow_mut(cx.no_gc()) = DOMString::from(store.name.clone()).traced();
+            *self.name.safe_borrow_mut(cx.no_gc()) = store.name.clone();
         }
 
         // Step 6. For each index handle handle associated with transaction, including those for
@@ -170,7 +167,7 @@ impl IDBObjectStore {
             .collect();
         for handle in &handles {
             if let Some(index) = indexes.iter().find(|index| index.id == handle.id()) {
-                handle.set_name(index.name.clone().into());
+                handle.set_name(index.name.clone());
             }
         }
 
@@ -182,10 +179,10 @@ impl IDBObjectStore {
                 Some(handle) => {
                     self.index_set
                         .safe_borrow_mut(cx.no_gc())
-                        .insert(handle.Name().traced(), Dom::from_ref(&**handle));
+                        .insert(NoTrace(handle.name()), Dom::from_ref(&**handle));
                 },
                 None => {
-                    self.add_index(cx, index.name.clone().into(), index);
+                    self.add_index(cx, index);
                 },
             }
         }
@@ -503,34 +500,29 @@ impl IDBObjectStore {
         .inspect(|request| cursor.set_request(request))
     }
 
-    /// Adds a handle named `name` of the index `index` to this handle's index set.
-    fn add_index(
-        &self,
-        cx: &mut JSContext,
-        name: DOMString,
-        index: &IndexedDBIndex,
-    ) -> DomRoot<IDBIndex> {
+    /// Adds a handle of the index `index` to this handle's index set.
+    fn add_index(&self, cx: &mut JSContext, index: &IndexedDBIndex) -> DomRoot<IDBIndex> {
         let handle = IDBIndex::new(
             cx,
             &self.global(),
             self,
             index.id,
-            name.clone(),
+            index.name.clone(),
             index.multi_entry,
             index.unique,
             index.key_path.clone().into(),
         );
         self.index_set
             .safe_borrow_mut(cx.no_gc())
-            .insert(name.traced(), Dom::from_ref(&handle));
+            .insert(NoTrace(index.name.clone()), Dom::from_ref(&handle));
         self.index_handles
             .safe_borrow_mut(cx.no_gc())
             .push(Dom::from_ref(&handle));
         handle
     }
 
-    pub(crate) fn has_index(&self, name: &TracedDOMString) -> bool {
-        self.index_set.borrow().contains_key(name)
+    pub(crate) fn has_index(&self, name: &Utf16String) -> bool {
+        self.index_set.borrow().contains_key(&NoTrace(name.clone()))
     }
 
     /// <https://w3c.github.io/IndexedDB/#dom-idbdatabase-deleteobjectstore> step 6.
@@ -544,7 +536,7 @@ impl IDBObjectStore {
         self.get_idb_thread()
             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
                 origin: self.global().origin().immutable().clone(),
-                database_name: self.db_name.to_string(),
+                database_name: self.db_name.clone(),
                 store_id: self.id,
                 operation,
                 transaction: self.transaction.id(),
@@ -561,15 +553,15 @@ impl IDBObjectStore {
     pub(crate) fn rename_index(
         &self,
         index: IndexedDBIndexId,
-        name: &TracedDOMString,
-        new_name: &DOMString,
+        name: &Utf16String,
+        new_name: &Utf16String,
     ) {
         self.transaction
             .get_db()
-            .rename_index(self.id, index, new_name.to_string());
+            .rename_index(self.id, index, new_name.clone());
         let operation = AsyncSchemaOperation::RenameIndex {
             index_id: index,
-            new_name: new_name.to_string(),
+            new_name: new_name.clone(),
         };
         if self.send_schema_operation(operation).is_err() {
             warn!("Could not send AsyncSchemaOperation");
@@ -579,12 +571,12 @@ impl IDBObjectStore {
         let index = self
             .index_set
             .borrow_mut()
-            .remove(name)
+            .remove(&NoTrace(name.clone()))
             .expect("Earlier steps of the algorithm checked that the index exists")
             .as_rooted();
         self.index_set
             .borrow_mut()
-            .insert(new_name.clone().traced(), Dom::from_ref(&index));
+            .insert(NoTrace(new_name.clone()), Dom::from_ref(&index));
     }
 }
 
@@ -832,13 +824,13 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-name>
     fn Name(&self) -> DOMString {
-        self.name.borrow().clone().root()
+        dom_string_from_name(&self.name.borrow())
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-name>
     fn SetName(&self, value: DOMString) -> ErrorResult {
         // Step 1. Let name be the given value.
-        let name = value;
+        let name = name_from_dom_string(&value);
 
         // Step 2. Let transaction be this’s transaction.
         let transaction = &self.transaction;
@@ -855,13 +847,13 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         self.check_transaction_active()?;
 
         // Step 7. If store’s name is equal to name, terminate these steps.
-        if *self.name.borrow() == *name {
+        if *self.name.borrow() == name {
             return Ok(());
         }
 
         // Step 8. If an object store named name already exists in store’s database,
         // throw a "ConstraintError" DOMException.
-        if transaction.get_db().object_store_exists(&name.str()) {
+        if transaction.get_db().object_store_exists(&name) {
             return Err(Error::Constraint(None));
         }
 
@@ -869,13 +861,13 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         // The records and indexes of the store stay with it: the backend renames the store's row.
         transaction
             .get_db()
-            .rename_object_store(self.id, name.to_string());
+            .rename_object_store(self.id, name.clone());
         self.send_schema_operation(AsyncSchemaOperation::RenameObjectStore {
-            new_name: name.to_string(),
+            new_name: name.clone(),
         })?;
 
         // Step 10. Set this’s name to name.
-        *self.name.borrow_mut() = name.traced();
+        *self.name.borrow_mut() = name;
         Ok(())
     }
 
@@ -890,7 +882,13 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-indexnames>
     fn IndexNames(&self, cx: &mut JSContext) -> DomRoot<DOMStringList> {
-        DOMStringList::new_sorted(cx, &self.global(), self.index_set.borrow().keys())
+        let names: Vec<Utf16String> = self
+            .index_set
+            .borrow()
+            .keys()
+            .map(|name| name.0.clone())
+            .collect();
+        sorted_name_list(cx, &self.global(), names)
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-transaction>
@@ -923,6 +921,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         self.check_transaction_active()?;
 
         // Step 6. If an index named name already exists in store, throw a "ConstraintError" DOMException.
+        let name = name_from_dom_string(&name);
         if self.has_index(&name) {
             return Err(Error::Constraint(None));
         }
@@ -949,7 +948,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         let db = self.transaction.get_db();
         let index = IndexedDBIndex {
             id: db.allocate_index_id(),
-            name: name.to_string(),
+            name,
             key_path: key_path.into(),
             unique: options.unique,
             multi_entry: options.multiEntry,
@@ -964,7 +963,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         db.add_index(self.id, index.clone());
 
         // Step 12. Add index to this object store handle's index set.
-        let index = self.add_index(cx, name, &index);
+        let index = self.add_index(cx, &index);
 
         // Step 13. Return a new index handle associated with index and this object store handle.
         Ok(index)
@@ -982,6 +981,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         self.check_transaction_active()?;
         // Step 6. Let index be the index named name in store if one exists,
         // or throw a "NotFoundError" DOMException otherwise.
+        let name = NoTrace(name_from_dom_string(&name));
         let Some(index) = self
             .index_set
             .borrow()
@@ -991,7 +991,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             return Err(Error::NotFound(None));
         };
         // Step 7. Remove index from this object store handle's index set.
-        self.index_set.borrow_mut().retain(|n, _| n != &*name);
+        self.index_set.borrow_mut().remove(&name);
         // Step 8. Destroy index.
         self.transaction.get_db().remove_index(self.id, index.id());
         self.send_schema_operation(AsyncSchemaOperation::DeleteIndex {
@@ -1011,7 +1011,9 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
 
         // Step 5. Let index be the index named name in this’s index set if one exists, or throw a "NotFoundError" DOMException otherwise.
         let index_set = self.index_set.borrow();
-        let index = index_set.get(&name).ok_or(Error::NotFound(None))?;
+        let index = index_set
+            .get(&NoTrace(name_from_dom_string(&name)))
+            .ok_or(Error::NotFound(None))?;
 
         // Step 6. Return an index handle associated with index and this.
         Ok(index.as_rooted())

@@ -13,7 +13,7 @@ use servo_base::generic_channel::GenericSend;
 use servo_url::origin::ImmutableOrigin;
 use storage_traits::indexeddb::{
     BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBObjectStore, IndexedDBThreadMsg,
-    IndexedDBTxnId, SyncOperation,
+    IndexedDBTxnId, SyncOperation, Utf16String,
 };
 use stylo_atoms::Atom;
 use uuid::Uuid;
@@ -134,21 +134,14 @@ impl IDBOpenDBRequest {
         &self,
         cx: &mut JSContext,
         global: &GlobalScope,
-        name: String,
+        name: Utf16String,
         version: u64,
         object_stores: Vec<IndexedDBObjectStore>,
         upgraded: bool,
     ) -> DomRoot<IDBDatabase> {
         self.pending_connection.or_init(|| {
             debug_assert!(!upgraded, "A connection should exist for the upgraded db.");
-            IDBDatabase::new(
-                cx,
-                global,
-                name.into(),
-                self.get_id(),
-                version,
-                object_stores,
-            )
+            IDBDatabase::new(cx, global, name, self.get_id(), version, object_stores)
         })
     }
 
@@ -174,6 +167,7 @@ impl IDBOpenDBRequest {
             IDBTransactionMode::Versionchange,
             IDBTransactionDurability::Default,
             &scope,
+            Vec::new(),
             transaction,
         );
         transaction.set_versionchange_old_version(old_version);
@@ -357,7 +351,7 @@ impl IDBOpenDBRequest {
     pub(crate) fn delete_database(
         &self,
         storage_key: ImmutableOrigin,
-        name: String,
+        name: Utf16String,
     ) -> Result<(), ()> {
         let global = self.global();
 

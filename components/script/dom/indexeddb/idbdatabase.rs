@@ -7,12 +7,12 @@ use std::cell::Cell;
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
-use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::{GenericSend, GenericSender};
 use storage_traits::indexeddb::{
     AsyncSchemaOperation, ConnectionEvent, IndexedDBIndex, IndexedDBIndexId, IndexedDBObjectStore,
     IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId, KeyPath, SyncOperation,
+    Utf16String,
 };
 use stylo_atoms::Atom;
 use uuid::Uuid;
@@ -33,13 +33,16 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::idbversionchangeevent::IDBVersionChangeEvent;
-use crate::dom::indexeddb::key::is_valid_key_path;
+use crate::dom::indexeddb::key::{
+    dom_string_from_name, is_valid_key_path, name_from_dom_string, sorted_name_list,
+};
 
 #[dom_struct]
 pub struct IDBDatabase {
     eventtarget: EventTarget,
     /// <https://w3c.github.io/IndexedDB/#database-name>
-    name: TracedDOMString,
+    #[no_trace]
+    name: Utf16String,
     /// <https://w3c.github.io/IndexedDB/#database-version>
     version: Cell<u64>,
     /// <https://w3c.github.io/IndexedDB/#connection-object-store-set>: the object stores and
@@ -71,7 +74,7 @@ pub struct IDBDatabase {
 
 impl IDBDatabase {
     pub fn new_inherited(
-        name: DOMString,
+        name: Utf16String,
         id: Uuid,
         version: u64,
         object_stores: Vec<IndexedDBObjectStore>,
@@ -83,7 +86,7 @@ impl IDBDatabase {
             .max();
         IDBDatabase {
             eventtarget: EventTarget::new_inherited(),
-            name: name.traced(),
+            name,
             id,
             version: Cell::new(version),
             object_stores: DomRefCell::new(object_stores),
@@ -99,7 +102,7 @@ impl IDBDatabase {
     pub fn new(
         cx: &mut JSContext,
         global: &GlobalScope,
-        name: DOMString,
+        name: Utf16String,
         id: Uuid,
         version: u64,
         object_stores: Vec<IndexedDBObjectStore>,
@@ -115,8 +118,9 @@ impl IDBDatabase {
         self.global().storage_threads().sender()
     }
 
-    pub fn get_name(&self) -> DOMString {
-        self.name.clone().root()
+    /// <https://w3c.github.io/IndexedDB/#database-name>
+    pub(crate) fn name(&self) -> &Utf16String {
+        &self.name
     }
 
     /// The id of a new transaction of this connection, unique among them.
@@ -173,7 +177,7 @@ impl IDBDatabase {
                 let global = self.global();
                 let operation = SyncOperation::NotifyEndOfVersionChange {
                     id: self.id,
-                    name: self.name.to_string(),
+                    name: self.name.clone(),
                     old_version,
                     origin: global.origin().immutable().clone(),
                 };
@@ -190,20 +194,21 @@ impl IDBDatabase {
 
     /// The names of the connection's object stores, sorted.
     pub(crate) fn object_store_names(&self, cx: &mut JSContext) -> DomRoot<DOMStringList> {
-        rooted_vec!(let names <- self
+        let names: Vec<Utf16String> = self
             .object_stores
             .borrow()
             .iter()
-            .map(|store| TracedDOMString::from(store.name.clone())));
-        DOMStringList::new_sorted(cx, &self.global(), names.iter())
+            .map(|store| store.name.clone())
+            .collect();
+        sorted_name_list(cx, &self.global(), names)
     }
 
     /// The object store named `name` in the connection's object store set.
-    pub(crate) fn object_store_named(&self, name: &str) -> Option<IndexedDBObjectStore> {
+    pub(crate) fn object_store_named(&self, name: &Utf16String) -> Option<IndexedDBObjectStore> {
         self.object_stores
             .borrow()
             .iter()
-            .find(|store| store.name == name)
+            .find(|store| store.name == *name)
             .cloned()
     }
 
@@ -216,11 +221,11 @@ impl IDBDatabase {
             .cloned()
     }
 
-    pub(crate) fn object_store_exists(&self, name: &str) -> bool {
+    pub(crate) fn object_store_exists(&self, name: &Utf16String) -> bool {
         self.object_stores
             .borrow()
             .iter()
-            .any(|store| store.name == name)
+            .any(|store| store.name == *name)
     }
 
     /// Whether the object store `id` is in the connection's object store set, that is, hasn't
@@ -267,7 +272,7 @@ impl IDBDatabase {
         }
     }
 
-    pub(crate) fn rename_object_store(&self, id: IndexedDBObjectStoreId, name: String) {
+    pub(crate) fn rename_object_store(&self, id: IndexedDBObjectStoreId, name: Utf16String) {
         self.change_object_store(id, |store| store.name = name);
     }
 
@@ -283,7 +288,7 @@ impl IDBDatabase {
         &self,
         store: IndexedDBObjectStoreId,
         index: IndexedDBIndexId,
-        name: String,
+        name: Utf16String,
     ) {
         self.change_object_store(store, |store| {
             if let Some(index) = store.indexes.iter_mut().find(|i| i.id == index) {
@@ -360,7 +365,7 @@ impl IDBDatabase {
         let operation = SyncOperation::CloseDatabase(
             self.global().origin().immutable().clone(),
             self.id,
-            self.name.to_string(),
+            self.name.clone(),
         );
         let _ = self
             .get_idb_thread()
@@ -391,20 +396,20 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
 
         // Step 3. Let scope be the set of unique strings in storeNames if it is
         // a sequence, or a set containing one string equal to storeNames otherwise.
-        let mut scope = match store_names {
-            StringOrStringSequence::String(name) => vec![name],
-            StringOrStringSequence::StringSequence(sequence) => sequence,
+        let mut scope: Vec<Utf16String> = match store_names {
+            StringOrStringSequence::String(name) => vec![name_from_dom_string(&name)],
+            StringOrStringSequence::StringSequence(sequence) => {
+                sequence.iter().map(name_from_dom_string).collect()
+            },
         };
-        scope.sort_unstable_by(|left, right| {
-            left.str().encode_utf16().cmp(right.str().encode_utf16())
-        });
+        scope.sort_unstable();
         scope.dedup();
 
         // Step 4. If any string in scope is not the name of an object store in
         // the connected database, throw a "NotFoundError" DOMException.
         let Some(store_ids) = scope
             .iter()
-            .map(|name| self.object_store_named(&name.str()).map(|store| store.id))
+            .map(|name| self.object_store_named(name).map(|store| store.id))
             .collect::<Option<Vec<_>>>()
         else {
             return Err(Error::NotFound(None));
@@ -424,7 +429,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         // connection, mode, options’ durability member, and the set of object
         // stores named in scope.
         let durability = options.durability;
-        let scope = DOMStringList::new(cx, &self.global(), scope);
+        let scope = sorted_name_list(cx, &self.global(), scope);
         let transaction = IDBTransaction::new(
             cx,
             &self.global(),
@@ -487,7 +492,8 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
 
         // Step 6. If an object store named name already exists in database throw
         // a "ConstraintError" DOMException.
-        if self.object_store_exists(&name.str()) {
+        let name = name_from_dom_string(&name);
+        if self.object_store_exists(&name) {
             return Err(Error::Constraint(None));
         }
 
@@ -522,7 +528,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         });
         let store = IndexedDBObjectStore {
             id: store_id,
-            name: name.to_string(),
+            name,
             key_path: key_path.clone(),
             has_key_generator: auto_increment,
             indexes: Vec::new(),
@@ -536,7 +542,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
             .get_idb_thread()
             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
                 origin: self.global().origin().immutable().clone(),
-                database_name: self.name.to_string(),
+                database_name: self.name.clone(),
                 store_id,
                 operation,
                 transaction: transaction.id(),
@@ -551,7 +557,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
             .safe_borrow_mut(cx.no_gc())
             .push(store.clone());
 
-        let object_store = IDBObjectStore::new(cx, &self.global(), name, &store, &transaction);
+        let object_store = IDBObjectStore::new(cx, &self.global(), &store, &transaction);
         transaction.register_object_store_handle(&object_store);
 
         // Step 10. Return a new object store handle associated with store and transaction.
@@ -574,7 +580,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
 
         // Step 4. Let store be the object store named name in database, or throw a
         // "NotFoundError" DOMException if none.
-        let Some(store) = self.object_store_named(&name.str()) else {
+        let Some(store) = self.object_store_named(&name_from_dom_string(&name)) else {
             return Err(Error::NotFound(None));
         };
 
@@ -595,7 +601,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
             .get_idb_thread()
             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
                 origin: self.global().origin().immutable().clone(),
-                database_name: self.name.to_string(),
+                database_name: self.name.clone(),
                 store_id: store.id,
                 operation,
                 transaction: transaction.id(),
@@ -610,7 +616,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbdatabase-name>
     fn Name(&self) -> DOMString {
-        self.name.clone().root()
+        dom_string_from_name(&self.name)
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbdatabase-version>

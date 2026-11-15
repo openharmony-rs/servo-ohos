@@ -21,6 +21,7 @@ use storage_traits::client_storage::{
     ClientStorageThreadHandle, ClientStorageThreadMessage, StorageIdentifier, StorageProxyMap,
     StorageType,
 };
+use storage_traits::indexeddb::Utf16String;
 
 fn install_test_namespace() {
     if PIPELINE_NAMESPACE.get().is_none() {
@@ -134,6 +135,76 @@ fn test_workflow() {
     // Workaround for https://github.com/servo/servo/issues/32912
     #[cfg(windows)]
     std::thread::sleep(std::time::Duration::from_millis(1000));
+}
+
+/// A database name with an unpaired surrogate names its own database, and a well-formed name
+/// keeps its registry entry as text.
+#[test]
+fn test_database_names_with_unpaired_surrogates() {
+    install_test_namespace();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let handle: ClientStorageThreadHandle =
+        ClientStorageThreadFactory::new(Some(tmp_dir.path().to_path_buf()), false);
+    let bottle_id = obtain_bottle_map(
+        &handle,
+        StorageType::Local,
+        Some(WebViewId::new(servo_base::id::TEST_PAINTER_ID)),
+        StorageIdentifier::IndexedDB,
+        ServoUrl::parse("https://example.com").unwrap().origin(),
+    )
+    .bottle_id;
+
+    let names = [
+        Utf16String::from_units(vec![0xD800]),
+        Utf16String::from_units(vec![0xDC00]),
+        Utf16String::from("\u{FFFD}"),
+        Utf16String::from("plain"),
+    ];
+    let create = |name: &Utf16String| {
+        handle
+            .create_database(bottle_id, name.clone())
+            .recv()
+            .unwrap()
+            .unwrap()
+    };
+    let paths: Vec<PathBuf> = names
+        .iter()
+        .map(|name| {
+            let (path, created) = create(name);
+            assert!(created);
+            path
+        })
+        .collect();
+    for (index, path) in paths.iter().enumerate() {
+        assert!(!paths[..index].contains(path));
+    }
+    assert_eq!(create(&names[0]), (paths[0].clone(), false));
+
+    let registry = open_registry(&tmp_dir);
+    let stored: Vec<(String, Vec<u8>)> = registry
+        .prepare("SELECT typeof(name), CAST(name AS BLOB) FROM databases ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            ("blob".to_owned(), vec![0xD8, 0x00]),
+            ("blob".to_owned(), vec![0xDC, 0x00]),
+            ("text".to_owned(), "\u{FFFD}".as_bytes().to_vec()),
+            ("text".to_owned(), b"plain".to_vec()),
+        ]
+    );
+
+    handle
+        .delete_database(bottle_id, names[0].clone())
+        .recv()
+        .unwrap()
+        .unwrap();
+    assert!(!paths[0].exists());
+    assert!(paths[1..].iter().all(|path| path.exists()));
 }
 
 #[test]

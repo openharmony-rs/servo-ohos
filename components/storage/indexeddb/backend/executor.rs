@@ -34,6 +34,7 @@ pub(crate) enum SqlParam<'a> {
 /// A result row of [`SqlExecutor::query`]. Columns are numbered from 0; `None` is SQL NULL.
 pub(crate) trait SqlRow {
     fn optional_integer(&self, column: usize) -> Result<Option<i64>, SqlError>;
+    #[cfg(test)]
     fn optional_text(&self, column: usize) -> Result<Option<String>, SqlError>;
     fn optional_blob(&self, column: usize) -> Result<Option<Vec<u8>>, SqlError>;
 
@@ -42,6 +43,7 @@ pub(crate) trait SqlRow {
             .ok_or(SqlError::UnexpectedNull(column))
     }
 
+    #[cfg(test)]
     fn text(&self, column: usize) -> Result<String, SqlError> {
         self.optional_text(column)?
             .ok_or(SqlError::UnexpectedNull(column))
@@ -184,6 +186,8 @@ pub(crate) enum SqlError {
     KeyPath(postcard::Error),
     /// A stored key that can't be decoded.
     InvalidKey,
+    /// A stored name that can't be decoded.
+    InvalidName,
     /// A misuse of the executor: [`SqlExecutor::begin`] while a transaction is open, a commit
     /// without one, or a delete while other executors on the database exist.
     TransactionState(&'static str),
@@ -211,6 +215,7 @@ impl fmt::Display for SqlError {
             Self::MissingRow(context) => write!(formatter, "missing row: {context}"),
             Self::KeyPath(error) => write!(formatter, "invalid stored key path: {error}"),
             Self::InvalidKey => write!(formatter, "invalid stored key"),
+            Self::InvalidName => write!(formatter, "invalid stored name"),
             Self::TransactionState(context) => write!(formatter, "transaction state: {context}"),
             Self::ResetFailed => write!(formatter, "failed to delete a database to reset it"),
             Self::InvalidMetadata(context) => write!(formatter, "invalid metadata: {context}"),

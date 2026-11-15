@@ -309,7 +309,7 @@ fn send_request<T: TestReply>(
         &ctx.private_threads,
         IndexedDBThreadMsg::Async(
             ctx.origin.clone(),
-            db_name.to_string(),
+            db_name.into(),
             store,
             txn,
             request_id,
@@ -364,7 +364,7 @@ fn open_database_with(
         &ctx.private_threads,
         IndexedDBThreadMsg::Sync(SyncOperation::OpenDatabase(
             ctx.origin.clone(),
-            db_name.to_string(),
+            db_name.into(),
             version,
             id,
             ctx.bottle_source.clone(),
@@ -402,7 +402,7 @@ fn send_schema_operation(
         &ctx.private_threads,
         IndexedDBThreadMsg::AsyncSchemaOperation {
             origin: ctx.origin.clone(),
-            database_name: db_name.to_string(),
+            database_name: db_name.into(),
             store_id: store,
             operation,
             transaction,
@@ -428,7 +428,7 @@ fn create_object_store(
         store,
         transaction,
         AsyncSchemaOperation::CreateObjectStore {
-            name: store_name.to_owned(),
+            name: store_name.into(),
             key_path,
             auto_increment,
         },
@@ -453,7 +453,7 @@ fn create_index(
         transaction,
         AsyncSchemaOperation::CreateIndex {
             index_id,
-            name: index_name.to_string(),
+            name: index_name.into(),
             key_path,
             unique,
             multi_entry,
@@ -462,8 +462,8 @@ fn create_index(
 }
 
 /// The names of `stores`.
-fn names(stores: &[IndexedDBObjectStore]) -> Vec<&str> {
-    stores.iter().map(|store| store.name.as_str()).collect()
+fn names(stores: &[IndexedDBObjectStore]) -> Vec<String> {
+    stores.iter().map(|store| store.name.to_string()).collect()
 }
 
 /// The committed version and object stores of `db_name`, from the metadata snapshot that a new
@@ -503,7 +503,7 @@ fn create_transaction(
         &ctx.private_threads,
         IndexedDBThreadMsg::Sync(SyncOperation::CreateTransaction {
             origin: ctx.origin.clone(),
-            db_name: db_name.to_string(),
+            db_name: db_name.into(),
             txn,
             mode,
             scope,
@@ -531,7 +531,7 @@ fn commit_transaction(
         &ctx.private_threads,
         IndexedDBThreadMsg::Sync(SyncOperation::Commit {
             origin: ctx.origin.clone(),
-            db_name: db_name.to_string(),
+            db_name: db_name.into(),
             txn,
         }),
     )
@@ -573,7 +573,7 @@ fn close_database(ctx: &IndexedDbTestContext, id: Uuid, db_name: &str) {
         IndexedDBThreadMsg::Sync(SyncOperation::CloseDatabase(
             ctx.origin.clone(),
             id,
-            db_name.to_string(),
+            db_name.into(),
         )),
     )
     .unwrap();
@@ -589,7 +589,7 @@ fn finish_upgrade_transaction(
         &ctx.private_threads,
         IndexedDBThreadMsg::Sync(SyncOperation::UpgradeTransactionFinished {
             txn,
-            db_name: db_name.to_string(),
+            db_name: db_name.into(),
             origin: ctx.origin.clone(),
             committed,
         }),
@@ -602,7 +602,7 @@ fn finish_transaction(ctx: &IndexedDbTestContext, db_name: &str, txn: IndexedDBT
         &ctx.private_threads,
         IndexedDBThreadMsg::Sync(SyncOperation::TransactionFinished {
             origin: ctx.origin.clone(),
-            db_name: db_name.to_string(),
+            db_name: db_name.into(),
             txn,
         }),
     )
@@ -869,7 +869,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
         db_name,
         STORE,
         txn,
-        IndexedDBKeyType::String("book-1".to_string()),
+        IndexedDBKeyType::String("book-1".into()),
         b"Moby Dick".to_vec(),
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
@@ -877,7 +877,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
     assert_eq!(
         put_msg,
-        PutItemResult::Key(IndexedDBKeyType::String("book-1".to_string()))
+        PutItemResult::Key(IndexedDBKeyType::String("book-1".into()))
     );
     assert!(commit_msg.is_ok());
     finish_transaction(&ctx, db_name, txn);
@@ -894,7 +894,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
         db_name,
         STORE,
         txn,
-        IndexedDBKeyType::String("book-1".to_string()),
+        IndexedDBKeyType::String("book-1".into()),
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let roundtrip_msg = recv_callback_timeout(&roundtrip, "get item reply").unwrap();
@@ -902,7 +902,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
     assert_eq!(
         roundtrip_msg,
         Some(IndexedDBValue {
-            primary_key: IndexedDBKeyType::String("book-1".to_string()),
+            primary_key: IndexedDBKeyType::String("book-1".into()),
             value: b"Moby Dick".to_vec(),
         })
     );
@@ -921,7 +921,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
         db_name,
         STORE,
         txn,
-        IndexedDBKeyType::String("book-1".to_string()),
+        IndexedDBKeyType::String("book-1".into()),
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let remove_msg = recv_callback_timeout(&remove_result, "remove item reply");
@@ -942,7 +942,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
         db_name,
         STORE,
         txn,
-        IndexedDBKeyType::String("book-1".to_string()),
+        IndexedDBKeyType::String("book-1".into()),
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let deleted_msg = recv_callback_timeout(&deleted, "get deleted item reply").unwrap();
@@ -1087,7 +1087,7 @@ fn test_indexeddb_duplicate_store_fails_the_upgrade() {
     ));
 
     let (version, stores) = committed_metadata(&ctx, db_name);
-    assert_eq!((version, names(&stores)), (1, vec![store_name]));
+    assert_eq!((version, names(&stores)), (1, vec![store_name.to_owned()]));
     ctx.shutdown();
 }
 
@@ -1097,7 +1097,7 @@ fn abort_transaction(ctx: &IndexedDbTestContext, db_name: &str, txn: IndexedDBTx
         &ctx.private_threads,
         IndexedDBThreadMsg::Sync(SyncOperation::Abort {
             origin: ctx.origin.clone(),
-            db_name: db_name.to_string(),
+            db_name: db_name.into(),
             txn,
         }),
     )
@@ -1140,7 +1140,7 @@ fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
         db_name,
         STORE,
         txn,
-        IndexedDBKeyType::String("book-aborted".to_string()),
+        IndexedDBKeyType::String("book-aborted".into()),
         b"Never Committed".to_vec(),
     );
     abort_transaction(&ctx, db_name, txn);
@@ -1163,7 +1163,7 @@ fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
         db_name,
         STORE,
         txn,
-        IndexedDBKeyType::String("book-aborted".to_string()),
+        IndexedDBKeyType::String("book-aborted".into()),
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let lookup_msg = recv_callback_timeout(&lookup, "get aborted item reply").unwrap();
@@ -1201,7 +1201,7 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
         db_name,
         STORE,
         txn,
-        IndexedDBKeyType::String("book-1".to_string()),
+        IndexedDBKeyType::String("book-1".into()),
         b"Moby Dick".to_vec(),
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
@@ -1276,7 +1276,7 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
         db_name,
         STORE,
         txn,
-        IndexedDBKeyType::String("book-1".to_string()),
+        IndexedDBKeyType::String("book-1".into()),
     );
     let commit_result = commit_transaction(&ctx, db_name, txn);
     let lookup_msg = recv_callback_timeout(&lookup, "get preserved item reply").unwrap();
@@ -1310,11 +1310,7 @@ fn test_indexeddb_cross_type_key_sort_order() {
     for (request_id, key, value) in [
         (1, IndexedDBKeyType::Number(1.0), b"number".to_vec()),
         (2, IndexedDBKeyType::Date(1.0), b"date".to_vec()),
-        (
-            3,
-            IndexedDBKeyType::String("1".to_string()),
-            b"string".to_vec(),
-        ),
+        (3, IndexedDBKeyType::String("1".into()), b"string".to_vec()),
         (4, IndexedDBKeyType::Binary(vec![1]), b"binary".to_vec()),
         (
             5,
@@ -1364,7 +1360,7 @@ fn test_indexeddb_cross_type_key_sort_order() {
         vec![
             IndexedDBKeyType::Number(1.0),
             IndexedDBKeyType::Date(1.0),
-            IndexedDBKeyType::String("1".to_string()),
+            IndexedDBKeyType::String("1".into()),
             IndexedDBKeyType::Binary(vec![1]),
             IndexedDBKeyType::Array(vec![IndexedDBKeyType::Number(1.0)]),
         ]
@@ -1766,12 +1762,12 @@ fn test_indexeddb_aborted_put_that_succeeded_leaves_no_record() {
         db_name,
         STORE,
         txn,
-        IndexedDBKeyType::String("book-aborted".to_string()),
+        IndexedDBKeyType::String("book-aborted".into()),
         b"Never Committed".to_vec(),
     );
     assert_eq!(
         recv_callback_timeout(&put_result, "put item reply").unwrap(),
-        PutItemResult::Key(IndexedDBKeyType::String("book-aborted".to_string()))
+        PutItemResult::Key(IndexedDBKeyType::String("book-aborted".into()))
     );
 
     abort_transaction(&ctx, db_name, txn);
@@ -1783,7 +1779,7 @@ fn test_indexeddb_aborted_put_that_succeeded_leaves_no_record() {
             db_name,
             connection_id,
             STORE,
-            IndexedDBKeyType::String("book-aborted".to_string()),
+            IndexedDBKeyType::String("book-aborted".into()),
         ),
         None
     );
@@ -2008,7 +2004,7 @@ fn test_indexeddb_upgrade_waits_for_no_versionchange_of_a_closed_connection() {
     GenericSend::send(
         &ctx.private_threads,
         IndexedDBThreadMsg::Sync(SyncOperation::NotifyEndOfVersionChange {
-            name: db_name.to_string(),
+            name: db_name.into(),
             id: stays,
             old_version: 1,
             origin: ctx.origin.clone(),

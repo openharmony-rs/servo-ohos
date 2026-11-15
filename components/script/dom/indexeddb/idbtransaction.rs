@@ -14,11 +14,10 @@ use servo_base::generic_channel::{GenericSend, GenericSender};
 use servo_base::id::ScriptEventLoopId;
 use storage_traits::indexeddb::{
     BackendError, BackendResult, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg,
-    IndexedDBTxnId, IndexedDBTxnMode, RequestOutput, SyncOperation, TransactionEvent,
+    IndexedDBTxnId, IndexedDBTxnMode, RequestOutput, SyncOperation, TransactionEvent, Utf16String,
 };
 use stylo_atoms::Atom;
 
-use crate::dom::bindings::codegen::Bindings::DOMStringListBinding::DOMStringListMethods;
 use crate::dom::bindings::codegen::Bindings::IDBDatabaseBinding::IDBTransactionDurability;
 use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::{
     IDBTransactionMethods, IDBTransactionMode,
@@ -38,7 +37,7 @@ use crate::dom::indexeddb::idbcursor::IterationParam;
 use crate::dom::indexeddb::idbdatabase::IDBDatabase;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
 use crate::dom::indexeddb::idbrequest::IDBRequest;
-use crate::dom::indexeddb::key::map_backend_error_to_dom_error;
+use crate::dom::indexeddb::key::{map_backend_error_to_dom_error, name_from_dom_string};
 use crate::realms::enter_auto_realm;
 
 /// A request in a transaction's request list, and its result once the backend has reported it.
@@ -60,6 +59,9 @@ struct PendingRequest {
 pub struct IDBTransaction {
     eventtarget: EventTarget,
     object_store_names: Dom<DOMStringList>,
+    /// <https://w3c.github.io/IndexedDB/#transaction-scope>, by object store id, of a transaction
+    /// that isn't an upgrade transaction.
+    scope: Vec<IndexedDBObjectStoreId>,
     mode: IDBTransactionMode,
     durability: IDBTransactionDurability,
     db: Dom<IDBDatabase>,
@@ -101,12 +103,14 @@ impl IDBTransaction {
         connection: &IDBDatabase,
         mode: IDBTransactionMode,
         durability: IDBTransactionDurability,
-        scope: &DOMStringList,
+        scope_names: &DOMStringList,
+        scope: Vec<IndexedDBObjectStoreId>,
         id: IndexedDBTxnId,
     ) -> IDBTransaction {
         IDBTransaction {
             eventtarget: EventTarget::new_inherited(),
-            object_store_names: Dom::from_ref(scope),
+            object_store_names: Dom::from_ref(scope_names),
+            scope,
             mode,
             durability,
             db: Dom::from_ref(connection),
@@ -131,16 +135,17 @@ impl IDBTransaction {
         }
     }
 
-    /// Creates a readonly or readwrite transaction of `connection` with the object stores `scope`,
-    /// whose ids are `scope_ids`, and tells the backend about it without waiting for a reply.
+    /// Creates a readonly or readwrite transaction of `connection` with the object stores named
+    /// `scope_names`, whose ids are `scope`, and tells the backend about it without waiting for a
+    /// reply.
     pub fn new(
         cx: &mut JSContext,
         global: &GlobalScope,
         connection: &IDBDatabase,
         mode: IDBTransactionMode,
         durability: IDBTransactionDurability,
-        scope: &DOMStringList,
-        scope_ids: Vec<IndexedDBObjectStoreId>,
+        scope_names: &DOMStringList,
+        scope: Vec<IndexedDBObjectStoreId>,
     ) -> DomRoot<IDBTransaction> {
         let id = connection.allocate_transaction_id();
         let backend_mode = match mode {
@@ -155,31 +160,47 @@ impl IDBTransaction {
             .storage_threads()
             .send(IndexedDBThreadMsg::Sync(SyncOperation::CreateTransaction {
                 origin: global.origin().immutable().clone(),
-                db_name: String::from(connection.get_name()),
+                db_name: connection.name().clone(),
                 txn: id,
                 mode: backend_mode,
-                scope: scope_ids,
+                scope: scope.clone(),
             }))
             .is_err()
         {
             error!("Failed to send SyncOperation::CreateTransaction");
         }
-        IDBTransaction::new_with_id(cx, global, connection, mode, durability, scope, id)
+        IDBTransaction::new_with_id(
+            cx,
+            global,
+            connection,
+            mode,
+            durability,
+            scope_names,
+            scope,
+            id,
+        )
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new_with_id(
         cx: &mut JSContext,
         global: &GlobalScope,
         connection: &IDBDatabase,
         mode: IDBTransactionMode,
         durability: IDBTransactionDurability,
-        scope: &DOMStringList,
+        scope_names: &DOMStringList,
+        scope: Vec<IndexedDBObjectStoreId>,
         id: IndexedDBTxnId,
     ) -> DomRoot<IDBTransaction> {
         let transaction = reflect_dom_object(
             cx,
             Box::new(IDBTransaction::new_inherited(
-                connection, mode, durability, scope, id,
+                connection,
+                mode,
+                durability,
+                scope_names,
+                scope,
+                id,
             )),
             global,
         );
@@ -293,7 +314,7 @@ impl IDBTransaction {
         let global = self.global();
         let commit_operation = SyncOperation::Commit {
             origin: global.origin().immutable().clone(),
-            db_name: String::from(self.db.get_name()),
+            db_name: self.db.name().clone(),
             txn: self.id,
         };
 
@@ -348,8 +369,8 @@ impl IDBTransaction {
         self.mode
     }
 
-    pub fn get_db_name(&self) -> DOMString {
-        self.db.get_name()
+    pub fn get_db_name(&self) -> Utf16String {
+        self.db.name().clone()
     }
 
     pub(crate) fn get_db(&self) -> &IDBDatabase {
@@ -616,7 +637,7 @@ impl IDBTransaction {
             let _ = self.get_idb_thread().send(IndexedDBThreadMsg::Sync(
                 SyncOperation::UpgradeTransactionFinished {
                     origin: global.origin().immutable().clone(),
-                    db_name: String::from(self.db.get_name()),
+                    db_name: self.db.name().clone(),
                     txn: self.id,
                     committed: false,
                 },
@@ -644,7 +665,7 @@ impl IDBTransaction {
             .get_idb_thread()
             .send(IndexedDBThreadMsg::Sync(SyncOperation::Abort {
                 origin: global.origin().immutable().clone(),
-                db_name: String::from(self.db.get_name()),
+                db_name: self.db.name().clone(),
                 txn: self.id,
             }));
     }
@@ -668,7 +689,7 @@ impl IDBTransaction {
         let _ = self.get_idb_thread().send(IndexedDBThreadMsg::Sync(
             SyncOperation::TransactionFinished {
                 origin: global.origin().immutable().clone(),
-                db_name: String::from(self.db.get_name()),
+                db_name: self.db.name().clone(),
                 txn: self.id,
             },
         ));
@@ -709,7 +730,7 @@ impl IDBTransaction {
             let _ = self.get_idb_thread().send(IndexedDBThreadMsg::Sync(
                 SyncOperation::UpgradeTransactionFinished {
                     origin: global.origin().immutable().clone(),
-                    db_name: String::from(self.db.get_name()),
+                    db_name: self.db.name().clone(),
                     txn: self.id,
                     committed: true,
                 },
@@ -750,11 +771,12 @@ impl IDBTransactionMethods<crate::DomTypeHolder> for IDBTransaction {
         // "NotFoundError" DOMException if none.
         // For versionchange transactions, the scope is the connection's object store set,
         // which follows the changes of the upgrade.
-        let in_scope = self.mode == IDBTransactionMode::Versionchange ||
-            self.object_store_names.Contains(name.clone());
-        let Some(store) = in_scope
-            .then(|| self.db.object_store_named(&name.str()))
-            .flatten()
+        let Some(store) = self
+            .db
+            .object_store_named(&name_from_dom_string(&name))
+            .filter(|store| {
+                self.mode == IDBTransactionMode::Versionchange || self.scope.contains(&store.id)
+            })
         else {
             return Err(Error::NotFound(None));
         };
@@ -767,7 +789,7 @@ impl IDBTransactionMethods<crate::DomTypeHolder> for IDBTransaction {
         }
 
         // Step 4: Return an object store handle associated with store and this.
-        let handle = IDBObjectStore::new(cx, &self.global(), name, &store, self);
+        let handle = IDBObjectStore::new(cx, &self.global(), &store, self);
         self.register_object_store_handle(&handle);
         Ok(handle)
     }

@@ -9,11 +9,10 @@ use js::rust::HandleValue;
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::IDBIndexBinding::IDBIndexMethods;
 use script_bindings::codegen::GenericBindings::IDBTransactionBinding::IDBTransactionMode;
-use script_bindings::domstring::TracedDOMString;
 use script_bindings::error::{Error, ErrorResult, Fallible};
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use script_bindings::str::DOMString;
-use storage_traits::indexeddb::IndexedDBIndexId;
+use storage_traits::indexeddb::{IndexedDBIndexId, Utf16String};
 
 use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
 use crate::dom::bindings::refcounted::Trusted;
@@ -25,7 +24,9 @@ use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrI
 use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
 use crate::dom::indexeddb::idbrequest::IDBRequest;
-use crate::dom::indexeddb::key::convert_value_to_key_range;
+use crate::dom::indexeddb::key::{
+    convert_value_to_key_range, dom_string_from_name, name_from_dom_string,
+};
 
 #[dom_struct]
 pub(crate) struct IDBIndex {
@@ -33,7 +34,8 @@ pub(crate) struct IDBIndex {
     object_store: Dom<IDBObjectStore>,
     /// The id of the handle's index.
     id: IndexedDBIndexId,
-    name: DomRefCell<TracedDOMString>,
+    #[no_trace]
+    name: DomRefCell<Utf16String>,
     multi_entry: bool,
     unique: bool,
     key_path: KeyPath,
@@ -43,7 +45,7 @@ impl IDBIndex {
     pub fn new_inherited(
         object_store: &IDBObjectStore,
         id: IndexedDBIndexId,
-        name: DOMString,
+        name: Utf16String,
         multi_entry: bool,
         unique: bool,
         key_path: KeyPath,
@@ -52,7 +54,7 @@ impl IDBIndex {
             reflector_: Reflector::new(),
             object_store: Dom::from_ref(object_store),
             id,
-            name: DomRefCell::new(name.traced()),
+            name: DomRefCell::new(name),
             multi_entry,
             unique,
             key_path,
@@ -65,7 +67,7 @@ impl IDBIndex {
         global: &GlobalScope,
         object_store: &IDBObjectStore,
         id: IndexedDBIndexId,
-        name: DOMString,
+        name: Utf16String,
         multi_entry: bool,
         unique: bool,
         key_path: KeyPath,
@@ -90,8 +92,13 @@ impl IDBIndex {
 
     /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction> step 6: reverts the
     /// handle's name.
-    pub(crate) fn set_name(&self, name: DOMString) {
-        *self.name.borrow_mut() = name.traced();
+    pub(crate) fn set_name(&self, name: Utf16String) {
+        *self.name.borrow_mut() = name;
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#index-handle-name>
+    pub(crate) fn name(&self) -> Utf16String {
+        self.name.borrow().clone()
     }
 
     pub(crate) fn object_store(&self) -> DomRoot<IDBObjectStore> {
@@ -183,12 +190,13 @@ impl IDBIndex {
 impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
     /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-name>
     fn Name(&self) -> DOMString {
-        self.name.borrow().clone().root()
+        dom_string_from_name(&self.name.borrow())
     }
 
     /// <https://www.w3.org/TR/IndexedDB/#ref-for-dom-idbindex-name%E2%91%A2>
     fn SetName(&self, name: DOMString) -> ErrorResult {
         // Step 1: Let name be the given value.
+        let name = name_from_dom_string(&name);
         // Step 2: Let transaction be this’s transaction.
         let transaction = self.object_store.transaction();
 
@@ -214,7 +222,7 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
         let mut stored_name = self.name.borrow_mut();
 
         // Step 7: If index’s name is equal to name, terminate these steps.
-        if *stored_name == *name {
+        if *stored_name == name {
             return Ok(());
         }
 
@@ -229,7 +237,7 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
         self.object_store.rename_index(self.id, &stored_name, &name);
 
         // Step 10: Set this’s name to name.
-        *stored_name = name.traced();
+        *stored_name = name;
         Ok(())
     }
 

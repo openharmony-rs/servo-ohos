@@ -124,6 +124,7 @@ impl SqlRow for SqliteRow<'_, '_> {
         Ok(self.0.get(column)?)
     }
 
+    #[cfg(test)]
     fn optional_text(&self, column: usize) -> Result<Option<String>, SqlError> {
         Ok(self.0.get(column)?)
     }

@@ -3,25 +3,26 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::ffi::CString;
-use std::ptr;
+use std::{ptr, slice};
 
 use itertools::Itertools;
 use js::context::JSContext;
-use js::conversions::{ToJSValConvertible, jsstr_to_string};
+use js::conversions::ToJSValConvertible;
 use js::jsapi::{
     ClippedTime, ESClass, IsArrayBufferObject, IsDetachedArrayBufferObject,
-    JS_GetArrayBufferViewBuffer, JS_GetStringLength, JS_IsArrayBufferViewObject, NewArrayObject1,
-    PropertyKey,
+    JS_DeprecatedStringHasLatin1Chars, JS_GetArrayBufferViewBuffer, JS_GetStringLength,
+    JS_IsArrayBufferViewObject, JSString, NewArrayObject1, PropertyKey,
 };
-use js::jsval::{DoubleValue, ObjectValue, UndefinedValue};
+use js::jsval::{DoubleValue, ObjectValue, StringValue, UndefinedValue};
 use js::rust::wrappers2::{
-    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_HasOwnPropertyById, JS_IndexToId,
-    JS_IsIdentifier, NewDateObject, ObjectIsDate, SameValue,
+    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_GetLatin1StringCharsAndLength,
+    JS_GetTwoByteStringCharsAndLength, JS_HasOwnPropertyById, JS_IndexToId, JS_IsIdentifier,
+    JS_NewUCStringCopyN, NewDateObject, ObjectIsDate, SameValue,
 };
 use js::rust::{HandleValue, MutableHandleValue};
 use js::typedarray::{ArrayBuffer, ArrayBufferU8, ArrayBufferView};
 use script_bindings::js::{JS_GetPropertyById, JS_NewObject};
-use storage_traits::indexeddb::{BackendError, IndexedDBKeyRange, IndexedDBKeyType};
+use storage_traits::indexeddb::{BackendError, IndexedDBKeyRange, IndexedDBKeyType, Utf16String};
 
 use crate::dom::bindings::buffer_source::create_buffer_source;
 use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
@@ -29,12 +30,75 @@ use crate::dom::bindings::codegen::Bindings::FileBinding::FileMethods;
 use crate::dom::bindings::codegen::UnionTypes::StringOrStringSequence as StrOrStringSequence;
 use crate::dom::bindings::conversions::{get_property_jsval, root_from_handlevalue};
 use crate::dom::bindings::error::Error;
+use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::utils::{define_dictionary_property, has_own_property};
 use crate::dom::blob::Blob;
+use crate::dom::domstringlist::DOMStringList;
 use crate::dom::file::File;
+use crate::dom::globalscope::GlobalScope;
 use crate::dom::idbkeyrange::IDBKeyRange;
 use crate::dom::idbobjectstore::KeyPath;
+
+/// The code units of the JavaScript string `string`, which must not be null.
+#[expect(unsafe_code)]
+fn js_string_code_units(cx: &JSContext, string: *mut JSString) -> Vec<u16> {
+    let mut length = 0;
+    // SAFETY: `string` is a live string, and its characters are copied before anything can
+    // garbage collect.
+    unsafe {
+        if JS_DeprecatedStringHasLatin1Chars(string) {
+            let chars = JS_GetLatin1StringCharsAndLength(cx, string, &mut length);
+            assert!(!chars.is_null());
+            slice::from_raw_parts(chars, length)
+                .iter()
+                .map(|&char| char.into())
+                .collect()
+        } else {
+            let chars = JS_GetTwoByteStringCharsAndLength(cx, string, &mut length);
+            assert!(!chars.is_null());
+            slice::from_raw_parts(chars, length).to_vec()
+        }
+    }
+}
+
+/// Sets `result` to a JavaScript string of the code units of `string`.
+#[expect(unsafe_code)]
+fn utf16_string_to_jsval(cx: &mut JSContext, string: &Utf16String, mut result: MutableHandleValue) {
+    let units = string.units();
+    // SAFETY: `units` is valid for `units.len()` code units, which the call copies.
+    let js_string = unsafe { JS_NewUCStringCopyN(cx, units.as_ptr(), units.len()) };
+    assert!(
+        !js_string.is_null(),
+        "Failed to convert an IndexedDB string into a JS string"
+    );
+    // SAFETY: `js_string` is a new, non-null string.
+    result.set(StringValue(unsafe { &*js_string }));
+}
+
+/// The name (<https://w3c.github.io/IndexedDB/#name>) that the DOMString `name` gives.
+pub(crate) fn name_from_dom_string(name: &DOMString) -> Utf16String {
+    Utf16String::from(&*name.str())
+}
+
+/// The DOMString of the name `name`.
+pub(crate) fn dom_string_from_name(name: &Utf16String) -> DOMString {
+    DOMString::from(name.to_string_lossy())
+}
+
+/// <https://w3c.github.io/IndexedDB/#sorted-name-list> of `names`, sorted by code unit.
+pub(crate) fn sorted_name_list(
+    cx: &mut JSContext,
+    global: &GlobalScope,
+    names: impl IntoIterator<Item = Utf16String>,
+) -> DomRoot<DOMStringList> {
+    let names = names
+        .into_iter()
+        .sorted_unstable()
+        .map(|name| dom_string_from_name(&name))
+        .collect();
+    DOMStringList::new(cx, global, names)
+}
 
 // https://www.w3.org/TR/IndexedDB-3/#convert-key-to-value
 #[expect(unsafe_code)]
@@ -51,7 +115,7 @@ pub fn key_type_to_jsval(
         IndexedDBKeyType::Number(n) => result.set(DoubleValue(*n)),
 
         // Step 3. If type is string, return an ECMAScript String value equal to value.
-        IndexedDBKeyType::String(s) => s.to_jsval(cx, result),
+        IndexedDBKeyType::String(s) => utf16_string_to_jsval(cx, s, result),
 
         IndexedDBKeyType::Date(d) => unsafe {
             // Step 3.1. Let date be the result of executing the ECMAScript Date
@@ -254,9 +318,10 @@ pub fn convert_value_to_key(
     // If Type(input) is String:
     if input.is_string() {
         // 3.1. Return a new key with type string and value input.
-        let string_ptr = std::ptr::NonNull::new(input.to_string()).unwrap();
-        let key = unsafe { jsstr_to_string(cx, string_ptr) };
-        return Ok(ConversionResult::Valid(IndexedDBKeyType::String(key)));
+        let units = js_string_code_units(cx, input.to_string());
+        return Ok(ConversionResult::Valid(IndexedDBKeyType::String(
+            Utf16String::from_units(units),
+        )));
     }
 
     if input.is_object() {

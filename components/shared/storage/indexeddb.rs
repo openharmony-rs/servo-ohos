@@ -61,6 +61,92 @@ impl Error for BackendError {}
 
 pub type BackendResult<T> = Result<T, BackendError>;
 
+/// A DOMString as its UTF-16 code units, which may include unpaired surrogates
+/// (<https://webidl.spec.whatwg.org/#idl-DOMString>). String keys and the names of databases,
+/// object stores and indexes take this form, so that any JavaScript string survives unchanged,
+/// and it orders by code units, as IndexedDB compares keys and sorts names.
+#[derive(
+    Clone, Default, Deserialize, Eq, Hash, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct Utf16String(Vec<u16>);
+
+impl Utf16String {
+    pub fn from_units(units: Vec<u16>) -> Self {
+        Self(units)
+    }
+
+    pub fn units(&self) -> &[u16] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The string, unless it has an unpaired surrogate.
+    pub fn to_utf8(&self) -> Option<String> {
+        String::from_utf16(&self.0).ok()
+    }
+
+    /// The string with each unpaired surrogate replaced by U+FFFD.
+    pub fn to_string_lossy(&self) -> String {
+        String::from_utf16_lossy(&self.0)
+    }
+
+    /// The code units in big-endian byte order, which sorts like the code units.
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        self.0.iter().flat_map(|unit| unit.to_be_bytes()).collect()
+    }
+
+    /// The string of [`Utf16String::to_be_bytes`], or `None` for an odd number of bytes.
+    pub fn from_be_bytes(bytes: &[u8]) -> Option<Self> {
+        let (pairs, remainder) = bytes.as_chunks::<2>();
+        if !remainder.is_empty() {
+            return None;
+        }
+        Some(Self(
+            pairs.iter().map(|pair| u16::from_be_bytes(*pair)).collect(),
+        ))
+    }
+}
+
+impl From<&str> for Utf16String {
+    fn from(string: &str) -> Self {
+        Self(string.encode_utf16().collect())
+    }
+}
+
+impl From<String> for Utf16String {
+    fn from(string: String) -> Self {
+        Self::from(string.as_str())
+    }
+}
+
+impl PartialEq<&str> for Utf16String {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.iter().copied().eq(other.encode_utf16())
+    }
+}
+
+impl Debug for Utf16String {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"")?;
+        for unit in char::decode_utf16(self.0.iter().copied()) {
+            match unit {
+                Ok(character) => write!(f, "{}", character.escape_debug())?,
+                Err(error) => write!(f, "\\u{{{:x}}}", error.unpaired_surrogate())?,
+            }
+        }
+        f.write_str("\"")
+    }
+}
+
+impl Display for Utf16String {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_string_lossy())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, MallocSizeOf, Serialize)]
 pub enum KeyPath {
     String(String),
@@ -105,7 +191,7 @@ pub enum IndexedDBTxnMode {
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum IndexedDBKeyType {
     Number(f64),
-    String(String),
+    String(Utf16String),
     Binary(Vec<u8>),
     Date(f64),
     Array(Vec<IndexedDBKeyType>),
@@ -166,7 +252,8 @@ impl PartialOrd for IndexedDBKeyType {
             // Step 11 skipped
             // TODO: Likely a tiny bit wrong (use js number comparison)
             (IndexedDBKeyType::Number(a), IndexedDBKeyType::Number(b)) => a.partial_cmp(b),
-            // TODO: Likely a tiny bit wrong (use js string comparison)
+            // Step 11. string: If va is code unit less than vb, then return -1. If vb is code
+            // unit less than va, then return 1. Return 0.
             (IndexedDBKeyType::String(a), IndexedDBKeyType::String(b)) => a.partial_cmp(b),
             // TODO: Likely a little wrong (use js binary comparison)
             (IndexedDBKeyType::Binary(a), IndexedDBKeyType::Binary(b)) => a.partial_cmp(b),
@@ -334,7 +421,7 @@ pub type IndexedDBIndexId = i64;
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub struct IndexedDBIndex {
     pub id: IndexedDBIndexId,
-    pub name: String,
+    pub name: Utf16String,
     pub key_path: KeyPath,
     pub multi_entry: bool,
     pub unique: bool,
@@ -345,7 +432,7 @@ pub struct IndexedDBIndex {
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub struct IndexedDBObjectStore {
     pub id: IndexedDBObjectStoreId,
-    pub name: String,
+    pub name: Utf16String,
     pub key_path: Option<KeyPath>,
     pub has_key_generator: bool,
     pub indexes: Vec<IndexedDBIndex>,
@@ -413,18 +500,18 @@ pub enum AsyncReadWriteOperation {
 pub enum AsyncSchemaOperation {
     /// Creates the object store, with its id from script.
     CreateObjectStore {
-        name: String,
+        name: Utf16String,
         key_path: Option<KeyPath>,
         auto_increment: bool,
     },
     /// Deletes the object store and its records and indexes.
     DeleteObjectStore,
     /// Renames the object store, which keeps its records and indexes.
-    RenameObjectStore { new_name: String },
+    RenameObjectStore { new_name: Utf16String },
     /// Creates an index of the object store, with its id from script.
     CreateIndex {
         index_id: IndexedDBIndexId,
-        name: String,
+        name: Utf16String,
         key_path: KeyPath,
         unique: bool,
         multi_entry: bool,
@@ -432,7 +519,7 @@ pub enum AsyncSchemaOperation {
     /// Renames an index of the object store.
     RenameIndex {
         index_id: IndexedDBIndexId,
-        new_name: String,
+        new_name: Utf16String,
     },
     /// Deletes an index of the object store.
     DeleteIndex { index_id: IndexedDBIndexId },
@@ -506,13 +593,13 @@ pub enum ConnectionEvent {
 /// Messaging used in the context of connection lifecycle management.
 pub enum ConnectionMsg {
     /// Error if a DB is opened for a version lower than the current db version.
-    VersionError { name: String, id: Uuid },
+    VersionError { name: Utf16String, id: Uuid },
     /// Opening a connection was aborted.
-    AbortError { name: String, id: Uuid },
+    AbortError { name: Utf16String, id: Uuid },
     /// A newly created connection with a version,
     /// updgraded or not.
     Connection {
-        name: String,
+        name: Utf16String,
         id: Uuid,
         version: u64,
         upgraded: bool,
@@ -521,7 +608,7 @@ pub enum ConnectionMsg {
     },
     /// An upgrade transaction for a version started.
     Upgrade {
-        name: String,
+        name: Utf16String,
         id: Uuid,
         version: u64,
         old_version: u64,
@@ -532,14 +619,14 @@ pub enum ConnectionMsg {
     },
     /// A `blocked` event should be fired for a connection.
     Blocked {
-        name: String,
+        name: Utf16String,
         id: Uuid,
         version: u64,
         old_version: u64,
     },
     /// A backend error related to the database occurred.
     DatabaseError {
-        name: String,
+        name: Utf16String,
         id: Uuid,
         error: BackendError,
     },
@@ -556,7 +643,7 @@ pub struct StorageBottleSource {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DatabaseInfo {
-    pub name: String,
+    pub name: Utf16String,
     pub version: u64,
 }
 
@@ -572,7 +659,7 @@ pub enum SyncOperation {
     /// results of all the transaction's requests have been delivered.
     Commit {
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
         txn: IndexedDBTxnId,
     },
     /// <https://w3c.github.io/IndexedDB/#abort-a-transaction>: rolls the transaction back, after
@@ -580,13 +667,13 @@ pub enum SyncOperation {
     /// already, and results that arrive after this are discarded.
     Abort {
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
         txn: IndexedDBTxnId,
     },
     /// Upgrade transaction finished after its event was fired in script.
     UpgradeTransactionFinished {
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
         txn: IndexedDBTxnId,
         committed: bool,
     },
@@ -596,28 +683,28 @@ pub enum SyncOperation {
     /// <https://w3c.github.io/IndexedDB/#transaction-scheduling>.
     CreateTransaction {
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
         txn: IndexedDBTxnId,
         mode: IndexedDBTxnMode,
         scope: Vec<IndexedDBObjectStoreId>,
     },
     TransactionFinished {
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
         txn: IndexedDBTxnId,
     },
 
     CloseDatabase(
         ImmutableOrigin,
         Uuid,
-        String, // Database
+        Utf16String, // Database
     ),
 
     OpenDatabase(
         // Origin of the request.
         ImmutableOrigin,
         // Name of the database.
-        String,
+        Utf16String,
         // Requested db version(optional).
         Option<u64>,
         // The id of the request.
@@ -633,7 +720,7 @@ pub enum SyncOperation {
         GenericCallback<BackendResult<u64>>,
         ImmutableOrigin,
         // Database name.
-        String,
+        Utf16String,
         // Where to obtain the storage proxy map.
         StorageBottleSource,
         Uuid,
@@ -641,13 +728,13 @@ pub enum SyncOperation {
 
     /// Abort pending database upgrades
     AbortPendingUpgrades {
-        pending_upgrades: HashMap<String, HashSet<Uuid>>,
+        pending_upgrades: HashMap<Utf16String, HashSet<Uuid>>,
         origin: ImmutableOrigin,
     },
 
     NotifyEndOfVersionChange {
         id: Uuid,
-        name: String,
+        name: Utf16String,
         old_version: u64,
         origin: ImmutableOrigin,
     },
@@ -661,7 +748,7 @@ pub enum IndexedDBThreadMsg {
     Sync(SyncOperation),
     Async(
         ImmutableOrigin,
-        String, // Database
+        Utf16String, // Database
         IndexedDBObjectStoreId,
         IndexedDBTxnId,
         u64, // Monotonic request id in the transaction
@@ -670,14 +757,14 @@ pub enum IndexedDBThreadMsg {
     ),
     AsyncSchemaOperation {
         origin: ImmutableOrigin,
-        database_name: String,
+        database_name: Utf16String,
         store_id: IndexedDBObjectStoreId,
         operation: AsyncSchemaOperation,
         transaction: IndexedDBTxnId,
     },
     EngineTxnBatchComplete {
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
         txn: IndexedDBTxnId,
     },
 

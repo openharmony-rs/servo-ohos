@@ -13,6 +13,8 @@ use servo_base::generic_channel::{
 use servo_base::id::WebViewId;
 use servo_url::ImmutableOrigin;
 
+use crate::indexeddb::Utf16String;
+
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ClientStorageThreadHandle {
     sender: GenericSender<ClientStorageThreadMessage>,
@@ -45,12 +47,12 @@ impl ClientStorageThreadHandle {
     pub fn create_database(
         &self,
         bottle_id: i64,
-        name: String,
+        name: impl Into<Utf16String>,
     ) -> GenericReceiver<Result<(PathBuf, bool), String>> {
         let (sender, receiver) = generic_channel::channel().unwrap();
         let message = ClientStorageThreadMessage::CreateDatabase {
             bottle_id,
-            name,
+            name: name.into(),
             sender,
         };
         self.sender.send(message).unwrap();
@@ -60,12 +62,12 @@ impl ClientStorageThreadHandle {
     pub fn delete_database(
         &self,
         bottle_id: i64,
-        name: String,
+        name: impl Into<Utf16String>,
     ) -> GenericReceiver<Result<(), String>> {
         let (sender, receiver) = generic_channel::channel().unwrap();
         let message = ClientStorageThreadMessage::DeleteDatabase {
             bottle_id,
-            name,
+            name: name.into(),
             sender,
         };
         self.sender.send(message).unwrap();
@@ -247,13 +249,13 @@ pub enum ClientStorageThreadMessage {
     },
     CreateDatabase {
         bottle_id: i64,
-        name: String,
+        name: Utf16String,
         /// Boolean stands for "created".
         sender: GenericSender<Result<(PathBuf, bool), String>>,
     },
     DeleteDatabase {
         bottle_id: i64,
-        name: String,
+        name: Utf16String,
         sender: GenericSender<Result<(), String>>,
     },
     Persisted {

@@ -11832,6 +11832,69 @@
       }
      ]
     ],
+    "string-keys-code-units.any.js": [
+     "4959920d8f31f40d5d0a879a598d0888c74a09f5",
+     [
+      "IndexedDB/string-keys-code-units.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: string keys are their code units, unpaired surrogates included"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/string-keys-code-units.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: string keys are their code units, unpaired surrogates included"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/string-keys-code-units.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: string keys are their code units, unpaired surrogates included"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/string-keys-code-units.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: string keys are their code units, unpaired surrogates included"
+        ]
+       ]
+      }
+     ]
+    ],
     "upgrade-metadata-by-id.any.js": [
      "8da07ef7c26414dfc154868aa33032afd3af6d52",
      [

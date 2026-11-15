@@ -29,7 +29,7 @@ use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, Storage
 use storage_traits::indexeddb::{
     AsyncOperation, BackendError, BackendResult, ConnectionEvent, ConnectionMsg, DatabaseInfo,
     IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId,
-    IndexedDBTxnMode, StorageBottleSource, SyncOperation, TransactionEvent,
+    IndexedDBTxnMode, StorageBottleSource, SyncOperation, TransactionEvent, Utf16String,
 };
 use uuid::Uuid;
 
@@ -73,7 +73,7 @@ impl IndexedDBThreadFactory for GenericSender<IndexedDBThreadMsg> {
 #[derive(Clone, Debug, Eq, Hash, MallocSizeOf, PartialEq)]
 pub struct IndexedDBDescription {
     pub origin: ImmutableOrigin,
-    pub name: String,
+    pub name: Utf16String,
 }
 
 #[derive(MallocSizeOf)]
@@ -320,7 +320,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
     }
 
     /// <https://w3c.github.io/IndexedDB/#transaction-scheduling>
-    fn schedule_transactions(&mut self, origin: ImmutableOrigin, db_name: &str) {
+    fn schedule_transactions(&mut self, origin: ImmutableOrigin, db_name: &Utf16String) {
         let readonly_len = self.queued_readonly.len();
         for _ in 0..readonly_len {
             let Some(txn) = self.queued_readonly.pop_front() else {
@@ -351,7 +351,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             // Mark running and start async.
             // DO NOT clear here; clear on EngineTxnBatchComplete.
             self.running_readonly.insert(txn);
-            self.start_transaction(origin.clone(), db_name.to_string(), txn, None);
+            self.start_transaction(origin.clone(), db_name.clone(), txn, None);
         }
 
         // Start at most one readwrite txn.
@@ -390,7 +390,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             // Mark running and start async.
             // DO NOT clear here; clear on EngineTxnBatchComplete.
             self.running_readwrite = Some(txn);
-            self.start_transaction(origin, db_name.to_string(), txn, None);
+            self.start_transaction(origin, db_name.clone(), txn, None);
             return;
         }
     }
@@ -399,7 +399,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
     fn start_transaction(
         &mut self,
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
         txn: IndexedDBTxnId,
         sender: Option<GenericSender<BackendResult<()>>>,
     ) {
@@ -575,7 +575,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
     fn abort(
         &mut self,
         origin: &ImmutableOrigin,
-        database_name: &str,
+        database_name: &Utf16String,
         transaction: IndexedDBTxnId,
     ) {
         self.engine.rollback(transaction, Box::new(|| {}));
@@ -628,7 +628,7 @@ fn obtain_a_local_storage_bottle_map(
 enum OpenRequest {
     Open {
         /// The name of the database.
-        db_name: String,
+        db_name: Utf16String,
 
         /// Optionnaly, a requested db version.
         /// Note: when the open algorithm starts, this will be mutated and set to something as per the algo.
@@ -666,7 +666,7 @@ enum OpenRequest {
 
         /// The name of the database.
         /// Note: will be used when the full spec is implemented.
-        db_name: String,
+        db_name: Utf16String,
 
         /// <https://w3c.github.io/IndexedDB/#request-processed-flag>
         processed: bool,
@@ -958,7 +958,7 @@ impl IndexedDBManager {
     fn queue_operation(
         &mut self,
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
         txn: IndexedDBTxnId,
         mode: IndexedDBTxnMode,
         operation: KvsOperation,
@@ -1017,7 +1017,7 @@ impl IndexedDBManager {
     /// Handle when an upgrade transaction finishes in script.
     fn handle_upgrade_transaction_finished(
         &mut self,
-        name: String,
+        name: Utf16String,
         origin: ImmutableOrigin,
         txn: IndexedDBTxnId,
         committed: bool,
@@ -1228,7 +1228,7 @@ impl IndexedDBManager {
     /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
     fn abort_pending_upgrade(
         &mut self,
-        name: String,
+        name: Utf16String,
         id: Uuid,
         origin: ImmutableOrigin,
         proxy_map: &StorageProxyMap,
@@ -1266,7 +1266,7 @@ impl IndexedDBManager {
     /// Note: this only reverts the version at this point.
     fn abort_pending_upgrades(
         &mut self,
-        pending_upgrades: HashMap<String, HashSet<Uuid>>,
+        pending_upgrades: HashMap<Utf16String, HashSet<Uuid>>,
         origin: ImmutableOrigin,
     ) {
         for (name, ids) in pending_upgrades.into_iter() {
@@ -1313,7 +1313,7 @@ impl IndexedDBManager {
     fn open_a_database_connection(
         &mut self,
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
         version: Option<u64>,
         id: Uuid,
         bottle_source: StorageBottleSource,
@@ -1369,7 +1369,7 @@ impl IndexedDBManager {
     fn get_database_mut(
         &mut self,
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
     ) -> Option<&mut IndexedDBEnvironment<ActiveKvsEngine>> {
         let idb_description = IndexedDBDescription {
             origin,
@@ -1468,7 +1468,7 @@ impl IndexedDBManager {
     /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
     fn handle_version_change_done(
         &mut self,
-        name: String,
+        name: Utf16String,
         from_id: Uuid,
         old_version: u64,
         origin: ImmutableOrigin,
@@ -1914,7 +1914,7 @@ impl IndexedDBManager {
     }
 
     /// <https://w3c.github.io/IndexedDB/#closing-connection>
-    fn close_database(&mut self, origin: ImmutableOrigin, id: Uuid, name: String) {
+    fn close_database(&mut self, origin: ImmutableOrigin, id: Uuid, name: Utf16String) {
         // Step 1: Set connection’s close pending flag to true.
         // TODO: seems like a script only flag.
 
@@ -2285,7 +2285,7 @@ mod tests {
         GenericReceiver<IndexedDBThreadMsg>,
     ) {
         let description = IndexedDBDescription {
-            name: "test_db".to_string(),
+            name: "test_db".into(),
             origin: test_origin(),
         };
         let engine = SqlEngine::<X>::new(
@@ -2374,7 +2374,7 @@ mod tests {
             operation,
         };
         env.queue_operation(txn(serial), mode, operation);
-        env.schedule_transactions(test_origin(), "test_db");
+        env.schedule_transactions(test_origin(), &"test_db".into());
         match batches.recv().unwrap() {
             IndexedDBThreadMsg::EngineTxnBatchComplete { txn: done, .. } => {
                 assert_eq!(done, txn(serial));
@@ -2387,7 +2387,7 @@ mod tests {
 
     /// Aborts `serial` and waits until the engine has rolled it back.
     fn abort<X: SqlExecutor>(env: &mut IndexedDBEnvironment<SqlEngine<X>>, serial: u64) {
-        env.abort(&test_origin(), "test_db", txn(serial));
+        env.abort(&test_origin(), &"test_db".into(), txn(serial));
         let (sender, rolled_back) = mpsc::channel();
         // A second rollback is a no-op, which the engine runs after the first.
         env.engine.rollback(
@@ -2408,7 +2408,7 @@ mod tests {
 
     fn create_store_operation(name: &str, auto_increment: bool) -> AsyncOperation {
         AsyncOperation::Schema(AsyncSchemaOperation::CreateObjectStore {
-            name: name.to_owned(),
+            name: name.into(),
             key_path: None,
             auto_increment,
         })
@@ -2417,7 +2417,7 @@ mod tests {
     fn store_names<X: SqlExecutor>(env: &IndexedDBEnvironment<SqlEngine<X>>) -> Vec<String> {
         env.object_stores()
             .into_iter()
-            .map(|store| store.name)
+            .map(|store| store.name.to_string())
             .collect()
     }
 
@@ -2445,7 +2445,7 @@ mod tests {
             1,
             AsyncOperation::Schema(AsyncSchemaOperation::CreateIndex {
                 index_id: 1,
-                name: "not_by_author".to_string(),
+                name: "not_by_author".into(),
                 key_path: KeyPath::String("author".to_string()),
                 unique: false,
                 multi_entry: false,

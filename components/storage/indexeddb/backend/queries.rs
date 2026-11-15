@@ -6,7 +6,7 @@
 
 use storage_traits::indexeddb::{
     IndexedDBIndex, IndexedDBIndexId, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore,
-    IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBValue, KeyPath, PutItemResult,
+    IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBValue, KeyPath, PutItemResult, Utf16String,
 };
 
 use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
@@ -30,6 +30,10 @@ pub(crate) fn decode_key_path(data: &[u8]) -> Result<KeyPath, SqlError> {
 
 fn decode_key(data: &[u8]) -> Result<IndexedDBKeyType, SqlError> {
     encoding::deserialize(data).ok_or(SqlError::InvalidKey)
+}
+
+fn decode_name(data: &[u8]) -> Result<Utf16String, SqlError> {
+    Utf16String::from_be_bytes(data).ok_or(SqlError::InvalidName)
 }
 
 fn expect_one_changed_row(changed: u64, context: &'static str) -> Result<(), SqlError> {
@@ -75,7 +79,7 @@ pub(crate) fn object_stores<X: SqlExecutor>(
         |row| {
             Ok(IndexedDBObjectStore {
                 id: row.integer(0)?,
-                name: row.text(1)?,
+                name: decode_name(&row.blob(1)?)?,
                 key_path: row
                     .optional_blob(2)?
                     .map(|key_path| decode_key_path(&key_path))
@@ -95,7 +99,7 @@ pub(crate) fn object_stores<X: SqlExecutor>(
                 row.integer(0)?,
                 IndexedDBIndex {
                     id: row.integer(1)?,
-                    name: row.text(2)?,
+                    name: decode_name(&row.blob(2)?)?,
                     key_path: decode_key_path(&row.blob(3)?)?,
                     unique: row.integer(4)? != 0,
                     multi_entry: row.integer(5)? != 0,
@@ -130,7 +134,7 @@ fn is_new_id<X: SqlExecutor>(executor: &mut X, table: &str, id: i64) -> Result<b
 pub(crate) fn create_object_store<X: SqlExecutor>(
     executor: &mut X,
     store_id: IndexedDBObjectStoreId,
-    name: &str,
+    name: &Utf16String,
     key_path: Option<&KeyPath>,
     auto_increment: bool,
 ) -> Result<(), SqlError> {
@@ -145,7 +149,7 @@ pub(crate) fn create_object_store<X: SqlExecutor>(
         "INSERT INTO object_store (id, name, key_path, auto_increment) VALUES (?, ?, ?, ?)",
         &[
             SqlParam::Integer(store_id),
-            SqlParam::Text(name),
+            SqlParam::Blob(&name.to_be_bytes()),
             key_path.as_deref().map_or(SqlParam::Null, SqlParam::Blob),
             SqlParam::Integer(auto_increment as i64),
         ],
@@ -156,12 +160,12 @@ pub(crate) fn create_object_store<X: SqlExecutor>(
 /// The id of the object store named `name`, if there is one.
 fn object_store_named<X: SqlExecutor>(
     executor: &mut X,
-    name: &str,
+    name: &Utf16String,
 ) -> Result<Option<IndexedDBObjectStoreId>, SqlError> {
     query_row(
         executor,
         "SELECT id FROM object_store WHERE name = ?",
-        &[SqlParam::Text(name)],
+        &[SqlParam::Blob(&name.to_be_bytes())],
         |row| row.integer(0),
     )
 }
@@ -193,14 +197,17 @@ pub(crate) fn delete_object_store<X: SqlExecutor>(
 pub(crate) fn rename_object_store<X: SqlExecutor>(
     executor: &mut X,
     store_id: IndexedDBObjectStoreId,
-    new_name: &str,
+    new_name: &Utf16String,
 ) -> Result<(), SqlError> {
     if object_store_named(executor, new_name)?.is_some_and(|other| other != store_id) {
         return Err(SqlError::InvalidMetadata("object store name exists"));
     }
     let changed = executor.execute(
         "UPDATE object_store SET name = ? WHERE id = ?",
-        &[SqlParam::Text(new_name), SqlParam::Integer(store_id)],
+        &[
+            SqlParam::Blob(&new_name.to_be_bytes()),
+            SqlParam::Integer(store_id),
+        ],
     )?;
     expect_one_changed_row(changed, "object store rename")
 }
@@ -220,12 +227,15 @@ pub(crate) fn key_generator_current_number<X: SqlExecutor>(
 fn index_named<X: SqlExecutor>(
     executor: &mut X,
     store_id: IndexedDBObjectStoreId,
-    name: &str,
+    name: &Utf16String,
 ) -> Result<Option<IndexedDBIndexId>, SqlError> {
     query_row(
         executor,
         "SELECT id FROM object_store_index WHERE object_store_id = ? AND name = ?",
-        &[SqlParam::Integer(store_id), SqlParam::Text(name)],
+        &[
+            SqlParam::Integer(store_id),
+            SqlParam::Blob(&name.to_be_bytes()),
+        ],
         |row| row.integer(0),
     )
 }
@@ -236,7 +246,7 @@ pub(crate) fn create_index<X: SqlExecutor>(
     executor: &mut X,
     store_id: IndexedDBObjectStoreId,
     index_id: IndexedDBIndexId,
-    name: &str,
+    name: &Utf16String,
     key_path: &KeyPath,
     unique: bool,
     multi_entry: bool,
@@ -255,7 +265,7 @@ pub(crate) fn create_index<X: SqlExecutor>(
         &[
             SqlParam::Integer(index_id),
             SqlParam::Integer(store.id),
-            SqlParam::Text(name),
+            SqlParam::Blob(&name.to_be_bytes()),
             SqlParam::Blob(&encode_key_path(key_path)?),
             SqlParam::Integer(unique as i64),
             SqlParam::Integer(multi_entry as i64),
@@ -269,7 +279,7 @@ pub(crate) fn rename_index<X: SqlExecutor>(
     executor: &mut X,
     store_id: IndexedDBObjectStoreId,
     index_id: IndexedDBIndexId,
-    new_name: &str,
+    new_name: &Utf16String,
 ) -> Result<(), SqlError> {
     if index_named(executor, store_id, new_name)?.is_some_and(|other| other != index_id) {
         return Err(SqlError::InvalidMetadata("index name exists"));
@@ -277,7 +287,7 @@ pub(crate) fn rename_index<X: SqlExecutor>(
     let changed = executor.execute(
         "UPDATE object_store_index SET name = ? WHERE id = ? AND object_store_id = ?",
         &[
-            SqlParam::Text(new_name),
+            SqlParam::Blob(&new_name.to_be_bytes()),
             SqlParam::Integer(index_id),
             SqlParam::Integer(store_id),
         ],

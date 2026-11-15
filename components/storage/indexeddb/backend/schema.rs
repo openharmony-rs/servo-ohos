@@ -15,14 +15,16 @@ use crate::shared::DB_INIT_PRAGMAS;
 /// The version of the tables below and of how records are stored in them, kept in the database
 /// file's `user_version`. Bump it with every change to either: a database stored with another
 /// version is deleted and created anew when it is opened, as there are no migrations.
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 // Adapted from:
 // https://github.com/mozilla-firefox/firefox/blob/ee102e926521b3e460293b0aea6b54b1a03f6f74/dom/indexedDB/DBSchema.cpp#L78
+// Names are BLOBs of UTF-16 code units (`Utf16String::to_be_bytes`), which, unlike text, hold
+// any DOMString.
 const CREATE_TABLES: [&str; 6] = [
     r#"
 CREATE TABLE IF NOT EXISTS database (
-    name    varchar          not null
+    name    blob             not null
         primary key,
     origin  varchar          not null,
     version bigint default 0 not null
@@ -31,7 +33,7 @@ CREATE TABLE IF NOT EXISTS database (
 CREATE TABLE IF NOT EXISTS object_store (
     id             integer               not null
         primary key autoincrement,
-    name           varchar               not null
+    name           blob                  not null
         unique,
     key_path       varbinary_blob,
     auto_increment integer default FALSE not null
@@ -51,7 +53,7 @@ CREATE TABLE IF NOT EXISTS object_store_index (
     primary key autoincrement,
     object_store_id   integer        not null
     references object_store,
-    name              varchar        not null,
+    name              blob           not null,
     key_path          varbinary_blob not null,
     unique_index      boolean        not null,
     multi_entry_index boolean        not null,
@@ -148,7 +150,10 @@ fn init_database<X: SqlExecutor>(
         // "When a database is first created, its version is 0 (zero)."
         executor.execute(
             "INSERT INTO database (name, origin, version) VALUES (?, ?, 0)",
-            &[SqlParam::Text(&description.name), SqlParam::Text(&origin)],
+            &[
+                SqlParam::Blob(&description.name.to_be_bytes()),
+                SqlParam::Text(&origin),
+            ],
         )?;
         executor.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), &[])?;
         Ok(true)
