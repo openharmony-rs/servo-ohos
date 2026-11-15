@@ -7,7 +7,8 @@ use std::collections::VecDeque;
 use malloc_size_of::MallocSizeOf;
 use malloc_size_of_derive::MallocSizeOf;
 use storage_traits::indexeddb::{
-    AsyncOperation, BackendResult, IndexedDBIndex, IndexedDBTxnId, IndexedDBTxnMode, KeyPath,
+    AsyncOperation, BackendResult, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBTxnId,
+    IndexedDBTxnMode,
 };
 
 pub(crate) use crate::indexeddb::backend::ActiveKvsEngine;
@@ -17,7 +18,7 @@ pub(crate) mod encoding;
 
 #[derive(MallocSizeOf)]
 pub struct KvsOperation {
-    pub store_name: String,
+    pub store: IndexedDBObjectStoreId,
     pub operation: AsyncOperation,
 }
 
@@ -61,10 +62,7 @@ pub trait KvsEngine: MallocSizeOf {
     fn rollback(&self, transaction: IndexedDBTxnId, on_done: Box<dyn FnOnce() + Send>);
 
     // The metadata reads answer as of the last commit, without waiting for the work handed over.
-    fn has_key_generator(&self, store_name: &str) -> bool;
-    fn key_path(&self, store_name: &str) -> Option<KeyPath>;
-    fn object_store_names(&self) -> Result<Vec<String>, Self::Error>;
-    fn indexes(&self, store_name: &str) -> Result<Vec<IndexedDBIndex>, Self::Error>;
-
+    /// The object stores of the database, in the order they were created.
+    fn object_stores(&self) -> Vec<IndexedDBObjectStore>;
     fn version(&self) -> Result<u64, Self::Error>;
 }

@@ -13,6 +13,7 @@ use script_bindings::domstring::TracedDOMString;
 use script_bindings::error::{Error, ErrorResult, Fallible};
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use script_bindings::str::DOMString;
+use storage_traits::indexeddb::IndexedDBIndexId;
 
 use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
 use crate::dom::bindings::refcounted::Trusted;
@@ -30,6 +31,8 @@ use crate::dom::indexeddb::key::convert_value_to_key_range;
 pub(crate) struct IDBIndex {
     reflector_: Reflector,
     object_store: Dom<IDBObjectStore>,
+    /// The id of the handle's index.
+    id: IndexedDBIndexId,
     name: DomRefCell<TracedDOMString>,
     multi_entry: bool,
     unique: bool,
@@ -39,6 +42,7 @@ pub(crate) struct IDBIndex {
 impl IDBIndex {
     pub fn new_inherited(
         object_store: &IDBObjectStore,
+        id: IndexedDBIndexId,
         name: DOMString,
         multi_entry: bool,
         unique: bool,
@@ -47,6 +51,7 @@ impl IDBIndex {
         IDBIndex {
             reflector_: Reflector::new(),
             object_store: Dom::from_ref(object_store),
+            id,
             name: DomRefCell::new(name.traced()),
             multi_entry,
             unique,
@@ -54,10 +59,12 @@ impl IDBIndex {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         cx: &mut JSContext,
         global: &GlobalScope,
         object_store: &IDBObjectStore,
+        id: IndexedDBIndexId,
         name: DOMString,
         multi_entry: bool,
         unique: bool,
@@ -67,6 +74,7 @@ impl IDBIndex {
             cx,
             Box::new(IDBIndex::new_inherited(
                 object_store,
+                id,
                 name,
                 multi_entry,
                 unique,
@@ -76,17 +84,25 @@ impl IDBIndex {
         )
     }
 
+    pub(crate) fn id(&self) -> IndexedDBIndexId {
+        self.id
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction> step 6: reverts the
+    /// handle's name.
+    pub(crate) fn set_name(&self, name: DOMString) {
+        *self.name.borrow_mut() = name.traced();
+    }
+
     pub(crate) fn object_store(&self) -> DomRoot<IDBObjectStore> {
         DomRoot::from_ref(&self.object_store)
     }
 
     pub(crate) fn verify_not_deleted(&self) -> ErrorResult {
-        let stored_name = self.name.borrow().clone().root();
         let transaction = self.object_store.transaction();
-        if !self.object_store.has_index(&stored_name) ||
-            !transaction
-                .get_db()
-                .object_store_exists(&self.object_store.get_name())
+        if !transaction
+            .get_db()
+            .has_index(self.object_store.id(), self.id)
         {
             return Err(Error::InvalidState(Some(
                 "Index or its object store has been deleted".to_owned(),
@@ -194,16 +210,8 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
         }
 
         // Step 6: If index or index’s object store has been deleted, throw an "InvalidStateError" DOMException.
+        self.verify_not_deleted()?;
         let mut stored_name = self.name.borrow_mut();
-        if !self.object_store.has_index(&stored_name) ||
-            !transaction
-                .get_db()
-                .object_store_exists(&self.object_store.get_name())
-        {
-            return Err(Error::InvalidState(Some(
-                "Index or its object store has been deleted".to_owned(),
-            )));
-        }
 
         // Step 7: If index’s name is equal to name, terminate these steps.
         if *stored_name == *name {
@@ -218,7 +226,7 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
         }
 
         // Step 9: Set index’s name to name.
-        self.object_store.rename_index(&stored_name, &name);
+        self.object_store.rename_index(self.id, &stored_name, &name);
 
         // Step 10: Set this’s name to name.
         *stored_name = name.traced();

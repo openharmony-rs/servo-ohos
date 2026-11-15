@@ -5,8 +5,8 @@
 //! The IndexedDB operations on the tables of `schema.rs`.
 
 use storage_traits::indexeddb::{
-    CreateObjectResult, IndexedDBIndex, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
-    IndexedDBValue, KeyPath, PutItemResult,
+    IndexedDBIndex, IndexedDBIndexId, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore,
+    IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBValue, KeyPath, PutItemResult,
 };
 
 use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
@@ -16,8 +16,6 @@ use crate::indexeddb::engines::encoding;
 #[derive(Clone, Debug)]
 pub(crate) struct ObjectStore {
     pub(crate) id: i64,
-    /// The encoded key path, see [`encode_key_path`].
-    pub(crate) key_path: Option<Vec<u8>>,
     /// The key generator's current number, or 0 for a store without a key generator.
     pub(crate) auto_increment: i64,
 }
@@ -44,17 +42,16 @@ fn expect_one_changed_row(changed: u64, context: &'static str) -> Result<(), Sql
 
 pub(crate) fn object_store<X: SqlExecutor>(
     executor: &mut X,
-    store_name: &str,
+    store_id: IndexedDBObjectStoreId,
 ) -> Result<Option<ObjectStore>, SqlError> {
     query_row(
         executor,
-        "SELECT id, key_path, auto_increment FROM object_store WHERE name = ?",
-        &[SqlParam::Text(store_name)],
+        "SELECT id, auto_increment FROM object_store WHERE id = ?",
+        &[SqlParam::Integer(store_id)],
         |row| {
             Ok(ObjectStore {
                 id: row.integer(0)?,
-                key_path: row.optional_blob(1)?,
-                auto_increment: row.integer(2)?,
+                auto_increment: row.integer(1)?,
             })
         },
     )
@@ -62,50 +59,120 @@ pub(crate) fn object_store<X: SqlExecutor>(
 
 fn required_object_store<X: SqlExecutor>(
     executor: &mut X,
-    store_name: &str,
+    store_id: IndexedDBObjectStoreId,
 ) -> Result<ObjectStore, SqlError> {
-    object_store(executor, store_name)?.ok_or(SqlError::MissingRow("object store"))
+    object_store(executor, store_id)?.ok_or(SqlError::MissingRow("object store"))
 }
 
-pub(crate) fn object_store_names<X: SqlExecutor>(
+/// The metadata of every object store and its indexes, in the order they were created.
+pub(crate) fn object_stores<X: SqlExecutor>(
     executor: &mut X,
-) -> Result<Vec<String>, SqlError> {
-    query_rows(
+) -> Result<Vec<IndexedDBObjectStore>, SqlError> {
+    let mut stores = query_rows(
         executor,
-        "SELECT name FROM object_store ORDER BY id",
+        "SELECT id, name, key_path, auto_increment FROM object_store ORDER BY id",
         &[],
-        |row| row.text(0),
-    )
+        |row| {
+            Ok(IndexedDBObjectStore {
+                id: row.integer(0)?,
+                name: row.text(1)?,
+                key_path: row
+                    .optional_blob(2)?
+                    .map(|key_path| decode_key_path(&key_path))
+                    .transpose()?,
+                has_key_generator: row.integer(3)? != 0,
+                indexes: Vec::new(),
+            })
+        },
+    )?;
+    let indexes = query_rows(
+        executor,
+        "SELECT object_store_id, id, name, key_path, unique_index, multi_entry_index \
+         FROM object_store_index ORDER BY id",
+        &[],
+        |row| {
+            Ok((
+                row.integer(0)?,
+                IndexedDBIndex {
+                    id: row.integer(1)?,
+                    name: row.text(2)?,
+                    key_path: decode_key_path(&row.blob(3)?)?,
+                    unique: row.integer(4)? != 0,
+                    multi_entry: row.integer(5)? != 0,
+                },
+            ))
+        },
+    )?;
+    for (store_id, index) in indexes {
+        let store = stores
+            .iter_mut()
+            .find(|store| store.id == store_id)
+            .ok_or(SqlError::MissingRow("object store of an index"))?;
+        store.indexes.push(index);
+    }
+    Ok(stores)
 }
 
+/// Whether `id` is larger than every value in the `id` column of `table`.
+fn is_new_id<X: SqlExecutor>(executor: &mut X, table: &str, id: i64) -> Result<bool, SqlError> {
+    let largest = query_row(
+        executor,
+        &format!("SELECT MAX(id) FROM {table}"),
+        &[],
+        |row| row.optional_integer(0),
+    )?
+    .flatten();
+    Ok(largest.is_none_or(|largest| id > largest))
+}
+
+/// <https://w3c.github.io/IndexedDB/#dom-idbdatabase-createobjectstore> step 9, with the id
+/// script gave the store, which must be larger than the id of every store in the database.
 pub(crate) fn create_object_store<X: SqlExecutor>(
     executor: &mut X,
-    store_name: &str,
+    store_id: IndexedDBObjectStoreId,
+    name: &str,
     key_path: Option<&KeyPath>,
     auto_increment: bool,
-) -> Result<CreateObjectResult, SqlError> {
-    if object_store(executor, store_name)?.is_some() {
-        return Ok(CreateObjectResult::AlreadyExists);
+) -> Result<(), SqlError> {
+    if store_id <= 0 || !is_new_id(executor, "object_store", store_id)? {
+        return Err(SqlError::InvalidMetadata("object store id is not new"));
+    }
+    if object_store_named(executor, name)?.is_some() {
+        return Err(SqlError::InvalidMetadata("object store name exists"));
     }
     let key_path = key_path.map(encode_key_path).transpose()?;
     executor.execute(
-        "INSERT INTO object_store (name, key_path, auto_increment) VALUES (?, ?, ?)",
+        "INSERT INTO object_store (id, name, key_path, auto_increment) VALUES (?, ?, ?, ?)",
         &[
-            SqlParam::Text(store_name),
+            SqlParam::Integer(store_id),
+            SqlParam::Text(name),
             key_path.as_deref().map_or(SqlParam::Null, SqlParam::Blob),
             SqlParam::Integer(auto_increment as i64),
         ],
     )?;
-    Ok(CreateObjectResult::Created)
+    Ok(())
+}
+
+/// The id of the object store named `name`, if there is one.
+fn object_store_named<X: SqlExecutor>(
+    executor: &mut X,
+    name: &str,
+) -> Result<Option<IndexedDBObjectStoreId>, SqlError> {
+    query_row(
+        executor,
+        "SELECT id FROM object_store WHERE name = ?",
+        &[SqlParam::Text(name)],
+        |row| row.integer(0),
+    )
 }
 
 pub(crate) fn delete_object_store<X: SqlExecutor>(
     executor: &mut X,
-    store_name: &str,
+    store_id: IndexedDBObjectStoreId,
 ) -> Result<(), SqlError> {
     // https://www.w3.org/TR/IndexedDB-3/#dom-idbdatabase-deleteobjectstore
     // Step 7. Destroy store.
-    let store = required_object_store(executor, store_name)?;
+    let store = required_object_store(executor, store_id)?;
     let params = [SqlParam::Integer(store.id)];
     executor.execute("DELETE FROM index_data WHERE object_store_id = ?", &params)?;
     executor.execute(
@@ -121,112 +188,118 @@ pub(crate) fn delete_object_store<X: SqlExecutor>(
     expect_one_changed_row(changed, "object store delete")
 }
 
-pub(crate) fn key_path<X: SqlExecutor>(
+/// <https://w3c.github.io/IndexedDB/#dom-idbobjectstore-name> step 9. The records and indexes
+/// stay with the store.
+pub(crate) fn rename_object_store<X: SqlExecutor>(
     executor: &mut X,
-    store_name: &str,
-) -> Result<Option<KeyPath>, SqlError> {
-    object_store(executor, store_name)?
-        .and_then(|store| store.key_path)
-        .map(|key_path| decode_key_path(&key_path))
-        .transpose()
+    store_id: IndexedDBObjectStoreId,
+    new_name: &str,
+) -> Result<(), SqlError> {
+    if object_store_named(executor, new_name)?.is_some_and(|other| other != store_id) {
+        return Err(SqlError::InvalidMetadata("object store name exists"));
+    }
+    let changed = executor.execute(
+        "UPDATE object_store SET name = ? WHERE id = ?",
+        &[SqlParam::Text(new_name), SqlParam::Integer(store_id)],
+    )?;
+    expect_one_changed_row(changed, "object store rename")
 }
 
 /// <https://w3c.github.io/IndexedDB/#key-generator-current-number>, or `None` for a store without
 /// a key generator.
+#[cfg(test)]
 pub(crate) fn key_generator_current_number<X: SqlExecutor>(
     executor: &mut X,
-    store_name: &str,
+    store_id: IndexedDBObjectStoreId,
 ) -> Result<Option<i64>, SqlError> {
-    Ok(object_store(executor, store_name)?
+    Ok(object_store(executor, store_id)?
         .and_then(|store| (store.auto_increment != 0).then_some(store.auto_increment)))
 }
 
-pub(crate) fn indexes<X: SqlExecutor>(
+/// The id of the index named `name` of the store `store_id`, if there is one.
+fn index_named<X: SqlExecutor>(
     executor: &mut X,
-    store_name: &str,
-) -> Result<Vec<IndexedDBIndex>, SqlError> {
-    let store = required_object_store(executor, store_name)?;
-    query_rows(
+    store_id: IndexedDBObjectStoreId,
+    name: &str,
+) -> Result<Option<IndexedDBIndexId>, SqlError> {
+    query_row(
         executor,
-        "SELECT name, key_path, unique_index, multi_entry_index FROM object_store_index \
-         WHERE object_store_id = ? ORDER BY id",
-        &[SqlParam::Integer(store.id)],
-        |row| {
-            Ok(IndexedDBIndex {
-                name: row.text(0)?,
-                key_path: decode_key_path(&row.blob(1)?)?,
-                unique: row.integer(2)? != 0,
-                multi_entry: row.integer(3)? != 0,
-            })
-        },
+        "SELECT id FROM object_store_index WHERE object_store_id = ? AND name = ?",
+        &[SqlParam::Integer(store_id), SqlParam::Text(name)],
+        |row| row.integer(0),
     )
 }
 
+/// <https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex> step 11, with the id script
+/// gave the index, which must be larger than the id of every index in the database.
 pub(crate) fn create_index<X: SqlExecutor>(
     executor: &mut X,
-    store_name: &str,
-    index_name: &str,
+    store_id: IndexedDBObjectStoreId,
+    index_id: IndexedDBIndexId,
+    name: &str,
     key_path: &KeyPath,
     unique: bool,
     multi_entry: bool,
-) -> Result<CreateObjectResult, SqlError> {
-    let store = required_object_store(executor, store_name)?;
-    let exists = query_row(
-        executor,
-        "SELECT 1 FROM object_store_index WHERE object_store_id = ? AND name = ?",
-        &[SqlParam::Integer(store.id), SqlParam::Text(index_name)],
-        |_| Ok(()),
-    )?
-    .is_some();
-    if exists {
-        return Ok(CreateObjectResult::AlreadyExists);
+) -> Result<(), SqlError> {
+    let store = required_object_store(executor, store_id)?;
+    if index_id <= 0 || !is_new_id(executor, "object_store_index", index_id)? {
+        return Err(SqlError::InvalidMetadata("index id is not new"));
+    }
+    if index_named(executor, store.id, name)?.is_some() {
+        return Err(SqlError::InvalidMetadata("index name exists"));
     }
     executor.execute(
         "INSERT INTO object_store_index \
-         (object_store_id, name, key_path, unique_index, multi_entry_index) \
-         VALUES (?, ?, ?, ?, ?)",
+         (id, object_store_id, name, key_path, unique_index, multi_entry_index) \
+         VALUES (?, ?, ?, ?, ?, ?)",
         &[
+            SqlParam::Integer(index_id),
             SqlParam::Integer(store.id),
-            SqlParam::Text(index_name),
+            SqlParam::Text(name),
             SqlParam::Blob(&encode_key_path(key_path)?),
             SqlParam::Integer(unique as i64),
             SqlParam::Integer(multi_entry as i64),
         ],
     )?;
-    Ok(CreateObjectResult::Created)
+    Ok(())
 }
 
-/// Renaming an index that does not exist is not an error.
+/// <https://w3c.github.io/IndexedDB/#dom-idbindex-name> step 9.
 pub(crate) fn rename_index<X: SqlExecutor>(
     executor: &mut X,
-    store_name: &str,
-    index_name: &str,
+    store_id: IndexedDBObjectStoreId,
+    index_id: IndexedDBIndexId,
     new_name: &str,
 ) -> Result<(), SqlError> {
-    let store = required_object_store(executor, store_name)?;
-    executor.execute(
-        "UPDATE object_store_index SET name = ? WHERE name = ? AND object_store_id = ?",
+    if index_named(executor, store_id, new_name)?.is_some_and(|other| other != index_id) {
+        return Err(SqlError::InvalidMetadata("index name exists"));
+    }
+    let changed = executor.execute(
+        "UPDATE object_store_index SET name = ? WHERE id = ? AND object_store_id = ?",
         &[
             SqlParam::Text(new_name),
-            SqlParam::Text(index_name),
-            SqlParam::Integer(store.id),
+            SqlParam::Integer(index_id),
+            SqlParam::Integer(store_id),
         ],
     )?;
-    Ok(())
+    expect_one_changed_row(changed, "index rename")
 }
 
-/// Deleting an index that does not exist is not an error.
+/// <https://w3c.github.io/IndexedDB/#dom-idbobjectstore-deleteindex> step 8: deletes the index and
+/// its records.
 pub(crate) fn delete_index<X: SqlExecutor>(
     executor: &mut X,
-    store_name: &str,
-    index_name: &str,
+    store_id: IndexedDBObjectStoreId,
+    index_id: IndexedDBIndexId,
 ) -> Result<(), SqlError> {
-    let store = required_object_store(executor, store_name)?;
-    executor.execute(
-        "DELETE FROM object_store_index WHERE name = ? AND object_store_id = ?",
-        &[SqlParam::Text(index_name), SqlParam::Integer(store.id)],
+    let params = [SqlParam::Integer(index_id)];
+    executor.execute("DELETE FROM index_data WHERE index_id = ?", &params)?;
+    executor.execute("DELETE FROM unique_index_data WHERE index_id = ?", &params)?;
+    let changed = executor.execute(
+        "DELETE FROM object_store_index WHERE id = ? AND object_store_id = ?",
+        &[SqlParam::Integer(index_id), SqlParam::Integer(store_id)],
     )?;
-    Ok(())
+    expect_one_changed_row(changed, "index delete")
 }
 
 pub(crate) fn version<X: SqlExecutor>(executor: &mut X) -> Result<u64, SqlError> {

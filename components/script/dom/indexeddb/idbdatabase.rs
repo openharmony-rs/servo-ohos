@@ -11,7 +11,8 @@ use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::{GenericSend, GenericSender};
 use storage_traits::indexeddb::{
-    AsyncSchemaOperation, IndexedDBThreadMsg, IndexedDBTxnId, KeyPath, SyncOperation,
+    AsyncSchemaOperation, IndexedDBIndex, IndexedDBIndexId, IndexedDBObjectStore,
+    IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId, KeyPath, SyncOperation,
 };
 use stylo_atoms::Atom;
 use uuid::Uuid;
@@ -29,7 +30,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::domstringlist::DOMStringList;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::indexeddb::idbobjectstore::{IDBObjectStore, IDBObjectStoreAbortState};
+use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::idbversionchangeevent::IDBVersionChangeEvent;
 use crate::dom::indexeddb::key::is_valid_key_path;
@@ -41,8 +42,11 @@ pub struct IDBDatabase {
     name: TracedDOMString,
     /// <https://w3c.github.io/IndexedDB/#database-version>
     version: Cell<u64>,
-    /// <https://w3c.github.io/IndexedDB/#object-store>
-    object_store_names: DomRefCell<Vec<TracedDOMString>>,
+    /// <https://w3c.github.io/IndexedDB/#connection-object-store-set>: the object stores and
+    /// their indexes as this connection sees them, in the order they were created. Only an
+    /// upgrade transaction changes them, and aborting it reverts them.
+    #[no_trace]
+    object_stores: DomRefCell<Vec<IndexedDBObjectStore>>,
     /// <https://w3c.github.io/IndexedDB/#database-upgrade-transaction>
     upgrade_transaction: MutNullableDom<IDBTransaction>,
 
@@ -51,6 +55,11 @@ pub struct IDBDatabase {
     /// The serial number of the next transaction this connection creates; 0 is its upgrade
     /// transaction's.
     next_transaction_serial: Cell<u64>,
+    /// The ids of the next object store and index that the upgrade transaction creates: one more
+    /// than the largest id the connection has seen, so that a store or index deleted in the
+    /// transaction doesn't share its id with one created after it, while handles of both exist.
+    next_object_store_id: Cell<IndexedDBObjectStoreId>,
+    next_index_id: Cell<IndexedDBIndexId>,
 
     // Flags
     /// <https://w3c.github.io/IndexedDB/#connection-close-pending-flag>
@@ -62,18 +71,23 @@ impl IDBDatabase {
         name: DOMString,
         id: Uuid,
         version: u64,
-        object_store_names: Vec<String>,
+        object_stores: Vec<IndexedDBObjectStore>,
     ) -> IDBDatabase {
+        let largest_store_id = object_stores.iter().map(|store| store.id).max();
+        let largest_index_id = object_stores
+            .iter()
+            .flat_map(|store| store.indexes.iter().map(|index| index.id))
+            .max();
         IDBDatabase {
             eventtarget: EventTarget::new_inherited(),
             name: name.traced(),
             id,
             version: Cell::new(version),
-            object_store_names: DomRefCell::new(
-                object_store_names.into_iter().map(Into::into).collect(),
-            ),
+            object_stores: DomRefCell::new(object_stores),
             upgrade_transaction: Default::default(),
             next_transaction_serial: Cell::new(1),
+            next_object_store_id: Cell::new(largest_store_id.unwrap_or(0) + 1),
+            next_index_id: Cell::new(largest_index_id.unwrap_or(0) + 1),
             close_pending: Cell::new(false),
         }
     }
@@ -84,16 +98,11 @@ impl IDBDatabase {
         name: DOMString,
         id: Uuid,
         version: u64,
-        object_store_names: Vec<String>,
+        object_stores: Vec<IndexedDBObjectStore>,
     ) -> DomRoot<IDBDatabase> {
         reflect_dom_object(
             cx,
-            Box::new(IDBDatabase::new_inherited(
-                name,
-                id,
-                version,
-                object_store_names,
-            )),
+            Box::new(IDBDatabase::new_inherited(name, id, version, object_stores)),
             global,
         )
     }
@@ -116,52 +125,115 @@ impl IDBDatabase {
         }
     }
 
-    pub fn object_stores(&self, cx: &mut JSContext) -> DomRoot<DOMStringList> {
-        DOMStringList::new(
-            cx,
-            &self.global(),
-            self.object_store_names
-                .borrow()
-                .clone()
-                .into_iter()
-                .map(|domstring| domstring.root())
-                .collect(),
-        )
-    }
-
-    pub(crate) fn object_store_names_snapshot(&self) -> Vec<DOMString> {
-        // https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction
-        // Step 4. Set connection’s object store set to the set of object stores in database if database previously existed,
-        // or the empty set if database was newly created.
-        self.object_store_names
+    /// The names of the connection's object stores, sorted.
+    pub(crate) fn object_store_names(&self, cx: &mut JSContext) -> DomRoot<DOMStringList> {
+        rooted_vec!(let names <- self
+            .object_stores
             .borrow()
-            .clone()
-            .into_iter()
-            .map(|domstring| domstring.root())
-            .collect()
-    }
-
-    pub(crate) fn restore_object_store_names(&self, names: Vec<DOMString>) {
-        // https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction
-        // Step 4. NOTE: This reverts the value of objectStoreNames returned by the IDBDatabase object.
-        *self.object_store_names.borrow_mut() = names
-            .into_iter()
-            .map(|domstring| domstring.traced())
-            .collect();
-    }
-
-    pub(crate) fn rename_object_store_name(&self, old_name: &TracedDOMString, new_name: DOMString) {
-        let mut object_store_names = self.object_store_names.borrow_mut();
-        if let Some(position) = object_store_names
             .iter()
-            .position(|name| *name == *old_name)
+            .map(|store| TracedDOMString::from(store.name.clone())));
+        DOMStringList::new_sorted(cx, &self.global(), names.iter())
+    }
+
+    /// The object store named `name` in the connection's object store set.
+    pub(crate) fn object_store_named(&self, name: &str) -> Option<IndexedDBObjectStore> {
+        self.object_stores
+            .borrow()
+            .iter()
+            .find(|store| store.name == name)
+            .cloned()
+    }
+
+    /// The object store `id` in the connection's object store set.
+    pub(crate) fn object_store(&self, id: IndexedDBObjectStoreId) -> Option<IndexedDBObjectStore> {
+        self.object_stores
+            .borrow()
+            .iter()
+            .find(|store| store.id == id)
+            .cloned()
+    }
+
+    pub(crate) fn object_store_exists(&self, name: &str) -> bool {
+        self.object_stores
+            .borrow()
+            .iter()
+            .any(|store| store.name == name)
+    }
+
+    /// Whether the object store `id` is in the connection's object store set, that is, hasn't
+    /// been deleted.
+    pub(crate) fn has_object_store(&self, id: IndexedDBObjectStoreId) -> bool {
+        self.object_stores
+            .borrow()
+            .iter()
+            .any(|store| store.id == id)
+    }
+
+    /// Whether the index `index` of the object store `store` exists.
+    pub(crate) fn has_index(&self, store: IndexedDBObjectStoreId, index: IndexedDBIndexId) -> bool {
+        self.object_stores.borrow().iter().any(|object_store| {
+            object_store.id == store && object_store.indexes.iter().any(|i| i.id == index)
+        })
+    }
+
+    pub(crate) fn object_stores_snapshot(&self) -> Vec<IndexedDBObjectStore> {
+        self.object_stores.borrow().clone()
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
+    /// Step 4. Set connection’s object store set to the set of object stores in database if
+    /// database previously existed, or the empty set if database was newly created.
+    /// NOTE: This reverts the value of objectStoreNames returned by the IDBDatabase object.
+    pub(crate) fn restore_object_stores(&self, object_stores: Vec<IndexedDBObjectStore>) {
+        *self.object_stores.borrow_mut() = object_stores;
+    }
+
+    /// Changes the metadata of the object store `id` with `change`, if it exists.
+    fn change_object_store(
+        &self,
+        id: IndexedDBObjectStoreId,
+        change: impl FnOnce(&mut IndexedDBObjectStore),
+    ) {
+        if let Some(store) = self
+            .object_stores
+            .borrow_mut()
+            .iter_mut()
+            .find(|store| store.id == id)
         {
-            object_store_names[position] = new_name.traced();
+            change(store);
         }
     }
 
-    pub(crate) fn object_store_exists(&self, name: &TracedDOMString) -> bool {
-        self.object_store_names.borrow().contains(name)
+    pub(crate) fn rename_object_store(&self, id: IndexedDBObjectStoreId, name: String) {
+        self.change_object_store(id, |store| store.name = name);
+    }
+
+    pub(crate) fn add_index(&self, store: IndexedDBObjectStoreId, index: IndexedDBIndex) {
+        self.change_object_store(store, |store| store.indexes.push(index));
+    }
+
+    pub(crate) fn remove_index(&self, store: IndexedDBObjectStoreId, index: IndexedDBIndexId) {
+        self.change_object_store(store, |store| store.indexes.retain(|i| i.id != index));
+    }
+
+    pub(crate) fn rename_index(
+        &self,
+        store: IndexedDBObjectStoreId,
+        index: IndexedDBIndexId,
+        name: String,
+    ) {
+        self.change_object_store(store, |store| {
+            if let Some(index) = store.indexes.iter_mut().find(|i| i.id == index) {
+                index.name = name;
+            }
+        });
+    }
+
+    /// The id of a new index of the upgrade transaction.
+    pub(crate) fn allocate_index_id(&self) -> IndexedDBIndexId {
+        let id = self.next_index_id.get();
+        self.next_index_id.set(id + 1);
+        id
     }
 
     /// <https://w3c.github.io/IndexedDB/#dom-idbdatabase-version>
@@ -262,9 +334,13 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
 
         // Step 4. If any string in scope is not the name of an object store in
         // the connected database, throw a "NotFoundError" DOMException.
-        if scope.iter().any(|name| !self.object_store_exists(name)) {
+        let Some(store_ids) = scope
+            .iter()
+            .map(|name| self.object_store_named(&name.str()).map(|store| store.id))
+            .collect::<Option<Vec<_>>>()
+        else {
             return Err(Error::NotFound(None));
-        }
+        };
 
         // Step 5. If scope is empty, throw an "InvalidAccessError" DOMException.
         if scope.is_empty() {
@@ -281,7 +357,15 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         // stores named in scope.
         let durability = options.durability;
         let scope = DOMStringList::new(cx, &self.global(), scope);
-        let transaction = IDBTransaction::new(cx, &self.global(), self, mode, durability, &scope);
+        let transaction = IDBTransaction::new(
+            cx,
+            &self.global(),
+            self,
+            mode,
+            durability,
+            &scope,
+            store_ids,
+        );
 
         // Step 8. Set transaction’s cleanup event loop to the current event loop.
         transaction.set_cleanup_event_loop();
@@ -335,7 +419,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
 
         // Step 6. If an object store named name already exists in database throw
         // a "ConstraintError" DOMException.
-        if self.object_store_names.borrow().contains(&name) {
+        if self.object_store_exists(&name.str()) {
             return Err(Error::Constraint(None));
         }
 
@@ -360,46 +444,48 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         // object store’s name to name. If autoIncrement is true, then the
         // created object store uses a key generator. If keyPath is not null,
         // set the created object store’s key path to keyPath.
-        let object_store = IDBObjectStore::new(
-            cx,
-            &self.global(),
-            self.name.clone().root(),
-            name.clone(),
-            Some(options),
-            IDBObjectStoreAbortState {
-                newly_created_during_transaction: true,
-                rollback_indexes_on_abort: vec![],
-            },
-            &transaction,
-        );
-
-        let key_paths = key_path.map(|p| match p {
+        let store_id = self.next_object_store_id.get();
+        self.next_object_store_id.set(store_id + 1);
+        let key_path = key_path.map(|p| match p {
             StringOrStringSequence::String(s) => KeyPath::String(s.to_string()),
             StringOrStringSequence::StringSequence(s) => {
                 KeyPath::Sequence(s.iter().map(|s| s.to_string()).collect())
             },
         });
-
+        let store = IndexedDBObjectStore {
+            id: store_id,
+            name: name.to_string(),
+            key_path: key_path.clone(),
+            has_key_generator: auto_increment,
+            indexes: Vec::new(),
+        };
         let operation = AsyncSchemaOperation::CreateObjectStore {
             callback: transaction.create_abort_callback(),
-            key_path: key_paths,
+            name: store.name.clone(),
+            key_path,
             auto_increment,
         };
-
-        self.get_idb_thread()
+        if self
+            .get_idb_thread()
             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
                 origin: self.global().origin().immutable().clone(),
                 database_name: self.name.to_string(),
-                store_name: name.to_string(),
+                store_id,
                 operation,
                 transaction: transaction.id(),
             })
-            .unwrap();
-
-        self.object_store_names
+            .is_err()
+        {
+            return Err(Error::Operation(Some(
+                "Failed to send the object store to the backend".to_owned(),
+            )));
+        }
+        self.object_stores
             .safe_borrow_mut(cx.no_gc())
-            .push(name.traced());
-        transaction.register_object_store_handle(&object_store.get_name(), &object_store);
+            .push(store.clone());
+
+        let object_store = IDBObjectStore::new(cx, &self.global(), name, &store, &transaction);
+        transaction.register_object_store_handle(&object_store);
 
         // Step 10. Return a new object store handle associated with store and transaction.
         Ok(object_store)
@@ -419,32 +505,40 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
             return Err(Error::TransactionInactive(None));
         }
 
-        // Step 4
-        if !self.object_store_names.borrow().contains(&name) {
+        // Step 4. Let store be the object store named name in database, or throw a
+        // "NotFoundError" DOMException if none.
+        let Some(store) = self.object_store_named(&name.str()) else {
             return Err(Error::NotFound(None));
+        };
+
+        // Step 5. Remove store from this’s object store set.
+        self.object_stores
+            .borrow_mut()
+            .retain(|object_store| object_store.id != store.id);
+
+        // Step 6. If there is an object store handle associated with store and transaction,
+        // remove all entries from its index set.
+        if let Some(handle) = transaction.object_store_handle(store.id) {
+            handle.clear_index_set();
         }
 
-        // Step 5
-        self.object_store_names
-            .borrow_mut()
-            .retain(|store_name| *store_name != *name);
-
-        // Step 6
-        // FIXME:(arihant2math) Remove from index set ...
-
-        // Step 7
+        // Step 7. Destroy store.
         let operation = AsyncSchemaOperation::DeleteObjectStore {
             callback: transaction.create_abort_callback(),
         };
-        self.get_idb_thread()
+        if self
+            .get_idb_thread()
             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
                 origin: self.global().origin().immutable().clone(),
                 database_name: self.name.to_string(),
-                store_name: name.to_string(),
+                store_id: store.id,
                 operation,
                 transaction: transaction.id(),
             })
-            .unwrap();
+            .is_err()
+        {
+            warn!("Could not send AsyncSchemaOperation");
+        }
 
         Ok(())
     }
@@ -461,7 +555,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbdatabase-objectstorenames>
     fn ObjectStoreNames(&self, cx: &mut JSContext) -> DomRoot<DOMStringList> {
-        DOMStringList::new_sorted(cx, &self.global(), &*self.object_store_names.borrow())
+        self.object_store_names(cx)
     }
 
     /// <https://w3c.github.io/IndexedDB/#dom-idbdatabase-close>

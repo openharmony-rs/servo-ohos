@@ -262,7 +262,7 @@ impl IDBFactory {
                 id,
                 version,
                 upgraded,
-                object_store_names,
+                object_stores,
             } => {
                 let Some(request) = self.get_request(name.clone(), &id) else {
                     return debug_assert!(
@@ -278,7 +278,7 @@ impl IDBFactory {
                     &self.global(),
                     name,
                     version,
-                    object_store_names,
+                    object_stores,
                     upgraded,
                 );
 
@@ -294,7 +294,7 @@ impl IDBFactory {
                 version,
                 old_version,
                 transaction,
-                object_store_names,
+                object_stores,
             } => {
                 let global = self.global();
 
@@ -310,7 +310,7 @@ impl IDBFactory {
                     &global,
                     name,
                     version,
-                    object_store_names,
+                    object_stores,
                     false,
                 );
                 // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps

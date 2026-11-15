@@ -319,16 +319,32 @@ pub struct IndexedDBRecord {
     pub value: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+/// The id of an object store, unique in its database. An upgrade transaction in script gives a
+/// store it creates one more than the largest id its connection has seen in the transaction, and
+/// the backend checks that it is larger than the id of every store in the database. The id of a
+/// store deleted in an earlier transaction can be given again, so nothing that outlives a store's
+/// rows may be keyed by its id.
+pub type IndexedDBObjectStoreId = i64;
+
+/// The id of an index, unique in its database, given like an [`IndexedDBObjectStoreId`], and
+/// reused like it.
+pub type IndexedDBIndexId = i64;
+
+/// <https://w3c.github.io/IndexedDB/#index-construct>
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub struct IndexedDBIndex {
+    pub id: IndexedDBIndexId,
     pub name: String,
     pub key_path: KeyPath,
     pub multi_entry: bool,
     pub unique: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+/// <https://w3c.github.io/IndexedDB/#object-store-construct>, without its records: what a
+/// connection knows about an object store.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub struct IndexedDBObjectStore {
+    pub id: IndexedDBObjectStoreId,
     pub name: String,
     pub key_path: Option<KeyPath>,
     pub has_key_generator: bool,
@@ -423,52 +439,60 @@ impl AsyncReadWriteOperation {
     }
 }
 
+/// A change to the object stores and indexes in an upgrade transaction, of the object store that
+/// [`IndexedDBThreadMsg::AsyncSchemaOperation`] names. Script doesn't wait for it: the callback
+/// is only called if the operation failed, which fails the transaction.
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum AsyncSchemaOperation {
-    /// Creates a new index for the database
+    /// Creates the object store, with its id from script.
+    CreateObjectStore {
+        callback: GenericCallback<BackendError>,
+        name: String,
+        key_path: Option<KeyPath>,
+        auto_increment: bool,
+    },
+    /// Deletes the object store and its records and indexes.
+    DeleteObjectStore {
+        callback: GenericCallback<BackendError>,
+    },
+    /// Renames the object store, which keeps its records and indexes.
+    RenameObjectStore {
+        callback: GenericCallback<BackendError>,
+        new_name: String,
+    },
+    /// Creates an index of the object store, with its id from script.
     CreateIndex {
         callback: GenericCallback<BackendError>,
-        index_name: String,
+        index_id: IndexedDBIndexId,
+        name: String,
         key_path: KeyPath,
         unique: bool,
         multi_entry: bool,
     },
-    /// Rename an index
+    /// Renames an index of the object store.
     RenameIndex {
         callback: GenericCallback<BackendError>,
-        index_name: String,
+        index_id: IndexedDBIndexId,
         new_name: String,
     },
-    /// Delete an index
+    /// Deletes an index of the object store.
     DeleteIndex {
         callback: GenericCallback<BackendError>,
-        index_name: String,
-    },
-    /// Creates a new store for the database
-    CreateObjectStore {
-        callback: GenericCallback<BackendError>,
-        key_path: Option<KeyPath>,
-        auto_increment: bool,
-    },
-    /// Delete an existing object store in the database
-    DeleteObjectStore {
-        callback: GenericCallback<BackendError>,
+        index_id: IndexedDBIndexId,
     },
 }
 
 impl AsyncSchemaOperation {
     pub fn notify_error(&self, error: BackendError) {
-        match self {
-            AsyncSchemaOperation::CreateIndex { .. } |
-            AsyncSchemaOperation::RenameIndex { .. } |
-            AsyncSchemaOperation::DeleteIndex { .. } => {},
-            AsyncSchemaOperation::CreateObjectStore { callback, .. } => {
-                let _ = callback.send(error);
-            },
-            AsyncSchemaOperation::DeleteObjectStore { callback, .. } => {
-                let _ = callback.send(error);
-            },
+        let callback = match self {
+            Self::CreateObjectStore { callback, .. } |
+            Self::DeleteObjectStore { callback } |
+            Self::RenameObjectStore { callback, .. } |
+            Self::CreateIndex { callback, .. } |
+            Self::RenameIndex { callback, .. } |
+            Self::DeleteIndex { callback, .. } => callback,
         };
+        let _ = callback.send(error);
     }
 }
 
@@ -491,12 +515,6 @@ impl AsyncOperation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
-pub enum CreateObjectResult {
-    Created,
-    AlreadyExists,
-}
-
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 /// Messaging used in the context of connection lifecycle management.
 pub enum ConnectionMsg {
@@ -511,9 +529,8 @@ pub enum ConnectionMsg {
         id: Uuid,
         version: u64,
         upgraded: bool,
-        // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps
-        // Step 3. Set transaction’s scope to connection’s object store set.
-        object_store_names: Vec<String>,
+        /// <https://w3c.github.io/IndexedDB/#connection-object-store-set>, as committed.
+        object_stores: Vec<IndexedDBObjectStore>,
     },
     /// An upgrade transaction for a version started.
     Upgrade {
@@ -522,9 +539,9 @@ pub enum ConnectionMsg {
         version: u64,
         old_version: u64,
         transaction: IndexedDBTxnId,
-        // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps
-        // Step 3. Set transaction’s scope to connection’s object store set.
-        object_store_names: Vec<String>,
+        /// <https://w3c.github.io/IndexedDB/#connection-object-store-set>, as committed, which
+        /// is also the scope of the upgrade transaction.
+        object_stores: Vec<IndexedDBObjectStore>,
     },
     /// A `versionchange` event should be fired for a connection.
     VersionChange {
@@ -585,13 +602,6 @@ pub enum SyncOperation {
         GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
         ImmutableOrigin,
     ),
-    /// Get object store info
-    GetObjectStore(
-        GenericSender<BackendResult<IndexedDBObjectStore>>,
-        ImmutableOrigin,
-        String, // Database
-        String, // Store
-    ),
     /// Commits changes of a transaction to the database
     Commit(
         GenericCallback<TxnCompleteMsg>,
@@ -635,7 +645,7 @@ pub enum SyncOperation {
         db_name: String,
         txn: IndexedDBTxnId,
         mode: IndexedDBTxnMode,
-        scope: Vec<String>,
+        scope: Vec<IndexedDBObjectStoreId>,
     },
     /// Request script to recheck transaction commit eligibility.
     TxnMaybeCommit {
@@ -681,13 +691,6 @@ pub enum SyncOperation {
         Uuid,
     ),
 
-    /// Returns the version of the database
-    Version(
-        GenericSender<BackendResult<u64>>,
-        ImmutableOrigin,
-        String, // Database
-    ),
-
     /// Abort pending database upgrades
     AbortPendingUpgrades {
         pending_upgrades: HashMap<String, HashSet<Uuid>>,
@@ -711,7 +714,7 @@ pub enum IndexedDBThreadMsg {
     Async(
         ImmutableOrigin,
         String, // Database
-        String, // ObjectStore
+        IndexedDBObjectStoreId,
         IndexedDBTxnId,
         u64, // Monotonic request id in the transaction
         IndexedDBTxnMode,
@@ -720,7 +723,7 @@ pub enum IndexedDBThreadMsg {
     AsyncSchemaOperation {
         origin: ImmutableOrigin,
         database_name: String,
-        store_name: String,
+        store_id: IndexedDBObjectStoreId,
         operation: AsyncSchemaOperation,
         transaction: IndexedDBTxnId,
     },

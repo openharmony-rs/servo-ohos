@@ -8,24 +8,18 @@ use std::collections::{HashMap, HashSet};
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use profile_traits::generic_callback::GenericCallback;
-use profile_traits::generic_channel::channel;
 use script_bindings::cell::DomRefCell;
-use script_bindings::codegen::GenericUnionTypes::StringOrStringSequence;
-use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::{GenericSend, GenericSender, SendError};
 use servo_base::id::ScriptEventLoopId;
 use storage_traits::indexeddb::{
-    BackendError, IndexedDBIndex, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode, KeyPath,
-    SyncOperation, TxnCompleteMsg,
+    BackendError, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId,
+    IndexedDBTxnMode, SyncOperation, TxnCompleteMsg,
 };
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::DOMStringListBinding::DOMStringListMethods;
-use crate::dom::bindings::codegen::Bindings::IDBDatabaseBinding::{
-    IDBObjectStoreParameters, IDBTransactionDurability,
-};
-use crate::dom::bindings::codegen::Bindings::IDBObjectStoreBinding::IDBIndexParameters;
+use crate::dom::bindings::codegen::Bindings::IDBDatabaseBinding::IDBTransactionDurability;
 use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::{
     IDBTransactionMethods, IDBTransactionMode,
 };
@@ -41,7 +35,7 @@ use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbdatabase::IDBDatabase;
-use crate::dom::indexeddb::idbobjectstore::{IDBObjectStore, IDBObjectStoreAbortState};
+use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
 use crate::dom::indexeddb::idbrequest::IDBRequest;
 use crate::dom::indexeddb::key::map_backend_error_to_dom_error;
 
@@ -54,7 +48,9 @@ pub struct IDBTransaction {
     db: Dom<IDBDatabase>,
     error: MutNullableDom<DOMException>,
 
-    store_handles: DomRefCell<HashMap<String, Dom<IDBObjectStore>>>,
+    /// <https://w3c.github.io/IndexedDB/#object-store-handle>: the handles of this transaction,
+    /// by object store, also of stores deleted since.
+    store_handles: DomRefCell<HashMap<IndexedDBObjectStoreId, Dom<IDBObjectStore>>>,
     // https://www.w3.org/TR/IndexedDB-3/#transaction-request-list
     requests: DomRefCell<Vec<Dom<IDBRequest>>>,
     // https://www.w3.org/TR/IndexedDB-3/#transaction-active-flag
@@ -68,7 +64,8 @@ pub struct IDBTransaction {
     version_change_old_version: Cell<Option<u64>>,
     // https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction
     // Step 4. NOTE: This reverts the value of objectStoreNames returned by the IDBDatabase object.
-    version_change_old_object_store_names: DomRefCell<Option<Vec<TracedDOMString>>>,
+    #[no_trace]
+    version_change_old_object_stores: DomRefCell<Option<Vec<IndexedDBObjectStore>>>,
     // https://w3c.github.io/IndexedDB/#transaction-concept
     // “A transaction optionally has a cleanup event loop which is an event loop.”
     #[no_trace]
@@ -114,14 +111,9 @@ impl IDBTransaction {
             committing: Cell::new(false),
             commit_started: Cell::new(false),
             version_change_old_version: Cell::new(None),
-            version_change_old_object_store_names: DomRefCell::new(
-                (mode == IDBTransactionMode::Versionchange).then(|| {
-                    connection
-                        .object_store_names_snapshot()
-                        .into_iter()
-                        .map(|domstring| domstring.traced())
-                        .collect()
-                }),
+            version_change_old_object_stores: DomRefCell::new(
+                (mode == IDBTransactionMode::Versionchange)
+                    .then(|| connection.object_stores_snapshot()),
             ),
             cleanup_event_loop: Cell::new(None),
             registered_in_global: Cell::new(false),
@@ -133,8 +125,8 @@ impl IDBTransaction {
         }
     }
 
-    /// Creates a readonly or readwrite transaction of `connection`, and tells the backend about
-    /// it without waiting for a reply.
+    /// Creates a readonly or readwrite transaction of `connection` with the object stores `scope`,
+    /// whose ids are `scope_ids`, and tells the backend about it without waiting for a reply.
     pub fn new(
         cx: &mut JSContext,
         global: &GlobalScope,
@@ -142,6 +134,7 @@ impl IDBTransaction {
         mode: IDBTransactionMode,
         durability: IDBTransactionDurability,
         scope: &DOMStringList,
+        scope_ids: Vec<IndexedDBObjectStoreId>,
     ) -> DomRoot<IDBTransaction> {
         let id = connection.allocate_transaction_id();
         let backend_mode = match mode {
@@ -149,10 +142,6 @@ impl IDBTransaction {
             IDBTransactionMode::Readwrite => IndexedDBTxnMode::Readwrite,
             IDBTransactionMode::Versionchange => IndexedDBTxnMode::Versionchange,
         };
-        let backend_scope = (0..scope.Length())
-            .filter_map(|i| scope.Item(i))
-            .map(String::from)
-            .collect();
         // https://w3c.github.io/IndexedDB/#transaction-scheduling
         // The backend orders transactions by the arrival of this message, which is sent before
         // any other message about the transaction.
@@ -163,7 +152,7 @@ impl IDBTransaction {
                 db_name: String::from(connection.get_name()),
                 txn: id,
                 mode: backend_mode,
-                scope: backend_scope,
+                scope: scope_ids,
             }))
             .is_err()
         {
@@ -258,21 +247,21 @@ impl IDBTransaction {
         self.version_change_old_version.set(Some(version));
     }
 
-    pub(crate) fn register_object_store_handle(&self, name: &DOMString, store: &IDBObjectStore) {
+    pub(crate) fn register_object_store_handle(&self, store: &IDBObjectStore) {
         self.store_handles
             .borrow_mut()
-            .insert(name.to_string(), Dom::from_ref(store));
+            .insert(store.id(), Dom::from_ref(store));
     }
 
-    pub(crate) fn rename_object_store_handle_cache(
+    /// The handle of the object store `id` in this transaction, if there is one.
+    pub(crate) fn object_store_handle(
         &self,
-        old_name: &TracedDOMString,
-        new_name: &TracedDOMString,
-        store: &IDBObjectStore,
-    ) {
-        let mut store_handles = self.store_handles.borrow_mut();
-        store_handles.remove(&old_name.to_string());
-        store_handles.insert(new_name.to_string(), Dom::from_ref(store));
+        id: IndexedDBObjectStoreId,
+    ) -> Option<DomRoot<IDBObjectStore>> {
+        self.store_handles
+            .borrow()
+            .get(&id)
+            .map(|store| DomRoot::from_ref(&**store))
     }
 
     /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
@@ -481,19 +470,8 @@ impl IDBTransaction {
             // https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction
             // Step 4. Set connection’s object store set to the set of object stores in database if database previously existed,
             // or the empty set if database was newly created.
-            if let Some(names) = self
-                .version_change_old_object_store_names
-                .borrow()
-                .as_ref()
-                .cloned()
-                .map(|domstring_vec| {
-                    domstring_vec
-                        .into_iter()
-                        .map(|domstring| domstring.root())
-                        .collect::<Vec<_>>()
-                })
-            {
-                self.db.restore_object_store_names(names);
+            if let Some(object_stores) = self.version_change_old_object_stores.borrow().clone() {
+                self.db.restore_object_stores(object_stores);
             }
             self.restore_associated_object_store_handles_after_abort(cx);
         }
@@ -624,7 +602,7 @@ impl IDBTransaction {
                 // Step 6: When a transaction is committed or aborted, its state is set to finished.
                 this.finished.set(true);
                 this.version_change_old_version.set(None);
-                this.version_change_old_object_store_names.safe_borrow_mut(cx.no_gc()).take();
+                this.version_change_old_object_stores.safe_borrow_mut(cx.no_gc()).take();
                 this.notify_backend_transaction_finished();
                 if this.registered_in_global.get() {
                     this.global().ensure_indexeddb_factory(cx).unregister_indexeddb_transaction(&this);
@@ -648,7 +626,7 @@ impl IDBTransaction {
                 this.committing.set(false);
                 this.commit_started.set(false);
                 this.version_change_old_version.set(None);
-                this.version_change_old_object_store_names
+                this.version_change_old_object_stores
                     .safe_borrow_mut(cx.no_gc())
                     .take();
                 if this.mode == IDBTransactionMode::Versionchange {
@@ -702,44 +680,6 @@ impl IDBTransaction {
         self.global().storage_threads().sender()
     }
 
-    fn object_store_parameters(
-        &self,
-        object_store_name: &DOMString,
-    ) -> Option<(IDBObjectStoreParameters, Vec<IndexedDBIndex>)> {
-        let global = self.global();
-        let idb_sender = global.storage_threads().sender();
-        let (sender, receiver) =
-            channel(global.time_profiler_chan().clone()).expect("failed to create channel");
-
-        let origin = global.origin().immutable().clone();
-        let db_name = String::from(self.db.get_name());
-        let object_store_name = object_store_name.to_string();
-
-        let operation = SyncOperation::GetObjectStore(sender, origin, db_name, object_store_name);
-
-        let _ = idb_sender.send(IndexedDBThreadMsg::Sync(operation));
-
-        // First unwrap for ipc
-        // Second unwrap will never happen unless this db gets manually deleted somehow
-        let object_store = receiver.recv().ok()?.ok()?;
-
-        // First unwrap for ipc
-        // Second unwrap will never happen unless this db gets manually deleted somehow
-        let key_path = object_store.key_path.map(|key_path| match key_path {
-            KeyPath::String(string) => StringOrStringSequence::String(string.into()),
-            KeyPath::Sequence(seq) => {
-                StringOrStringSequence::StringSequence(seq.into_iter().map(Into::into).collect())
-            },
-        });
-        Some((
-            IDBObjectStoreParameters {
-                autoIncrement: object_store.has_key_generator,
-                keyPath: key_path,
-            },
-            object_store.indexes,
-        ))
-    }
-
     pub(crate) fn create_abort_callback(&self) -> GenericCallback<BackendError> {
         let trusted_transaction = Trusted::new(self);
         let task_source = self
@@ -779,60 +719,30 @@ impl IDBTransactionMethods<crate::DomTypeHolder> for IDBTransaction {
             return Err(Error::InvalidState(None));
         }
 
-        // Step 2: Check that the object store exists in this transaction's scope.
-        // For versionchange transactions, the scope tracks object store changes
-        // performed during the upgrade.
-        let in_scope = if self.mode == IDBTransactionMode::Versionchange {
-            self.db.object_store_exists(&name)
-        } else {
-            self.object_store_names.Contains(name.clone())
-        };
-        if !in_scope {
+        // Step 2: Let store be the object store named name in this’s scope, or throw a
+        // "NotFoundError" DOMException if none.
+        // For versionchange transactions, the scope is the connection's object store set,
+        // which follows the changes of the upgrade.
+        let in_scope = self.mode == IDBTransactionMode::Versionchange ||
+            self.object_store_names.Contains(name.clone());
+        let Some(store) = in_scope
+            .then(|| self.db.object_store_named(&name.str()))
+            .flatten()
+        else {
             return Err(Error::NotFound(None));
-        }
+        };
 
         // Step 3: Each call to this method on the same
         // IDBTransaction instance with the same name
         // returns the same IDBObjectStore instance.
-        if let Some(store) = self.store_handles.borrow().get(&*name.str()) {
-            return Ok(DomRoot::from_ref(store));
+        if let Some(handle) = self.object_store_handle(store.id) {
+            return Ok(handle);
         }
 
-        let parameters = self.object_store_parameters(&name);
-        let store = IDBObjectStore::new(
-            cx,
-            &self.global(),
-            self.db.get_name(),
-            name.clone(),
-            parameters.as_ref().map(|(params, _)| params),
-            IDBObjectStoreAbortState {
-                newly_created_during_transaction: false,
-                rollback_indexes_on_abort: if self.mode == IDBTransactionMode::Versionchange {
-                    parameters
-                        .as_ref()
-                        .map(|(_, indexes)| indexes.clone())
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                },
-            },
-            self,
-        );
-        if let Some(indexes) = parameters.map(|(_, indexes)| indexes) {
-            for index in indexes {
-                store.add_index(
-                    cx,
-                    index.name.into(),
-                    &IDBIndexParameters {
-                        multiEntry: index.multi_entry,
-                        unique: index.unique,
-                    },
-                    index.key_path.into(),
-                );
-            }
-        }
-        self.register_object_store_handle(&name, &store);
-        Ok(store)
+        // Step 4: Return an object store handle associated with store and this.
+        let handle = IDBObjectStore::new(cx, &self.global(), name, &store, self);
+        self.register_object_store_handle(&handle);
+        Ok(handle)
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbtransaction-commit>
@@ -864,9 +774,12 @@ impl IDBTransactionMethods<crate::DomTypeHolder> for IDBTransaction {
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbtransaction-objectstorenames>
     fn ObjectStoreNames(&self, cx: &mut JSContext) -> DomRoot<DOMStringList> {
+        // Step 1. If this’s transaction is an upgrade transaction, return a list of names of the
+        // object stores in this’s connection’s object store set, sorted.
         if self.mode == IDBTransactionMode::Versionchange {
-            self.db.object_stores(cx)
+            self.db.object_store_names(cx)
         } else {
+            // Step 2. Otherwise, return a sorted list of names in this’s scope.
             self.object_store_names.as_rooted()
         }
     }

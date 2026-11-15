@@ -15,7 +15,8 @@ use serde::de::DeserializeOwned;
 use servo_base::threadpool::ThreadPool;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, IndexedDBIndex, IndexedDBTxnId, IndexedDBTxnMode, KeyPath,
+    BackendError, BackendResult, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBTxnId,
+    IndexedDBTxnMode,
 };
 
 use super::executor::{SqlError, SqlExecutor, TransactionBehavior};
@@ -78,14 +79,16 @@ impl<X: SqlExecutor> SqlEngine<X> {
         self.created_db_path
     }
 
-    /// The current number of the key generator of `store_name`, read on the connection after
-    /// the work handed over before, inside the open SQL transaction if there is one.
+    /// The current number of the key generator of the store `store`, read on the connection
+    /// after the work handed over before, inside the open SQL transaction if there is one.
     #[cfg(test)]
-    pub(crate) fn key_generator_current_number(&self, store_name: &str) -> Option<i64> {
-        let store_name = store_name.to_owned();
+    pub(crate) fn key_generator_current_number(
+        &self,
+        store: IndexedDBObjectStoreId,
+    ) -> Option<i64> {
         self.actor
             .call(move |database| {
-                queries::key_generator_current_number(&mut database.executor, &store_name)
+                queries::key_generator_current_number(&mut database.executor, store)
             })
             .and_then(|result| result)
             .unwrap_or_else(|error| {
@@ -493,31 +496,8 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
         });
     }
 
-    fn has_key_generator(&self, store_name: &str) -> bool {
-        lock(&self.metadata)
-            .store(store_name)
-            .is_some_and(|store| store.has_key_generator)
-    }
-
-    fn key_path(&self, store_name: &str) -> Option<KeyPath> {
-        lock(&self.metadata)
-            .store(store_name)
-            .and_then(|store| store.key_path.clone())
-    }
-
-    fn object_store_names(&self) -> Result<Vec<String>, Self::Error> {
-        Ok(lock(&self.metadata)
-            .stores
-            .iter()
-            .map(|store| store.name.clone())
-            .collect())
-    }
-
-    fn indexes(&self, store_name: &str) -> Result<Vec<IndexedDBIndex>, Self::Error> {
-        lock(&self.metadata)
-            .store(store_name)
-            .map(|store| store.indexes.clone())
-            .ok_or(SqlError::MissingRow("object store"))
+    fn object_stores(&self) -> Vec<IndexedDBObjectStore> {
+        lock(&self.metadata).stores.clone()
     }
 
     fn version(&self) -> Result<u64, Self::Error> {
@@ -529,39 +509,16 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
 struct Metadata {
     version: u64,
     /// In the order the stores were created.
-    stores: Vec<StoreMetadata>,
-}
-
-struct StoreMetadata {
-    name: String,
-    key_path: Option<KeyPath>,
-    has_key_generator: bool,
-    indexes: Vec<IndexedDBIndex>,
+    stores: Vec<IndexedDBObjectStore>,
 }
 
 impl Metadata {
     /// Reads the metadata on `executor`, inside its open SQL transaction if there is one.
     fn load<X: SqlExecutor>(executor: &mut X) -> Result<Self, SqlError> {
-        let stores = queries::object_store_names(executor)?
-            .into_iter()
-            .map(|name| {
-                Ok(StoreMetadata {
-                    key_path: queries::key_path(executor, &name)?,
-                    has_key_generator: queries::key_generator_current_number(executor, &name)?
-                        .is_some(),
-                    indexes: queries::indexes(executor, &name)?,
-                    name,
-                })
-            })
-            .collect::<Result<_, SqlError>>()?;
         Ok(Self {
             version: queries::version(executor)?,
-            stores,
+            stores: queries::object_stores(executor)?,
         })
-    }
-
-    fn store(&self, name: &str) -> Option<&StoreMetadata> {
-        self.stores.iter().find(|store| store.name == name)
     }
 }
 
@@ -620,26 +577,17 @@ fn schema_reply(
 }
 
 /// Runs a request and replies to it. A request that fails before reading or writing anything,
-/// such as one for a missing object store, fails only itself.
+/// such as one for a missing object store, fails only itself; a schema operation that fails
+/// fails its transaction.
 fn run_request<X: SqlExecutor>(executor: &mut X, request: KvsOperation) -> Option<Failure> {
-    let KvsOperation {
-        store_name,
-        operation,
-    } = request;
+    let KvsOperation { store, operation } = request;
 
-    // Runs before the store lookup below, because the store it creates does not exist yet.
-    if let AsyncOperation::Schema(AsyncSchemaOperation::CreateObjectStore {
-        callback,
-        key_path,
-        auto_increment,
-    }) = operation
-    {
-        let result =
-            queries::create_object_store(executor, &store_name, key_path.as_ref(), auto_increment);
-        return schema_reply(&callback, result.map(|_| ()));
-    }
+    let operation = match operation {
+        AsyncOperation::Schema(operation) => return run_schema(executor, store, operation),
+        operation => operation,
+    };
 
-    let store = match queries::object_store(executor, &store_name) {
+    let store = match queries::object_store(executor, store) {
         Ok(Some(store)) => store,
         Ok(None) => {
             operation.notify_error(BackendError::StoreNotFound);
@@ -655,7 +603,7 @@ fn run_request<X: SqlExecutor>(executor: &mut X, request: KvsOperation) -> Optio
     match operation {
         AsyncOperation::ReadOnly(operation) => run_read_only(executor, &store, operation),
         AsyncOperation::ReadWrite(operation) => run_read_write(executor, &store, operation),
-        AsyncOperation::Schema(operation) => run_schema(executor, &store_name, operation),
+        AsyncOperation::Schema(_) => unreachable!("Schema operations run above"),
     }
 }
 
@@ -756,13 +704,30 @@ fn run_read_write<X: SqlExecutor>(
 
 fn run_schema<X: SqlExecutor>(
     executor: &mut X,
-    store_name: &str,
+    store: IndexedDBObjectStoreId,
     operation: AsyncSchemaOperation,
 ) -> Option<Failure> {
     let (callback, result) = match operation {
+        AsyncSchemaOperation::CreateObjectStore {
+            callback,
+            name,
+            key_path,
+            auto_increment,
+        } => (
+            callback,
+            queries::create_object_store(executor, store, &name, key_path.as_ref(), auto_increment),
+        ),
+        AsyncSchemaOperation::DeleteObjectStore { callback } => {
+            (callback, queries::delete_object_store(executor, store))
+        },
+        AsyncSchemaOperation::RenameObjectStore { callback, new_name } => (
+            callback,
+            queries::rename_object_store(executor, store, &new_name),
+        ),
         AsyncSchemaOperation::CreateIndex {
             callback,
-            index_name,
+            index_id,
+            name,
             key_path,
             unique,
             multi_entry,
@@ -770,34 +735,24 @@ fn run_schema<X: SqlExecutor>(
             callback,
             queries::create_index(
                 executor,
-                store_name,
-                &index_name,
+                store,
+                index_id,
+                &name,
                 &key_path,
                 unique,
                 multi_entry,
-            )
-            .map(|_| ()),
+            ),
         ),
         AsyncSchemaOperation::RenameIndex {
             callback,
-            index_name,
+            index_id,
             new_name,
         } => (
             callback,
-            queries::rename_index(executor, store_name, &index_name, &new_name),
+            queries::rename_index(executor, store, index_id, &new_name),
         ),
-        AsyncSchemaOperation::DeleteIndex {
-            callback,
-            index_name,
-        } => (
-            callback,
-            queries::delete_index(executor, store_name, &index_name),
-        ),
-        AsyncSchemaOperation::DeleteObjectStore { callback } => {
-            (callback, queries::delete_object_store(executor, store_name))
-        },
-        AsyncSchemaOperation::CreateObjectStore { .. } => {
-            unreachable!("Should be handled above");
+        AsyncSchemaOperation::DeleteIndex { callback, index_id } => {
+            (callback, queries::delete_index(executor, store, index_id))
         },
     };
     schema_reply(&callback, result)

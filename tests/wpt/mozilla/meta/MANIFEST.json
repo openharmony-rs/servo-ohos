@@ -11685,6 +11685,69 @@
       null,
       {}
      ]
+    ],
+    "upgrade-metadata-by-id.any.js": [
+     "8da07ef7c26414dfc154868aa33032afd3af6d52",
+     [
+      "IndexedDB/upgrade-metadata-by-id.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: object stores and indexes keep their identity through renames and deletes"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/upgrade-metadata-by-id.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: object stores and indexes keep their identity through renames and deletes"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/upgrade-metadata-by-id.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: object stores and indexes keep their identity through renames and deletes"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/upgrade-metadata-by-id.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: object stores and indexes keep their identity through renames and deletes"
+        ]
+       ]
+      }
+     ]
     ]
    },
    "accessibility-tree": {

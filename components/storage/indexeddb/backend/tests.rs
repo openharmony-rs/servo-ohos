@@ -15,8 +15,8 @@ use servo_base::threadpool::ThreadPool;
 use servo_url::ImmutableOrigin;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, CreateObjectResult, IndexedDBKeyRange, IndexedDBKeyType,
-    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
+    BackendError, BackendResult, IndexedDBIndex, IndexedDBKeyRange, IndexedDBKeyType,
+    IndexedDBObjectStore, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
 };
 use tempfile::TempDir;
 use url::Host;
@@ -29,7 +29,7 @@ use super::executor::{
 };
 use super::queries;
 use super::schema::{self, SCHEMA_VERSION};
-use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction};
+use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction, encoding};
 use crate::indexeddb::{BackendErrorMapper, IndexedDBDescription};
 
 /// Defines a `#[test]` for every executor compiled in, for each of the given generic functions,
@@ -85,6 +85,7 @@ executor_tests!(
     test_key_path,
     test_delete_store,
     test_delete_store_removes_store_records,
+    test_metadata_snapshot_and_renames,
     test_async_operations,
     test_delete_item_range_respects_open_bounds,
     test_failed_write_fails_the_transaction,
@@ -95,6 +96,7 @@ executor_tests!(
     test_failed_add_changes_nothing,
     test_abort_reverts_the_key_generator,
     test_abort_rolls_back_data_schema_and_version,
+    test_invalid_schema_operation_fails_the_transaction,
     test_transaction_spanning_batches_commits_atomically,
     test_requests_run_in_order,
     test_two_databases_progress_independently,
@@ -110,6 +112,9 @@ executor_tests!(
 );
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The id of the first store created in a database, which the tests name "test_store".
+const TEST_STORE: i64 = 1;
 
 /// The transaction numbered `serial` of a test connection.
 pub(crate) fn txn(serial: u64) -> IndexedDBTxnId {
@@ -169,41 +174,67 @@ fn in_own_transaction<X: SqlExecutor, T>(
     result
 }
 
+/// The id after the largest in the `id` column of `table`, as script gives a new store or index.
+fn next_id<X: SqlExecutor>(executor: &mut X, table: &str) -> Result<i64, SqlError> {
+    Ok(query_row(
+        executor,
+        &format!("SELECT MAX(id) FROM {table}"),
+        &[],
+        |row| row.optional_integer(0),
+    )?
+    .flatten()
+    .unwrap_or(0) +
+        1)
+}
+
+/// Creates the store `store_name` with the next id, and returns the id.
 fn create_store<X: SqlExecutor>(
     db: &SqlEngine<X>,
     store_name: &str,
     key_path: Option<KeyPath>,
     auto_increment: bool,
-) -> Result<CreateObjectResult, SqlError> {
+) -> Result<i64, SqlError> {
     in_own_transaction(db, |executor| {
-        queries::create_object_store(executor, store_name, key_path.as_ref(), auto_increment)
+        let id = next_id(executor, "object_store")?;
+        queries::create_object_store(executor, id, store_name, key_path.as_ref(), auto_increment)?;
+        Ok(id)
     })
 }
 
-fn delete_store<X: SqlExecutor>(db: &SqlEngine<X>, store_name: &str) -> Result<(), SqlError> {
-    in_own_transaction(db, |executor| {
-        queries::delete_object_store(executor, store_name)
-    })
+fn delete_store<X: SqlExecutor>(db: &SqlEngine<X>, store: i64) -> Result<(), SqlError> {
+    in_own_transaction(db, |executor| queries::delete_object_store(executor, store))
 }
 
+/// Creates the index `index_name` of `store` with the next id, and returns the id.
 fn create_index<X: SqlExecutor>(
     db: &SqlEngine<X>,
-    store_name: &str,
+    store: i64,
     index_name: String,
     key_path: KeyPath,
     unique: bool,
     multi_entry: bool,
-) -> Result<CreateObjectResult, SqlError> {
+) -> Result<i64, SqlError> {
     in_own_transaction(db, |executor| {
+        let id = next_id(executor, "object_store_index")?;
         queries::create_index(
             executor,
-            store_name,
+            store,
+            id,
             &index_name,
             &key_path,
             unique,
             multi_entry,
-        )
+        )?;
+        Ok(id)
     })
+}
+
+/// The names of the stores in the engine's committed metadata.
+fn store_names<X: SqlExecutor>(db: &SqlEngine<X>) -> Vec<String> {
+    db.object_stores()
+        .into_iter()
+        .map(|store| store.name)
+        .collect()
 }
 
 fn set_version<X: SqlExecutor>(db: &SqlEngine<X>, version: u64) -> Result<(), SqlError> {
@@ -580,7 +611,7 @@ fn schema_version_is_stamped_on_a_new_database<X: SqlExecutor>() {
     assert!(db.created_db_path());
     assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
     assert_eq!(db.version().unwrap(), 0);
-    assert!(db.object_store_names().unwrap().is_empty());
+    assert!(store_names(&db).is_empty());
 }
 
 fn schema_version_match_keeps_the_database<X: SqlExecutor>() {
@@ -592,7 +623,7 @@ fn schema_version_match_keeps_the_database<X: SqlExecutor>() {
 
     let db = open_engine_in::<X>(dir.path(), false);
     assert!(!db.created_db_path());
-    assert_eq!(db.object_store_names().unwrap(), vec!["store".to_owned()]);
+    assert_eq!(store_names(&db), vec!["store".to_owned()]);
     assert_eq!(db.version().unwrap(), 3);
     assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
 }
@@ -615,7 +646,7 @@ fn schema_version_mismatch_resets_the_database<X: SqlExecutor>() {
 
         let db = open_engine_in::<X>(dir.path(), false);
         assert!(db.created_db_path(), "stored version {stored_version}");
-        assert!(db.object_store_names().unwrap().is_empty());
+        assert!(store_names(&db).is_empty());
         assert_eq!(db.version().unwrap(), 0);
         assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
         assert!(
@@ -664,7 +695,7 @@ fn schema_reset_that_keeps_the_old_database_fails<X: SqlExecutor>() {
     faults_for(dir.path()).lock().unwrap().keep_on_delete = false;
     let db = open_engine_in::<Faulty<X>>(dir.path(), false);
     assert!(db.created_db_path());
-    assert!(db.object_store_names().unwrap().is_empty());
+    assert!(store_names(&db).is_empty());
 }
 
 fn test_cycle<X: SqlExecutor>() {
@@ -689,28 +720,27 @@ fn test_cycle<X: SqlExecutor>() {
 fn test_create_store<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
-    let store_name = "test_store";
-    let result = create_store(&db, store_name, None, true);
-    assert!(result.is_ok());
-    let create_result = result.unwrap();
-    assert_eq!(create_result, CreateObjectResult::Created);
-    // Try to create the same store again
-    let result = create_store(&db, store_name, None, false);
-    assert!(result.is_ok());
-    let create_result = result.unwrap();
-    assert_eq!(create_result, CreateObjectResult::AlreadyExists);
+    let store = create_store(&db, "test_store", None, true).unwrap();
+    assert_eq!(store, 1);
+    // A second store of the same name, or one with an id that isn't new, is refused.
+    assert!(matches!(
+        create_store(&db, "test_store", None, false),
+        Err(SqlError::InvalidMetadata(_))
+    ));
+    let reused_id = in_own_transaction(&db, |executor| {
+        queries::create_object_store(executor, store, "other", None, false)
+    });
+    assert!(matches!(reused_id, Err(SqlError::InvalidMetadata(_))));
     // Ensure store was not overwritten
-    assert!(db.key_generator_current_number(store_name).is_some());
+    assert!(db.key_generator_current_number(store).is_some());
+    assert_eq!(store_names(&db), vec!["test_store".to_owned()]);
 }
 
 fn test_create_store_empty_name<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
-    let store_name = "";
-    let result = create_store(&db, store_name, None, true);
-    assert!(result.is_ok());
-    let create_result = result.unwrap();
-    assert_eq!(create_result, CreateObjectResult::Created);
+    create_store(&db, "", None, true).unwrap();
+    assert_eq!(store_names(&db), vec![String::new()]);
 }
 
 fn test_injection<X: SqlExecutor>() {
@@ -718,18 +748,12 @@ fn test_injection<X: SqlExecutor>() {
     let db = open_engine::<X>(&dir);
     // Create a normal store
     let store_name1 = "test_store";
-    let result = create_store(&db, store_name1, None, true);
-    assert!(result.is_ok());
-    let create_result = result.unwrap();
-    assert_eq!(create_result, CreateObjectResult::Created);
+    create_store(&db, store_name1, None, true).unwrap();
     // Injection
     let store_name2 = "' OR 1=1 -- -";
-    let result = create_store(&db, store_name2, None, false);
-    assert!(result.is_ok());
-    let create_result = result.unwrap();
-    assert_eq!(create_result, CreateObjectResult::Created);
+    create_store(&db, store_name2, None, false).unwrap();
     assert_eq!(
-        db.object_store_names().unwrap(),
+        store_names(&db),
         vec![store_name1.to_owned(), store_name2.to_owned()]
     );
 }
@@ -737,34 +761,220 @@ fn test_injection<X: SqlExecutor>() {
 fn test_key_path<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
-    let store_name = "test_store";
-    let result = create_store(
-        &db,
-        store_name,
-        Some(KeyPath::String("test".to_string())),
-        true,
-    );
-    assert!(result.is_ok());
-    assert_eq!(
-        db.key_path(store_name),
-        Some(KeyPath::String("test".to_string()))
-    );
-    assert_eq!(db.key_path("missing"), None);
+    let key_path = Some(KeyPath::String("test".to_string()));
+    let store = create_store(&db, "test_store", key_path.clone(), true).unwrap();
+    let stores = db.object_stores();
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].id, store);
+    assert_eq!(stores[0].key_path, key_path);
+    assert!(stores[0].has_key_generator);
 }
 
 fn test_delete_store<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
-    create_store(&db, "test_store", None, false).expect("Failed to create store");
+    let store = create_store(&db, "test_store", None, false).expect("Failed to create store");
     // Delete the store
-    delete_store(&db, "test_store").expect("Failed to delete store");
-    // Try to delete the same store again
-    let result = delete_store(&db, "test_store");
-    assert!(result.is_err());
-    // Try to delete a non-existing store
-    let result = delete_store(&db, "test_store");
-    // Should work as per spec
-    assert!(result.is_err());
+    delete_store(&db, store).expect("Failed to delete store");
+    // A store that doesn't exist can't be deleted.
+    assert!(delete_store(&db, store).is_err());
+    assert!(store_names(&db).is_empty());
+}
+
+/// The metadata snapshot has every store and index with its id, in the order of creation; a
+/// renamed store keeps its id, records and indexes, and a deleted index takes its records along.
+fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let books = create_store(&db, "books", Some(KeyPath::String("isbn".to_owned())), true).unwrap();
+    let authors = create_store(&db, "authors", None, false).unwrap();
+    let by_title = create_index(
+        &db,
+        books,
+        "by_title".to_owned(),
+        KeyPath::String("title".to_owned()),
+        true,
+        false,
+    )
+    .unwrap();
+    let by_name = create_index(
+        &db,
+        authors,
+        "by_name".to_owned(),
+        KeyPath::Sequence(vec!["first".to_owned(), "last".to_owned()]),
+        false,
+        false,
+    )
+    .unwrap();
+    let by_author = create_index(
+        &db,
+        books,
+        "by_author".to_owned(),
+        KeyPath::String("author".to_owned()),
+        false,
+        true,
+    )
+    .unwrap();
+    assert_eq!((books, authors), (1, 2));
+    assert_eq!((by_title, by_name, by_author), (1, 2, 3));
+    let index = |id, name: &str, key_path: KeyPath, unique, multi_entry| IndexedDBIndex {
+        id,
+        name: name.to_owned(),
+        key_path,
+        unique,
+        multi_entry,
+    };
+    assert_eq!(
+        db.object_stores(),
+        vec![
+            IndexedDBObjectStore {
+                id: books,
+                name: "books".to_owned(),
+                key_path: Some(KeyPath::String("isbn".to_owned())),
+                has_key_generator: true,
+                indexes: vec![
+                    index(
+                        by_title,
+                        "by_title",
+                        KeyPath::String("title".to_owned()),
+                        true,
+                        false
+                    ),
+                    index(
+                        by_author,
+                        "by_author",
+                        KeyPath::String("author".to_owned()),
+                        false,
+                        true
+                    ),
+                ],
+            },
+            IndexedDBObjectStore {
+                id: authors,
+                name: "authors".to_owned(),
+                key_path: None,
+                has_key_generator: false,
+                indexes: vec![index(
+                    by_name,
+                    "by_name",
+                    KeyPath::Sequence(vec!["first".to_owned(), "last".to_owned()]),
+                    false,
+                    false
+                )],
+            },
+        ]
+    );
+
+    in_own_transaction(&db, |executor| {
+        let store = queries::object_store(executor, books)?.unwrap();
+        queries::put_record(executor, &store, None, &[7], false)?;
+        executor.execute(
+            "INSERT INTO index_data (index_id, value, object_data_key, object_store_id) \
+             VALUES (?, ?, ?, ?)",
+            &[
+                SqlParam::Integer(by_author),
+                SqlParam::Blob(&[1]),
+                SqlParam::Blob(&encoding::serialize(&IndexedDBKeyType::Number(1.0))),
+                SqlParam::Integer(books),
+            ],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    // Swap the names of the two stores and of two indexes, as script does it.
+    in_own_transaction(&db, |executor| {
+        queries::rename_object_store(executor, books, "tmp")?;
+        queries::rename_object_store(executor, authors, "books")?;
+        queries::rename_object_store(executor, books, "authors")?;
+        queries::rename_index(executor, books, by_title, "tmp")?;
+        queries::rename_index(executor, books, by_author, "by_title")?;
+        queries::rename_index(executor, books, by_title, "by_author")
+    })
+    .unwrap();
+    let stores = db.object_stores();
+    assert_eq!(
+        (
+            stores[0].id,
+            stores[0].name.as_str(),
+            stores[1].name.as_str()
+        ),
+        (books, "authors", "books")
+    );
+    assert_eq!(
+        stores[0]
+            .indexes
+            .iter()
+            .map(|index| (index.id, index.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(by_title, "by_author"), (by_author, "by_title")]
+    );
+    assert_eq!(stored_keys(&db, books), number_keys([1]));
+    assert_eq!(db.key_generator_current_number(books), Some(2));
+
+    // A name in use, a missing store or index, and an index of another store are refused.
+    for result in [
+        in_own_transaction(&db, |executor| {
+            queries::rename_object_store(executor, books, "books")
+        }),
+        in_own_transaction(&db, |executor| {
+            queries::rename_object_store(executor, 9, "other")
+        }),
+        in_own_transaction(&db, |executor| {
+            queries::rename_index(executor, books, by_title, "by_title")
+        }),
+        in_own_transaction(&db, |executor| {
+            queries::rename_index(executor, authors, by_title, "other")
+        }),
+        in_own_transaction(&db, |executor| {
+            queries::delete_index(executor, authors, by_title)
+        }),
+        in_own_transaction(&db, |executor| {
+            queries::create_index(
+                executor,
+                books,
+                by_author,
+                "new",
+                &KeyPath::String("new".to_owned()),
+                false,
+                false,
+            )
+        }),
+        in_own_transaction(&db, |executor| {
+            queries::create_index(
+                executor,
+                9,
+                9,
+                "new",
+                &KeyPath::String("new".to_owned()),
+                false,
+                false,
+            )
+        }),
+    ] {
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    in_own_transaction(&db, |executor| {
+        queries::delete_index(executor, books, by_author)
+    })
+    .unwrap();
+    let index_rows = query_row(
+        &mut *db.connection(),
+        "SELECT COUNT(*) FROM index_data WHERE index_id = ?",
+        &[SqlParam::Integer(by_author)],
+        |row| row.integer(0),
+    )
+    .unwrap();
+    assert_eq!(index_rows, Some(0));
+    assert_eq!(
+        db.object_stores()[0]
+            .indexes
+            .iter()
+            .map(|index| index.id)
+            .collect::<Vec<_>>(),
+        vec![by_title]
+    );
 }
 
 fn record_count<X: SqlExecutor>(executor: &mut X, store_id: i64) -> i64 {
@@ -782,10 +992,10 @@ fn test_delete_store_removes_store_records<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
 
-    create_store(&db, "test_store", None, false).expect("Failed to create store");
+    let store = create_store(&db, "test_store", None, false).expect("Failed to create store");
     let store_id = {
         let mut connection = db.connection();
-        let object_store = queries::object_store(&mut *connection, "test_store")
+        let object_store = queries::object_store(&mut *connection, store)
             .expect("Failed to fetch store metadata")
             .expect("The store should exist");
         queries::put_record(
@@ -800,7 +1010,7 @@ fn test_delete_store_removes_store_records<X: SqlExecutor>() {
         object_store.id
     };
 
-    delete_store(&db, "test_store").expect("Failed to delete store");
+    delete_store(&db, store).expect("Failed to delete store");
 
     assert_eq!(record_count(&mut *db.connection(), store_id), 0);
 }
@@ -820,22 +1030,19 @@ where
     (callback, receiver)
 }
 
-fn request(store_name: &str, operation: AsyncOperation) -> KvsOperation {
-    KvsOperation {
-        store_name: store_name.to_owned(),
-        operation,
-    }
+fn request(store: i64, operation: AsyncOperation) -> KvsOperation {
+    KvsOperation { store, operation }
 }
 
 fn put_request(
-    store_name: &str,
+    store: i64,
     callback: GenericCallback<BackendResult<PutItemResult>>,
     key: IndexedDBKeyType,
     value: Vec<u8>,
     should_overwrite: bool,
 ) -> KvsOperation {
     request(
-        store_name,
+        store,
         AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
             callback,
             key: Some(key),
@@ -846,11 +1053,11 @@ fn put_request(
 }
 
 /// Runs `puts` (an explicit key or `None` for a generated one, and the value) in order as one
-/// batch of the readwrite `transaction` on `store_name`, and returns their replies.
+/// batch of the readwrite `transaction` on `store`, and returns their replies.
 fn run_puts<X: SqlExecutor>(
     db: &SqlEngine<X>,
     transaction: u64,
-    store_name: &str,
+    store: i64,
     puts: Vec<(Option<IndexedDBKeyType>, Vec<u8>)>,
     should_overwrite: bool,
 ) -> Vec<BackendResult<PutItemResult>> {
@@ -864,7 +1071,7 @@ fn run_puts<X: SqlExecutor>(
                 value,
                 should_overwrite,
             });
-            (request(store_name, operation), receiver)
+            (request(store, operation), receiver)
         })
         .unzip();
     run_batch(db, transaction, IndexedDBTxnMode::Readwrite, requests);
@@ -928,11 +1135,9 @@ fn abort<X: SqlExecutor>(db: &SqlEngine<X>, transaction: u64) {
         .expect("The abort should complete");
 }
 
-/// The keys of the store `store_name`, read on `executor`.
-fn keys_of<X: SqlExecutor>(executor: &mut X, store_name: &str) -> Vec<IndexedDBKeyType> {
-    let store = queries::object_store(executor, store_name)
-        .unwrap()
-        .unwrap();
+/// The keys of the store `store`, read on `executor`.
+fn keys_of<X: SqlExecutor>(executor: &mut X, store: i64) -> Vec<IndexedDBKeyType> {
+    let store = queries::object_store(executor, store).unwrap().unwrap();
     queries::get_all_keys(executor, &store, &IndexedDBKeyRange::default(), None).unwrap()
 }
 
@@ -965,8 +1170,7 @@ fn recv<T>(receiver: &mpsc::Receiver<T>) -> T {
 fn test_async_operations<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
-    let store_name = "test_store";
-    create_store(&db, store_name, None, false).expect("Failed to create store");
+    let store_id = create_store(&db, "test_store", None, false).expect("Failed to create store");
     let put = get_callback();
     let put2 = get_callback();
     let put3 = get_callback();
@@ -984,21 +1188,21 @@ fn test_async_operations<X: SqlExecutor>() {
         IndexedDBTxnMode::Readwrite,
         vec![
             put_request(
-                store_name,
+                store_id,
                 put.0,
                 IndexedDBKeyType::Number(1.0),
                 vec![1, 2, 3],
                 false,
             ),
             put_request(
-                store_name,
+                store_id,
                 put2.0,
                 IndexedDBKeyType::String("2.0".to_string()),
                 vec![4, 5, 6],
                 false,
             ),
             put_request(
-                store_name,
+                store_id,
                 put3.0,
                 IndexedDBKeyType::Array(vec![
                     IndexedDBKeyType::String("3".to_string()),
@@ -1009,35 +1213,35 @@ fn test_async_operations<X: SqlExecutor>() {
             ),
             // Try to put a duplicate key without overwrite
             put_request(
-                store_name,
+                store_id,
                 put_dup.0,
                 IndexedDBKeyType::Number(1.0),
                 vec![10, 11, 12],
                 false,
             ),
             put_request(
-                store_name,
+                store_id,
                 put_overwrite.0,
                 IndexedDBKeyType::Number(1.0),
                 vec![13, 14, 15],
                 true,
             ),
             request(
-                store_name,
+                store_id,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
                     callback: get_item_some.0,
                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
                 }),
             ),
             request(
-                store_name,
+                store_id,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
                     callback: get_item_none.0,
                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(5.0)),
                 }),
             ),
             request(
-                store_name,
+                store_id,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
                     callback: get_all_items.0,
                     key_range: IndexedDBKeyRange::lower_bound(IndexedDBKeyType::Number(0.0), false),
@@ -1045,21 +1249,21 @@ fn test_async_operations<X: SqlExecutor>() {
                 }),
             ),
             request(
-                store_name,
+                store_id,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
                     callback: count.0,
                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
                 }),
             ),
             request(
-                store_name,
+                store_id,
                 AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
                     callback: remove.0,
                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
                 }),
             ),
             request(
-                store_name,
+                store_id,
                 AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear(clear.0)),
             ),
         ],
@@ -1109,10 +1313,10 @@ fn test_delete_item_range_respects_open_bounds<X: SqlExecutor>() {
     ) -> Vec<i32> {
         let dir = tempfile::tempdir().unwrap();
         let db = open_engine::<X>(&dir);
-        let store_name = "test_store";
-        create_store(&db, store_name, None, false).expect("Failed to create store");
+        let store_id =
+            create_store(&db, "test_store", None, false).expect("Failed to create store");
         let mut connection = db.connection();
-        let store = queries::object_store(&mut *connection, store_name)
+        let store = queries::object_store(&mut *connection, store_id)
             .expect("Failed to get object store")
             .expect("The store should exist");
 
@@ -1172,8 +1376,8 @@ fn test_delete_item_range_respects_open_bounds<X: SqlExecutor>() {
     );
 }
 
-fn stored_keys<X: SqlExecutor>(db: &SqlEngine<X>, store_name: &str) -> Vec<IndexedDBKeyType> {
-    keys_of(&mut *db.connection(), store_name)
+fn stored_keys<X: SqlExecutor>(db: &SqlEngine<X>, store: i64) -> Vec<IndexedDBKeyType> {
+    keys_of(&mut *db.connection(), store)
 }
 
 /// The version and the object store names in the database, also inside its open SQL
@@ -1184,7 +1388,11 @@ pub(crate) fn stored_version_and_store_names<X: SqlExecutor>(
     let mut connection = db.connection();
     (
         queries::version(&mut *connection).unwrap(),
-        queries::object_store_names(&mut *connection).unwrap(),
+        queries::object_stores(&mut *connection)
+            .unwrap()
+            .into_iter()
+            .map(|store| store.name)
+            .collect(),
     )
 }
 
@@ -1193,19 +1401,21 @@ pub(crate) fn stored_version_and_store_names<X: SqlExecutor>(
 fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
-    let store_name = "test_store";
-    create_store(&db, store_name, None, false).unwrap();
-    for index_name in ["a", "b"] {
-        create_index(
-            &db,
-            store_name,
-            index_name.to_owned(),
-            KeyPath::String(index_name.to_owned()),
-            false,
-            false,
-        )
-        .unwrap();
-    }
+    let store_id = create_store(&db, "test_store", None, false).unwrap();
+    let index_ids: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|index_name| {
+            create_index(
+                &db,
+                store_id,
+                index_name.to_owned(),
+                KeyPath::String(index_name.to_owned()),
+                false,
+                false,
+            )
+            .unwrap()
+        })
+        .collect();
 
     let put = get_callback();
     let rename = get_callback();
@@ -1216,7 +1426,7 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
         IndexedDBTxnMode::Versionchange,
         vec![
             put_request(
-                store_name,
+                store_id,
                 put.0,
                 IndexedDBKeyType::Number(1.0),
                 vec![1],
@@ -1224,15 +1434,15 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
             ),
             // Index names are unique per store, so this fails in the database.
             request(
-                store_name,
+                store_id,
                 AsyncOperation::Schema(AsyncSchemaOperation::RenameIndex {
                     callback: rename.0,
-                    index_name: "a".to_owned(),
+                    index_id: index_ids[0],
                     new_name: "b".to_owned(),
                 }),
             ),
             put_request(
-                store_name,
+                store_id,
                 put_after.0,
                 IndexedDBKeyType::Number(2.0),
                 vec![2],
@@ -1253,7 +1463,7 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
         1,
         IndexedDBTxnMode::Versionchange,
         vec![put_request(
-            store_name,
+            store_id,
             put_later.0,
             IndexedDBKeyType::Number(3.0),
             vec![3],
@@ -1263,12 +1473,11 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
     assert!(recv(&put_later.1).is_err());
     assert!(commit(&db, 1).is_err());
 
-    assert_eq!(stored_keys(&db, store_name), vec![]);
-    let index_names: Vec<String> = db
-        .indexes(store_name)
-        .unwrap()
-        .into_iter()
-        .map(|index| index.name)
+    assert_eq!(stored_keys(&db, store_id), vec![]);
+    let index_names: Vec<String> = db.object_stores()[0]
+        .indexes
+        .iter()
+        .map(|index| index.name.clone())
         .collect();
     assert_eq!(index_names, vec!["a".to_owned(), "b".to_owned()]);
 }
@@ -1277,8 +1486,7 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
 fn test_missing_store_fails_only_its_request<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
-    let store_name = "test_store";
-    create_store(&db, store_name, None, false).unwrap();
+    let store_id = create_store(&db, "test_store", None, false).unwrap();
 
     let missing = get_callback();
     let put = get_callback();
@@ -1288,14 +1496,14 @@ fn test_missing_store_fails_only_its_request<X: SqlExecutor>() {
         IndexedDBTxnMode::Readwrite,
         vec![
             put_request(
-                "missing",
+                store_id + 1,
                 missing.0,
                 IndexedDBKeyType::Number(1.0),
                 vec![1],
                 false,
             ),
             put_request(
-                store_name,
+                store_id,
                 put.0,
                 IndexedDBKeyType::Number(2.0),
                 vec![2],
@@ -1310,7 +1518,7 @@ fn test_missing_store_fails_only_its_request<X: SqlExecutor>() {
         Ok(PutItemResult::Key(IndexedDBKeyType::Number(2.0)))
     );
     assert_eq!(commit(&db, 1), Ok(()));
-    assert_eq!(stored_keys(&db, store_name), number_keys([2]));
+    assert_eq!(stored_keys(&db, store_id), number_keys([2]));
 }
 
 /// <https://w3c.github.io/IndexedDB/#key-generator-construct>: generated keys start at 1 and
@@ -1325,7 +1533,7 @@ fn test_key_generator_follows_generated_and_explicit_keys<X: SqlExecutor>() {
     let replies = run_puts(
         &db,
         1,
-        "test_store",
+        TEST_STORE,
         vec![
             (None, vec![1]),
             (None, vec![2]),
@@ -1360,7 +1568,7 @@ fn test_key_generator_follows_generated_and_explicit_keys<X: SqlExecutor>() {
             .all(|reply| matches!(reply, Ok(PutItemResult::Key(_))))
     );
     assert_eq!(commit(&db, 1), Ok(()));
-    assert_eq!(db.key_generator_current_number("test_store"), Some(1006));
+    assert_eq!(db.key_generator_current_number(TEST_STORE), Some(1006));
 }
 
 /// A key generator whose current number is above 2^53 fails to generate keys, which fails only
@@ -1374,7 +1582,7 @@ fn test_key_generator_generates_up_to_2_pow_53<X: SqlExecutor>() {
     let replies = run_puts(
         &db,
         1,
-        "test_store",
+        TEST_STORE,
         vec![
             (Some(IndexedDBKeyType::Number(max - 1.0)), vec![1]),
             (None, vec![2]),
@@ -1390,7 +1598,7 @@ fn test_key_generator_generates_up_to_2_pow_53<X: SqlExecutor>() {
     assert_eq!(replies[4], Ok(PutItemResult::KeyGeneratorExhausted));
     assert_eq!(commit(&db, 1), Ok(()));
     assert_eq!(
-        stored_keys(&db, "test_store"),
+        stored_keys(&db, TEST_STORE),
         vec![
             IndexedDBKeyType::Number(2.0),
             IndexedDBKeyType::Number(max - 1.0),
@@ -1398,7 +1606,7 @@ fn test_key_generator_generates_up_to_2_pow_53<X: SqlExecutor>() {
         ]
     );
     assert_eq!(
-        db.key_generator_current_number("test_store"),
+        db.key_generator_current_number(TEST_STORE),
         Some((1 << 53) + 1)
     );
 }
@@ -1421,12 +1629,11 @@ fn test_large_explicit_keys_and_the_key_generator<X: SqlExecutor>() {
         f64::NEG_INFINITY,
     ];
     for (transaction, key) in (1..).zip(keys) {
-        let store_name = format!("store {key}");
-        create_store(&db, &store_name, None, true).unwrap();
+        let store = create_store(&db, &format!("store {key}"), None, true).unwrap();
         let replies = run_puts(
             &db,
             transaction,
-            &store_name,
+            store,
             vec![
                 (Some(IndexedDBKeyType::Number(key)), vec![1]),
                 (None, vec![2]),
@@ -1448,13 +1655,13 @@ fn test_failed_add_changes_nothing<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
     create_store(&db, "test_store", None, true).unwrap();
-    let replies = run_puts(&db, 1, "test_store", vec![(None, vec![1])], false);
+    let replies = run_puts(&db, 1, TEST_STORE, vec![(None, vec![1])], false);
     assert_eq!(replies[0], key_reply(1.0));
 
     let replies = run_puts(
         &db,
         1,
-        "test_store",
+        TEST_STORE,
         vec![
             (Some(IndexedDBKeyType::Number(1.0)), vec![2]),
             (None, vec![3]),
@@ -1473,7 +1680,7 @@ fn test_failed_add_changes_nothing<X: SqlExecutor>() {
         vec![get_request(get.0, 1.0)],
     );
     assert_eq!(recv(&get.1), Ok(Some(stored_value(1.0, vec![1]))));
-    assert_eq!(db.key_generator_current_number("test_store"), Some(3));
+    assert_eq!(db.key_generator_current_number(TEST_STORE), Some(3));
 }
 
 /// Aborting a transaction reverts what its generated and its explicit keys did to the key
@@ -1486,7 +1693,7 @@ fn test_abort_reverts_the_key_generator<X: SqlExecutor>() {
     let replies = run_puts(
         &db,
         1,
-        "test_store",
+        TEST_STORE,
         vec![
             (None, vec![1]),
             (Some(IndexedDBKeyType::Number(10.0)), vec![2]),
@@ -1496,12 +1703,12 @@ fn test_abort_reverts_the_key_generator<X: SqlExecutor>() {
     );
     assert_eq!(replies[2], key_reply(11.0));
     abort(&db, 1);
-    assert_eq!(db.key_generator_current_number("test_store"), Some(1));
+    assert_eq!(db.key_generator_current_number(TEST_STORE), Some(1));
 
-    let replies = run_puts(&db, 2, "test_store", vec![(None, vec![4])], true);
+    let replies = run_puts(&db, 2, TEST_STORE, vec![(None, vec![4])], true);
     assert_eq!(replies[0], key_reply(1.0));
     assert_eq!(commit(&db, 2), Ok(()));
-    assert_eq!(db.key_generator_current_number("test_store"), Some(2));
+    assert_eq!(db.key_generator_current_number(TEST_STORE), Some(2));
 }
 
 /// Aborting a transaction rolls back everything it did in all its batches, and for an upgrade
@@ -1510,12 +1717,11 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
     set_version(&db, 1).unwrap();
-    for store_name in ["kept", "deleted"] {
-        create_store(&db, store_name, None, false).unwrap();
-    }
-    create_index(
+    let kept = create_store(&db, "kept", None, false).unwrap();
+    let deleted = create_store(&db, "deleted", None, false).unwrap();
+    let by_a = create_index(
         &db,
-        "kept",
+        kept,
         "by_a".to_owned(),
         KeyPath::String("a".to_owned()),
         false,
@@ -1527,12 +1733,12 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
         &db,
         1,
         IndexedDBTxnMode::Readwrite,
-        ["kept", "deleted"]
+        [kept, deleted]
             .into_iter()
             .zip(&seeds)
-            .map(|(store_name, seed)| {
+            .map(|(store, seed)| {
                 put_request(
-                    store_name,
+                    store,
                     seed.0.clone(),
                     IndexedDBKeyType::Number(1.0),
                     vec![1],
@@ -1544,8 +1750,8 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
     assert_eq!(commit(&db, 1), Ok(()));
 
     let (schema_callback, schema_errors) = get_callback::<BackendError>();
-    let schema =
-        |store_name: &str, operation| request(store_name, AsyncOperation::Schema(operation));
+    let schema = |store, operation| request(store, AsyncOperation::Schema(operation));
+    let created = 3;
     let put = get_callback();
     db.upgrade_version(txn(2), 2);
     run_batch(
@@ -1553,37 +1759,46 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
         2,
         IndexedDBTxnMode::Versionchange,
         vec![
-            put_request("kept", put.0, IndexedDBKeyType::Number(2.0), vec![2], false),
+            put_request(kept, put.0, IndexedDBKeyType::Number(2.0), vec![2], false),
             schema(
-                "created",
+                created,
                 AsyncSchemaOperation::CreateObjectStore {
                     callback: schema_callback.clone(),
+                    name: "created".to_owned(),
                     key_path: None,
                     auto_increment: true,
                 },
             ),
             schema(
-                "kept",
+                kept,
                 AsyncSchemaOperation::CreateIndex {
                     callback: schema_callback.clone(),
-                    index_name: "by_b".to_owned(),
+                    index_id: 2,
+                    name: "by_b".to_owned(),
                     key_path: KeyPath::String("b".to_owned()),
                     unique: false,
                     multi_entry: false,
                 },
             ),
             schema(
-                "kept",
+                kept,
                 AsyncSchemaOperation::RenameIndex {
                     callback: schema_callback.clone(),
-                    index_name: "by_a".to_owned(),
+                    index_id: by_a,
                     new_name: "by_c".to_owned(),
                 },
             ),
             schema(
-                "deleted",
+                deleted,
                 AsyncSchemaOperation::DeleteObjectStore {
                     callback: schema_callback.clone(),
+                },
+            ),
+            schema(
+                kept,
+                AsyncSchemaOperation::RenameObjectStore {
+                    callback: schema_callback.clone(),
+                    new_name: "renamed".to_owned(),
                 },
             ),
         ],
@@ -1594,7 +1809,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
         2,
         IndexedDBTxnMode::Versionchange,
         vec![request(
-            "created",
+            created,
             AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
                 callback: generated.0,
                 key: None,
@@ -1610,8 +1825,12 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
     );
     assert!(schema_errors.try_recv().is_err());
     let index_names = |db: &SqlEngine<X>| -> Vec<String> {
-        queries::indexes(&mut *db.connection(), "kept")
+        queries::object_stores(&mut *db.connection())
             .unwrap()
+            .into_iter()
+            .find(|store| store.id == kept)
+            .unwrap()
+            .indexes
             .into_iter()
             .map(|index| index.name)
             .collect()
@@ -1619,33 +1838,136 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
     let before = (1, vec!["kept".to_owned(), "deleted".to_owned()]);
     assert_eq!(
         stored_version_and_store_names(&db),
-        (2, vec!["kept".to_owned(), "created".to_owned()])
+        (2, vec!["renamed".to_owned(), "created".to_owned()])
     );
     assert_eq!(index_names(&db), vec!["by_c", "by_b"]);
-    assert_eq!(stored_keys(&db, "kept"), number_keys([1, 2]));
-    assert_eq!(
-        (db.version().unwrap(), db.object_store_names().unwrap()),
-        before
-    );
+    assert_eq!(stored_keys(&db, kept), number_keys([1, 2]));
+    assert_eq!((db.version().unwrap(), store_names(&db)), before);
 
     abort(&db, 2);
 
     assert_eq!(stored_version_and_store_names(&db), before);
-    assert_eq!(
-        (db.version().unwrap(), db.object_store_names().unwrap()),
-        before
-    );
+    assert_eq!((db.version().unwrap(), store_names(&db)), before);
     assert_eq!(index_names(&db), vec!["by_a"]);
     assert_eq!(
-        db.indexes("kept")
-            .unwrap()
-            .into_iter()
-            .map(|index| index.name)
+        db.object_stores()[0]
+            .indexes
+            .iter()
+            .map(|index| index.name.as_str())
             .collect::<Vec<_>>(),
         vec!["by_a"]
     );
-    assert_eq!(stored_keys(&db, "kept"), number_keys([1]));
-    assert_eq!(stored_keys(&db, "deleted"), number_keys([1]));
+    assert_eq!(stored_keys(&db, kept), number_keys([1]));
+    assert_eq!(stored_keys(&db, deleted), number_keys([1]));
+}
+
+/// A schema operation with an id that isn't new, or for a store or index that doesn't exist,
+/// fails its transaction, which rolls back.
+fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "test_store", None, false).unwrap();
+    let invalid_operations = |callback: GenericCallback<BackendError>| {
+        vec![
+            (
+                store,
+                AsyncSchemaOperation::CreateObjectStore {
+                    callback: callback.clone(),
+                    name: "other".to_owned(),
+                    key_path: None,
+                    auto_increment: false,
+                },
+            ),
+            (
+                store + 1,
+                AsyncSchemaOperation::CreateIndex {
+                    callback: callback.clone(),
+                    index_id: 0,
+                    name: "index".to_owned(),
+                    key_path: KeyPath::String("a".to_owned()),
+                    unique: false,
+                    multi_entry: false,
+                },
+            ),
+            (
+                store + 5,
+                AsyncSchemaOperation::CreateIndex {
+                    callback: callback.clone(),
+                    index_id: 1,
+                    name: "index".to_owned(),
+                    key_path: KeyPath::String("a".to_owned()),
+                    unique: false,
+                    multi_entry: false,
+                },
+            ),
+            (
+                store,
+                AsyncSchemaOperation::DeleteIndex {
+                    callback: callback.clone(),
+                    index_id: 1,
+                },
+            ),
+            (
+                store,
+                AsyncSchemaOperation::RenameIndex {
+                    callback: callback.clone(),
+                    index_id: 1,
+                    new_name: "index".to_owned(),
+                },
+            ),
+            (
+                store,
+                AsyncSchemaOperation::RenameObjectStore {
+                    callback: callback.clone(),
+                    new_name: "created".to_owned(),
+                },
+            ),
+            (
+                store + 5,
+                AsyncSchemaOperation::RenameObjectStore {
+                    callback: callback.clone(),
+                    new_name: "other".to_owned(),
+                },
+            ),
+            (
+                store + 5,
+                AsyncSchemaOperation::DeleteObjectStore { callback },
+            ),
+        ]
+    };
+    let (callback, errors) = get_callback::<BackendError>();
+    for (serial, (target, operation)) in (1..).zip(invalid_operations(callback)) {
+        db.upgrade_version(txn(serial), serial + 1);
+        let put = get_callback();
+        let created = get_callback::<BackendError>();
+        run_batch(
+            &db,
+            serial,
+            IndexedDBTxnMode::Versionchange,
+            vec![
+                request(
+                    store + 1,
+                    AsyncOperation::Schema(AsyncSchemaOperation::CreateObjectStore {
+                        callback: created.0,
+                        name: "created".to_owned(),
+                        key_path: None,
+                        auto_increment: false,
+                    }),
+                ),
+                request(target, AsyncOperation::Schema(operation)),
+                put_request(store, put.0, IndexedDBKeyType::Number(1.0), vec![1], false),
+            ],
+        );
+        assert!(created.1.try_recv().is_err());
+        assert!(matches!(recv(&errors), BackendError::DbErr(_)));
+        assert!(recv(&put.1).is_err());
+        assert!(commit(&db, serial).is_err());
+        abort(&db, serial);
+        assert_eq!(
+            stored_version_and_store_names(&db),
+            (0, vec!["test_store".to_owned()])
+        );
+    }
 }
 
 /// A transaction's batches all run in its one SQL transaction: another connection sees none of
@@ -1664,7 +1986,7 @@ fn test_transaction_spanning_batches_commits_atomically<X: SqlExecutor>() {
                 transaction,
                 IndexedDBTxnMode::Readwrite,
                 vec![put_request(
-                    "test_store",
+                    TEST_STORE,
                     put.0,
                     IndexedDBKeyType::Number(key.into()),
                     vec![key as u8],
@@ -1672,13 +1994,13 @@ fn test_transaction_spanning_batches_commits_atomically<X: SqlExecutor>() {
                 )],
             );
             assert!(recv(&put.1).is_ok());
-            assert_eq!(keys_of(other, "test_store"), vec![]);
+            assert_eq!(keys_of(other, TEST_STORE), vec![]);
         }
     };
 
     put_batches(1, 1..=10, &mut other);
     assert_eq!(commit(&db, 1), Ok(()));
-    assert_eq!(keys_of(&mut other, "test_store"), number_keys(1..=10));
+    assert_eq!(keys_of(&mut other, TEST_STORE), number_keys(1..=10));
 
     let mut other_after_commit = db.connection().connector()().unwrap();
     for key in 11..=20 {
@@ -1688,7 +2010,7 @@ fn test_transaction_spanning_batches_commits_atomically<X: SqlExecutor>() {
             2,
             IndexedDBTxnMode::Readwrite,
             vec![put_request(
-                "test_store",
+                TEST_STORE,
                 put.0,
                 IndexedDBKeyType::Number(key.into()),
                 vec![key as u8],
@@ -1699,10 +2021,10 @@ fn test_transaction_spanning_batches_commits_atomically<X: SqlExecutor>() {
     }
     abort(&db, 2);
     assert_eq!(
-        keys_of(&mut other_after_commit, "test_store"),
+        keys_of(&mut other_after_commit, TEST_STORE),
         number_keys(1..=10)
     );
-    assert_eq!(stored_keys(&db, "test_store"), number_keys(1..=10));
+    assert_eq!(stored_keys(&db, TEST_STORE), number_keys(1..=10));
 }
 
 /// A callback that reports `id` on `order` when it is called.
@@ -1722,13 +2044,12 @@ where
 fn test_requests_run_in_order<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_engine::<X>(&dir);
-    for store_name in ["written", "read"] {
-        create_store(&db, store_name, None, false).unwrap();
-    }
+    let written = create_store(&db, "written", None, false).unwrap();
+    let read = create_store(&db, "read", None, false).unwrap();
     let (order_sender, order) = mpsc::channel();
     let put = |id: u32, key: f64, value: u8| {
         put_request(
-            "written",
+            written,
             tagged(&order_sender, id),
             IndexedDBKeyType::Number(key),
             vec![value],
@@ -1737,7 +2058,7 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
     };
     let read = |id: u32| {
         request(
-            "read",
+            read,
             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
                 callback: tagged(&order_sender, id),
                 key_range: IndexedDBKeyRange::default(),
@@ -1790,7 +2111,7 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
         4,
         IndexedDBTxnMode::Readonly,
         vec![request(
-            "written",
+            written,
             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
                 callback: value.0,
                 key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
@@ -1816,7 +2137,7 @@ fn test_two_databases_progress_independently<X: SqlExecutor>() {
             1,
             IndexedDBTxnMode::Readwrite,
             vec![put_request(
-                "test_store",
+                TEST_STORE,
                 put.0,
                 IndexedDBKeyType::Number(1.0),
                 vec![1],
@@ -1851,7 +2172,7 @@ fn test_two_databases_progress_independently<X: SqlExecutor>() {
     release.send(()).unwrap();
     assert_eq!(recv(&get.1), Ok(Some(stored_value(1.0, vec![1]))));
     assert_eq!(commit(&busy, 1), Ok(()));
-    assert_eq!(stored_keys(&busy, "test_store"), number_keys([1]));
+    assert_eq!(stored_keys(&busy, TEST_STORE), number_keys([1]));
 }
 
 /// The SQLite executor refuses what RDB's executor refuses, so that the host tests catch SQL that
@@ -2021,7 +2342,7 @@ fn open_faulty_engine<X: SqlExecutor>(dir: &TempDir) -> SqlEngine<Faulty<X>> {
         0,
         IndexedDBTxnMode::Readwrite,
         vec![put_request(
-            "test_store",
+            TEST_STORE,
             put.0,
             IndexedDBKeyType::Number(1.0),
             vec![1],
@@ -2038,7 +2359,7 @@ fn get_request(
     key: f64,
 ) -> KvsOperation {
     request(
-        "test_store",
+        TEST_STORE,
         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
             callback,
             key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(key)),
@@ -2054,7 +2375,7 @@ fn put_requests(
         .zip(first_key..)
         .map(|(put, key)| {
             put_request(
-                "test_store",
+                TEST_STORE,
                 put.0.clone(),
                 IndexedDBKeyType::Number(key.into()),
                 vec![1],
@@ -2079,7 +2400,7 @@ fn test_begin_failure_fails_the_transaction<X: SqlExecutor>() {
         IndexedDBTxnMode::Readwrite,
         vec![
             put_request(
-                "test_store",
+                TEST_STORE,
                 put.0,
                 IndexedDBKeyType::Number(2.0),
                 vec![2],
@@ -2096,7 +2417,7 @@ fn test_begin_failure_fails_the_transaction<X: SqlExecutor>() {
     run_batch(&db, 1, IndexedDBTxnMode::Readwrite, put_requests(&later, 3));
     assert!(recv(&later[0].1).is_err());
     assert!(commit(&db, 1).is_err());
-    assert_eq!(stored_keys(&db, "test_store"), number_keys([1]));
+    assert_eq!(stored_keys(&db, TEST_STORE), number_keys([1]));
 }
 
 /// A statement that ends the SQL transaction, as SQLite does after SQLITE_FULL, fails the
@@ -2113,7 +2434,7 @@ fn test_statement_failure_that_ends_the_transaction_fails_it<X: SqlExecutor>() {
     assert!(recv(&puts[1].1).is_err());
     assert!(recv(&puts[2].1).is_err());
     assert!(commit(&db, 1).is_err());
-    assert_eq!(stored_keys(&db, "test_store"), number_keys([1]));
+    assert_eq!(stored_keys(&db, TEST_STORE), number_keys([1]));
 
     faults_for(dir.path()).lock().unwrap().statement = Some(("FROM object_data", 1));
     let gets: Vec<_> = (0..3).map(|_| get_callback()).collect();
@@ -2137,7 +2458,7 @@ fn test_statement_failure_that_ends_the_transaction_fails_it<X: SqlExecutor>() {
 fn test_readonly_failure_that_ends_the_sql_transaction_fails_the_writer<X: SqlExecutor>() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_faulty_engine::<X>(&dir);
-    create_store(&db, "other", None, false).unwrap();
+    let other = create_store(&db, "other", None, false).unwrap();
 
     let puts = [get_callback()];
     run_batch(&db, 1, IndexedDBTxnMode::Readwrite, put_requests(&puts, 2));
@@ -2150,7 +2471,7 @@ fn test_readonly_failure_that_ends_the_sql_transaction_fails_the_writer<X: SqlEx
         2,
         IndexedDBTxnMode::Readonly,
         vec![request(
-            "other",
+            other,
             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
                 callback: get.0,
                 key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
@@ -2164,7 +2485,7 @@ fn test_readonly_failure_that_ends_the_sql_transaction_fails_the_writer<X: SqlEx
     run_batch(&db, 1, IndexedDBTxnMode::Readwrite, put_requests(&later, 3));
     assert!(recv(&later[0].1).is_err());
     assert!(commit(&db, 1).is_err());
-    assert_eq!(stored_keys(&db, "test_store"), number_keys([1]));
+    assert_eq!(stored_keys(&db, TEST_STORE), number_keys([1]));
 }
 
 /// If the commit fails, the transaction's writes are rolled back and the commit reports the
@@ -2192,7 +2513,7 @@ fn test_commit_failure_rolls_back<X: SqlExecutor>() {
     assert_eq!(commit(&db, 2), Ok(()));
 
     faults_for(dir.path()).lock().unwrap().commit = false;
-    assert_eq!(stored_keys(&db, "test_store"), number_keys([1]));
+    assert_eq!(stored_keys(&db, TEST_STORE), number_keys([1]));
 }
 
 /// Batches reply in the order the manager hands them over, also those of overlapping readonly
@@ -2251,14 +2572,14 @@ fn check_writer_fails_after<X: SqlExecutor>(between: impl FnOnce(&SqlEngine<Faul
     assert!(recv(&later[0].1).is_err());
     assert!(commit(&db, 1).is_err());
     abort(&db, 1);
-    assert_eq!(stored_keys(&db, "test_store"), number_keys([1]));
+    assert_eq!(stored_keys(&db, TEST_STORE), number_keys([1]));
 }
 
 /// Any job on the connection, not only a request, can end the writer's SQL transaction.
 fn test_job_that_ends_the_sql_transaction_fails_the_writer<X: SqlExecutor>() {
     check_writer_fails_after::<X>(|db| {
         db.spawn_on_connection(|executor| {
-            let _ = queries::key_path(executor, "test_store");
+            let _ = queries::object_store(executor, TEST_STORE);
         })
     });
 }
@@ -2277,10 +2598,11 @@ fn test_metadata_reads_do_not_wait_for_the_connection<X: SqlExecutor>() {
     });
 
     assert_eq!(db.version().unwrap(), 0);
-    assert_eq!(db.object_store_names().unwrap(), vec!["test_store"]);
-    assert_eq!(db.key_path("test_store"), key_path);
-    assert!(db.has_key_generator("test_store"));
-    assert!(db.indexes("test_store").unwrap().is_empty());
+    let stores = db.object_stores();
+    assert_eq!(store_names(&db), vec!["test_store"]);
+    assert_eq!(stores[0].key_path, key_path);
+    assert!(stores[0].has_key_generator);
+    assert!(stores[0].indexes.is_empty());
     release.send(()).unwrap();
     assert!(
         !timed_out.recv().unwrap(),
@@ -2323,7 +2645,7 @@ fn transaction_holds_across_idle_minutes<X: SqlExecutor>() {
             1,
             IndexedDBTxnMode::Readwrite,
             vec![put_request(
-                "test_store",
+                TEST_STORE,
                 put.0,
                 IndexedDBKeyType::Number(key.into()),
                 vec![1],
@@ -2331,12 +2653,12 @@ fn transaction_holds_across_idle_minutes<X: SqlExecutor>() {
             )],
         );
         assert!(recv(&put.1).is_ok());
-        assert_eq!(keys_of(&mut other, "test_store"), vec![]);
+        assert_eq!(keys_of(&mut other, TEST_STORE), vec![]);
         std::thread::sleep(Duration::from_secs(idle_seconds));
     }
     assert_eq!(commit(&db, 1), Ok(()));
     assert!(start.elapsed() > Duration::from_secs(180));
-    assert_eq!(keys_of(&mut other, "test_store"), number_keys(1..=3));
+    assert_eq!(keys_of(&mut other, TEST_STORE), number_keys(1..=3));
 }
 
 #[cfg(feature = "sqlite-backend")]

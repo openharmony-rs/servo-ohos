@@ -27,9 +27,9 @@ use servo_base::threadpool::ThreadPool;
 use servo_url::origin::ImmutableOrigin;
 use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
 use storage_traits::indexeddb::{
-    AsyncOperation, BackendError, BackendResult, ConnectionMsg, DatabaseInfo, DbResult,
-    IndexedDBIndex, IndexedDBObjectStore, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode,
-    KeyPath, StorageBottleSource, SyncOperation, TxnCompleteMsg,
+    AsyncOperation, BackendError, BackendResult, ConnectionMsg, DatabaseInfo, IndexedDBObjectStore,
+    IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode,
+    StorageBottleSource, SyncOperation, TxnCompleteMsg,
 };
 use uuid::Uuid;
 
@@ -78,7 +78,7 @@ pub struct IndexedDBDescription {
 struct TxnInfo {
     created_seq: u64,
     mode: IndexedDBTxnMode,
-    scope: Vec<String>,
+    scope: Vec<IndexedDBObjectStoreId>,
     live: bool,
     /// Whether the engine has been handed a batch of this transaction.
     started: bool,
@@ -132,12 +132,12 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
         &mut self,
         txn: IndexedDBTxnId,
         mode: IndexedDBTxnMode,
-        scope: Vec<String>,
+        scope: Vec<IndexedDBObjectStoreId>,
     ) {
         if self.txn_info.contains_key(&txn) {
             return;
         }
-        let scope: HashSet<String> = scope.into_iter().collect();
+        let scope: HashSet<IndexedDBObjectStoreId> = scope.into_iter().collect();
         let created_seq = self.next_created_seq;
         self.next_created_seq += 1;
         self.txn_info.insert(
@@ -237,7 +237,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
 
     fn queue_operation(
         &mut self,
-        store_name: &str,
+        store: IndexedDBObjectStoreId,
         serial_number: IndexedDBTxnId,
         mode: IndexedDBTxnMode,
         operation: AsyncOperation,
@@ -248,10 +248,9 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 let transaction = entry.get_mut();
                 let transaction_mode = transaction.mode.clone();
                 let was_empty = transaction.requests.is_empty();
-                transaction.requests.push_back(KvsOperation {
-                    operation,
-                    store_name: String::from(store_name),
-                });
+                transaction
+                    .requests
+                    .push_back(KvsOperation { operation, store });
                 if was_empty {
                     // If the queue was empty and we just added work, we must enqueue the txn
                     // even if it is currently running a prior batch. The next batch will run
@@ -266,10 +265,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                         mode: mode.clone(),
                     })
                     .requests
-                    .push_back(KvsOperation {
-                        operation,
-                        store_name: String::from(store_name),
-                    });
+                    .push_back(KvsOperation { operation, store });
                 enqueue_mode = Some(mode);
             },
         };
@@ -568,24 +564,9 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
         );
     }
 
-    fn has_key_generator(&self, store_name: &str) -> bool {
-        self.engine.has_key_generator(store_name)
-    }
-
-    fn key_path(&self, store_name: &str) -> Option<KeyPath> {
-        self.engine.key_path(store_name)
-    }
-
-    fn object_store_names(&self) -> DbResult<Vec<String>> {
-        self.engine
-            .object_store_names()
-            .map_err(|err| format!("{err:?}"))
-    }
-
-    fn indexes(&self, store_name: &str) -> DbResult<Vec<IndexedDBIndex>> {
-        self.engine
-            .indexes(store_name)
-            .map_err(|err| format!("{err:?}"))
+    /// The committed metadata of the object stores, for a connection's object store set.
+    fn object_stores(&self) -> Vec<IndexedDBObjectStore> {
+        self.engine.object_stores()
     }
 
     fn version(&self) -> Result<u64, E::Error> {
@@ -946,7 +927,7 @@ impl IndexedDBManager {
                 IndexedDBThreadMsg::Async(
                     origin,
                     db_name,
-                    store_name,
+                    store,
                     txn,
                     _request_id,
                     mode,
@@ -954,7 +935,7 @@ impl IndexedDBManager {
                 ) => {
                     if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
                         // Queues an operation for a transaction without starting it
-                        db.queue_operation(&store_name, txn, mode, operation);
+                        db.queue_operation(store, txn, mode, operation);
                         db.schedule_transactions(origin, &db_name);
                     } else {
                         operation.notify_error(BackendError::DbNotFound);
@@ -1006,7 +987,7 @@ impl IndexedDBManager {
                 IndexedDBThreadMsg::AsyncSchemaOperation {
                     origin,
                     database_name,
-                    store_name,
+                    store_id,
                     operation,
                     transaction,
                 } => {
@@ -1015,7 +996,7 @@ impl IndexedDBManager {
                     {
                         // Queues an operation for a transaction without starting it
                         database.queue_operation(
-                            &store_name,
+                            store_id,
                             transaction,
                             IndexedDBTxnMode::Versionchange,
                             AsyncOperation::Schema(operation),
@@ -1126,10 +1107,10 @@ impl IndexedDBManager {
                 return;
             };
             let VersionUpgrade { new, .. } = pending_upgrade;
-            let object_store_names = self
+            let object_stores = self
                 .databases
                 .get(&key)
-                .and_then(|db| db.object_store_names().ok())
+                .map(|db| db.object_stores())
                 .unwrap_or_default();
             if sender
                 .send(ConnectionMsg::Connection {
@@ -1137,7 +1118,7 @@ impl IndexedDBManager {
                     name: db_name,
                     version: new,
                     upgraded: true,
-                    object_store_names,
+                    object_stores,
                 })
                 .is_err()
             {
@@ -1429,19 +1410,6 @@ impl IndexedDBManager {
         }
     }
 
-    fn get_database(
-        &self,
-        origin: ImmutableOrigin,
-        db_name: String,
-    ) -> Option<&IndexedDBEnvironment<ActiveKvsEngine>> {
-        let idb_description = IndexedDBDescription {
-            origin,
-            name: db_name,
-        };
-
-        self.databases.get(&idb_description)
-    }
-
     fn get_database_mut(
         &mut self,
         origin: ImmutableOrigin,
@@ -1490,13 +1458,12 @@ impl IndexedDBManager {
         let transaction = IndexedDBTxnId::upgrade(*id);
 
         // Step 3: Set transaction’s scope to connection’s object store set.
-        let scope = db
-            .object_store_names()
-            .expect("Fetching object store names should not fail.");
+        let object_stores = db.object_stores();
+        let scope = object_stores.iter().map(|store| store.id).collect();
 
         // Step 4: Set db’s upgrade transaction to transaction.
         // Backend tracks the active upgrade transaction in `pending_upgrade` below.
-        db.register_transaction(transaction, IndexedDBTxnMode::Versionchange, scope.clone());
+        db.register_transaction(transaction, IndexedDBTxnMode::Versionchange, scope);
 
         // Step 5: Set transaction’s state to inactive.
         // Step 6: Start transaction.
@@ -1526,7 +1493,7 @@ impl IndexedDBManager {
                 version: new_version,
                 old_version,
                 transaction,
-                object_store_names: scope,
+                object_stores,
             })
             .is_err()
         {
@@ -1826,10 +1793,10 @@ impl IndexedDBManager {
         }
 
         // Step 11:
-        let object_store_names = self
+        let object_stores = self
             .databases
             .get(&key)
-            .and_then(|db| db.object_store_names().ok())
+            .map(|db| db.object_stores())
             .unwrap_or_default();
         *processed = true;
         if sender
@@ -1838,7 +1805,7 @@ impl IndexedDBManager {
                 id: *id,
                 version: db_version,
                 upgraded: false,
-                object_store_names,
+                object_stores,
             })
             .is_err()
         {
@@ -2163,18 +2130,6 @@ impl IndexedDBManager {
                 };
                 self.start_delete_database(idb_description, id, proxy_map, callback);
             },
-            SyncOperation::GetObjectStore(sender, origin, db_name, store_name) => {
-                // FIXME:(arihant2math) Should we error out more aggressively here?
-                let result = self
-                    .get_database(origin, db_name)
-                    .map(|db| IndexedDBObjectStore {
-                        key_path: db.key_path(&store_name),
-                        has_key_generator: db.has_key_generator(&store_name),
-                        indexes: db.indexes(&store_name).unwrap_or_default(),
-                        name: store_name,
-                    });
-                let _ = sender.send(result.ok_or(BackendError::DbNotFound));
-            },
             SyncOperation::Commit(callback, origin, db_name, txn) => {
                 // https://w3c.github.io/IndexedDB/#commit-a-transaction
                 // The reply follows the engine's COMMIT, or its failure.
@@ -2286,13 +2241,6 @@ impl IndexedDBManager {
                 } else {
                     // Its requests fail with DbNotFound, see `IndexedDBThreadMsg::Async`.
                     debug!("Transaction {txn} created for a database that is gone.");
-                }
-            },
-            SyncOperation::Version(sender, origin, db_name) => {
-                if let Some(db) = self.get_database(origin, db_name) {
-                    let _ = sender.send(db.version().map_err(backend_error_from_storage_error));
-                } else {
-                    let _ = sender.send(Err(BackendError::DbNotFound));
                 }
             },
             SyncOperation::NotifyEndOfVersionChange {
@@ -2427,10 +2375,10 @@ mod tests {
         batches: &GenericReceiver<IndexedDBThreadMsg>,
         serial: u64,
         mode: IndexedDBTxnMode,
-        store_name: &str,
+        store: i64,
         operation: AsyncOperation,
     ) {
-        env.queue_operation(store_name, txn(serial), mode, operation);
+        env.queue_operation(store, txn(serial), mode, operation);
         env.schedule_transactions(test_origin(), "test_db");
         match batches.recv().unwrap() {
             IndexedDBThreadMsg::EngineTxnBatchComplete { txn: done, .. } => {
@@ -2480,19 +2428,27 @@ mod tests {
         env.finish_transaction(txn(serial));
     }
 
-    fn create_store_operation(auto_increment: bool) -> AsyncOperation {
+    fn create_store_operation(name: &str, auto_increment: bool) -> AsyncOperation {
         AsyncOperation::Schema(AsyncSchemaOperation::CreateObjectStore {
             callback: GenericCallback::new(|_| panic!("creating the store should not fail"))
                 .unwrap(),
+            name: name.to_owned(),
             key_path: None,
             auto_increment,
         })
     }
 
+    fn store_names<X: SqlExecutor>(env: &IndexedDBEnvironment<SqlEngine<X>>) -> Vec<String> {
+        env.object_stores()
+            .into_iter()
+            .map(|store| store.name)
+            .collect()
+    }
+
     fn test_aborted_upgrade_rolls_back_created_store_and_index<X: SqlExecutor>() {
         let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let (mut env, batches) = open_environment::<X>(&base_dir);
-        assert!(env.object_store_names().unwrap().is_empty());
+        assert!(store_names(&env).is_empty());
 
         env.register_transaction(txn(1), IndexedDBTxnMode::Versionchange, vec![]);
         env.engine.upgrade_version(txn(1), 1);
@@ -2502,19 +2458,20 @@ mod tests {
             &batches,
             1,
             mode.clone(),
-            "not_books",
-            create_store_operation(false),
+            1,
+            create_store_operation("not_books", false),
         );
         run(
             &mut env,
             &batches,
             1,
             mode,
-            "not_books",
+            1,
             AsyncOperation::Schema(AsyncSchemaOperation::CreateIndex {
                 callback: GenericCallback::new(|_| panic!("creating the index should not fail"))
                     .unwrap(),
-                index_name: "not_by_author".to_string(),
+                index_id: 1,
+                name: "not_by_author".to_string(),
                 key_path: KeyPath::String("author".to_string()),
                 unique: false,
                 multi_entry: false,
@@ -2524,14 +2481,17 @@ mod tests {
             stored_version_and_store_names(&env.engine),
             (1, vec!["not_books".to_owned()])
         );
-        assert!(env.object_store_names().unwrap().is_empty());
+        assert!(store_names(&env).is_empty());
 
         abort(&mut env, 1);
 
         assert_eq!(stored_version_and_store_names(&env.engine), (0, vec![]));
-        assert_eq!(env.object_store_names().unwrap(), Vec::<String>::new());
+        assert_eq!(store_names(&env), Vec::<String>::new());
         assert_eq!(env.version().unwrap(), 0);
     }
+
+    /// The id of the store `books`.
+    const BOOKS: i64 = 1;
 
     /// Creates a store `books` with a key generator in a committed upgrade transaction 1, and
     /// puts a record with a generated key in the readwrite transaction 2, which stays open.
@@ -2546,23 +2506,19 @@ mod tests {
             batches,
             1,
             IndexedDBTxnMode::Versionchange,
-            "books",
-            create_store_operation(true),
+            BOOKS,
+            create_store_operation("books", true),
         );
         commit(env, 1);
-        assert_eq!(env.engine.key_generator_current_number("books"), Some(1));
+        assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(1));
 
-        env.register_transaction(
-            txn(2),
-            IndexedDBTxnMode::Readwrite,
-            vec!["books".to_string()],
-        );
+        env.register_transaction(txn(2), IndexedDBTxnMode::Readwrite, vec![BOOKS]);
         run(
             env,
             batches,
             2,
             IndexedDBTxnMode::Readwrite,
-            "books",
+            BOOKS,
             AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
                 callback: GenericCallback::new(|_| {}).unwrap(),
                 key: None,
@@ -2570,7 +2526,7 @@ mod tests {
                 should_overwrite: false,
             }),
         );
-        assert_eq!(env.engine.key_generator_current_number("books"), Some(2));
+        assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(2));
     }
 
     fn test_abort_transaction_restores_readwrite_key_generator_current_number<X: SqlExecutor>() {
@@ -2580,7 +2536,7 @@ mod tests {
 
         abort(&mut env, 2);
 
-        assert_eq!(env.engine.key_generator_current_number("books"), Some(1));
+        assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(1));
     }
 
     fn test_failed_commit_reports_the_error_and_rolls_back<X: SqlExecutor>() {
@@ -2596,20 +2552,16 @@ mod tests {
 
         assert_eq!(message.txn, txn(2));
         assert!(matches!(message.result, Err(BackendError::DbErr(_))));
-        assert_eq!(env.engine.key_generator_current_number("books"), Some(1));
+        assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(1));
     }
 
     fn register<X: SqlExecutor>(
         env: &mut IndexedDBEnvironment<SqlEngine<X>>,
         serial: u64,
         mode: IndexedDBTxnMode,
-        scope: &[&str],
+        scope: &[i64],
     ) {
-        env.register_transaction(
-            txn(serial),
-            mode,
-            scope.iter().map(|name| name.to_string()).collect(),
-        );
+        env.register_transaction(txn(serial), mode, scope.to_vec());
     }
 
     fn clear_operation() -> AsyncOperation {
@@ -2623,8 +2575,8 @@ mod tests {
     fn test_only_a_started_writer_holds_back_other_writers<X: SqlExecutor>() {
         let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let (mut env, batches) = open_environment::<X>(&base_dir);
-        register(&mut env, 1, IndexedDBTxnMode::Readwrite, &["a"]);
-        register(&mut env, 2, IndexedDBTxnMode::Readwrite, &["b"]);
+        register(&mut env, 1, IndexedDBTxnMode::Readwrite, &[1]);
+        register(&mut env, 2, IndexedDBTxnMode::Readwrite, &[2]);
         assert!(env.can_start_by_spec(txn(1)));
         assert!(env.can_start_by_spec(txn(2)));
 
@@ -2633,11 +2585,11 @@ mod tests {
             &batches,
             1,
             IndexedDBTxnMode::Readwrite,
-            "a",
+            1,
             clear_operation(),
         );
         assert!(!env.can_start_by_spec(txn(2)));
-        register(&mut env, 3, IndexedDBTxnMode::Readonly, &["c"]);
+        register(&mut env, 3, IndexedDBTxnMode::Readonly, &[3]);
         assert!(env.can_start_by_spec(txn(3)));
 
         commit(&mut env, 1);
@@ -2650,9 +2602,9 @@ mod tests {
     fn test_readonly_waits_for_an_earlier_overlapping_writer<X: SqlExecutor>() {
         let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let (mut env, _batches) = open_environment::<X>(&base_dir);
-        register(&mut env, 1, IndexedDBTxnMode::Readwrite, &["a"]);
-        register(&mut env, 2, IndexedDBTxnMode::Readonly, &["a", "b"]);
-        register(&mut env, 3, IndexedDBTxnMode::Readonly, &["b"]);
+        register(&mut env, 1, IndexedDBTxnMode::Readwrite, &[1]);
+        register(&mut env, 2, IndexedDBTxnMode::Readonly, &[1, 2]);
+        register(&mut env, 3, IndexedDBTxnMode::Readonly, &[2]);
         assert!(!env.can_start_by_spec(txn(2)));
         assert!(env.can_start_by_spec(txn(3)));
         env.finish_transaction(txn(1));
@@ -2663,9 +2615,9 @@ mod tests {
     fn test_readwrite_without_requests_commits<X: SqlExecutor>() {
         let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let (mut env, _batches) = open_environment::<X>(&base_dir);
-        register(&mut env, 1, IndexedDBTxnMode::Readwrite, &["a"]);
+        register(&mut env, 1, IndexedDBTxnMode::Readwrite, &[1]);
         commit(&mut env, 1);
-        register(&mut env, 2, IndexedDBTxnMode::Readwrite, &["b"]);
+        register(&mut env, 2, IndexedDBTxnMode::Readwrite, &[2]);
         assert!(env.can_start_by_spec(txn(2)));
     }
 

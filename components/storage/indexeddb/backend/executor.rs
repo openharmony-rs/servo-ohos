@@ -189,6 +189,9 @@ pub(crate) enum SqlError {
     TransactionState(&'static str),
     /// A database of another schema version that is still there after deleting it.
     ResetFailed,
+    /// A schema operation that doesn't fit the object stores and indexes, such as a new store
+    /// whose id isn't larger than every store id, or a missing index.
+    InvalidMetadata(&'static str),
     /// A failure to delete a database file.
     #[cfg(feature = "sqlite-backend")]
     Io(std::io::Error),
@@ -210,6 +213,7 @@ impl fmt::Display for SqlError {
             Self::InvalidKey => write!(formatter, "invalid stored key"),
             Self::TransactionState(context) => write!(formatter, "transaction state: {context}"),
             Self::ResetFailed => write!(formatter, "failed to delete a database to reset it"),
+            Self::InvalidMetadata(context) => write!(formatter, "invalid metadata: {context}"),
             #[cfg(feature = "sqlite-backend")]
             Self::Io(error) => error.fmt(formatter),
             #[cfg(feature = "sqlite-backend")]
