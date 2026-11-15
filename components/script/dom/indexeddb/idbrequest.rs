@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::{GenericSend, SendError};
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, BackendError, BackendResult, IndexedDBKeyType,
-    IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, PutItemResult, SyncOperation,
+    IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, IndexedDBValue, PutItemResult,
+    SyncOperation,
 };
 use stylo_atoms::Atom;
 
@@ -31,7 +32,6 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
-use crate::dom::bindings::structuredclone;
 use crate::dom::domexception::DOMException;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
@@ -53,8 +53,8 @@ struct RequestListener {
 pub enum IdbResult {
     Key(IndexedDBKeyType),
     Keys(Vec<IndexedDBKeyType>),
-    Value(Vec<u8>),
-    Values(Vec<Vec<u8>>),
+    Value(IndexedDBValue),
+    Values(Vec<IndexedDBValue>),
     Count(u64),
     Iterate(Vec<IndexedDBRecord>),
     Error(Error),
@@ -73,14 +73,14 @@ impl From<Vec<IndexedDBKeyType>> for IdbResult {
     }
 }
 
-impl From<Vec<u8>> for IdbResult {
-    fn from(value: Vec<u8>) -> Self {
+impl From<IndexedDBValue> for IdbResult {
+    fn from(value: IndexedDBValue) -> Self {
         IdbResult::Value(value)
     }
 }
 
-impl From<Vec<Vec<u8>>> for IdbResult {
-    fn from(value: Vec<Vec<u8>>) -> Self {
+impl From<Vec<IndexedDBValue>> for IdbResult {
+    fn from(value: Vec<IndexedDBValue>) -> Self {
         IdbResult::Values(value)
     }
 }
@@ -89,7 +89,9 @@ impl From<PutItemResult> for IdbResult {
     fn from(value: PutItemResult) -> Self {
         match value {
             PutItemResult::Key(key) => Self::Key(key),
-            PutItemResult::CannotOverwrite => Self::Error(Error::Constraint(None)),
+            PutItemResult::CannotOverwrite | PutItemResult::KeyGeneratorExhausted => {
+                Self::Error(Error::Constraint(None))
+            },
         }
     }
 }
@@ -176,12 +178,14 @@ impl RequestListener {
                     }
                     array.to_jsval(cx, answer.handle_mut());
                 },
-                IdbResult::Value(serialized_data) => {
-                    let result = postcard::from_bytes(&serialized_data)
-                        .map_err(|_| Error::Data(None))
-                        .and_then(|data| {
-                            structuredclone::read(cx, &global, data, answer.handle_mut())
-                        });
+                IdbResult::Value(value) => {
+                    let store = request.source.get().expect("Value requests have a source");
+                    let result = store.deserialize_value(
+                        cx,
+                        &value.primary_key,
+                        &value.value,
+                        answer.handle_mut(),
+                    );
                     if let Err(e) = result {
                         warn!("Error reading structuredclone data");
                         Self::handle_async_request_error(&global, cx, request, e, self.request_id);
@@ -189,13 +193,15 @@ impl RequestListener {
                     };
                 },
                 IdbResult::Values(serialized_values) => {
+                    let store = request.source.get().expect("Value requests have a source");
                     rooted!(&in(cx) let mut values = vec![JSVal::default(); serialized_values.len()]);
-                    for (i, serialized_data) in serialized_values.into_iter().enumerate() {
-                        let result = postcard::from_bytes(&serialized_data)
-                            .map_err(|_| Error::Data(None))
-                            .and_then(|data| {
-                                structuredclone::read(cx, &global, data, values.handle_mut_at(i))
-                            });
+                    for (i, value) in serialized_values.into_iter().enumerate() {
+                        let result = store.deserialize_value(
+                            cx,
+                            &value.primary_key,
+                            &value.value,
+                            values.handle_mut_at(i),
+                        );
                         if let Err(e) = result {
                             warn!("Error reading structuredclone data");
                             Self::handle_async_request_error(
@@ -217,7 +223,7 @@ impl RequestListener {
                     let param = self.iteration_param.as_ref().expect(
                         "iteration_param must be provided by IDBRequest::execute_async for Iterate",
                     );
-                    let cursor = match iterate_cursor(&global, cx, param, records) {
+                    let cursor = match iterate_cursor(cx, param, records) {
                         Ok(cursor) => cursor,
                         Err(e) => {
                             warn!("Error reading structuredclone data");

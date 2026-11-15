@@ -11607,6 +11607,71 @@
    }
   },
   "testharness": {
+   "IndexedDB": {
+    "generated-key-value-kinds.any.js": [
+     "93e646d1ad6073457e3aa79c4751b7ab82b16066",
+     [
+      "IndexedDB/generated-key-value-kinds.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/generated-key-value-kinds.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/generated-key-value-kinds.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/generated-key-value-kinds.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
+        ]
+       ]
+      }
+     ]
+    ]
+   },
    "accessibility-tree": {
     "accessibility-update-basic-mutation.html": [
      "f86426901b096137876adf6fcbb272e5bca47658",

@@ -2072,16 +2072,14 @@ impl IndexedDBManager {
             },
             SyncOperation::GetObjectStore(sender, origin, db_name, store_name) => {
                 // FIXME:(arihant2math) Should we error out more aggressively here?
-                let result = self.get_database(origin, db_name).map(|db| {
-                    let key_generator_current_number = db.key_generator_current_number(&store_name);
-                    IndexedDBObjectStore {
+                let result = self
+                    .get_database(origin, db_name)
+                    .map(|db| IndexedDBObjectStore {
                         key_path: db.key_path(&store_name),
-                        has_key_generator: key_generator_current_number.is_some(),
-                        key_generator_current_number,
+                        has_key_generator: db.key_generator_current_number(&store_name).is_some(),
                         indexes: db.indexes(&store_name).unwrap_or_default(),
                         name: store_name,
-                    }
-                });
+                    });
                 let _ = sender.send(result.ok_or(BackendError::DbNotFound));
             },
             SyncOperation::Commit(callback, origin, db_name, txn) => {
@@ -2474,7 +2472,6 @@ mod tests {
                 key: None,
                 value: vec![1],
                 should_overwrite: false,
-                key_generator_current_number: None,
             }),
         );
         assert_eq!(env.key_generator_current_number("books"), Some(2));

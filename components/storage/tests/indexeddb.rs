@@ -20,8 +20,8 @@ use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, Storage
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
     BackendError, BackendResult, ConnectionMsg, IndexedDBKeyRange, IndexedDBKeyType,
-    IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath,
-    PutItemResult, SyncOperation, TxnCompleteMsg,
+    IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, IndexedDBValue,
+    KeyPath, PutItemResult, SyncOperation, TxnCompleteMsg,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -503,7 +503,6 @@ fn put_item_request(
                 key,
                 value,
                 should_overwrite,
-                key_generator_current_number: None,
             }),
         ),
     )
@@ -579,7 +578,7 @@ fn get_item(
     store_name: &str,
     txn: u64,
     key: IndexedDBKeyType,
-) -> mpsc::Receiver<Option<BackendResult<Option<Vec<u8>>>>> {
+) -> mpsc::Receiver<Option<BackendResult<Option<IndexedDBValue>>>> {
     let request_id = 1;
     let (sender, receiver) = make_profile_callback();
     GenericSend::send(
@@ -759,7 +758,6 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
     assert_eq!(store.name, store_name);
     assert_eq!(store.key_path, Some(KeyPath::String("id".to_string())));
     assert_eq!(store.has_key_generator, false);
-    assert_eq!(store.key_generator_current_number, None);
     assert_eq!(store.indexes.len(), 1);
     assert_eq!(store.indexes[0].name, index_name);
     assert_eq!(
@@ -811,7 +809,13 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
     let roundtrip_msg = recv_callback_timeout(&roundtrip, "get item reply").unwrap();
     mark_request_handled(&ctx, db_name, txn, 1);
     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
-    assert_eq!(roundtrip_msg, Some(b"Moby Dick".to_vec()));
+    assert_eq!(
+        roundtrip_msg,
+        Some(IndexedDBValue {
+            primary_key: IndexedDBKeyType::String("book-1".to_string()),
+            value: b"Moby Dick".to_vec(),
+        })
+    );
     assert!(commit_msg.result.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
@@ -1192,7 +1196,10 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
     let lookup_msg = recv_callback_timeout(&lookup, "get preserved item reply").unwrap();
     mark_request_handled(&ctx, db_name, txn, 1);
     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
-    assert_eq!(lookup_msg, Some(b"Moby Dick".to_vec()));
+    assert_eq!(
+        lookup_msg.map(|value| value.value),
+        Some(b"Moby Dick".to_vec())
+    );
     assert!(commit_msg.result.is_ok());
     finish_transaction(&ctx, db_name, txn);
 
@@ -1682,7 +1689,9 @@ fn get_item_in_new_readonly_transaction(
     );
     let lookup = get_item(ctx, db_name, store_name, txn, key);
     let commit_result = commit_transaction(ctx, db_name, txn);
-    let value = recv_callback_timeout(&lookup, "get item reply").unwrap();
+    let value = recv_callback_timeout(&lookup, "get item reply")
+        .unwrap()
+        .map(|value| value.value);
     mark_request_handled(ctx, db_name, txn, 1);
     assert!(
         recv_callback_timeout(&commit_result, "readonly commit reply")

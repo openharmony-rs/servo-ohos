@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use servo_base::threadpool::ThreadPool;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, IndexedDBIndex, IndexedDBKeyType, IndexedDBTxnMode, KeyPath,
+    BackendError, BackendResult, IndexedDBIndex, IndexedDBTxnMode, KeyPath,
 };
 
 use super::executor::{SqlError, SqlExecutor, TransactionBehavior};
@@ -638,37 +638,13 @@ fn run_read_write<X: SqlExecutor>(
             key,
             value,
             should_overwrite,
-            key_generator_current_number,
         } => {
-            let (key, key_generator_current_number) = match key {
-                Some(key) => (key, key_generator_current_number),
-                None => {
-                    if store.auto_increment == 0 {
-                        let error = BackendError::DbErr("Missing key for PutItem request".into());
-                        let _ = callback.send(Err(error));
-                        return None;
-                    }
-                    let Some(next_key_generator_current_number) =
-                        store.auto_increment.checked_add(1)
-                    else {
-                        let error = BackendError::DbErr("Key generator overflow".into());
-                        let _ = callback.send(Err(error));
-                        return None;
-                    };
-                    (
-                        IndexedDBKeyType::Number(store.auto_increment as f64),
-                        Some(next_key_generator_current_number),
-                    )
-                },
-            };
-            let result = queries::put_record(
-                executor,
-                store,
-                key,
-                &value,
-                should_overwrite,
-                key_generator_current_number,
-            );
+            if key.is_none() && store.auto_increment == 0 {
+                let error = BackendError::DbErr("Missing key for PutItem request".into());
+                let _ = callback.send(Err(error));
+                return None;
+            }
+            let result = queries::put_record(executor, store, key, &value, should_overwrite);
             reply(&callback, result, Failure::Write)
         },
         AsyncReadWriteOperation::RemoveItem {

@@ -16,7 +16,7 @@ use servo_url::ImmutableOrigin;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
     BackendError, BackendResult, CreateObjectResult, IndexedDBKeyRange, IndexedDBKeyType,
-    IndexedDBTxnMode, KeyPath, PutItemResult,
+    IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
 };
 use tempfile::TempDir;
 use url::Host;
@@ -88,6 +88,11 @@ executor_tests!(
     test_delete_item_range_respects_open_bounds,
     test_failed_write_fails_the_transaction,
     test_missing_store_fails_only_its_request,
+    test_key_generator_follows_generated_and_explicit_keys,
+    test_key_generator_generates_up_to_2_pow_53,
+    test_large_explicit_keys_and_the_key_generator,
+    test_failed_add_changes_nothing,
+    test_abort_reverts_the_key_generator,
     test_abort_rolls_back_data_schema_and_version,
     test_transaction_spanning_batches_commits_atomically,
     test_requests_run_in_order,
@@ -775,10 +780,9 @@ fn test_delete_store_removes_store_records<X: SqlExecutor>() {
         queries::put_record(
             &mut *connection,
             &object_store,
-            IndexedDBKeyType::Number(1.0),
+            Some(IndexedDBKeyType::Number(1.0)),
             &[1, 2, 3],
             true,
-            None,
         )
         .expect("Failed to insert item");
         assert_eq!(record_count(&mut *connection, object_store.id), 1);
@@ -826,9 +830,39 @@ fn put_request(
             key: Some(key),
             value,
             should_overwrite,
-            key_generator_current_number: None,
         }),
     )
+}
+
+/// Runs `puts` (an explicit key or `None` for a generated one, and the value) in order as one
+/// batch of the readwrite `transaction` on `store_name`, and returns their replies.
+fn run_puts<X: SqlExecutor>(
+    db: &SqlEngine<X>,
+    transaction: u64,
+    store_name: &str,
+    puts: Vec<(Option<IndexedDBKeyType>, Vec<u8>)>,
+    should_overwrite: bool,
+) -> Vec<BackendResult<PutItemResult>> {
+    let (requests, receivers): (Vec<_>, Vec<_>) = puts
+        .into_iter()
+        .map(|(key, value)| {
+            let (callback, receiver) = get_callback();
+            let operation = AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
+                callback,
+                key,
+                value,
+                should_overwrite,
+            });
+            (request(store_name, operation), receiver)
+        })
+        .unzip();
+    run_batch(db, transaction, IndexedDBTxnMode::Readwrite, requests);
+    receivers.iter().map(recv).collect()
+}
+
+/// The reply to a put that stored its record under the number `key`.
+fn key_reply(key: f64) -> BackendResult<PutItemResult> {
+    Ok(PutItemResult::Key(IndexedDBKeyType::Number(key)))
 }
 
 /// Runs a batch of `transaction` and waits until it has run.
@@ -895,6 +929,14 @@ fn number_keys(keys: impl IntoIterator<Item = i32>) -> Vec<IndexedDBKeyType> {
     keys.into_iter()
         .map(|key| IndexedDBKeyType::Number(key.into()))
         .collect()
+}
+
+/// The reply to reading `value` stored under the number `key`.
+fn stored_value(key: f64, value: Vec<u8>) -> IndexedDBValue {
+    IndexedDBValue {
+        primary_key: IndexedDBKeyType::Number(key),
+        value,
+    }
 }
 
 /// Receives the one reply of a request, and checks that no second one follows.
@@ -1022,15 +1064,24 @@ fn test_async_operations<X: SqlExecutor>() {
         PutItemResult::Key(IndexedDBKeyType::Number(1.0))
     );
     let value = recv(&get_item_some.1).unwrap();
-    assert_eq!(value, Some(vec![13, 14, 15]));
+    assert_eq!(value, Some(stored_value(1.0, vec![13, 14, 15])));
     let value = recv(&get_item_none.1).unwrap();
     assert_eq!(value, None);
     let all_items = recv(&get_all_items.1).unwrap();
     assert_eq!(all_items.len(), 3);
     // Check that all three items are present
-    assert!(all_items.contains(&vec![13, 14, 15]));
-    assert!(all_items.contains(&vec![4, 5, 6]));
-    assert!(all_items.contains(&vec![7, 8, 9]));
+    assert!(all_items.contains(&stored_value(1.0, vec![13, 14, 15])));
+    assert!(all_items.contains(&IndexedDBValue {
+        primary_key: IndexedDBKeyType::String("2.0".to_string()),
+        value: vec![4, 5, 6],
+    }));
+    assert!(all_items.contains(&IndexedDBValue {
+        primary_key: IndexedDBKeyType::Array(vec![
+            IndexedDBKeyType::String("3".to_string()),
+            IndexedDBKeyType::Number(0.0),
+        ]),
+        value: vec![7, 8, 9],
+    }));
     let amount = recv(&count.1).unwrap();
     assert_eq!(amount, 1);
     recv(&remove.1).unwrap();
@@ -1058,10 +1109,9 @@ fn test_delete_item_range_respects_open_bounds<X: SqlExecutor>() {
             queries::put_record(
                 &mut *connection,
                 &store,
-                IndexedDBKeyType::Number(key as f64),
+                Some(IndexedDBKeyType::Number(key as f64)),
                 &[key as u8],
                 false,
-                None,
             )
             .expect("Failed to seed object store");
         }
@@ -1240,6 +1290,197 @@ fn test_missing_store_fails_only_its_request<X: SqlExecutor>() {
     assert_eq!(stored_keys(&db, store_name), number_keys([2]));
 }
 
+/// <https://w3c.github.io/IndexedDB/#key-generator-construct>: generated keys start at 1 and
+/// count up; explicit number keys at or above the current number move it past their integer part,
+/// other keys leave it alone.
+fn test_key_generator_follows_generated_and_explicit_keys<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    create_store(&db, "test_store", None, true).unwrap();
+    let number = |key: f64| Some(IndexedDBKeyType::Number(key));
+
+    let replies = run_puts(
+        &db,
+        1,
+        "test_store",
+        vec![
+            (None, vec![1]),
+            (None, vec![2]),
+            (number(1000.0), vec![3]),
+            (None, vec![4]),
+            (Some(IndexedDBKeyType::String("9999".to_owned())), vec![5]),
+            (Some(IndexedDBKeyType::Date(9999.0)), vec![6]),
+            (
+                Some(IndexedDBKeyType::Array(vec![IndexedDBKeyType::Number(
+                    9999.0,
+                )])),
+                vec![7],
+            ),
+            (None, vec![8]),
+            (number(1002.5), vec![9]),
+            (number(-5.0), vec![10]),
+            (None, vec![11]),
+            (number(1004.7), vec![12]),
+            (None, vec![13]),
+        ],
+        false,
+    );
+    assert_eq!(replies[0], key_reply(1.0));
+    assert_eq!(replies[1], key_reply(2.0));
+    assert_eq!(replies[3], key_reply(1001.0));
+    assert_eq!(replies[7], key_reply(1002.0));
+    assert_eq!(replies[10], key_reply(1003.0));
+    assert_eq!(replies[12], key_reply(1005.0));
+    assert!(
+        replies
+            .iter()
+            .all(|reply| matches!(reply, Ok(PutItemResult::Key(_))))
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+    assert_eq!(db.key_generator_current_number("test_store"), Some(1006));
+}
+
+/// A key generator whose current number is above 2^53 fails to generate keys, which fails only
+/// that request, stores nothing and leaves the current number as it is.
+fn test_key_generator_generates_up_to_2_pow_53<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    create_store(&db, "test_store", None, true).unwrap();
+    let max = 9_007_199_254_740_992.0;
+
+    let replies = run_puts(
+        &db,
+        1,
+        "test_store",
+        vec![
+            (Some(IndexedDBKeyType::Number(max - 1.0)), vec![1]),
+            (None, vec![2]),
+            (None, vec![3]),
+            (Some(IndexedDBKeyType::Number(2.0)), vec![4]),
+            (None, vec![5]),
+        ],
+        false,
+    );
+    assert_eq!(replies[1], key_reply(max));
+    assert_eq!(replies[2], Ok(PutItemResult::KeyGeneratorExhausted));
+    assert_eq!(replies[3], key_reply(2.0));
+    assert_eq!(replies[4], Ok(PutItemResult::KeyGeneratorExhausted));
+    assert_eq!(commit(&db, 1), Ok(()));
+    assert_eq!(
+        stored_keys(&db, "test_store"),
+        vec![
+            IndexedDBKeyType::Number(2.0),
+            IndexedDBKeyType::Number(max - 1.0),
+            IndexedDBKeyType::Number(max),
+        ]
+    );
+    assert_eq!(
+        db.key_generator_current_number("test_store"),
+        Some((1 << 53) + 1)
+    );
+}
+
+/// An explicit key of 2^53 or more uses up the key generator; a key below every current number
+/// leaves it alone.
+fn test_large_explicit_keys_and_the_key_generator<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let keys = [
+        9_007_199_254_740_992.0,
+        2f64.powi(60),
+        2f64.powi(63),
+        2f64.powi(64),
+        2f64.powi(70),
+        f64::INFINITY,
+        -2f64.powi(60),
+        -2f64.powi(64),
+        -2f64.powi(70),
+        f64::NEG_INFINITY,
+    ];
+    for (transaction, key) in (1..).zip(keys) {
+        let store_name = format!("store {key}");
+        create_store(&db, &store_name, None, true).unwrap();
+        let replies = run_puts(
+            &db,
+            transaction,
+            &store_name,
+            vec![
+                (Some(IndexedDBKeyType::Number(key)), vec![1]),
+                (None, vec![2]),
+            ],
+            false,
+        );
+        assert_eq!(replies[0], key_reply(key));
+        if key > 0.0 {
+            assert_eq!(replies[1], Ok(PutItemResult::KeyGeneratorExhausted));
+        } else {
+            assert_eq!(replies[1], key_reply(1.0));
+        }
+        assert_eq!(commit(&db, transaction), Ok(()));
+    }
+}
+
+/// An `add` of an existing key fails without changing anything, and the transaction goes on.
+fn test_failed_add_changes_nothing<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    create_store(&db, "test_store", None, true).unwrap();
+    let replies = run_puts(&db, 1, "test_store", vec![(None, vec![1])], false);
+    assert_eq!(replies[0], key_reply(1.0));
+
+    let replies = run_puts(
+        &db,
+        1,
+        "test_store",
+        vec![
+            (Some(IndexedDBKeyType::Number(1.0)), vec![2]),
+            (None, vec![3]),
+        ],
+        false,
+    );
+    assert_eq!(replies[0], Ok(PutItemResult::CannotOverwrite));
+    assert_eq!(replies[1], key_reply(2.0));
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    let get = get_callback();
+    run_batch(
+        &db,
+        2,
+        IndexedDBTxnMode::Readonly,
+        vec![get_request(get.0, 1.0)],
+    );
+    assert_eq!(recv(&get.1), Ok(Some(stored_value(1.0, vec![1]))));
+    assert_eq!(db.key_generator_current_number("test_store"), Some(3));
+}
+
+/// Aborting a transaction reverts what its generated and its explicit keys did to the key
+/// generator.
+fn test_abort_reverts_the_key_generator<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    create_store(&db, "test_store", None, true).unwrap();
+
+    let replies = run_puts(
+        &db,
+        1,
+        "test_store",
+        vec![
+            (None, vec![1]),
+            (Some(IndexedDBKeyType::Number(10.0)), vec![2]),
+            (None, vec![3]),
+        ],
+        false,
+    );
+    assert_eq!(replies[2], key_reply(11.0));
+    abort(&db, 1);
+    assert_eq!(db.key_generator_current_number("test_store"), Some(1));
+
+    let replies = run_puts(&db, 2, "test_store", vec![(None, vec![4])], true);
+    assert_eq!(replies[0], key_reply(1.0));
+    assert_eq!(commit(&db, 2), Ok(()));
+    assert_eq!(db.key_generator_current_number("test_store"), Some(2));
+}
+
 /// Aborting a transaction rolls back everything it did in all its batches, and for an upgrade
 /// transaction also its schema changes and the version.
 fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
@@ -1336,7 +1577,6 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
                 key: None,
                 value: vec![3],
                 should_overwrite: false,
-                key_generator_current_number: None,
             }),
         )],
     );
@@ -1516,7 +1756,7 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
             }),
         )],
     );
-    assert_eq!(recv(&value.1), Ok(Some(vec![9])));
+    assert_eq!(recv(&value.1), Ok(Some(stored_value(1.0, vec![9]))));
 }
 
 /// Each database has its own actor: one whose connection is busy, with a write transaction
@@ -1568,7 +1808,7 @@ fn test_two_databases_progress_independently<X: SqlExecutor>() {
     );
 
     release.send(()).unwrap();
-    assert_eq!(recv(&get.1), Ok(Some(vec![1])));
+    assert_eq!(recv(&get.1), Ok(Some(stored_value(1.0, vec![1]))));
     assert_eq!(commit(&busy, 1), Ok(()));
     assert_eq!(stored_keys(&busy, "test_store"), number_keys([1]));
 }
@@ -1753,7 +1993,7 @@ fn open_faulty_engine<X: SqlExecutor>(dir: &TempDir) -> SqlEngine<Faulty<X>> {
 }
 
 fn get_request(
-    callback: GenericCallback<BackendResult<Option<Vec<u8>>>>,
+    callback: GenericCallback<BackendResult<Option<IndexedDBValue>>>,
     key: f64,
 ) -> KvsOperation {
     request(
@@ -1844,9 +2084,9 @@ fn test_statement_failure_that_ends_the_transaction_fails_it<X: SqlExecutor>() {
             .map(|get| get_request(get.0.clone(), 1.0))
             .collect(),
     );
-    assert_eq!(recv(&gets[0].1), Ok(Some(vec![1])));
+    assert_eq!(recv(&gets[0].1), Ok(Some(stored_value(1.0, vec![1]))));
     assert!(recv(&gets[1].1).is_err());
-    assert_eq!(recv(&gets[2].1), Ok(Some(vec![1])));
+    assert_eq!(recv(&gets[2].1), Ok(Some(stored_value(1.0, vec![1]))));
     assert_eq!(commit(&db, 2), Ok(()));
 }
 
@@ -1907,7 +2147,7 @@ fn test_commit_failure_rolls_back<X: SqlExecutor>() {
         IndexedDBTxnMode::Readonly,
         vec![get_request(get.0, 1.0)],
     );
-    assert_eq!(recv(&get.1), Ok(Some(vec![1])));
+    assert_eq!(recv(&get.1), Ok(Some(stored_value(1.0, vec![1]))));
     assert_eq!(commit(&db, 2), Ok(()));
 
     faults_for(dir.path()).lock().unwrap().commit = false;

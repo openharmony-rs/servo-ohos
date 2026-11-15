@@ -275,6 +275,15 @@ impl IndexedDBKeyRange {
     }
 }
 
+/// A serialized value read from an object store, with the primary key of its record. A value
+/// stored under a generated key in a store with an in-line key path doesn't contain the key: script
+/// injects it into the deserialized value.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct IndexedDBValue {
+    pub primary_key: IndexedDBKeyType,
+    pub value: Vec<u8>,
+}
+
 /// <https://w3c.github.io/IndexedDB/#record-snapshot>
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct IndexedDBRecord {
@@ -296,7 +305,6 @@ pub struct IndexedDBObjectStore {
     pub name: String,
     pub key_path: Option<KeyPath>,
     pub has_key_generator: bool,
-    pub key_generator_current_number: Option<i64>,
     pub indexes: Vec<IndexedDBIndex>,
 }
 
@@ -304,6 +312,8 @@ pub struct IndexedDBObjectStore {
 pub enum PutItemResult {
     Key(IndexedDBKeyType),
     CannotOverwrite,
+    /// The store's key generator can't generate another key.
+    KeyGeneratorExhausted,
 }
 
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -314,7 +324,7 @@ pub enum AsyncReadOnlyOperation {
         key_range: IndexedDBKeyRange,
     },
     GetItem {
-        callback: GenericCallback<BackendResult<Option<Vec<u8>>>>,
+        callback: GenericCallback<BackendResult<Option<IndexedDBValue>>>,
         key_range: IndexedDBKeyRange,
     },
 
@@ -324,7 +334,7 @@ pub enum AsyncReadOnlyOperation {
         count: Option<u32>,
     },
     GetAllItems {
-        callback: GenericCallback<BackendResult<Vec<Vec<u8>>>>,
+        callback: GenericCallback<BackendResult<Vec<IndexedDBValue>>>,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
     },
@@ -358,14 +368,13 @@ impl AsyncReadOnlyOperation {
 
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum AsyncReadWriteOperation {
-    /// Sets the value of the given key in the associated idb data
+    /// Sets the value of the given key in the associated idb data, or of a key from the store's
+    /// key generator if `key` is `None`.
     PutItem {
         callback: GenericCallback<BackendResult<PutItemResult>>,
         key: Option<IndexedDBKeyType>,
         value: Vec<u8>,
         should_overwrite: bool,
-        /// New object store key generator current number to persist if the put succeeds.
-        key_generator_current_number: Option<i64>,
     },
 
     /// Removes the key/value pair for the given key in the associated idb data

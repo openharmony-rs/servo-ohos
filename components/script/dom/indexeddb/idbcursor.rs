@@ -711,7 +711,6 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
                     key: self.effective_key(),
                     value: serialized_value,
                     should_overwrite: true,
-                    key_generator_current_number: None,
                 })
             },
             None,
@@ -791,7 +790,6 @@ pub(crate) struct IterationParam {
 ///   "record’s value" means the primary key of the record, and
 ///   "record’s referenced value" means the value of the record.
 pub(crate) fn iterate_cursor(
-    global: &GlobalScope,
     cx: &mut JSContext,
     param: &IterationParam,
     records: Vec<IndexedDBRecord>,
@@ -1063,11 +1061,12 @@ pub(crate) fn iterate_cursor(
         // Step 13.1. Let serialized be found record’s referenced value.
         // Step 13.2. Set cursor’s value to ! StructuredDeserialize(serialized, targetRealm)
         rooted!(&in(cx) let mut new_cursor_value = UndefinedValue());
-        postcard::from_bytes(&found_record.value)
-            .map_err(|_| Error::Data(None))
-            .and_then(|data| {
-                structuredclone::read(cx, global, data, new_cursor_value.handle_mut())
-            })?;
+        cursor.effective_object_store().deserialize_value(
+            cx,
+            &found_record.primary_key,
+            &found_record.value,
+            new_cursor_value.handle_mut(),
+        )?;
         cursor.value.set(new_cursor_value.get());
     }
 

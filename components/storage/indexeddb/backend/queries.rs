@@ -6,7 +6,7 @@
 
 use storage_traits::indexeddb::{
     CreateObjectResult, IndexedDBIndex, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
-    KeyPath, PutItemResult,
+    IndexedDBValue, KeyPath, PutItemResult,
 };
 
 use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
@@ -323,17 +323,28 @@ fn select_records<X: SqlExecutor, T>(
     query_rows(executor, &sql, &params, map_row)
 }
 
+fn value_of_row(row: &dyn SqlRow) -> Result<IndexedDBValue, SqlError> {
+    Ok(IndexedDBValue {
+        primary_key: decode_key(&row.blob(0)?)?,
+        value: row.blob(1)?,
+    })
+}
+
 pub(crate) fn get_value<X: SqlExecutor>(
     executor: &mut X,
     store: &ObjectStore,
     range: &IndexedDBKeyRange,
-) -> Result<Option<Vec<u8>>, SqlError> {
-    Ok(
-        select_records(executor, "data", store, range, Some(1), false, |row| {
-            row.blob(0)
-        })?
-        .pop(),
-    )
+) -> Result<Option<IndexedDBValue>, SqlError> {
+    Ok(select_records(
+        executor,
+        "key, data",
+        store,
+        range,
+        Some(1),
+        false,
+        value_of_row,
+    )?
+    .pop())
 }
 
 pub(crate) fn get_key<X: SqlExecutor>(
@@ -365,10 +376,16 @@ pub(crate) fn get_all_values<X: SqlExecutor>(
     store: &ObjectStore,
     range: &IndexedDBKeyRange,
     count: Option<u32>,
-) -> Result<Vec<Vec<u8>>, SqlError> {
-    select_records(executor, "data", store, range, count, false, |row| {
-        row.blob(0)
-    })
+) -> Result<Vec<IndexedDBValue>, SqlError> {
+    select_records(
+        executor,
+        "key, data",
+        store,
+        range,
+        count,
+        false,
+        value_of_row,
+    )
 }
 
 /// The records of `store` in `range` in ascending key order: the first `count` of them, or the
@@ -409,16 +426,80 @@ pub(crate) fn count<X: SqlExecutor>(
     Ok(count as u64)
 }
 
-/// Stores `value` under `key`, unless a record with `key` exists and `overwrite` isn't set, and
-/// then sets the store's key generator current number to `key_generator_current_number`, if any.
+/// 2^53, the largest key that a key generator generates.
+const MAX_GENERATED_KEY: i64 = 1 << 53;
+
+/// <https://w3c.github.io/IndexedDB/#generate-a-key>, without step 4: the caller increases the
+/// current number once the record is stored.
+fn generate_key(current_number: i64) -> Option<IndexedDBKeyType> {
+    // Step 1. Let generator be store’s key generator.
+    // Step 2. Let key be generator’s current number.
+    // Step 3. If key is greater than 2^53 (9007199254740992), then return failure.
+    if current_number > MAX_GENERATED_KEY {
+        return None;
+    }
+    // Step 5. Return key.
+    Some(IndexedDBKeyType::Number(current_number as f64))
+}
+
+/// <https://w3c.github.io/IndexedDB/#possibly-update-the-key-generator>: the new current number,
+/// if `key` changes it.
+fn possibly_update_the_key_generator(current_number: i64, key: &IndexedDBKeyType) -> Option<i64> {
+    // Step 1. If the type of key is not number, abort these steps.
+    let IndexedDBKeyType::Number(value) = key else {
+        return None;
+    };
+    // Step 2. Let value be the value of key.
+    // Step 3. Set value to the minimum of value and 2^53 (9007199254740992).
+    // Step 4. Set value to the largest integer not greater than value.
+    // The conversion is exact for integers up to 2^53, and saturates below i64::MIN, which is
+    // less than any current number.
+    let value = value.min(MAX_GENERATED_KEY as f64).floor() as i64;
+    // Step 5. Let generator be store’s key generator.
+    // Step 6. If value is greater than or equal to generator’s current number, then set
+    // generator’s current number to value + 1.
+    (value >= current_number).then_some(value + 1)
+}
+
+/// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store>: stores `value` under
+/// `key`, or under a key from the store's key generator if `key` is `None`, which requires that
+/// the store has one. A record that can't be stored changes nothing, not even the key generator.
 pub(crate) fn put_record<X: SqlExecutor>(
     executor: &mut X,
     store: &ObjectStore,
-    key: IndexedDBKeyType,
+    key: Option<IndexedDBKeyType>,
     value: &[u8],
     overwrite: bool,
-    key_generator_current_number: Option<i64>,
 ) -> Result<PutItemResult, SqlError> {
+    let has_key_generator = store.auto_increment != 0;
+    debug_assert!(key.is_some() || has_key_generator);
+    // Step 1. If store uses a key generator, then:
+    let (key, new_current_number) = match key {
+        // Step 1.1. If key is undefined, then:
+        None => {
+            // Step 1.1.1. Let key be the result of generating a key for store.
+            // Step 1.1.2. If key is failure, then this operation failed with a "ConstraintError"
+            // DOMException. Abort this algorithm without taking any further steps.
+            let Some(key) = generate_key(store.auto_increment) else {
+                return Ok(PutItemResult::KeyGeneratorExhausted);
+            };
+            // Step 1.1.3. If store also uses in-line keys, then run inject a key into a value
+            // using a key path with value, key and store’s key path.
+            // NOTE: The value is stored without the key; script injects it when it reads the
+            // value.
+            (key, Some(store.auto_increment + 1))
+        },
+        // Step 1.2. Otherwise, run possibly update the key generator for store with key.
+        Some(key) if has_key_generator => {
+            let new_current_number = possibly_update_the_key_generator(store.auto_increment, &key);
+            (key, new_current_number)
+        },
+        Some(key) => (key, None),
+    };
+
+    // Step 2. If the no-overwrite flag was given to these steps and is true, and a record already
+    // exists in store with its key equal to key, then this operation failed with a
+    // "ConstraintError" DOMException. Abort this algorithm without taking any further steps.
     let encoded_key = encoding::serialize(&key);
     let exists = query_row(
         executor,
@@ -427,12 +508,17 @@ pub(crate) fn put_record<X: SqlExecutor>(
         |_| Ok(()),
     )?
     .is_some();
+    if exists && !overwrite {
+        return Ok(PutItemResult::CannotOverwrite);
+    }
+
+    // Step 3. If a record already exists in store with its key equal to key, then remove the
+    // record from store using delete records from an object store.
+    // Step 4. Store a record in store containing key as its key and !
+    // StructuredSerializeForStorage(value) as its value. The record is stored in the object
+    // store’s list of records such that the list is sorted according to the key of the records in
+    // ascending order.
     if exists {
-        if !overwrite {
-            return Ok(PutItemResult::CannotOverwrite);
-        }
-        // Preserve `put()` semantics by replacing the stored value when the primary
-        // key already exists.
         executor.execute(
             "UPDATE object_data SET data = ? WHERE object_store_id = ? AND key = ?",
             &[
@@ -451,7 +537,7 @@ pub(crate) fn put_record<X: SqlExecutor>(
             ],
         )?;
     }
-    if let Some(current_number) = key_generator_current_number {
+    if let Some(current_number) = new_current_number {
         executor.execute(
             "UPDATE object_store SET auto_increment = ? WHERE id = ?",
             &[
@@ -460,6 +546,8 @@ pub(crate) fn put_record<X: SqlExecutor>(
             ],
         )?;
     }
+
+    // Step 6. Return key.
     Ok(PutItemResult::Key(key))
 }
 

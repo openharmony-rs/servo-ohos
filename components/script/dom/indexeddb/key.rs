@@ -9,13 +9,14 @@ use itertools::Itertools;
 use js::context::JSContext;
 use js::conversions::{ToJSValConvertible, jsstr_to_string};
 use js::jsapi::{
-    ClippedTime, IsArrayBufferObject, IsDetachedArrayBufferObject, JS_GetArrayBufferViewBuffer,
-    JS_GetStringLength, JS_IsArrayBufferViewObject, NewArrayObject1, PropertyKey,
+    ClippedTime, ESClass, IsArrayBufferObject, IsDetachedArrayBufferObject,
+    JS_GetArrayBufferViewBuffer, JS_GetStringLength, JS_IsArrayBufferViewObject, NewArrayObject1,
+    PropertyKey,
 };
 use js::jsval::{DoubleValue, ObjectValue, UndefinedValue};
 use js::rust::wrappers2::{
-    GetArrayLength, IsArrayObject, JS_HasOwnPropertyById, JS_IndexToId, JS_IsIdentifier,
-    NewDateObject, ObjectIsDate, SameValue,
+    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_HasOwnPropertyById, JS_IndexToId,
+    JS_IsIdentifier, NewDateObject, ObjectIsDate, SameValue,
 };
 use js::rust::{HandleValue, MutableHandleValue};
 use js::typedarray::{ArrayBuffer, ArrayBufferU8, ArrayBufferView};
@@ -688,6 +689,49 @@ pub(crate) fn can_inject_key_into_value(
 
     // Step 4. Return true if value is an Object or an Array, and false otherwise.
     Ok(current_value.is_object())
+}
+
+/// Whether a key that <https://w3c.github.io/IndexedDB/#inject-a-key-into-a-value-using-a-key-path>
+/// puts into `value` at `key_path` is stored with the value. StructuredSerializeForStorage keeps
+/// the own properties of ordinary objects and Arrays only, so a key that attaches to any other
+/// object, such as a Date, a Map, a Blob or a typed array, or to an object below one, is dropped.
+/// The objects that injecting creates are ordinary ones.
+#[expect(unsafe_code)]
+pub(crate) fn injected_key_is_stored(
+    cx: &mut JSContext,
+    value: HandleValue,
+    key_path: &DOMString,
+) -> Result<bool, Error> {
+    let key_path = key_path.str();
+    let mut identifiers = key_path.split('.').peekable();
+    rooted!(&in(cx) let mut current_value = *value);
+    while let Some(identifier) = identifiers.next() {
+        if !current_value.is_object() {
+            return Ok(false);
+        }
+        rooted!(&in(cx) let object = current_value.to_object());
+        let mut class = ESClass::Other;
+        if !unsafe { GetBuiltinClass(cx, object.handle(), &mut class) } {
+            return Err(Error::JSFailed);
+        }
+        if class != ESClass::Object && class != ESClass::Array {
+            return Ok(false);
+        }
+        if identifiers.peek().is_none() {
+            break;
+        }
+        let name = CString::new(identifier).expect("Failed to convert key path identifier");
+        if !has_own_property(cx, object.handle(), name.as_c_str()).map_err(|_| Error::JSFailed)? {
+            break;
+        }
+        get_property_jsval(
+            cx,
+            object.handle(),
+            name.as_c_str(),
+            current_value.handle_mut(),
+        )?;
+    }
+    Ok(true)
 }
 
 /// <https://w3c.github.io/IndexedDB/#inject-a-key-into-a-value-using-a-key-path>
