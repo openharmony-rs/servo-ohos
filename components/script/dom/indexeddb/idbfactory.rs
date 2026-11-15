@@ -13,9 +13,9 @@ use script_bindings::inheritance::Castable;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::generic_channel::GenericSend;
 use servo_url::origin::ImmutableOrigin;
-use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
 use storage_traits::indexeddb::{
-    BackendResult, ConnectionMsg, DatabaseInfo, IndexedDBThreadMsg, SyncOperation,
+    BackendResult, ConnectionMsg, DatabaseInfo, IndexedDBThreadMsg, StorageBottleSource,
+    SyncOperation,
 };
 use stylo_atoms::Atom;
 use uuid::Uuid;
@@ -455,7 +455,6 @@ impl IDBFactory {
         name: DOMString,
         version: Option<u64>,
         request: &IDBOpenDBRequest,
-        proxy_map: StorageProxyMap,
     ) -> Result<(), ()> {
         let global = self.global();
         let request_id = request.get_id();
@@ -477,7 +476,7 @@ impl IDBFactory {
             String::from(name),
             version,
             request.get_id(),
-            proxy_map,
+            Self::storage_bottle_source(&global),
         );
 
         // Note: algo continues in parallel.
@@ -516,17 +515,12 @@ impl IDBFactory {
             })
             .collect();
         let origin = global.origin().immutable().clone();
-        let Ok(proxy_map) = self.obtain_a_local_storage_bottle_map(&global, origin.clone()) else {
-            debug_assert!(false, "Failed to obtain a proxy map.");
-            return;
-        };
         if global
             .storage_threads()
             .send(IndexedDBThreadMsg::Sync(
                 SyncOperation::AbortPendingUpgrades {
                     pending_upgrades,
                     origin,
-                    proxy_map,
                 },
             ))
             .is_err()
@@ -543,29 +537,14 @@ impl IDBFactory {
         }
     }
 
-    /// The indexeddb call into
-    /// <https://storage.spec.whatwg.org/#obtain-a-local-storage-bottle-map>
-    fn obtain_a_local_storage_bottle_map(
-        &self,
-        global: &GlobalScope,
-        origin: ImmutableOrigin,
-    ) -> Result<StorageProxyMap, Error> {
-        let handle = global.storage_threads().client_storage_handle();
-        let message = handle
-            .obtain_a_storage_bottle_map(
-                StorageType::Local,
-                global.webview_id(),
-                StorageIdentifier::IndexedDB,
-                origin,
-            )
-            .recv();
-        let Ok(response) = message else {
-            return Err(Error::Operation(None));
-        };
-        let Ok(proxy_map) = response else {
-            return Err(Error::Operation(None));
-        };
-        Ok(proxy_map)
+    /// What the backend needs to run
+    /// <https://storage.spec.whatwg.org/#obtain-a-local-storage-bottle-map> for `global`, which it
+    /// does in parallel.
+    pub(crate) fn storage_bottle_source(global: &GlobalScope) -> StorageBottleSource {
+        StorageBottleSource {
+            client_storage: global.storage_threads().client_storage_handle(),
+            webview: global.webview_id(),
+        }
     }
 }
 
@@ -595,15 +574,14 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
 
         // Note: switching to obtaining a storage bottle map,
         // as per https://github.com/w3c/IndexedDB/pull/334/
-        let proxy_map =
-            self.obtain_a_local_storage_bottle_map(&global, global.origin().immutable().clone())?;
+        // The backend obtains it in parallel, see `open_database`.
 
         // Step 4: Let request be a new open request.
         let request = IDBOpenDBRequest::new(cx, &self.global());
 
         // Step 5: Runs in parallel
         if self
-            .open_database(storage_key, name, version, &request, proxy_map)
+            .open_database(storage_key, name, version, &request)
             .is_err()
         {
             return Err(Error::Operation(None));
@@ -630,15 +608,14 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
 
         // Note: switching to obtaining a storage bottle map,
         // as per https://github.com/w3c/IndexedDB/pull/334/
-        let proxy_map =
-            self.obtain_a_local_storage_bottle_map(&global, global.origin().immutable().clone())?;
+        // The backend obtains it in parallel.
 
         // Step 3: Let request be a new open request
         let request = IDBOpenDBRequest::new(cx, &self.global());
 
         // Step 4: Runs in parallel
         if request
-            .delete_database(storage_key, String::from(name), proxy_map)
+            .delete_database(storage_key, String::from(name))
             .is_err()
         {
             return Err(Error::Operation(None));

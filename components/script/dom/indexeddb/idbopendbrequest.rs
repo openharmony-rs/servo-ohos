@@ -11,7 +11,6 @@ use profile_traits::generic_callback::GenericCallback;
 use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::GenericSend;
 use servo_url::origin::ImmutableOrigin;
-use storage_traits::client_storage::StorageProxyMap;
 use storage_traits::indexeddb::{BackendResult, IndexedDBThreadMsg, SyncOperation};
 use stylo_atoms::Atom;
 use uuid::Uuid;
@@ -27,6 +26,7 @@ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbdatabase::IDBDatabase;
+use crate::dom::indexeddb::idbfactory::IDBFactory;
 use crate::dom::indexeddb::idbrequest::IDBRequest;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::idbversionchangeevent::IDBVersionChangeEvent;
@@ -235,7 +235,6 @@ impl IDBOpenDBRequest {
         &self,
         storage_key: ImmutableOrigin,
         name: String,
-        proxy_map: StorageProxyMap,
     ) -> Result<(), ()> {
         let global = self.global();
 
@@ -254,8 +253,13 @@ impl IDBOpenDBRequest {
         })
         .expect("Could not create delete database callback");
 
-        let delete_operation =
-            SyncOperation::DeleteDatabase(callback, storage_key, name, proxy_map, self.get_id());
+        let delete_operation = SyncOperation::DeleteDatabase(
+            callback,
+            storage_key,
+            name,
+            IDBFactory::storage_bottle_source(&global),
+            self.get_id(),
+        );
 
         if global
             .storage_threads()

@@ -16,12 +16,11 @@ use servo_config::prefs;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use storage::ClientStorageThreadFactory;
 use storage_traits::StorageThreads;
-use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
     BackendError, BackendResult, ConnectionMsg, IndexedDBKeyRange, IndexedDBKeyType,
     IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, IndexedDBValue,
-    KeyPath, PutItemResult, SyncOperation, TxnCompleteMsg,
+    KeyPath, PutItemResult, StorageBottleSource, SyncOperation, TxnCompleteMsg,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -135,7 +134,7 @@ struct IndexedDbTestContext {
     _temp_dir: TempDir,
     private_threads: StorageThreads,
     public_threads: StorageThreads,
-    proxy_map: StorageProxyMap,
+    bottle_source: StorageBottleSource,
     origin: ImmutableOrigin,
     shutdown: Cell<bool>,
 }
@@ -151,23 +150,17 @@ impl IndexedDbTestContext {
         let (private_threads, public_threads) =
             storage::new_storage_threads(mem_profiler_chan, Some(config_dir), false);
         let origin = ServoUrl::parse("https://example.com").unwrap().origin();
-        let proxy_map = client_handle
-            .obtain_a_storage_bottle_map(
-                StorageType::Local,
-                Some(WebViewId::new(TEST_PAINTER_ID)),
-                StorageIdentifier::IndexedDB,
-                origin.clone(),
-            )
-            .recv()
-            .unwrap()
-            .unwrap();
+        let bottle_source = StorageBottleSource {
+            client_storage: client_handle.clone(),
+            webview: Some(WebViewId::new(TEST_PAINTER_ID)),
+        };
 
         Self {
             _client_handle: client_handle,
             _temp_dir: temp_dir,
             private_threads,
             public_threads,
-            proxy_map,
+            bottle_source,
             origin,
             shutdown: Cell::new(false),
         }
@@ -231,7 +224,7 @@ fn open_database(
             db_name.to_string(),
             version,
             Uuid::new_v4(),
-            ctx.proxy_map.clone(),
+            ctx.bottle_source.clone(),
         )),
     )
     .unwrap();

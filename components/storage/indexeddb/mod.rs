@@ -25,11 +25,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::generic_channel::{self, GenericReceiver, GenericSender, ReceiveError};
 use servo_base::threadpool::ThreadPool;
 use servo_url::origin::ImmutableOrigin;
-use storage_traits::client_storage::StorageProxyMap;
+use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
 use storage_traits::indexeddb::{
     AsyncOperation, BackendError, BackendResult, ConnectionMsg, DatabaseInfo, DbResult,
     IndexedDBIndex, IndexedDBObjectStore, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath,
-    SyncOperation, TxnCompleteMsg,
+    StorageBottleSource, SyncOperation, TxnCompleteMsg,
 };
 use uuid::Uuid;
 
@@ -653,6 +653,24 @@ fn backend_error_from_storage_error<E: BackendErrorMapper>(err: E) -> BackendErr
     err.into_backend_error()
 }
 
+/// <https://storage.spec.whatwg.org/#obtain-a-local-storage-bottle-map>
+fn obtain_a_local_storage_bottle_map(
+    source: &StorageBottleSource,
+    origin: &ImmutableOrigin,
+) -> BackendResult<StorageProxyMap> {
+    source
+        .client_storage
+        .obtain_a_storage_bottle_map(
+            StorageType::Local,
+            source.webview,
+            StorageIdentifier::IndexedDB,
+            origin.clone(),
+        )
+        .recv()
+        .map_err(|_| BackendError::DbErr("Failed to communicate with client storage.".to_owned()))?
+        .map_err(|error| BackendError::DbErr(format!("Client storage error: {error}")))
+}
+
 /// <https://w3c.github.io/IndexedDB/#request-open-request>
 /// Used here to implement the
 /// <https://w3c.github.io/IndexedDB/#connection-queue>
@@ -733,6 +751,14 @@ impl OpenRequest {
             } => id,
         };
         *id
+    }
+
+    fn proxy_map(&self) -> &StorageProxyMap {
+        match self {
+            OpenRequest::Open { proxy_map, .. } | OpenRequest::Delete { proxy_map, .. } => {
+                proxy_map
+            },
+        }
     }
 
     fn is_open(&self) -> bool {
@@ -1287,10 +1313,9 @@ impl IndexedDBManager {
         &mut self,
         pending_upgrades: HashMap<String, HashSet<Uuid>>,
         origin: ImmutableOrigin,
-        proxy_map: StorageProxyMap,
     ) {
         for (name, ids) in pending_upgrades.into_iter() {
-            let mut upgrade_to_revert: Option<VersionUpgrade> = None;
+            let mut upgrade_to_revert: Option<(VersionUpgrade, StorageProxyMap)> = None;
             let key = IndexedDBDescription {
                 name: name.clone(),
                 origin: origin.clone(),
@@ -1309,7 +1334,8 @@ impl IndexedDBManager {
                             if upgrade_to_revert.is_none() &&
                                 let Some(upgrade) = upgrade
                             {
-                                upgrade_to_revert = Some(upgrade);
+                                upgrade_to_revert =
+                                    Some((upgrade, open_request.proxy_map().clone()));
                             }
                             false
                         } else {
@@ -1322,7 +1348,7 @@ impl IndexedDBManager {
                     self.connection_queues.remove(&key);
                 }
             }
-            if let Some(upgrade) = upgrade_to_revert {
+            if let Some((upgrade, proxy_map)) = upgrade_to_revert {
                 self.revert_aborted_upgrade(&key, &upgrade, &proxy_map);
             }
         }
@@ -1336,8 +1362,24 @@ impl IndexedDBManager {
         db_name: String,
         version: Option<u64>,
         id: Uuid,
-        proxy_map: StorageProxyMap,
+        bottle_source: StorageBottleSource,
     ) {
+        let proxy_map = match obtain_a_local_storage_bottle_map(&bottle_source, &origin) {
+            Ok(proxy_map) => proxy_map,
+            Err(error) => {
+                if sender
+                    .send(ConnectionMsg::DatabaseError {
+                        name: db_name,
+                        id,
+                        error,
+                    })
+                    .is_err()
+                {
+                    debug!("Script exit during indexeddb database open");
+                }
+                return;
+            },
+        };
         let key = IndexedDBDescription {
             name: db_name.clone(),
             origin,
@@ -2072,17 +2114,32 @@ impl IndexedDBManager {
             SyncOperation::CloseDatabase(origin, id, db_name) => {
                 self.close_database(origin, id, db_name);
             },
-            SyncOperation::OpenDatabase(sender, origin, db_name, version, id, proxy_map) => {
-                self.open_a_database_connection(sender, origin, db_name, version, id, proxy_map);
+            SyncOperation::OpenDatabase(sender, origin, db_name, version, id, bottle_source) => {
+                self.open_a_database_connection(
+                    sender,
+                    origin,
+                    db_name,
+                    version,
+                    id,
+                    bottle_source,
+                );
             },
             SyncOperation::AbortPendingUpgrades {
                 pending_upgrades,
                 origin,
-                proxy_map,
             } => {
-                self.abort_pending_upgrades(pending_upgrades, origin, proxy_map);
+                self.abort_pending_upgrades(pending_upgrades, origin);
             },
-            SyncOperation::DeleteDatabase(callback, origin, db_name, proxy_map, id) => {
+            SyncOperation::DeleteDatabase(callback, origin, db_name, bottle_source, id) => {
+                let proxy_map = match obtain_a_local_storage_bottle_map(&bottle_source, &origin) {
+                    Ok(proxy_map) => proxy_map,
+                    Err(error) => {
+                        if callback.send(Err(error)).is_err() {
+                            debug!("Script went away during pending database delete.");
+                        }
+                        return;
+                    },
+                };
                 let idb_description = IndexedDBDescription {
                     origin,
                     name: db_name,

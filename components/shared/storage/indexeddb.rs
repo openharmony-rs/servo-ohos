@@ -12,10 +12,11 @@ use profile_traits::generic_callback::GenericCallback;
 use profile_traits::mem::ReportsChan;
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::GenericSender;
+use servo_base::id::WebViewId;
 use servo_url::origin::ImmutableOrigin;
 use uuid::Uuid;
 
-use crate::client_storage::StorageProxyMap;
+use crate::client_storage::ClientStorageThreadHandle;
 
 // TODO Box<dyn Error> is not serializable, fix needs to be found
 pub type DbError = String;
@@ -533,6 +534,15 @@ pub struct TxnCompleteMsg {
     pub result: BackendResult<()>,
 }
 
+/// What the IndexedDB manager needs to obtain a global's local storage bottle map
+/// (<https://storage.spec.whatwg.org/#obtain-a-local-storage-bottle-map>), so that script doesn't
+/// wait for it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StorageBottleSource {
+    pub client_storage: ClientStorageThreadHandle,
+    pub webview: Option<WebViewId>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DatabaseInfo {
     pub name: String,
@@ -632,8 +642,8 @@ pub enum SyncOperation {
         Option<u64>,
         // The id of the request.
         Uuid,
-        // The Storage proxy map.
-        StorageProxyMap,
+        // Where to obtain the storage proxy map.
+        StorageBottleSource,
     ),
 
     /// Deletes the database
@@ -642,8 +652,8 @@ pub enum SyncOperation {
         ImmutableOrigin,
         // Database name.
         String,
-        // The Storage proxy map.
-        StorageProxyMap,
+        // Where to obtain the storage proxy map.
+        StorageBottleSource,
         Uuid,
     ),
 
@@ -658,7 +668,6 @@ pub enum SyncOperation {
     AbortPendingUpgrades {
         pending_upgrades: HashMap<String, HashSet<Uuid>>,
         origin: ImmutableOrigin,
-        proxy_map: StorageProxyMap,
     },
 
     NotifyEndOfVersionChange {
