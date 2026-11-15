@@ -69,6 +69,9 @@ backend_tests!(
     test_indexeddb_batch_commit_failure_surfaces_an_error,
     test_indexeddb_aborted_put_that_succeeded_leaves_no_record,
     test_indexeddb_writers_with_disjoint_scopes_run_one_after_another,
+    test_indexeddb_abort_while_a_batch_runs_frees_the_next_writer,
+    test_indexeddb_finished_transaction_without_commit_is_rolled_back,
+    test_indexeddb_upgrade_waits_for_no_versionchange_of_a_closed_connection,
 );
 
 static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1821,5 +1824,182 @@ fn test_indexeddb_writers_with_disjoint_scopes_run_one_after_another() {
     }
 
     close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+/// Opens `db_name` at version 1 with the stores `a` and `b`.
+fn open_database_with_two_stores(ctx: &IndexedDbTestContext, db_name: &str) -> Uuid {
+    let receiver = open_database(ctx, db_name, Some(1));
+    loop {
+        match recv_callback_timeout(&receiver, "two stores open reply") {
+            ConnectionMsg::Upgrade { transaction, .. } => {
+                for store_name in ["a", "b"] {
+                    create_object_store(ctx, db_name, store_name, transaction, None, false);
+                }
+                commit_upgrade_transaction(ctx, db_name, transaction);
+            },
+            ConnectionMsg::Connection { id, .. } => break id,
+            other => panic!("unexpected two stores message: {other:?}"),
+        }
+    }
+}
+
+/// Runs a put into `store_name` in a new readwrite transaction and commits it.
+fn put_and_commit(ctx: &IndexedDbTestContext, db_name: &str, store_name: &str) {
+    let txn = create_transaction(
+        ctx,
+        db_name,
+        IndexedDBTxnMode::Readwrite,
+        vec![store_name.to_string()],
+    );
+    let put = put_item(
+        ctx,
+        db_name,
+        store_name,
+        txn,
+        IndexedDBKeyType::Number(1.0),
+        b"next".to_vec(),
+    );
+    assert!(
+        recv_callback_timeout(&put, "next writer put reply").is_ok(),
+        "The next writer's put must not meet the earlier writer's SQL transaction"
+    );
+    mark_request_handled(ctx, db_name, txn, 1);
+    let commit_result = commit_transaction(ctx, db_name, txn);
+    assert!(
+        recv_callback_timeout(&commit_result, "next writer commit reply")
+            .result
+            .is_ok()
+    );
+    finish_transaction(ctx, db_name, txn);
+}
+
+/// Sends `count` puts into `a` in the readwrite transaction `txn`, which keep the engine busy
+/// with a batch of them.
+fn send_puts(ctx: &IndexedDbTestContext, db_name: &str, txn: u64, count: u64) {
+    for key in 0..count {
+        let _ = put_item_request(
+            ctx,
+            db_name,
+            "a",
+            txn,
+            key,
+            Some(IndexedDBKeyType::Number(key as f64)),
+            vec![0; 1024],
+            true,
+        );
+    }
+}
+
+/// An abort that arrives while a batch of the transaction runs rolls the transaction back
+/// before the next writer runs, also when the transaction finishes right after the abort, as it
+/// does when its global goes away.
+fn test_indexeddb_abort_while_a_batch_runs_frees_the_next_writer() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-abort-running-batch";
+    let connection_id = open_database_with_two_stores(&ctx, db_name);
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readwrite,
+        vec!["a".to_string()],
+    );
+    send_puts(&ctx, db_name, txn, 2000);
+    let _abort_result = abort_transaction(&ctx, db_name, txn);
+    finish_transaction(&ctx, db_name, txn);
+
+    put_and_commit(&ctx, db_name, "b");
+    assert_eq!(
+        get_item_in_new_readonly_transaction(&ctx, db_name, "a", IndexedDBKeyType::Number(0.0)),
+        None
+    );
+
+    close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+/// A transaction that finishes without a commit or an abort, like one of a global that went
+/// away, is rolled back and holds back no other writer.
+fn test_indexeddb_finished_transaction_without_commit_is_rolled_back() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-finished-without-commit";
+    let connection_id = open_database_with_two_stores(&ctx, db_name);
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readwrite,
+        vec!["a".to_string()],
+    );
+    let put = put_item(
+        &ctx,
+        db_name,
+        "a",
+        txn,
+        IndexedDBKeyType::Number(0.0),
+        b"dead".to_vec(),
+    );
+    recv_callback_timeout(&put, "dead writer put reply").unwrap();
+    finish_transaction(&ctx, db_name, txn);
+
+    put_and_commit(&ctx, db_name, "b");
+    assert_eq!(
+        get_item_in_new_readonly_transaction(&ctx, db_name, "a", IndexedDBKeyType::Number(0.0)),
+        None
+    );
+
+    close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+/// A connection that closes before it reports its versionchange event, as one whose global went
+/// away does, holds back no upgrade; when its closing leaves no event to wait for while another
+/// connection stays open, the upgrade is blocked.
+fn test_indexeddb_upgrade_waits_for_no_versionchange_of_a_closed_connection() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-upgrade-closed-connection";
+    let gone = open_database_with_two_stores(&ctx, db_name);
+    let stays = match recv_callback_timeout(&open_database(&ctx, db_name, None), "second open") {
+        ConnectionMsg::Connection { id, .. } => id,
+        other => panic!("unexpected second open message: {other:?}"),
+    };
+
+    let upgrade = open_database(&ctx, db_name, Some(2));
+    GenericSend::send(
+        &ctx.private_threads,
+        IndexedDBThreadMsg::Sync(SyncOperation::NotifyEndOfVersionChange {
+            name: db_name.to_string(),
+            id: stays,
+            old_version: 1,
+            origin: ctx.origin.clone(),
+        }),
+    )
+    .unwrap();
+    close_database(&ctx, gone, db_name);
+    match recv_callback_timeout(&upgrade, "blocked event") {
+        ConnectionMsg::Blocked {
+            version,
+            old_version,
+            ..
+        } => assert_eq!((version, old_version), (2, 1)),
+        other => panic!("unexpected upgrade message: {other:?}"),
+    }
+
+    close_database(&ctx, stays, db_name);
+    let transaction = match recv_callback_timeout(&upgrade, "upgrade") {
+        ConnectionMsg::Upgrade { transaction, .. } => transaction,
+        other => panic!("unexpected upgrade message: {other:?}"),
+    };
+    commit_upgrade_transaction(&ctx, db_name, transaction);
+    let upgraded = match recv_callback_timeout(&upgrade, "upgraded connection") {
+        ConnectionMsg::Connection { id, version, .. } => {
+            assert_eq!(version, 2);
+            id
+        },
+        other => panic!("unexpected upgrade message: {other:?}"),
+    };
+
+    close_database(&ctx, upgraded, db_name);
     ctx.shutdown();
 }

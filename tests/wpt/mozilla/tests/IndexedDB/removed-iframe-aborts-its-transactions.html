@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>IndexedDB: the transactions of a removed iframe are aborted</title>
+<link rel="help" href="https://w3c.github.io/IndexedDB/#closing-connection">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+// When the global of a connection goes away, the connection is closed with the forced flag,
+// which aborts its transactions: a readwrite transaction that a removed iframe left running
+// leaves no writes behind and holds back no later transaction, also of the same scope.
+
+function request(r) {
+  return new Promise((resolve, reject) => {
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+
+function complete(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+promise_test(async t => {
+  const name = 'removed-iframe-' + Math.random();
+  const setup = indexedDB.open(name, 1);
+  setup.onupgradeneeded = () => {
+    setup.result.createObjectStore('a');
+    setup.result.createObjectStore('b');
+  };
+  (await request(setup)).close();
+  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
+
+  const frame = document.createElement('iframe');
+  const writing = new Promise(resolve => window.onmessage = e => resolve(e.data));
+  frame.src = 'resources/removed-iframe-writer.html?' + encodeURIComponent(name);
+  document.body.appendChild(frame);
+  assert_equals(await writing, 'writing');
+  frame.remove();
+
+  const db = await request(indexedDB.open(name));
+  t.add_cleanup(() => { db.close(); });
+
+  let tx = db.transaction('b', 'readwrite');
+  tx.objectStore('b').put('parent', 0);
+  await complete(tx);
+
+  tx = db.transaction('a', 'readonly');
+  const written = request(tx.objectStore('a').count());
+  await complete(tx);
+  assert_equals(await written, 0, "the removed iframe's writes are rolled back");
+
+  tx = db.transaction('a', 'readwrite');
+  tx.objectStore('a').put('parent', 0);
+  await complete(tx);
+}, "The transactions of a removed iframe are aborted and hold back no one");
+
+promise_test(async t => {
+  const name = 'removed-iframe-upgrade-' + Math.random();
+  const setup = indexedDB.open(name, 1);
+  setup.onupgradeneeded = () => setup.result.createObjectStore('a');
+  (await request(setup)).close();
+  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
+
+  const frame = document.createElement('iframe');
+  const writing = new Promise(resolve => window.onmessage = e => resolve(e.data));
+  frame.src = 'resources/removed-iframe-writer.html?' + encodeURIComponent(name);
+  document.body.appendChild(frame);
+  assert_equals(await writing, 'writing');
+  frame.remove();
+
+  const upgrade = indexedDB.open(name, 2);
+  upgrade.onupgradeneeded = () => upgrade.result.createObjectStore('b');
+  const upgraded = await request(upgrade);
+  upgraded.close();
+  assert_equals(upgraded.version, 2);
+}, "An upgrade waits for no transaction or connection of a removed iframe");
+</script>
+<body></body>

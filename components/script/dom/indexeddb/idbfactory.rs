@@ -492,6 +492,20 @@ impl IDBFactory {
     }
 
     pub(crate) fn abort_pending_upgrades_and_close_databases(&self) {
+        // https://w3c.github.io/IndexedDB/#closing-connection
+        // Step 2. If the forced flag is true, then for each transaction created using connection
+        // run abort a transaction with transaction and newly created "AbortError" DOMException.
+        let transactions: Vec<DomRoot<IDBTransaction>> = self
+            .indexeddb_transactions
+            .borrow()
+            .iter()
+            .flat_map(|(_, bucket)| bucket.iter())
+            .map(|transaction| DomRoot::from_ref(&**transaction))
+            .collect();
+        for transaction in transactions {
+            transaction.abort_when_global_goes_away();
+        }
+
         let global = self.global();
         let connections = self.connections.borrow();
         let pending_upgrades = connections

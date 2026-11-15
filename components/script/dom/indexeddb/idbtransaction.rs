@@ -558,6 +558,27 @@ impl IDBTransaction {
             .send(IndexedDBThreadMsg::Sync(operation));
     }
 
+    /// Aborts the transaction in the backend when its global goes away, which then fires no
+    /// more events: the backend rolls back what it wrote, and the transaction holds back no
+    /// other transaction any more.
+    pub(crate) fn abort_when_global_goes_away(&self) {
+        if self.finished.get() {
+            return;
+        }
+        self.finished.set(true);
+        let callback = GenericCallback::new(|_: Result<TxnCompleteMsg, SendError>| {})
+            .expect("Could not create callback");
+        let _ = self
+            .get_idb_thread()
+            .send(IndexedDBThreadMsg::Sync(SyncOperation::Abort(
+                callback,
+                self.global().origin().immutable().clone(),
+                String::from(self.db.get_name()),
+                self.serial_number,
+            )));
+        self.notify_backend_transaction_finished();
+    }
+
     fn notify_backend_transaction_finished(&self) {
         let global = self.global();
         let _ = self.get_idb_thread().send(IndexedDBThreadMsg::Sync(

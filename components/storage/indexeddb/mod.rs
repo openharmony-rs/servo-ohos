@@ -950,14 +950,11 @@ impl IndexedDBManager {
                                 },
                             }
 
-                            if db.abort(&origin, &db_name, txn) {
-                                return false;
-                            }
-
                             // If more requests were queued while this batch was running,
                             // schedule again now.
                             db.schedule_transactions(origin.clone(), &db_name);
-                            db.can_notify_txn_maybe_commit(txn)
+                            // An aborted transaction has nothing left to commit.
+                            mode.is_some() && db.can_notify_txn_maybe_commit(txn)
                         });
 
                     if should_notify {
@@ -1517,12 +1514,10 @@ impl IndexedDBManager {
                     "An request to open a connection should be in the queue."
                 );
             };
-            debug_assert!(
-                pending_versionchange.contains(&from_id),
-                "The open request should be pending on the versionchange event for the connection sending the message."
-            );
-
-            pending_versionchange.remove(&from_id);
+            // Note: a connection that closed first no longer counts, see `close_database`.
+            if !pending_versionchange.remove(&from_id) {
+                return;
+            }
 
             // Step 10.3: Wait for all of the events to be fired.
             if !pending_versionchange.is_empty() {
@@ -1952,10 +1947,10 @@ impl IndexedDBManager {
                 return;
             };
             if let OpenRequest::Open {
-                sender: _,
+                sender,
                 db_name: _,
                 version,
-                id: _,
+                id: request_id,
                 processed: _,
                 pending_upgrade,
                 pending_versionchange,
@@ -1964,6 +1959,33 @@ impl IndexedDBManager {
             } = open_request
             {
                 pending_close.remove(&id);
+                // A closed connection fires no versionchange event, so the request stops waiting
+                // for it: the connection's global may be gone and never report the event.
+                if pending_versionchange.remove(&id) &&
+                    pending_versionchange.is_empty() &&
+                    !pending_close.is_empty() &&
+                    let Some(version) = *version
+                {
+                    // Step 10.4: If any of the connections in openConnections are still not
+                    // closed, queue a database task to fire a version change event named blocked
+                    // at request with db’s version and version.
+                    let old_version = self
+                        .databases
+                        .get(&key)
+                        .and_then(|db| db.version().ok())
+                        .unwrap_or_default();
+                    if sender
+                        .send(ConnectionMsg::Blocked {
+                            name: key.name.clone(),
+                            id: *request_id,
+                            version,
+                            old_version,
+                        })
+                        .is_err()
+                    {
+                        debug!("Script exit during indexeddb database open");
+                    }
+                }
                 (
                     // Note: need to exclude requests that have already started upgrading.
                     pending_close.is_empty() &&
@@ -2162,6 +2184,10 @@ impl IndexedDBManager {
                 let maybe_commit_txns =
                     if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
                         db.finish_transaction(txn);
+                        // A no-op after a commit or an abort, but a transaction that finished
+                        // otherwise, such as one whose global went away, must not leave its SQL
+                        // transaction open.
+                        db.engine.rollback(txn, Box::new(|| {}));
                         db.schedule_transactions(origin.clone(), &db_name);
                         db.maybe_commit_candidates()
                     } else {
@@ -2219,9 +2245,9 @@ impl IndexedDBManager {
         }
     }
 
-    /// Handling for the `Abort` message which will call [`Self::abort`] if the transaction
-    /// being aborted is not ongoing. If the transaction is in process, abort is delayed until
-    /// the batch finishes.
+    /// Handling for the `Abort` message, which calls [`IndexedDBEnvironment::abort`] at once,
+    /// also while a batch of the transaction runs: the engine runs the rollback after it, and
+    /// before any batch the scheduler hands over later.
     fn handle_abort(
         &mut self,
         abort_callback: GenericCallback<TxnCompleteMsg>,
@@ -2252,15 +2278,6 @@ impl IndexedDBManager {
             .entry(transaction)
             .or_default()
             .push(abort_callback);
-
-        // If the transaction is running wait to abort until after it finishes to actually
-        // abort.
-        if database.running_readwrite == Some(transaction) ||
-            database.running_readonly.contains(&transaction)
-        {
-            return;
-        }
-
         database.abort(&origin, &database_name, transaction);
     }
 

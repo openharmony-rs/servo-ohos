@@ -8565,6 +8565,14 @@
     "b485d435a63ada28eabe976b49a8a580725e7508",
     []
    ],
+   "IndexedDB": {
+    "resources": {
+     "removed-iframe-writer.html": [
+      "728c70ad75c2804ca49320cd69afec1026e7fad8",
+      []
+     ]
+    }
+   },
    "appearance": {
     "document-selection-image-broken-ref.html": [
      "d4d29943249a0ec2b78c79f88573d505742f7a56",
@@ -11669,6 +11677,13 @@
         ]
        ]
       }
+     ]
+    ],
+    "removed-iframe-aborts-its-transactions.html": [
+     "4c72fe0190142520f2e483e292f0997bd6dc924b",
+     [
+      null,
+      {}
      ]
     ]
    },
