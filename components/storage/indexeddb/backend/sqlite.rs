@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use rusqlite::types::{ToSqlOutput, ValueRef};
-use rusqlite::{Connection, ToSql, ffi};
+use rusqlite::{Connection, ErrorCode, ToSql, ffi};
 
 use super::executor::{
     Connector, OnRow, SqlError, SqlExecutor, SqlParam, SqlRow, TransactionBehavior,
@@ -68,6 +68,25 @@ impl SqliteExecutor {
             let _ = connection.execute(pragma, ());
         }
         Ok(Self { path, connection })
+    }
+
+    /// Ends the open transaction after an error that SQLite may have rolled it back for, as
+    /// <https://sqlite.org/lang_transaction.html#response_to_errors_within_a_transaction>
+    /// recommends.
+    fn end_transaction_after<T>(&mut self, result: rusqlite::Result<T>) -> Result<T, SqlError> {
+        if let Err(rusqlite::Error::SqliteFailure(error, _)) = &result &&
+            matches!(
+                error.code,
+                ErrorCode::DiskFull |
+                    ErrorCode::SystemIoFailure |
+                    ErrorCode::DatabaseBusy |
+                    ErrorCode::OutOfMemory
+            ) &&
+            self.in_transaction()
+        {
+            let _ = self.connection.execute_batch("ROLLBACK");
+        }
+        Ok(result?)
     }
 
     fn db_status(&self, op: i32) -> usize {
@@ -141,13 +160,18 @@ impl SqlExecutor for SqliteExecutor {
     }
 
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
-        let mut statement = self.connection.prepare_cached(sql)?;
-        check_runs_on_rdb(sql, &statement, false)?;
-        match statement.execute(rusqlite::params_from_iter(params)) {
+        let result = match self.connection.prepare_cached(sql) {
+            Ok(mut statement) => {
+                check_runs_on_rdb(sql, &statement, false)?;
+                statement.execute(rusqlite::params_from_iter(params))
+            },
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(changed) => Ok(changed as u64),
             // A statement like `PRAGMA journal_mode = WAL` has run when it returns its row.
             Err(rusqlite::Error::ExecuteReturnedResults) => Ok(0),
-            Err(error) => Err(error.into()),
+            Err(error) => self.end_transaction_after(Err(error)),
         }
     }
 
@@ -157,15 +181,30 @@ impl SqlExecutor for SqliteExecutor {
         params: &[SqlParam<'_>],
         on_row: &mut OnRow<'_>,
     ) -> Result<(), SqlError> {
-        let mut statement = self.connection.prepare_cached(sql)?;
-        check_runs_on_rdb(sql, &statement, true)?;
-        let mut rows = statement.query(rusqlite::params_from_iter(params))?;
-        while let Some(row) = rows.next()? {
-            if on_row(&SqliteRow(row))?.is_break() {
-                break;
-            }
-        }
-        Ok(())
+        let mut on_row_error = None;
+        let result = match self.connection.prepare_cached(sql) {
+            Ok(mut statement) => {
+                check_runs_on_rdb(sql, &statement, true)?;
+                statement
+                    .query(rusqlite::params_from_iter(params))
+                    .and_then(|mut rows| {
+                        while let Some(row) = rows.next()? {
+                            match on_row(&SqliteRow(row)) {
+                                Ok(flow) if flow.is_break() => break,
+                                Ok(_) => {},
+                                Err(error) => {
+                                    on_row_error = Some(error);
+                                    break;
+                                },
+                            }
+                        }
+                        Ok(())
+                    })
+            },
+            Err(error) => Err(error),
+        };
+        self.end_transaction_after(result)?;
+        on_row_error.map_or(Ok(()), Err)
     }
 
     fn begin(&mut self, behavior: TransactionBehavior) -> Result<(), SqlError> {

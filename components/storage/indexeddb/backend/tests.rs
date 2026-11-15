@@ -64,6 +64,8 @@ executor_tests!(
     executor_round_trips_params,
     executor_counts_changed_rows,
     executor_disk_full_maps_to_quota_exceeded,
+    executor_disk_full_ends_the_transaction,
+    executor_failing_query_reports_the_transaction_state,
     executor_user_version_is_transactional_and_persistent,
     executor_delete_removes_the_database,
     schema_version_is_stamped_on_a_new_database,
@@ -301,6 +303,59 @@ fn executor_disk_full_maps_to_quota_exceeded<X: SqlExecutor>() {
         .expect("The database should have filled up");
     let _ = executor.rollback();
     assert_eq!(error.into_backend_error(), BackendError::QuotaExceeded);
+}
+
+fn executor_disk_full_ends_the_transaction<X: SqlExecutor>() {
+    let value = vec![0u8; 65536];
+    let statements = [
+        "INSERT INTO t (k, v) VALUES (?, ?)",
+        // A statement that can fail half-way, after which SQLite keeps the transaction open.
+        "INSERT INTO t (k, v) SELECT ? + n, ? FROM (SELECT 0 AS n UNION ALL SELECT 1000)",
+    ];
+    for statement in statements {
+        let dir = tempfile::tempdir().unwrap();
+        let mut executor = open_executor::<X>(dir.path());
+        insert_into_t(&mut executor, 1);
+        executor.begin(TransactionBehavior::Immediate).unwrap();
+        insert_into_t(&mut executor, 2);
+        executor.execute("PRAGMA max_page_count = 8", &[]).unwrap();
+        let error = (10..100)
+            .find_map(|key| {
+                executor
+                    .execute(statement, &[SqlParam::Integer(key), SqlParam::Blob(&value)])
+                    .err()
+            })
+            .expect("The database should have filled up");
+        assert_eq!(error.into_backend_error(), BackendError::QuotaExceeded);
+        assert!(!executor.in_transaction(), "{statement}");
+        assert!(executor.commit().is_err());
+        executor.rollback().unwrap();
+        assert_eq!(keys_in_t(&mut executor), vec![1], "{statement}");
+    }
+}
+
+/// After a failing query, the executor reports a transaction as open only if it still is: then
+/// rolling it back discards what it wrote, and if not, nothing of it is left.
+fn executor_failing_query_reports_the_transaction_state<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut executor = open_executor::<X>(dir.path());
+    insert_into_t(&mut executor, 1);
+    executor.begin(TransactionBehavior::Immediate).unwrap();
+    insert_into_t(&mut executor, 2);
+    assert!(
+        query_row(&mut executor, "SELECT k FROM missing", &[], |row| {
+            row.integer(0)
+        })
+        .is_err()
+    );
+    let open = executor.in_transaction();
+    insert_into_t(&mut executor, 3);
+    if open {
+        executor.rollback().unwrap();
+        assert_eq!(keys_in_t(&mut executor), vec![1]);
+    } else {
+        assert_eq!(keys_in_t(&mut executor), vec![1, 3]);
+    }
 }
 
 fn executor_user_version_is_transactional_and_persistent<X: SqlExecutor>() {

@@ -81,6 +81,13 @@ pub(crate) trait SqlExecutor: Send + Sized + 'static {
 
     /// Runs a statement that returns no rows. Returns the number of rows an `UPDATE` or `DELETE`
     /// changed; the value is unspecified for other statements.
+    ///
+    /// SQLite may roll back the whole transaction when a statement fails with SQLITE_FULL,
+    /// SQLITE_IOERR, SQLITE_BUSY or SQLITE_NOMEM. After such an error, in a statement or a query,
+    /// the open transaction is always rolled back and ended. The RDB executor, which doesn't
+    /// learn SQLite's code for most failing queries, also ends it after any query whose
+    /// statement failed, so [`Self::in_transaction`] stays true only while the transaction is
+    /// open.
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError>;
 
     /// Runs a query and calls `on_row` with its rows. An error from `on_row` stops the query and

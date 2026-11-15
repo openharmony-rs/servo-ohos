@@ -41,6 +41,39 @@ impl RdbExecutor {
             .lock()
             .map_err(|_| SqlError::TransactionState("poisoned RDB store lock"))
     }
+
+    /// Ends the open transaction, which SQLite may have rolled back already. RDB can't tell
+    /// whether it did, and if it did, the transaction's connection runs every later statement in
+    /// autocommit.
+    fn end_transaction(&mut self) {
+        if let Some(transaction) = self.transaction.take() {
+            // Fails if SQLite has rolled back already.
+            let _ = transaction.rollback();
+        }
+    }
+
+    /// Ends the open transaction after an execute error that SQLite may have rolled it back for.
+    fn end_transaction_after<T>(&mut self, result: Result<T, SqlError>) -> Result<T, SqlError> {
+        if result.as_ref().is_err_and(may_have_ended_transaction) {
+            self.end_transaction();
+        }
+        result
+    }
+}
+
+/// Whether SQLite may have rolled back the open transaction after `error` of an execute call:
+/// SQLITE_FULL, SQLITE_IOERR, SQLITE_BUSY or SQLITE_NOMEM. Failing queries mostly come without
+/// SQLite's code, see [`QueryError::Statement`].
+fn may_have_ended_transaction(error: &SqlError) -> bool {
+    matches!(error, SqlError::Rdb(OhosRdbError::Api { code, .. })
+        if [
+            OH_Rdb_ErrCode::RDB_E_SQLITE_FULL,
+            OH_Rdb_ErrCode::RDB_E_SQLITE_IOERR,
+            OH_Rdb_ErrCode::RDB_E_SQLITE_BUSY,
+            OH_Rdb_ErrCode::RDB_E_SQLITE_NOMEM,
+        ]
+        .iter()
+        .any(|ended| ended.0 == *code))
 }
 
 /// Whether an RDB error reports a full disk or an exceeded size limit.
@@ -64,9 +97,27 @@ fn values(params: &[SqlParam<'_>]) -> Result<OhosRdbValues, SqlError> {
     Ok(values)
 }
 
-fn read_rows(mut cursor: OhosRdbCursor<'_>, on_row: &mut OnRow<'_>) -> Result<(), SqlError> {
-    while cursor.next_row()? {
-        if on_row(&RdbRow(&cursor))?.is_break() {
+/// How a query failed.
+enum QueryError {
+    /// The statement failed. RDB reports most such failures without SQLite's code, as
+    /// RDB_E_STEP_RESULT_CLOSED or, after SQLITE_BUSY, as E_STEP_RESULT_QUERY_EXCEEDED, so any of
+    /// them may have ended the open transaction.
+    Statement(SqlError),
+    /// Reading a row, or `on_row`, failed, which leaves the statement and the transaction alone.
+    Row(SqlError),
+}
+
+fn read_rows(
+    cursor: crate::ohos_rdb::Result<OhosRdbCursor<'_>>,
+    on_row: &mut OnRow<'_>,
+) -> Result<(), QueryError> {
+    let statement_error = |error: OhosRdbError| QueryError::Statement(error.into());
+    let mut cursor = cursor.map_err(statement_error)?;
+    while cursor.next_row().map_err(statement_error)? {
+        if on_row(&RdbRow(&cursor))
+            .map_err(QueryError::Row)?
+            .is_break()
+        {
             break;
         }
     }
@@ -138,9 +189,10 @@ impl SqlExecutor for RdbExecutor {
         // RDB returns the number of changed rows for UPDATE and DELETE, and the row id or -1 for
         // INSERT.
         let result = match &self.transaction {
-            Some(transaction) => transaction.execute_with_result(sql, &values)?,
-            None => self.store()?.execute_with_args(sql, &values)?,
+            Some(transaction) => transaction.execute_with_result(sql, &values),
+            None => self.store()?.execute_with_args(sql, &values),
         };
+        let result = self.end_transaction_after(result.map_err(SqlError::from))?;
         Ok(result.filter(|value| *value > 0).unwrap_or(0) as u64)
     }
 
@@ -151,11 +203,19 @@ impl SqlExecutor for RdbExecutor {
         on_row: &mut OnRow<'_>,
     ) -> Result<(), SqlError> {
         let values = values(params)?;
-        match &self.transaction {
-            Some(transaction) => read_rows(transaction.query_sql(sql, &values)?, on_row),
+        let result = match &self.transaction {
+            Some(transaction) => read_rows(transaction.query_sql(sql, &values), on_row),
             None => {
                 let store = self.store()?;
-                read_rows(store.query_sql(sql, &values)?, on_row)
+                read_rows(store.query_sql(sql, &values), on_row)
+            },
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(QueryError::Row(error)) => Err(error),
+            Err(QueryError::Statement(error)) => {
+                self.end_transaction();
+                Err(error)
             },
         }
     }
