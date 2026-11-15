@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::path::Path;
+
 use log::info;
 
 use super::executor::{
@@ -9,6 +11,11 @@ use super::executor::{
 };
 use crate::indexeddb::IndexedDBDescription;
 use crate::shared::DB_INIT_PRAGMAS;
+
+/// The version of the tables below and of how records are stored in them, kept in the database
+/// file's `user_version`. Bump it with every change to either: a database stored with another
+/// version is deleted and created anew when it is opened, as there are no migrations.
+pub(crate) const SCHEMA_VERSION: i64 = 1;
 
 // Adapted from:
 // https://github.com/mozilla-firefox/firefox/blob/ee102e926521b3e460293b0aea6b54b1a03f6f74/dom/indexedDB/DBSchema.cpp#L78
@@ -76,20 +83,55 @@ CREATE TABLE IF NOT EXISTS unique_index_data (
 ) WITHOUT ROWID;"#,
 ];
 
-/// Creates the tables of a new database.
-pub(crate) fn init_database<X: SqlExecutor>(
-    executor: &mut X,
+/// Opens the database in `directory`, creating its tables if it is new. A database stored with
+/// another [`SCHEMA_VERSION`] is deleted and created anew. Returns the connection and whether
+/// the database was created.
+pub(crate) fn open_database<X: SqlExecutor>(
+    directory: &Path,
     description: &IndexedDBDescription,
-) -> Result<(), SqlError> {
-    let exists = query_row(
+) -> Result<(X, bool), SqlError> {
+    let mut executor = X::open(directory)?;
+    let stored_version = stored_schema_version(&mut executor)?;
+    // A new database file has neither a version nor tables.
+    if stored_version != SCHEMA_VERSION && (stored_version != 0 || is_initialized(&mut executor)?) {
+        info!(
+            "Resetting indexeddb database {:?} of schema version {stored_version}",
+            description.name
+        );
+        executor.delete()?;
+        executor = X::open(directory)?;
+        // RDB's delete reports success even when it couldn't remove the files.
+        if stored_schema_version(&mut executor)? != 0 || is_initialized(&mut executor)? {
+            return Err(SqlError::ResetFailed);
+        }
+    }
+    let created = init_database(&mut executor, description)?;
+    Ok((executor, created))
+}
+
+/// The schema version a database was stored with, 0 if it has none.
+pub(crate) fn stored_schema_version<X: SqlExecutor>(executor: &mut X) -> Result<i64, SqlError> {
+    Ok(query_row(executor, "PRAGMA user_version", &[], |row| row.integer(0))?.unwrap_or(0))
+}
+
+fn is_initialized<X: SqlExecutor>(executor: &mut X) -> Result<bool, SqlError> {
+    Ok(query_row(
         executor,
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'database'",
         &[],
         |_| Ok(()),
     )?
-    .is_some();
-    if exists {
-        return Ok(());
+    .is_some())
+}
+
+/// Creates the tables of a new database, stamped with [`SCHEMA_VERSION`]. Returns whether the
+/// database was new.
+fn init_database<X: SqlExecutor>(
+    executor: &mut X,
+    description: &IndexedDBDescription,
+) -> Result<bool, SqlError> {
+    if is_initialized(executor)? {
+        return Ok(false);
     }
 
     info!("Initializing indexeddb database {:?}", description.name);
@@ -108,6 +150,7 @@ pub(crate) fn init_database<X: SqlExecutor>(
             "INSERT INTO database (name, origin, version) VALUES (?, ?, 0)",
             &[SqlParam::Text(&description.name), SqlParam::Text(&origin)],
         )?;
-        Ok(())
+        executor.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), &[])?;
+        Ok(true)
     })
 }

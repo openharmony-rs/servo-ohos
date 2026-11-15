@@ -49,6 +49,10 @@ impl SqlExecutor for TwinExecutor {
         }
     }
 
+    fn delete(self) -> Result<(), SqlError> {
+        delegate!(self, |executor| executor.delete())
+    }
+
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
         delegate!(self, |executor| executor.execute(sql, params))
     }

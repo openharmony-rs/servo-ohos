@@ -47,19 +47,19 @@ impl<X: SqlExecutor> SqlEngine<X> {
         db_info: &IndexedDBDescription,
         pool: Arc<ThreadPool>,
     ) -> Result<Self, SqlError> {
-        let mut connection = X::open(&path)?;
-        schema::init_database(&mut connection, db_info)?;
+        let (connection, created_database) = schema::open_database::<X>(&path, db_info)?;
         Ok(Self {
             connector: Arc::from(connection.connector()),
             connection: RefCell::new(connection),
             batches: Default::default(),
             read_pool: pool.clone(),
             write_pool: pool,
-            created_db_path: created,
+            created_db_path: created || created_database,
         })
     }
 
-    /// Returns whether the physical db was created as part of `new`.
+    /// Returns whether the physical db was created as part of `new`, which includes recreating
+    /// a database of another schema version.
     pub(crate) fn created_db_path(&self) -> bool {
         self.created_db_path
     }

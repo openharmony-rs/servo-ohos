@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Connection, ToSql, ffi};
@@ -13,6 +14,10 @@ use super::executor::{
 use crate::shared::DB_PRAGMAS;
 
 const DATABASE_FILE_NAME: &str = "indexeddb.sqlite";
+
+/// The suffixes of the files SQLite keeps next to a database file, and the empty one of the
+/// database file itself, which is deleted last.
+const DATABASE_FILE_SUFFIXES: [&str; 4] = ["-wal", "-shm", "-journal", ""];
 
 /// Enough for every distinct statement of the IndexedDB layer, so none is prepared twice.
 const STATEMENT_CACHE_CAPACITY: usize = 64;
@@ -117,6 +122,22 @@ impl SqlExecutor for SqliteExecutor {
     fn connector(&self) -> Connector<Self> {
         let path = self.path.clone();
         Box::new(move || Self::open_file(path.clone()))
+    }
+
+    fn delete(self) -> Result<(), SqlError> {
+        let Self { path, connection } = self;
+        connection.close().map_err(|(_, error)| error)?;
+        for suffix in DATABASE_FILE_SUFFIXES {
+            let mut file = path.clone().into_os_string();
+            file.push(suffix);
+            match fs::remove_file(&file) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    return Err(SqlError::Io(error));
+                },
+                _ => {},
+            }
+        }
+        Ok(())
     }
 
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {

@@ -26,6 +26,7 @@ use super::executor::{
     Connector, OnRow, SqlError, SqlExecutor, SqlParam, TransactionBehavior, query_row, query_rows,
 };
 use super::queries;
+use super::schema::{self, SCHEMA_VERSION};
 use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction};
 use crate::indexeddb::{BackendErrorMapper, IndexedDBDescription};
 
@@ -63,6 +64,13 @@ executor_tests!(
     executor_round_trips_params,
     executor_counts_changed_rows,
     executor_disk_full_maps_to_quota_exceeded,
+    executor_user_version_is_transactional_and_persistent,
+    executor_delete_removes_the_database,
+    schema_version_is_stamped_on_a_new_database,
+    schema_version_match_keeps_the_database,
+    schema_version_mismatch_resets_the_database,
+    indexeddb_version_is_independent_of_the_schema_version,
+    schema_reset_that_keeps_the_old_database_fails,
     test_cycle,
     test_create_store,
     test_create_store_empty_name,
@@ -106,6 +114,31 @@ fn open_engine<X: SqlExecutor>(dir: &TempDir) -> SqlEngine<X> {
         ThreadPool::global(),
     )
     .expect("Opening a database should not fail")
+}
+
+fn open_engine_in<X: SqlExecutor>(dir: &Path, created: bool) -> SqlEngine<X> {
+    SqlEngine::new(
+        dir.to_path_buf(),
+        created,
+        &test_description(),
+        ThreadPool::global(),
+    )
+    .expect("Opening a database should not fail")
+}
+
+fn schema_version_of<X: SqlExecutor>(db: &SqlEngine<X>) -> i64 {
+    schema::stored_schema_version(&mut *db.connection()).unwrap()
+}
+
+fn has_table<X: SqlExecutor>(executor: &mut X, name: &str) -> bool {
+    query_row(
+        executor,
+        "SELECT 1 FROM sqlite_master WHERE name = ?",
+        &[SqlParam::Text(name)],
+        |_| Ok(()),
+    )
+    .unwrap()
+    .is_some()
 }
 
 /// An executor on a new database with a table `t (k INTEGER PRIMARY KEY, v BLOB)`.
@@ -268,6 +301,148 @@ fn executor_disk_full_maps_to_quota_exceeded<X: SqlExecutor>() {
         .expect("The database should have filled up");
     let _ = executor.rollback();
     assert_eq!(error.into_backend_error(), BackendError::QuotaExceeded);
+}
+
+fn executor_user_version_is_transactional_and_persistent<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut executor = open_executor::<X>(dir.path());
+    let version = |executor: &mut X| schema::stored_schema_version(executor).unwrap();
+    assert_eq!(version(&mut executor), 0);
+
+    executor.begin(TransactionBehavior::Immediate).unwrap();
+    executor.execute("PRAGMA user_version = 5", &[]).unwrap();
+    assert_eq!(version(&mut executor), 5);
+    executor.rollback().unwrap();
+    assert_eq!(version(&mut executor), 0);
+
+    executor.begin(TransactionBehavior::Immediate).unwrap();
+    executor.execute("PRAGMA user_version = 6", &[]).unwrap();
+    executor.commit().unwrap();
+    assert_eq!(version(&mut executor), 6);
+
+    // RDB runs each transaction, and each statement outside one, on a pool connection.
+    let mut other = executor.connector()().unwrap();
+    assert_eq!(version(&mut other), 6);
+    other.begin(TransactionBehavior::Deferred).unwrap();
+    assert_eq!(version(&mut other), 6);
+    other.commit().unwrap();
+    drop(other);
+    drop(executor);
+
+    let mut executor = X::open(dir.path()).unwrap();
+    assert_eq!(version(&mut executor), 6);
+}
+
+fn executor_delete_removes_the_database<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    for in_transaction in [false, true] {
+        let mut executor = open_executor::<X>(dir.path());
+        insert_into_t(&mut executor, 1);
+        executor.execute("PRAGMA user_version = 3", &[]).unwrap();
+        if in_transaction {
+            executor.begin(TransactionBehavior::Immediate).unwrap();
+            insert_into_t(&mut executor, 2);
+        }
+        executor.delete().unwrap();
+
+        let mut executor = X::open(dir.path()).unwrap();
+        assert!(!has_table(&mut executor, "t"));
+        assert_eq!(schema::stored_schema_version(&mut executor).unwrap(), 0);
+    }
+}
+
+fn schema_version_is_stamped_on_a_new_database<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    // The directory may exist already when the database file doesn't.
+    let db = open_engine_in::<X>(dir.path(), false);
+    assert!(db.created_db_path());
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
+    assert_eq!(db.version().unwrap(), 0);
+    assert!(db.object_store_names().unwrap().is_empty());
+}
+
+fn schema_version_match_keeps_the_database<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine_in::<X>(dir.path(), true);
+    db.create_store("store", None, false).unwrap();
+    db.set_version(3).unwrap();
+    drop(db);
+
+    let db = open_engine_in::<X>(dir.path(), false);
+    assert!(!db.created_db_path());
+    assert_eq!(db.object_store_names().unwrap(), vec!["store".to_owned()]);
+    assert_eq!(db.version().unwrap(), 3);
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
+}
+
+fn schema_version_mismatch_resets_the_database<X: SqlExecutor>() {
+    // 0 is what a database from before schema versions has.
+    for stored_version in [0, SCHEMA_VERSION + 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_engine_in::<X>(dir.path(), true);
+        db.create_store("store", None, false).unwrap();
+        db.set_version(3).unwrap();
+        {
+            let mut connection = db.connection();
+            connection.execute("CREATE TABLE extra (x)", &[]).unwrap();
+            connection
+                .execute(&format!("PRAGMA user_version = {stored_version}"), &[])
+                .unwrap();
+        }
+        drop(db);
+
+        let db = open_engine_in::<X>(dir.path(), false);
+        assert!(db.created_db_path(), "stored version {stored_version}");
+        assert!(db.object_store_names().unwrap().is_empty());
+        assert_eq!(db.version().unwrap(), 0);
+        assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
+        assert!(
+            !has_table(&mut *db.connection(), "extra"),
+            "The database file should have been deleted"
+        );
+    }
+}
+
+fn indexeddb_version_is_independent_of_the_schema_version<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine_in::<X>(dir.path(), true);
+    // https://w3c.github.io/IndexedDB/#dom-idbfactory-open: the largest version.
+    let largest_version = (1 << 53) - 1;
+    db.set_version(largest_version).unwrap();
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
+    drop(db);
+
+    let db = open_engine_in::<X>(dir.path(), false);
+    assert!(!db.created_db_path());
+    assert_eq!(db.version().unwrap(), largest_version);
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
+}
+
+fn schema_reset_that_keeps_the_old_database_fails<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine_in::<X>(dir.path(), true);
+    db.create_store("store", None, false).unwrap();
+    db.connection()
+        .execute(
+            &format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1),
+            &[],
+        )
+        .unwrap();
+    drop(db);
+
+    faults_for(dir.path()).lock().unwrap().keep_on_delete = true;
+    let open = SqlEngine::<Faulty<X>>::new(
+        dir.path().to_path_buf(),
+        false,
+        &test_description(),
+        ThreadPool::global(),
+    );
+    assert!(matches!(open, Err(SqlError::ResetFailed)));
+
+    faults_for(dir.path()).lock().unwrap().keep_on_delete = false;
+    let db = open_engine_in::<Faulty<X>>(dir.path(), false);
+    assert!(db.created_db_path());
+    assert!(db.object_store_names().unwrap().is_empty());
 }
 
 fn test_cycle<X: SqlExecutor>() {
@@ -846,6 +1021,8 @@ struct Faults {
     /// Fail the statement or query whose SQL contains this text, after letting the given number
     /// of them through, and end the open transaction the way SQLite does after SQLITE_FULL.
     statement: Option<(&'static str, usize)>,
+    /// Leave the database in place on delete, as RDB does when it can't remove the files.
+    keep_on_delete: bool,
 }
 
 /// The faults of the [`Faulty`] executors opened on each directory.
@@ -903,6 +1080,13 @@ impl<X: SqlExecutor> SqlExecutor for Faulty<X> {
                 faults: faults.clone(),
             })
         })
+    }
+
+    fn delete(self) -> Result<(), SqlError> {
+        if self.faults.lock().unwrap().keep_on_delete {
+            return Ok(());
+        }
+        self.inner.delete()
     }
 
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
@@ -1141,6 +1325,23 @@ fn test_batches_reply_in_dispatch_order<X: SqlExecutor>() {
         })
         .collect();
     assert_eq!(replies, (0..8).collect::<Vec<_>>());
+}
+
+/// Deleting the store would close it under the other executors on it.
+#[cfg(ohos_rdb)]
+#[test]
+fn rdb_delete_refuses_while_other_executors_exist() {
+    use super::rdb::RdbExecutor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let executor = RdbExecutor::open(dir.path()).unwrap();
+    let other = executor.connector()().unwrap();
+    assert!(matches!(
+        executor.delete(),
+        Err(SqlError::TransactionState(_))
+    ));
+    drop(other);
+    RdbExecutor::open(dir.path()).unwrap().delete().unwrap();
 }
 
 #[test]

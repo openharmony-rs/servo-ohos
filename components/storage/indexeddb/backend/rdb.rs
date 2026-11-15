@@ -4,7 +4,7 @@
 
 use std::error::Error as StdError;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ohos_rdb_sys::rdb_transaction::OH_RDB_TransType;
@@ -26,6 +26,8 @@ const DATABASE_FILE_NAME: &str = "indexeddb.rdb";
 /// is a handle of its own; statements outside one go to the store, which picks a connection per
 /// statement.
 pub(crate) struct RdbExecutor {
+    /// The directory the store was opened in, which RDB keeps its files under.
+    directory: PathBuf,
     /// Declared before the store, so that it is dropped, and rolled back, first.
     transaction: Option<OhosRdbTransaction>,
     /// Shared with the executors of [`SqlExecutor::connector`]. The lock serializes the calls on
@@ -95,19 +97,40 @@ impl SqlExecutor for RdbExecutor {
             let _ = store.execute(pragma);
         }
         Ok(Self {
+            directory: directory.to_owned(),
             store: Arc::new(Mutex::new(store)),
             transaction: None,
         })
     }
 
     fn connector(&self) -> Connector<Self> {
+        let directory = self.directory.clone();
         let store = self.store.clone();
         Box::new(move || {
             Ok(Self {
+                directory: directory.clone(),
                 store: store.clone(),
                 transaction: None,
             })
         })
+    }
+
+    fn delete(self) -> Result<(), SqlError> {
+        let Self {
+            directory,
+            store,
+            transaction,
+        } = self;
+        drop(transaction);
+        // RDB would close the store under the other executors.
+        let Some(store) = Arc::into_inner(store) else {
+            return Err(SqlError::TransactionState(
+                "delete while other executors on the database exist",
+            ));
+        };
+        drop(store);
+        OhosRdbStore::delete(&directory, DATABASE_FILE_NAME)?;
+        Ok(())
     }
 
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {

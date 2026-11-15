@@ -31,10 +31,10 @@ use ohos_rdb_sys::rdb_transaction::{
 use ohos_rdb_sys::rdb_types::{OH_ColumnType, OH_Data_Value};
 use ohos_rdb_sys::relational_store::{
     OH_Rdb_CloseStore, OH_Rdb_ConfigV2, OH_Rdb_CreateConfig, OH_Rdb_CreateOrOpen,
-    OH_Rdb_CreateTransaction, OH_Rdb_DestroyConfig, OH_Rdb_Execute, OH_Rdb_ExecuteQueryV2,
-    OH_Rdb_ExecuteV2, OH_Rdb_SecurityLevel, OH_Rdb_SetArea, OH_Rdb_SetDatabaseDir,
-    OH_Rdb_SetDbType, OH_Rdb_SetSecurityLevel, OH_Rdb_SetStoreName, OH_Rdb_Store, Rdb_DBType,
-    Rdb_SecurityArea,
+    OH_Rdb_CreateTransaction, OH_Rdb_DeleteStoreV2, OH_Rdb_DestroyConfig, OH_Rdb_Execute,
+    OH_Rdb_ExecuteQueryV2, OH_Rdb_ExecuteV2, OH_Rdb_SecurityLevel, OH_Rdb_SetArea,
+    OH_Rdb_SetDatabaseDir, OH_Rdb_SetDbType, OH_Rdb_SetSecurityLevel, OH_Rdb_SetStoreName,
+    OH_Rdb_Store, Rdb_DBType, Rdb_SecurityArea,
 };
 use ohos_rdb_sys::relational_store_error_code::OH_Rdb_ErrCode;
 pub(crate) use params::OhosRdbValues;
@@ -92,6 +92,45 @@ impl OhosRdbConfig {
                 inner: into_handle(OH_Rdb_CreateConfig(), "OH_Rdb_CreateConfig")?,
             })
         }
+    }
+
+    /// The configuration of the store `store_name` in `database_dir`.
+    fn for_store(database_dir: &Path, store_name: &str) -> Result<Self> {
+        let config = Self::new()?;
+        let database_dir = cstring_from_path(database_dir)?;
+        let store_name = CString::new(store_name)?;
+
+        // SAFETY: The config handle is initialized above and the strings outlive the calls,
+        // which copy them.
+        unsafe {
+            ensure_success(
+                OH_Rdb_SetDatabaseDir(config.as_ptr(), database_dir.as_ptr()),
+                "OH_Rdb_SetDatabaseDir",
+            )?;
+            ensure_success(
+                OH_Rdb_SetStoreName(config.as_ptr(), store_name.as_ptr()),
+                "OH_Rdb_SetStoreName",
+            )?;
+            ensure_success(
+                OH_Rdb_SetDbType(config.as_ptr(), Rdb_DBType::RDB_SQLITE.0 as c_int),
+                "OH_Rdb_SetDbType",
+            )?;
+            // securityLevel is mandatory for OH_Rdb_ConfigV2; without it
+            // OH_Rdb_CreateOrOpen fails with RDB_E_INVALID_ARGS (14800001).
+            ensure_success(
+                OH_Rdb_SetSecurityLevel(config.as_ptr(), OH_Rdb_SecurityLevel::S1.0 as c_int),
+                "OH_Rdb_SetSecurityLevel",
+            )?;
+            // App storage lives in the EL2 (post-unlock) area.
+            ensure_success(
+                OH_Rdb_SetArea(
+                    config.as_ptr(),
+                    Rdb_SecurityArea::RDB_SECURITY_AREA_EL2.0 as c_int,
+                ),
+                "OH_Rdb_SetArea",
+            )?;
+        }
+        Ok(config)
     }
 
     fn as_ptr(&self) -> *mut OH_Rdb_ConfigV2 {
@@ -162,39 +201,9 @@ unsafe impl Send for OhosRdbStore {}
 
 impl OhosRdbStore {
     pub(crate) fn open(database_dir: &Path, store_name: &str) -> Result<Self> {
-        let config = OhosRdbConfig::new()?;
-        let database_dir = cstring_from_path(database_dir)?;
-        let store_name = CString::new(store_name)?;
-
+        let config = OhosRdbConfig::for_store(database_dir, store_name)?;
         // SAFETY: The config handle is initialized above and all FFI writes target local values.
         unsafe {
-            ensure_success(
-                OH_Rdb_SetDatabaseDir(config.as_ptr(), database_dir.as_ptr()),
-                "OH_Rdb_SetDatabaseDir",
-            )?;
-            ensure_success(
-                OH_Rdb_SetStoreName(config.as_ptr(), store_name.as_ptr()),
-                "OH_Rdb_SetStoreName",
-            )?;
-            ensure_success(
-                OH_Rdb_SetDbType(config.as_ptr(), Rdb_DBType::RDB_SQLITE.0 as c_int),
-                "OH_Rdb_SetDbType",
-            )?;
-            // securityLevel is mandatory for OH_Rdb_ConfigV2; without it
-            // OH_Rdb_CreateOrOpen fails with RDB_E_INVALID_ARGS (14800001).
-            ensure_success(
-                OH_Rdb_SetSecurityLevel(config.as_ptr(), OH_Rdb_SecurityLevel::S1.0 as c_int),
-                "OH_Rdb_SetSecurityLevel",
-            )?;
-            // App storage lives in the EL2 (post-unlock) area.
-            ensure_success(
-                OH_Rdb_SetArea(
-                    config.as_ptr(),
-                    Rdb_SecurityArea::RDB_SECURITY_AREA_EL2.0 as c_int,
-                ),
-                "OH_Rdb_SetArea",
-            )?;
-
             let mut err = 0;
             let raw = OH_Rdb_CreateOrOpen(config.as_ptr(), &mut err);
             if err != OH_Rdb_ErrCode::RDB_OK.0 {
@@ -208,6 +217,19 @@ impl OhosRdbStore {
             }
 
             Self::from_raw(raw)
+        }
+    }
+
+    /// Deletes the store that [`Self::open`] opens, with all its files. RDB closes the store
+    /// if a handle to it is still open, so every handle must have been dropped first.
+    pub(crate) fn delete(database_dir: &Path, store_name: &str) -> Result<()> {
+        let config = OhosRdbConfig::for_store(database_dir, store_name)?;
+        // SAFETY: The config handle is initialized above and outlives the call.
+        unsafe {
+            ensure_success(
+                OH_Rdb_DeleteStoreV2(config.as_ptr()),
+                "OH_Rdb_DeleteStoreV2",
+            )
         }
     }
 

@@ -75,6 +75,10 @@ pub(crate) trait SqlExecutor: Send + Sized + 'static {
     /// connection pool runs the statements.
     fn connector(&self) -> Connector<Self>;
 
+    /// Closes this connection and deletes the database with all its files. No other connection
+    /// to the database may be open.
+    fn delete(self) -> Result<(), SqlError>;
+
     /// Runs a statement that returns no rows. Returns the number of rows an `UPDATE` or `DELETE`
     /// changed; the value is unspecified for other statements.
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError>;
@@ -169,8 +173,14 @@ pub(crate) enum SqlError {
     KeyPath(postcard::Error),
     /// A stored key that can't be decoded.
     InvalidKey,
-    /// [`SqlExecutor::begin`] while a transaction is open, or a commit without one.
+    /// A misuse of the executor: [`SqlExecutor::begin`] while a transaction is open, a commit
+    /// without one, or a delete while other executors on the database exist.
     TransactionState(&'static str),
+    /// A database of another schema version that is still there after deleting it.
+    ResetFailed,
+    /// A failure to delete a database file.
+    #[cfg(feature = "sqlite-backend")]
+    Io(std::io::Error),
     /// A statement that the RDB executor would reject, which the SQLite executor refuses too.
     #[cfg(feature = "sqlite-backend")]
     NotOnRdb(String),
@@ -188,6 +198,9 @@ impl fmt::Display for SqlError {
             Self::KeyPath(error) => write!(formatter, "invalid stored key path: {error}"),
             Self::InvalidKey => write!(formatter, "invalid stored key"),
             Self::TransactionState(context) => write!(formatter, "transaction state: {context}"),
+            Self::ResetFailed => write!(formatter, "failed to delete a database to reset it"),
+            #[cfg(feature = "sqlite-backend")]
+            Self::Io(error) => error.fmt(formatter),
             #[cfg(feature = "sqlite-backend")]
             Self::NotOnRdb(sql) => write!(formatter, "statement that RDB would reject: {sql}"),
         }
@@ -202,6 +215,8 @@ impl std::error::Error for SqlError {
             #[cfg(ohos_rdb)]
             Self::Rdb(error) => Some(error),
             Self::KeyPath(error) => Some(error),
+            #[cfg(feature = "sqlite-backend")]
+            Self::Io(error) => Some(error),
             _ => None,
         }
     }
