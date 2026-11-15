@@ -332,15 +332,23 @@ impl IDBTransaction {
                     Ok(()) => {
                         this.finalize_commit();
                     }
-                    Err(_err) => {
-                         // TODO: Map backend commit/rollback failure to an appropriate DOMException
-                        this.initiate_abort(cx, Error::Operation(None));
+                    Err(err) => {
+                        // https://w3c.github.io/IndexedDB/#commit-a-transaction
+                        // Step 2.4. If an error occurs while writing the changes to the database,
+                        // then run abort a transaction with transaction and an appropriate type
+                        // for the error, for example a QuotaExceededError or an "UnknownError"
+                        // DOMException, and terminate these steps.
+                        let error = match err {
+                            BackendError::DbErr(details) => Error::Operation(Some(format!(
+                                "IndexedDB commit failed: {details}"
+                            ))),
+                            other => map_backend_error_to_dom_error(other),
+                        };
+                        this.initiate_abort(cx, error);
 
                         this.finalize_abort();
                     }
                 }
-                // TODO: https://w3c.github.io/IndexedDB/#commit-a-transaction
-                // Backend commit/rollback is not yet atomic.
             }));
         })
         .expect("Could not create callback");
