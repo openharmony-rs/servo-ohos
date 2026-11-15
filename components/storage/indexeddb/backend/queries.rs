@@ -141,22 +141,6 @@ pub(crate) fn key_generator_current_number<X: SqlExecutor>(
         .and_then(|store| (store.auto_increment != 0).then_some(store.auto_increment)))
 }
 
-pub(crate) fn set_key_generator_current_number<X: SqlExecutor>(
-    executor: &mut X,
-    store_name: &str,
-    current_number: i64,
-) -> Result<(), SqlError> {
-    let store = required_object_store(executor, store_name)?;
-    let changed = executor.execute(
-        "UPDATE object_store SET auto_increment = ? WHERE id = ?",
-        &[
-            SqlParam::Integer(current_number),
-            SqlParam::Integer(store.id),
-        ],
-    )?;
-    expect_one_changed_row(changed, "key generator update")
-}
-
 pub(crate) fn indexes<X: SqlExecutor>(
     executor: &mut X,
     store_name: &str,

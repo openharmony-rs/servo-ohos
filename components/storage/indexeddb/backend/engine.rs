@@ -6,19 +6,19 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 
-use log::warn;
+use log::{error, warn};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use profile_traits::generic_callback::GenericCallback;
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use servo_base::threadpool::ThreadPool;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, CreateObjectResult, IndexedDBIndex, IndexedDBKeyType,
-    IndexedDBTxnMode, KeyPath,
+    BackendError, BackendResult, IndexedDBIndex, IndexedDBKeyType, IndexedDBTxnMode, KeyPath,
 };
 
-use super::executor::{SqlError, SqlExecutor, TransactionBehavior, with_transaction};
+use super::executor::{SqlError, SqlExecutor, TransactionBehavior};
 use super::queries::{self, ObjectStore};
 use super::schema;
 use crate::indexeddb::IndexedDBDescription;
@@ -26,8 +26,13 @@ use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction};
 
 /// The IndexedDB engine on a [`SqlExecutor`]: an actor that owns the database's only connection
 /// and runs everything on it one job at a time, on the thread pool, in the order the manager
-/// hands the work over: the manager thread's metadata calls, each in a storage transaction of its
-/// own, and the batches of requests, each in one storage transaction.
+/// hands the work over.
+///
+/// A readwrite or versionchange transaction is one SQL transaction: its first request begins it
+/// with `BEGIN IMMEDIATE`, and it stays open across batches until the transaction commits or
+/// aborts. Readonly requests run without one, inside the open SQL transaction if there is one;
+/// the manager never runs a readonly transaction alongside a writer with an overlapping scope, and
+/// starts at most one writer at a time.
 pub(crate) struct SqlEngine<X: SqlExecutor> {
     actor: Arc<Actor<X>>,
     created_db_path: bool,
@@ -48,7 +53,12 @@ impl<X: SqlExecutor> SqlEngine<X> {
                     waiting: VecDeque::new(),
                     running: false,
                 }),
-                database: Mutex::new(Some(Database { executor })),
+                database: Mutex::new(Some(Database {
+                    executor,
+                    writer: None,
+                    upgrade: None,
+                    failed: FxHashMap::default(),
+                })),
             }),
             created_db_path: created || created_database,
         })
@@ -60,21 +70,26 @@ impl<X: SqlExecutor> SqlEngine<X> {
         self.created_db_path
     }
 
-    /// Runs `f` on the connection in a transaction of its own, after the work handed over before,
-    /// and waits for it.
-    fn run<T: Send + 'static>(
+    /// Runs `read` on the connection after the work handed over before, and waits for it.
+    fn read<T: Send + 'static>(
         &self,
-        behavior: TransactionBehavior,
-        f: impl FnOnce(&mut X) -> Result<T, SqlError> + Send + 'static,
+        read: impl FnOnce(&mut X) -> Result<T, SqlError> + Send + 'static,
     ) -> Result<T, SqlError> {
         self.actor
-            .call(move |database| with_transaction(&mut database.executor, behavior, f))?
+            .call(move |database| read(&mut database.executor))?
     }
 
     /// The connection, for tests to use while no work is handed over.
     #[cfg(test)]
     pub(super) fn connection(&self) -> TestConnection<'_, X> {
         TestConnection(lock(&self.actor.database))
+    }
+
+    /// Runs `job` on the connection after the work handed over before, without waiting for it.
+    #[cfg(test)]
+    pub(super) fn spawn_on_connection(&self, job: impl FnOnce(&mut X) + Send + 'static) {
+        self.actor
+            .spawn(move |database| job(&mut database.executor));
     }
 }
 
@@ -182,6 +197,7 @@ impl<X: SqlExecutor> Actor<X> {
             Job::Run(job) => {
                 if let Some(database) = database.as_mut() {
                     job(database);
+                    database.notice_ended_transaction(ended_early);
                 }
             },
             Job::Close(closed) => {
@@ -232,9 +248,152 @@ impl<X: SqlExecutor> Actor<X> {
     }
 }
 
-/// The connection of a database, which only the jobs of its actor touch.
+/// The connection of a database and the state of the transactions on it, which only the jobs of
+/// its actor touch.
 pub(super) struct Database<X> {
     executor: X,
+    /// The readwrite or versionchange transaction whose SQL transaction is open.
+    writer: Option<u64>,
+    /// The upgrade transaction that hasn't begun yet, and the version it sets when it begins.
+    upgrade: Option<(u64, u64)>,
+    /// Transactions whose changes were rolled back by a failure, with the error that their later
+    /// requests and their commit report, until the transaction aborts.
+    failed: FxHashMap<u64, BackendError>,
+}
+
+impl<X: SqlExecutor> Database<X> {
+    /// Runs the requests of a batch in order and replies to each as it has run.
+    fn run_batch(&mut self, transaction: u64, batch: KvsTransaction) {
+        let writes = batch.mode != IndexedDBTxnMode::Readonly;
+        for request in batch.requests {
+            if let Some(error) = self.failed.get(&transaction) {
+                request.operation.notify_error(error.clone());
+                continue;
+            }
+            if writes && let Err(error) = self.begin(transaction) {
+                request.operation.notify_error(error);
+                continue;
+            }
+            let failure = run_request(&mut self.executor, request);
+            self.notice_ended_transaction(|| {
+                failure
+                    .as_ref()
+                    .map_or_else(ended_early, |failure| failure.error().clone())
+            });
+            if let Some(Failure::Write(error)) = failure {
+                self.fail(transaction, error);
+            }
+        }
+    }
+
+    /// Fails the writer if its SQL transaction has ended without the engine's commit or rollback.
+    /// SQLite ends it by itself after some errors, and the executors end it after the errors that
+    /// may have, also of a statement that isn't the writer's own, such as a readonly request that
+    /// ran inside its transaction. Its writes are gone then, and later statements would run in
+    /// autocommit.
+    fn notice_ended_transaction(&mut self, error: impl FnOnce() -> BackendError) {
+        if let Some(writer) = self.writer &&
+            !self.executor.in_transaction()
+        {
+            self.writer = None;
+            self.failed.insert(writer, error());
+        }
+    }
+
+    /// Begins the SQL transaction of the readwrite or versionchange `transaction`, unless it is
+    /// open already. An upgrade transaction sets the database's version when it begins. On
+    /// failure, the transaction has failed.
+    fn begin(&mut self, transaction: u64) -> Result<(), BackendError> {
+        self.notice_ended_transaction(ended_early);
+        if let Some(error) = self.failed.get(&transaction) {
+            return Err(error.clone());
+        }
+        if self.writer == Some(transaction) {
+            return Ok(());
+        }
+        if let Some(writer) = self.writer {
+            error!("IndexedDB transaction {transaction} began while {writer} writes");
+            let error = BackendError::DbErr("Another transaction is writing".to_owned());
+            self.failed.insert(transaction, error.clone());
+            return Err(error);
+        }
+        if let Err(error) = self.executor.begin(TransactionBehavior::Immediate) {
+            let error = error.to_backend_error();
+            self.failed.insert(transaction, error.clone());
+            return Err(error);
+        }
+        self.writer = Some(transaction);
+        if let Some((upgrade, version)) = self.upgrade &&
+            upgrade == transaction
+        {
+            self.upgrade = None;
+            if let Err(error) = queries::set_version(&mut self.executor, version) {
+                let error = error.to_backend_error();
+                self.fail(transaction, error.clone());
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>
+    fn commit(&mut self, transaction: u64) -> BackendResult<()> {
+        if let Some(error) = self.failed.remove(&transaction) {
+            return Err(error);
+        }
+        // An upgrade transaction without requests still sets the version.
+        if self
+            .upgrade
+            .is_some_and(|(upgrade, _)| upgrade == transaction)
+        {
+            self.begin(transaction).inspect_err(|_| {
+                self.failed.remove(&transaction);
+            })?;
+        }
+        if self.writer != Some(transaction) {
+            return Ok(());
+        }
+        self.writer = None;
+        // Step 2.3. Attempt to write any outstanding changes made by transaction to the database.
+        // Step 2.4. If an error occurs while writing the changes to the database, then run abort a
+        // transaction with transaction and an appropriate type for the error, for example a
+        // QuotaExceededError or an "UnknownError" DOMException, and terminate these steps.
+        self.executor.commit().map_err(|error| {
+            warn!("Failed to commit IndexedDB transaction {transaction}: {error:?}");
+            error.to_backend_error()
+        })
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#abort-a-transaction>
+    fn abort(&mut self, transaction: u64) {
+        self.failed.remove(&transaction);
+        if self
+            .upgrade
+            .is_some_and(|(upgrade, _)| upgrade == transaction)
+        {
+            self.upgrade = None;
+        }
+        // Step 2. All the changes made to the database by the transaction are reverted. For
+        // upgrade transactions this includes changes to the set of object stores and indexes, as
+        // well as the change to the version.
+        self.roll_back(transaction);
+    }
+
+    /// Rolls back `transaction`, and fails its later requests and its commit with `error`.
+    fn fail(&mut self, transaction: u64, error: BackendError) {
+        self.roll_back(transaction);
+        self.failed.insert(transaction, error);
+    }
+
+    fn roll_back(&mut self, transaction: u64) {
+        if self.writer != Some(transaction) {
+            return;
+        }
+        self.writer = None;
+        if let Err(error) = self.executor.rollback() {
+            warn!("Failed to roll back IndexedDB transaction {transaction}: {error:?}");
+        }
+    }
 }
 
 impl<X: SqlExecutor> MallocSizeOf for SqlEngine<X> {
@@ -246,25 +405,6 @@ impl<X: SqlExecutor> MallocSizeOf for SqlEngine<X> {
 impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
     type Error = SqlError;
 
-    fn create_store(
-        &self,
-        store_name: &str,
-        key_path: Option<KeyPath>,
-        auto_increment: bool,
-    ) -> Result<CreateObjectResult, Self::Error> {
-        let store_name = store_name.to_owned();
-        self.run(TransactionBehavior::Immediate, move |connection| {
-            queries::create_object_store(connection, &store_name, key_path.as_ref(), auto_increment)
-        })
-    }
-
-    fn delete_store(&self, store_name: &str) -> Result<(), Self::Error> {
-        let store_name = store_name.to_owned();
-        self.run(TransactionBehavior::Immediate, move |connection| {
-            queries::delete_object_store(connection, &store_name)
-        })
-    }
-
     fn close_store(&self, _store_name: &str) -> Result<(), Self::Error> {
         // TODO: do something
         Ok(())
@@ -272,280 +412,123 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
 
     fn process_transaction(
         &self,
-        transaction: KvsTransaction,
+        transaction: u64,
+        batch: KvsTransaction,
         on_complete: Box<dyn FnOnce() + Send + 'static>,
     ) {
         self.actor.spawn(move |database| {
-            run_batch(&mut database.executor, transaction);
+            database.run_batch(transaction, batch);
             on_complete();
+        });
+    }
+
+    fn upgrade_version(&self, transaction: u64, version: u64) {
+        self.actor.spawn(move |database| {
+            database.upgrade = Some((transaction, version));
+        });
+    }
+
+    fn commit(&self, transaction: u64, on_done: Box<dyn FnOnce(BackendResult<()>) + Send>) {
+        self.actor
+            .spawn(move |database| on_done(database.commit(transaction)));
+    }
+
+    fn rollback(&self, transaction: u64, on_done: Box<dyn FnOnce() + Send>) {
+        self.actor.spawn(move |database| {
+            database.abort(transaction);
+            on_done();
         });
     }
 
     fn key_generator_current_number(&self, store_name: &str) -> Option<i64> {
         let store_name = store_name.to_owned();
-        self.run(TransactionBehavior::Deferred, move |connection| {
-            queries::key_generator_current_number(connection, &store_name)
-        })
-        .unwrap_or_else(|error| {
-            warn!("IndexedDB key generator lookup failed: {error:?}");
-            None
-        })
-    }
-
-    fn set_key_generator_current_number(
-        &self,
-        store_name: &str,
-        current_number: i64,
-    ) -> Result<(), Self::Error> {
-        let store_name = store_name.to_owned();
-        self.run(TransactionBehavior::Immediate, move |connection| {
-            queries::set_key_generator_current_number(connection, &store_name, current_number)
-        })
+        self.read(move |executor| queries::key_generator_current_number(executor, &store_name))
+            .unwrap_or_else(|error| {
+                warn!("IndexedDB key generator lookup failed: {error:?}");
+                None
+            })
     }
 
     fn key_path(&self, store_name: &str) -> Option<KeyPath> {
         let store_name = store_name.to_owned();
-        self.run(TransactionBehavior::Deferred, move |connection| {
-            queries::key_path(connection, &store_name)
-        })
-        .unwrap_or_else(|error| {
-            warn!("IndexedDB key path lookup failed: {error:?}");
-            None
-        })
+        self.read(move |executor| queries::key_path(executor, &store_name))
+            .unwrap_or_else(|error| {
+                warn!("IndexedDB key path lookup failed: {error:?}");
+                None
+            })
     }
 
     fn object_store_names(&self) -> Result<Vec<String>, Self::Error> {
-        self.run(TransactionBehavior::Deferred, queries::object_store_names)
+        self.read(queries::object_store_names)
     }
 
     fn indexes(&self, store_name: &str) -> Result<Vec<IndexedDBIndex>, Self::Error> {
         let store_name = store_name.to_owned();
-        self.run(TransactionBehavior::Deferred, move |connection| {
-            queries::indexes(connection, &store_name)
-        })
-    }
-
-    fn create_index(
-        &self,
-        store_name: &str,
-        index_name: String,
-        key_path: KeyPath,
-        unique: bool,
-        multi_entry: bool,
-    ) -> Result<CreateObjectResult, Self::Error> {
-        let store_name = store_name.to_owned();
-        self.run(TransactionBehavior::Immediate, move |connection| {
-            queries::create_index(
-                connection,
-                &store_name,
-                &index_name,
-                &key_path,
-                unique,
-                multi_entry,
-            )
-        })
-    }
-
-    fn delete_index(&self, store_name: &str, index_name: String) -> Result<(), Self::Error> {
-        let store_name = store_name.to_owned();
-        self.run(TransactionBehavior::Immediate, move |connection| {
-            queries::delete_index(connection, &store_name, &index_name)
-        })
+        self.read(move |executor| queries::indexes(executor, &store_name))
     }
 
     fn version(&self) -> Result<u64, Self::Error> {
-        self.run(TransactionBehavior::Deferred, queries::version)
-    }
-
-    fn set_version(&self, version: u64) -> Result<(), Self::Error> {
-        self.run(TransactionBehavior::Immediate, move |connection| {
-            queries::set_version(connection, version)
-        })
+        self.read(queries::version)
     }
 }
 
-fn db_error(error: SqlError) -> BackendError {
-    BackendError::DbErr(format!("{error:?}"))
+fn ended_early() -> BackendError {
+    BackendError::DbErr("The storage transaction ended early".to_owned())
 }
 
-/// The reply to a request of a batch, sent when the batch's storage transaction has ended.
-struct Reply {
-    /// Sends the request's result after the transaction committed, or right away in a readonly
-    /// batch, if there is one to send.
-    on_commit: Option<Box<dyn FnOnce() + Send>>,
-    /// Sends an error instead, after the transaction was rolled back or failed to commit.
-    on_failure: Option<Box<dyn FnOnce(BackendError) + Send>>,
+/// How a request failed in the database.
+enum Failure {
+    /// A read failed. The transaction goes on, unless the failure ended its SQL transaction.
+    Read(BackendError),
+    /// A write failed, possibly after some of its statements had applied, so the transaction
+    /// fails.
+    Write(BackendError),
 }
 
-impl Reply {
-    fn result<T>(callback: GenericCallback<BackendResult<T>>, result: BackendResult<T>) -> Self
-    where
-        T: Serialize + DeserializeOwned + Send + 'static,
-    {
-        let failure_callback = callback.clone();
-        Self {
-            on_commit: Some(Box::new(move || {
-                let _ = callback.send(result);
-            })),
-            on_failure: Some(Box::new(move |error| {
-                let _ = failure_callback.send(Err(error));
-            })),
-        }
-    }
-
-    /// A schema operation's callback only ever carries an error, so `error` of `None` means the
-    /// operation succeeded and nothing is sent unless the transaction fails.
-    fn schema(callback: GenericCallback<BackendError>, error: Option<BackendError>) -> Self {
-        let failure_callback = callback.clone();
-        Self {
-            on_commit: error.map(|error| -> Box<dyn FnOnce() + Send> {
-                Box::new(move || {
-                    let _ = callback.send(error);
-                })
-            }),
-            on_failure: Some(Box::new(move |error| {
-                let _ = failure_callback.send(error);
-            })),
-        }
-    }
-
-    /// The reply to an operation that failed, or never ran, with `error`.
-    fn error(operation: AsyncOperation, error: BackendError) -> Self {
-        match operation {
-            // Mirrors `AsyncSchemaOperation::notify_error`: only the two object store operations
-            // report back.
-            AsyncOperation::Schema(
-                AsyncSchemaOperation::CreateIndex { .. } |
-                AsyncSchemaOperation::RenameIndex { .. } |
-                AsyncSchemaOperation::DeleteIndex { .. },
-            ) => Self {
-                on_commit: None,
-                on_failure: None,
-            },
-            AsyncOperation::Schema(
-                AsyncSchemaOperation::CreateObjectStore { callback, .. } |
-                AsyncSchemaOperation::DeleteObjectStore { callback },
-            ) => Self::schema(callback, Some(error)),
-            AsyncOperation::ReadOnly(operation) => match operation {
-                AsyncReadOnlyOperation::GetKey { callback, .. } => {
-                    Self::result(callback, Err(error))
-                },
-                AsyncReadOnlyOperation::GetItem { callback, .. } => {
-                    Self::result(callback, Err(error))
-                },
-                AsyncReadOnlyOperation::GetAllKeys { callback, .. } => {
-                    Self::result(callback, Err(error))
-                },
-                AsyncReadOnlyOperation::GetAllItems { callback, .. } => {
-                    Self::result(callback, Err(error))
-                },
-                AsyncReadOnlyOperation::Count { callback, .. } => {
-                    Self::result(callback, Err(error))
-                },
-                AsyncReadOnlyOperation::Iterate { callback, .. } => {
-                    Self::result(callback, Err(error))
-                },
-            },
-            AsyncOperation::ReadWrite(operation) => match operation {
-                AsyncReadWriteOperation::PutItem { callback, .. } => {
-                    Self::result(callback, Err(error))
-                },
-                AsyncReadWriteOperation::RemoveItem { callback, .. } => {
-                    Self::result(callback, Err(error))
-                },
-                AsyncReadWriteOperation::Clear(callback) => Self::result(callback, Err(error)),
-            },
-        }
-    }
-
-    fn commit(self) {
-        if let Some(on_commit) = self.on_commit {
-            on_commit();
-        }
-    }
-
-    fn fail(self, error: BackendError) {
-        if let Some(on_failure) = self.on_failure {
-            on_failure(error);
+impl Failure {
+    fn error(&self) -> &BackendError {
+        match self {
+            Self::Read(error) | Self::Write(error) => error,
         }
     }
 }
 
-/// The reply to a request, and the error that aborts the batch, if the request failed in a way
-/// that may have left some of its statements applied.
-type Outcome = (Reply, Option<BackendError>);
-
-/// Runs one batch of requests in one storage transaction. The replies of a readwrite or
-/// versionchange batch are held back until the transaction ends, so no success is reported for
-/// a write that never became durable; a readonly batch has nothing to make durable, so each of
-/// its replies goes out as soon as its request has run. A request that fails while writing
-/// aborts the batch: the transaction is rolled back and every request of the batch reports the
-/// error. A request that fails before writing anything, such as one for a missing object store,
-/// only fails itself.
-fn run_batch<X: SqlExecutor>(connection: &mut X, transaction: KvsTransaction) {
-    let readonly = transaction.mode == IndexedDBTxnMode::Readonly;
-    let behavior = if readonly {
-        TransactionBehavior::Deferred
-    } else {
-        TransactionBehavior::Immediate
-    };
-    if let Err(error) = connection.begin(behavior) {
-        let error = db_error(error);
-        for request in transaction.requests {
-            request.operation.notify_error(error.clone());
-        }
-        return;
-    }
-
-    let mut replies = Vec::with_capacity(transaction.requests.len());
-    let mut batch_error = None;
-    let mut requests = transaction.requests.into_iter();
-    for request in requests.by_ref() {
-        let (reply, error) = run_request(connection, request);
-        if readonly {
-            reply.commit();
-        } else {
-            replies.push(reply);
-        }
-        // SQLite ends a transaction by itself after some errors; the rest of the batch must not
-        // run outside of it.
-        batch_error = error.or_else(|| {
-            (!connection.in_transaction())
-                .then(|| BackendError::DbErr("The storage transaction ended early".to_owned()))
-        });
-        if batch_error.is_some() {
-            break;
-        }
-    }
-
-    if let Some(error) = batch_error {
-        if let Err(rollback_error) = connection.rollback() {
-            warn!("Failed to roll back IndexedDB transaction: {rollback_error:?}");
-        }
-        replies.extend(requests.map(|request| Reply::error(request.operation, error.clone())));
-        for reply in replies {
-            reply.fail(error.clone());
-        }
-        return;
-    }
-
-    match connection.commit() {
-        Ok(()) => {
-            for reply in replies {
-                reply.commit();
-            }
+/// Replies to a request with `result`, and returns how the request failed if it failed in the
+/// database.
+fn reply<T>(
+    callback: &GenericCallback<BackendResult<T>>,
+    result: Result<T, SqlError>,
+    failure: fn(BackendError) -> Failure,
+) -> Option<Failure>
+where
+    T: Serialize + DeserializeOwned + Send + 'static,
+{
+    match result {
+        Ok(value) => {
+            let _ = callback.send(Ok(value));
+            None
         },
         Err(error) => {
-            warn!("Failed to commit IndexedDB transaction: {error:?}");
-            let error = db_error(error);
-            for reply in replies {
-                reply.fail(error.clone());
-            }
+            let error = error.to_backend_error();
+            let _ = callback.send(Err(error.clone()));
+            Some(failure(error))
         },
     }
 }
 
-fn run_request<X: SqlExecutor>(connection: &mut X, request: KvsOperation) -> Outcome {
+/// Replies to a schema operation, whose callback only ever carries an error.
+fn schema_reply(
+    callback: &GenericCallback<BackendError>,
+    result: Result<(), SqlError>,
+) -> Option<Failure> {
+    let error = result.err()?.to_backend_error();
+    let _ = callback.send(error.clone());
+    Some(Failure::Write(error))
+}
+
+/// Runs a request and replies to it. A request that fails before reading or writing anything,
+/// such as one for a missing object store, fails only itself.
+fn run_request<X: SqlExecutor>(executor: &mut X, request: KvsOperation) -> Option<Failure> {
     let KvsOperation {
         store_name,
         operation,
@@ -558,102 +541,97 @@ fn run_request<X: SqlExecutor>(connection: &mut X, request: KvsOperation) -> Out
         auto_increment,
     }) = operation
     {
-        let error = queries::create_object_store(
-            connection,
-            &store_name,
-            key_path.as_ref(),
-            auto_increment,
-        )
-        .err()
-        .map(db_error);
-        return (Reply::schema(callback, error.clone()), error);
+        let result =
+            queries::create_object_store(executor, &store_name, key_path.as_ref(), auto_increment);
+        return schema_reply(&callback, result.map(|_| ()));
     }
 
-    let store = match queries::object_store(connection, &store_name) {
+    let store = match queries::object_store(executor, &store_name) {
         Ok(Some(store)) => store,
-        Ok(None) => return (Reply::error(operation, BackendError::StoreNotFound), None),
-        Err(error) => return (Reply::error(operation, db_error(error)), None),
+        Ok(None) => {
+            operation.notify_error(BackendError::StoreNotFound);
+            return None;
+        },
+        Err(error) => {
+            let error = error.to_backend_error();
+            operation.notify_error(error.clone());
+            return Some(Failure::Read(error));
+        },
     };
 
     match operation {
-        AsyncOperation::ReadOnly(operation) => (run_read_only(connection, &store, operation), None),
-        AsyncOperation::ReadWrite(operation) => run_read_write(connection, &store, operation),
-        AsyncOperation::Schema(operation) => run_schema(connection, &store_name, operation),
+        AsyncOperation::ReadOnly(operation) => run_read_only(executor, &store, operation),
+        AsyncOperation::ReadWrite(operation) => run_read_write(executor, &store, operation),
+        AsyncOperation::Schema(operation) => run_schema(executor, &store_name, operation),
     }
 }
 
 fn run_read_only<X: SqlExecutor>(
-    connection: &mut X,
+    executor: &mut X,
     store: &ObjectStore,
     operation: AsyncReadOnlyOperation,
-) -> Reply {
+) -> Option<Failure> {
     match operation {
         AsyncReadOnlyOperation::GetKey {
             callback,
             key_range,
-        } => Reply::result(
-            callback,
-            queries::get_key(connection, store, &key_range).map_err(db_error),
+        } => reply(
+            &callback,
+            queries::get_key(executor, store, &key_range),
+            Failure::Read,
         ),
         AsyncReadOnlyOperation::GetItem {
             callback,
             key_range,
-        } => Reply::result(
-            callback,
-            queries::get_value(connection, store, &key_range).map_err(db_error),
+        } => reply(
+            &callback,
+            queries::get_value(executor, store, &key_range),
+            Failure::Read,
         ),
         AsyncReadOnlyOperation::GetAllKeys {
             callback,
             key_range,
             count,
-        } => Reply::result(
-            callback,
-            queries::get_all_keys(connection, store, &key_range, count).map_err(db_error),
+        } => reply(
+            &callback,
+            queries::get_all_keys(executor, store, &key_range, count),
+            Failure::Read,
         ),
         AsyncReadOnlyOperation::GetAllItems {
             callback,
             key_range,
             count,
-        } => Reply::result(
-            callback,
-            queries::get_all_values(connection, store, &key_range, count).map_err(db_error),
+        } => reply(
+            &callback,
+            queries::get_all_values(executor, store, &key_range, count),
+            Failure::Read,
         ),
         AsyncReadOnlyOperation::Count {
             callback,
             key_range,
-        } => Reply::result(
-            callback,
-            queries::count(connection, store, &key_range).map_err(db_error),
+        } => reply(
+            &callback,
+            queries::count(executor, store, &key_range),
+            Failure::Read,
         ),
         AsyncReadOnlyOperation::Iterate {
             callback,
             key_range,
             count,
             reverse,
-        } => Reply::result(
-            callback,
-            queries::get_records(connection, store, &key_range, count, reverse).map_err(db_error),
+        } => reply(
+            &callback,
+            queries::get_records(executor, store, &key_range, count, reverse),
+            Failure::Read,
         ),
     }
 }
 
-/// The reply to a write, which aborts the batch if it failed.
-fn write_outcome<T>(
-    callback: GenericCallback<BackendResult<T>>,
-    result: BackendResult<T>,
-) -> Outcome
-where
-    T: Serialize + DeserializeOwned + Send + 'static,
-{
-    let batch_error = result.as_ref().err().cloned();
-    (Reply::result(callback, result), batch_error)
-}
-
 fn run_read_write<X: SqlExecutor>(
-    connection: &mut X,
+    executor: &mut X,
     store: &ObjectStore,
     operation: AsyncReadWriteOperation,
-) -> Outcome {
+) -> Option<Failure> {
     match operation {
         AsyncReadWriteOperation::PutItem {
             callback,
@@ -667,13 +645,15 @@ fn run_read_write<X: SqlExecutor>(
                 None => {
                     if store.auto_increment == 0 {
                         let error = BackendError::DbErr("Missing key for PutItem request".into());
-                        return (Reply::result(callback, Err(error)), None);
+                        let _ = callback.send(Err(error));
+                        return None;
                     }
                     let Some(next_key_generator_current_number) =
                         store.auto_increment.checked_add(1)
                     else {
                         let error = BackendError::DbErr("Key generator overflow".into());
-                        return (Reply::result(callback, Err(error)), None);
+                        let _ = callback.send(Err(error));
+                        return None;
                     };
                     (
                         IndexedDBKeyType::Number(store.auto_increment as f64),
@@ -682,35 +662,34 @@ fn run_read_write<X: SqlExecutor>(
                 },
             };
             let result = queries::put_record(
-                connection,
+                executor,
                 store,
                 key,
                 &value,
                 should_overwrite,
                 key_generator_current_number,
             );
-            write_outcome(callback, result.map_err(db_error))
+            reply(&callback, result, Failure::Write)
         },
         AsyncReadWriteOperation::RemoveItem {
             callback,
             key_range,
-        } => write_outcome(
-            callback,
-            queries::delete_records(connection, store, &key_range).map_err(db_error),
+        } => reply(
+            &callback,
+            queries::delete_records(executor, store, &key_range),
+            Failure::Write,
         ),
-        AsyncReadWriteOperation::Clear(callback) => write_outcome(
-            callback,
-            queries::clear(connection, store).map_err(db_error),
-        ),
+        AsyncReadWriteOperation::Clear(callback) => {
+            reply(&callback, queries::clear(executor, store), Failure::Write)
+        },
     }
 }
 
-/// Schema operations are transactional too, so a failing one aborts the batch.
 fn run_schema<X: SqlExecutor>(
-    connection: &mut X,
+    executor: &mut X,
     store_name: &str,
     operation: AsyncSchemaOperation,
-) -> Outcome {
+) -> Option<Failure> {
     let (callback, result) = match operation {
         AsyncSchemaOperation::CreateIndex {
             callback,
@@ -721,7 +700,7 @@ fn run_schema<X: SqlExecutor>(
         } => (
             callback,
             queries::create_index(
-                connection,
+                executor,
                 store_name,
                 &index_name,
                 &key_path,
@@ -736,23 +715,21 @@ fn run_schema<X: SqlExecutor>(
             new_name,
         } => (
             callback,
-            queries::rename_index(connection, store_name, &index_name, &new_name),
+            queries::rename_index(executor, store_name, &index_name, &new_name),
         ),
         AsyncSchemaOperation::DeleteIndex {
             callback,
             index_name,
         } => (
             callback,
-            queries::delete_index(connection, store_name, &index_name),
+            queries::delete_index(executor, store_name, &index_name),
         ),
-        AsyncSchemaOperation::DeleteObjectStore { callback } => (
-            callback,
-            queries::delete_object_store(connection, store_name),
-        ),
+        AsyncSchemaOperation::DeleteObjectStore { callback } => {
+            (callback, queries::delete_object_store(executor, store_name))
+        },
         AsyncSchemaOperation::CreateObjectStore { .. } => {
             unreachable!("Should be handled above");
         },
     };
-    let error = result.err().map(db_error);
-    (Reply::schema(callback, error.clone()), error)
+    schema_reply(&callback, result)
 }

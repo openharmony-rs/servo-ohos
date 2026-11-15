@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use malloc_size_of::MallocSizeOf;
 use malloc_size_of_derive::MallocSizeOf;
 use storage_traits::indexeddb::{
-    AsyncOperation, CreateObjectResult, IndexedDBIndex, IndexedDBTxnMode, KeyPath,
+    AsyncOperation, BackendResult, IndexedDBIndex, IndexedDBTxnMode, KeyPath,
 };
 
 pub(crate) use crate::indexeddb::backend::ActiveKvsEngine;
@@ -32,44 +32,34 @@ pub struct KvsTransaction {
 pub trait KvsEngine: MallocSizeOf {
     type Error: std::error::Error;
 
-    fn create_store(
-        &self,
-        store_name: &str,
-        key_path: Option<KeyPath>,
-        auto_increment: bool,
-    ) -> Result<CreateObjectResult, Self::Error>;
-
-    fn delete_store(&self, store_name: &str) -> Result<(), Self::Error>;
-
     #[expect(dead_code)]
     fn close_store(&self, store_name: &str) -> Result<(), Self::Error>;
 
+    /// Runs a batch of requests of `transaction` after all work handed over before, and calls
+    /// `on_complete` once they have run.
     fn process_transaction(
         &self,
-        transaction: KvsTransaction,
+        transaction: u64,
+        batch: KvsTransaction,
         on_complete: Box<dyn FnOnce() + Send + 'static>,
     );
 
+    /// Makes the database's version `version` as part of the upgrade `transaction`, so that
+    /// aborting the transaction reverts it.
+    fn upgrade_version(&self, transaction: u64, version: u64);
+
+    /// Commits `transaction` after all work handed over before, and calls `on_done` with the
+    /// result once it is durable or has failed.
+    fn commit(&self, transaction: u64, on_done: Box<dyn FnOnce(BackendResult<()>) + Send>);
+
+    /// Undoes everything `transaction` changed, after all work handed over before, and calls
+    /// `on_done` once it is undone.
+    fn rollback(&self, transaction: u64, on_done: Box<dyn FnOnce() + Send>);
+
     fn key_generator_current_number(&self, store_name: &str) -> Option<i64>;
-    fn set_key_generator_current_number(
-        &self,
-        store_name: &str,
-        current_number: i64,
-    ) -> Result<(), Self::Error>;
     fn key_path(&self, store_name: &str) -> Option<KeyPath>;
     fn object_store_names(&self) -> Result<Vec<String>, Self::Error>;
     fn indexes(&self, store_name: &str) -> Result<Vec<IndexedDBIndex>, Self::Error>;
 
-    fn create_index(
-        &self,
-        store_name: &str,
-        index_name: String,
-        key_path: KeyPath,
-        unique: bool,
-        multi_entry: bool,
-    ) -> Result<CreateObjectResult, Self::Error>;
-    fn delete_index(&self, store_name: &str, index_name: String) -> Result<(), Self::Error>;
-
     fn version(&self) -> Result<u64, Self::Error>;
-    fn set_version(&self, version: u64) -> Result<(), Self::Error>;
 }

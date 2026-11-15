@@ -13,7 +13,9 @@ use crate::indexeddb::BackendErrorMapper;
 /// How [`SqlExecutor::begin`] starts a transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TransactionBehavior {
-    /// `BEGIN DEFERRED`: locks are taken on first use. For transactions that only read.
+    /// `BEGIN DEFERRED`: locks are taken on first use. For transactions that only read; the
+    /// engine runs reads without a transaction, so only tests use it.
+    #[cfg_attr(not(test), expect(dead_code))]
     Deferred,
     /// `BEGIN IMMEDIATE`: the write lock is taken up front, so a writing transaction can't fail
     /// half-way because another connection wrote in the meantime.
@@ -245,20 +247,30 @@ impl From<crate::ohos_rdb::OhosRdbError> for SqlError {
     }
 }
 
-impl BackendErrorMapper for SqlError {
-    fn into_backend_error(self) -> BackendError {
+impl SqlError {
+    /// Whether the error reports a full disk or an exceeded size limit.
+    fn is_disk_full(&self) -> bool {
         match self {
             #[cfg(feature = "sqlite-backend")]
-            Self::Sqlite(error) => error.into_backend_error(),
+            Self::Sqlite(error) => crate::shared::is_sqlite_disk_full_error(error),
             #[cfg(ohos_rdb)]
-            Self::Rdb(error) => {
-                if super::rdb::is_disk_full_error(&error) {
-                    BackendError::QuotaExceeded
-                } else {
-                    BackendError::DbErr(format!("{error:?}"))
-                }
-            },
-            other => BackendError::DbErr(format!("{other:?}")),
+            Self::Rdb(error) => super::rdb::is_disk_full_error(error),
+            _ => false,
         }
+    }
+
+    /// The error to report for this one: QuotaExceeded for a full disk, DbErr otherwise.
+    pub(crate) fn to_backend_error(&self) -> BackendError {
+        if self.is_disk_full() {
+            BackendError::QuotaExceeded
+        } else {
+            BackendError::DbErr(format!("{self:?}"))
+        }
+    }
+}
+
+impl BackendErrorMapper for SqlError {
+    fn into_backend_error(self) -> BackendError {
+        self.to_backend_error()
     }
 }

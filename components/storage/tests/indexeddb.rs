@@ -67,6 +67,8 @@ backend_tests!(
     test_indexeddb_delete_item_range_respects_open_bounds,
     test_indexeddb_auto_increment_assigns_sequential_keys,
     test_indexeddb_batch_commit_failure_surfaces_an_error,
+    test_indexeddb_aborted_put_that_succeeded_leaves_no_record,
+    test_indexeddb_writers_with_disjoint_scopes_run_one_after_another,
 );
 
 static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -919,7 +921,7 @@ fn test_indexeddb_version_upgrade_persists_metadata() {
                 assert_eq!(old_version, 1);
                 assert_eq!(version, 2);
                 assert_eq!(object_store_names, vec![store_name.to_string()]);
-                finish_upgrade_transaction(&ctx, transaction, db_name, true);
+                commit_upgrade_transaction(&ctx, db_name, transaction);
             },
             ConnectionMsg::Connection {
                 id,
@@ -1026,12 +1028,11 @@ fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
         Some(KeyPath::String("id".to_string())),
     );
 
-    // Write inside a transaction, then abort instead of committing. The queued
-    // request must never reach the backing store, so no reply is awaited on the
-    // put callback. An earlier live transaction over the same store keeps the
-    // aborted one from starting: the backend drops queued requests on abort but
-    // has no rollback for a batch it already ran
-    // (<https://w3c.github.io/IndexedDB/#abort-a-transaction> step 2 is a TODO).
+    // Write inside a transaction, then abort instead of committing. An earlier
+    // live transaction over the same store keeps the aborted one from starting,
+    // so its queued request never runs and gets no reply. A put that has run is
+    // rolled back instead, see
+    // test_indexeddb_aborted_put_that_succeeded_leaves_no_record.
     let blocking_txn = create_transaction(
         &ctx,
         db_name,
@@ -1149,6 +1150,14 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
                 assert_eq!(old_version, 1);
                 assert_eq!(object_store_names, vec![store_name.to_string()]);
                 create_object_store(&ctx, db_name, "phantom", transaction, None, false);
+                let (callback, _deleted) = make_profile_callback();
+                send_schema_operation(
+                    &ctx,
+                    db_name,
+                    store_name,
+                    transaction,
+                    AsyncSchemaOperation::DeleteObjectStore { callback },
+                );
                 abort_upgrade_transaction(&ctx, db_name, transaction);
             },
             ConnectionMsg::AbortError { name, id: _ } => {
@@ -1161,8 +1170,8 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
     }
     assert!(aborted, "aborted upgrade must abort the open request");
 
-    // Version reverted, the phantom store is gone, and only the original
-    // store (with its data) remains.
+    // Version reverted, the phantom store is gone, and the original store,
+    // deleted in the aborted upgrade, is back with its data.
     assert_eq!(get_version(&ctx, db_name), 1);
     let connection_id = reopen_database(&ctx, db_name, store_name);
 
@@ -1654,6 +1663,153 @@ fn test_indexeddb_batch_commit_failure_surfaces_an_error() {
     mark_request_handled(&ctx, db_name, txn, 1);
     let _ = recv_callback_timeout(&commit_result, "batch commit reply");
     finish_transaction(&ctx, db_name, txn);
+
+    close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+fn get_item_in_new_readonly_transaction(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    store_name: &str,
+    key: IndexedDBKeyType,
+) -> Option<Vec<u8>> {
+    let txn = create_transaction(
+        ctx,
+        db_name,
+        IndexedDBTxnMode::Readonly,
+        vec![store_name.to_string()],
+    );
+    let lookup = get_item(ctx, db_name, store_name, txn, key);
+    let commit_result = commit_transaction(ctx, db_name, txn);
+    let value = recv_callback_timeout(&lookup, "get item reply").unwrap();
+    mark_request_handled(ctx, db_name, txn, 1);
+    assert!(
+        recv_callback_timeout(&commit_result, "readonly commit reply")
+            .result
+            .is_ok()
+    );
+    finish_transaction(ctx, db_name, txn);
+    value
+}
+
+/// <https://w3c.github.io/IndexedDB/#abort-a-transaction>: "All the changes made to the
+/// database by the transaction are reverted", also those of requests that have succeeded.
+/// Before the storage transaction spanned the whole IndexedDB transaction, a put that had
+/// replied was durable already and survived the abort.
+fn test_indexeddb_aborted_put_that_succeeded_leaves_no_record() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-aborted-put";
+    let store_name = "books";
+    let connection_id =
+        expect_upgrade_and_initialize_database(&ctx, db_name, store_name, "by_author", None);
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readwrite,
+        vec![store_name.to_string()],
+    );
+    let put_result = put_item(
+        &ctx,
+        db_name,
+        store_name,
+        txn,
+        IndexedDBKeyType::String("book-aborted".to_string()),
+        b"Never Committed".to_vec(),
+    );
+    assert_eq!(
+        recv_callback_timeout(&put_result, "put item reply").unwrap(),
+        PutItemResult::Key(IndexedDBKeyType::String("book-aborted".to_string()))
+    );
+    mark_request_handled(&ctx, db_name, txn, 1);
+
+    let abort_result = abort_transaction(&ctx, db_name, txn);
+    let abort_msg = recv_callback_timeout(&abort_result, "abort reply");
+    assert!(matches!(abort_msg.result, Err(BackendError::Abort)));
+    finish_transaction(&ctx, db_name, txn);
+
+    assert_eq!(
+        get_item_in_new_readonly_transaction(
+            &ctx,
+            db_name,
+            store_name,
+            IndexedDBKeyType::String("book-aborted".to_string()),
+        ),
+        None
+    );
+
+    close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+/// Each readwrite transaction is the one storage transaction of the database's connection while
+/// it runs, so a second writer waits for the first to finish even if their scopes don't
+/// overlap. Implementations may do that: the spec only allows such writers to run in parallel.
+fn test_indexeddb_writers_with_disjoint_scopes_run_one_after_another() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-serial-writers";
+    let receiver = open_database(&ctx, db_name, Some(1));
+    let connection_id = loop {
+        match recv_callback_timeout(&receiver, "serial writers open reply") {
+            ConnectionMsg::Upgrade { transaction, .. } => {
+                for store_name in ["a", "b"] {
+                    create_object_store(&ctx, db_name, store_name, transaction, None, false);
+                }
+                commit_upgrade_transaction(&ctx, db_name, transaction);
+            },
+            ConnectionMsg::Connection { id, .. } => break id,
+            other => panic!("unexpected serial writers message: {other:?}"),
+        }
+    };
+
+    let first = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readwrite,
+        vec!["a".to_string()],
+    );
+    let second = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readwrite,
+        vec!["b".to_string()],
+    );
+    let key = || IndexedDBKeyType::Number(1.0);
+    let first_put = put_item(&ctx, db_name, "a", first, key(), b"first".to_vec());
+    recv_callback_timeout(&first_put, "first writer put reply").unwrap();
+    mark_request_handled(&ctx, db_name, first, 1);
+
+    let second_put = put_item(&ctx, db_name, "b", second, key(), b"second".to_vec());
+    assert!(
+        second_put.recv_timeout(Duration::from_millis(200)).is_err(),
+        "The second writer must not start while the first is live"
+    );
+
+    let commit_result = commit_transaction(&ctx, db_name, first);
+    assert!(
+        recv_callback_timeout(&commit_result, "first writer commit reply")
+            .result
+            .is_ok()
+    );
+    finish_transaction(&ctx, db_name, first);
+
+    recv_callback_timeout(&second_put, "second writer put reply").unwrap();
+    mark_request_handled(&ctx, db_name, second, 1);
+    let commit_result = commit_transaction(&ctx, db_name, second);
+    assert!(
+        recv_callback_timeout(&commit_result, "second writer commit reply")
+            .result
+            .is_ok()
+    );
+    finish_transaction(&ctx, db_name, second);
+
+    for (store_name, value) in [("a", &b"first"[..]), ("b", &b"second"[..])] {
+        assert_eq!(
+            get_item_in_new_readonly_transaction(&ctx, db_name, store_name, key()),
+            Some(value.to_vec())
+        );
+    }
 
     close_database(&ctx, connection_id, db_name);
     ctx.shutdown();
