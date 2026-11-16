@@ -11640,6 +11640,49 @@
   },
   "testharness": {
    "IndexedDB": {
+    "back-forward-cache-versionchange.window.js": [
+     "2a30ff98ff0f8105c0d67766a5a158a5137e95f8",
+     [
+      "IndexedDB/back-forward-cache-versionchange.window.html",
+      {
+       "script_metadata": [
+        [
+         "title",
+         "IndexedDB: versionchange at a connection in the back/forward cache evicts its page"
+        ],
+        [
+         "script",
+         "/common/dispatcher/dispatcher.js"
+        ],
+        [
+         "script",
+         "/common/utils.js"
+        ],
+        [
+         "script",
+         "/common/get-host-info.sub.js"
+        ],
+        [
+         "script",
+         "/IndexedDB/resources/support.js"
+        ],
+        [
+         "script",
+         "/html/browsers/browsing-the-web/back-forward-cache/resources/rc-helper.js"
+        ],
+        [
+         "script",
+         "/html/browsers/browsing-the-web/remote-context-helper/resources/remote-context-helper.js"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
     "connection-after-aborted-upgrade.any.js": [
      "8b7e54ee97d9c2a1a5702ae531acf242328bab25",
      [

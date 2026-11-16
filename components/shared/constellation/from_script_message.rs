@@ -828,6 +828,9 @@ pub enum ScriptToConstellationMessage {
     LogEntry(Option<ScriptEventLoopId>, Option<String>, LogEntry),
     /// Discard the document.
     DiscardDocument,
+    /// Evict the session history entry whose document is or contains this pipeline's document
+    /// from the back/forward cache, unless that document is fully active again.
+    EvictFromBackForwardCache,
     /// Discard the browsing context.
     DiscardTopLevelBrowsingContext,
     /// Notifies the constellation that this pipeline has exited.

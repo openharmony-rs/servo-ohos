@@ -22,7 +22,9 @@ use crate::dom::RootedPromise;
 use crate::dom::bindings::codegen::Bindings::IDBFactoryBinding::{
     IDBDatabaseInfo, IDBFactoryMethods,
 };
+use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::error::{Error, ErrorToJsval, Fallible};
+use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
@@ -36,6 +38,7 @@ use crate::dom::indexeddb::key::{
 };
 use crate::dom::promise::Promise;
 use crate::dom::types::IDBTransaction;
+use crate::dom::window::Window;
 
 /// A non-jstraceable string wrapper for use in `HashMapTracedValues`.
 #[derive(Clone, Debug, Eq, Hash, MallocSizeOf, PartialEq)]
@@ -234,12 +237,37 @@ impl IDBFactory {
             .task_manager()
             .database_access_task_source()
             .to_sendable();
+        let in_window = global.is::<Window>();
         GenericCallback::new(move |message| {
             let event = match message {
                 Ok(event) => event,
                 Err(err) => return error!("Error in IndexedDB connection channel {:?}.", err),
             };
             let request = request.clone();
+            // A versionchange event at a connection of a document in the back/forward cache would
+            // wait there until the document is shown again, and the upgrade or delete with it.
+            // Like Gecko and Chromium, Servo evicts the document instead, which closes the
+            // connection; the IndexedDB specification doesn't say.
+            if in_window && matches!(event, ConnectionEvent::VersionChange { .. }) {
+                let event_task_source = task_source.clone();
+                task_source.queue_even_if_not_fully_active(
+                    task!(handle_indexeddb_versionchange: move |_cx| {
+                        if let Some(window) = request.root().global().downcast::<Window>() &&
+                            !window.Document().is_fully_active()
+                        {
+                            window.Document().evict_from_back_forward_cache();
+                        }
+                        // The event itself is a normal task, behind the tasks held back so far,
+                        // such as the open request's success that created the connection. It is
+                        // dropped with an evicted document, and fired if the document was shown
+                        // again before the eviction.
+                        event_task_source.queue(task!(handle_indexeddb_connection_event: move |cx| {
+                            request.root().handle_connection_event(cx, event);
+                        }));
+                    }),
+                );
+                return;
+            }
             // https://w3c.github.io/IndexedDB/#dom-idbfactory-open
             // Step 5.3: Queue a database task to run these steps:
             task_source.queue(task!(handle_indexeddb_connection_event: move |cx| {

@@ -1721,6 +1721,9 @@ where
             ScriptToConstellationMessage::DiscardDocument => {
                 self.handle_discard_document(webview_id, source_pipeline_id);
             },
+            ScriptToConstellationMessage::EvictFromBackForwardCache => {
+                self.handle_evict_from_back_forward_cache(webview_id, source_pipeline_id);
+            },
             ScriptToConstellationMessage::DiscardTopLevelBrowsingContext => {
                 self.handle_close_top_level_browsing_context(webview_id);
             },
@@ -6048,6 +6051,49 @@ where
             load_data.url = pipeline.url.clone();
             load_data
         })
+    }
+
+    /// Discards the pipeline of the session history entry that holds `pipeline_id`, which is the
+    /// pipeline itself or, for an iframe, the first ancestor that isn't the current pipeline of
+    /// its browsing context. Nothing is discarded if every one of them is current, as the user
+    /// went back to the entry in the meantime.
+    fn handle_evict_from_back_forward_cache(
+        &mut self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+    ) {
+        let mut current = pipeline_id;
+        loop {
+            let Some(browsing_context) = self
+                .pipelines
+                .get(&current)
+                .and_then(|pipeline| self.browsing_contexts.get(&pipeline.browsing_context_id))
+            else {
+                return warn!("{pipeline_id}: Evicting a closed pipeline");
+            };
+            if browsing_context.pipeline_id != current {
+                break;
+            }
+            match browsing_context.parent_pipeline_id {
+                Some(parent) => current = parent,
+                None => return debug!("{pipeline_id}: Not evicting a fully active document"),
+            }
+        }
+        let in_session_history = self.webviews.get(&webview_id).is_some_and(|webview| {
+            let history = &webview.session_history;
+            history
+                .past
+                .iter()
+                .chain(history.future.iter())
+                .any(|diff| {
+                    diff.alive_old_pipeline() == Some(current) ||
+                        diff.alive_new_pipeline() == Some(current)
+                })
+        });
+        if !in_session_history {
+            return debug!("{current}: Not evicting a pipeline outside the session history");
+        }
+        self.handle_discard_document(webview_id, current);
     }
 
     // Discard the pipeline for a given document, udpdate the joint session history.

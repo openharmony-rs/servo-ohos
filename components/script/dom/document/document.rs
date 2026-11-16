@@ -4899,6 +4899,19 @@ impl Document {
         self.salvageable.get()
     }
 
+    /// Evicts this document, which is not fully active, from the back/forward cache: the
+    /// constellation closes the pipeline of the session history entry that holds it, also for a
+    /// document in an iframe of another script thread, and reloads the entry if it is traversed
+    /// to again. It does nothing if the document is fully active again by then.
+    pub(crate) fn evict_from_back_forward_cache(&self) {
+        let msg = ScriptToConstellationMessage::EvictFromBackForwardCache;
+        let _ = self
+            .window
+            .as_global_scope()
+            .script_to_constellation_chan()
+            .send(msg);
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#make-document-unsalvageable>
     pub(crate) fn make_document_unsalvageable(&self) {
         // Step 1. Let details be a new not restored reason details whose reason is reason.

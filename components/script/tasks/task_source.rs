@@ -202,6 +202,28 @@ impl SendableTaskSource {
             );
         }
     }
+
+    /// Queues a task that the event loop runs even while the document of the task source's
+    /// global is not fully active, when it holds back the global's other tasks. The task runs
+    /// outside of any realm and must check the document's state itself.
+    pub(crate) fn queue_even_if_not_fully_active(&self, task: impl TaskOnce + 'static) {
+        if self.canceller.cancelled() {
+            return;
+        }
+        let task = self.canceller.wrap_task(task);
+        if self
+            .sender
+            .send(CommonScriptMsg::Task(
+                self.name.into(),
+                Box::new(task),
+                None,
+                self.name,
+            ))
+            .is_err()
+        {
+            warn!("Could not queue task {:?} during shutdown.", self.name);
+        }
+    }
 }
 
 impl Clone for SendableTaskSource {
