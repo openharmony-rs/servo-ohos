@@ -5,6 +5,7 @@
 #![cfg_attr(crown, allow(crown::jscontext_first_arg))]
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
@@ -15,12 +16,13 @@ use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, IndexedDBCursorDirection,
-    IndexedDBCursorStep, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
+    IndexedDBCursorStep, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord, RequestOutput,
 };
 
 use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::{
     IDBCursorDirection, IDBCursorMethods,
 };
+use crate::dom::bindings::codegen::Bindings::IDBIndexBinding::IDBIndexMethods;
 use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::IDBTransactionMode;
 use crate::dom::bindings::codegen::UnionTypes::IDBObjectStoreOrIDBIndex;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
@@ -44,6 +46,30 @@ pub(crate) fn backend_direction(direction: IDBCursorDirection) -> IndexedDBCurso
         IDBCursorDirection::Prev => IndexedDBCursorDirection::Prev,
         IDBCursorDirection::Prevunique => IndexedDBCursorDirection::PrevUnique,
     }
+}
+
+/// The most records that a cursor asks the backend for in one step: the record the step finds,
+/// and those that the next steps without a key would find, which the cursor keeps.
+const MAX_PREFETCHED_RECORDS: u32 = 64;
+
+/// The records that a cursor's request to the backend returned after the record that the
+/// request moved the cursor to, as the next steps without a key would find them.
+#[derive(Default, MallocSizeOf)]
+struct Prefetched {
+    records: VecDeque<IndexedDBRecord>,
+    /// The writes count of the cursor's transaction for its effective object store when the
+    /// request was made; the records are current while it stays the same.
+    writes: u64,
+}
+
+/// A request of a cursor that the backend runs.
+#[derive(Clone, Copy, MallocSizeOf)]
+struct Fetch {
+    /// The most records that it asks for.
+    records: u32,
+    /// The writes count of the cursor's transaction for its effective object store when it was
+    /// made.
+    writes: u64,
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -89,6 +115,14 @@ pub(crate) struct IDBCursor {
 
     /// <https://w3c.github.io/IndexedDB/#cursor-request>
     request: MutNullableDom<IDBRequest>,
+
+    /// The records that the next steps of the cursor can take without asking the backend.
+    #[no_trace]
+    prefetched: DomRefCell<Prefetched>,
+    /// The last request of the cursor that the backend runs, and whether its result is pending.
+    #[no_trace]
+    last_fetch: Cell<Option<Fetch>>,
+    fetch_pending: Cell<bool>,
 }
 
 impl IDBCursor {
@@ -116,6 +150,9 @@ impl IDBCursor {
             object_store_position: DomRefCell::new(None),
             key_only,
             request: Default::default(),
+            prefetched: Default::default(),
+            last_fetch: Cell::new(None),
+            fetch_pending: Cell::new(false),
         }
     }
 
@@ -231,9 +268,31 @@ impl IDBCursor {
         Ok(())
     }
 
+    /// How many records the next request of the cursor to the backend asks for: twice as many
+    /// as the last request, up to [`MAX_PREFETCHED_RECORDS`], for a step without a key, as
+    /// Chromium and Gecko prefetch; one at first, after a write in the transaction, and for a
+    /// step with a key, which went beyond the records taken before.
+    ///
+    /// A "nextunique" cursor over an index that isn't unique asks for one record: to return the
+    /// keys after the first, the backend reads every record of each key, while a step reads only
+    /// the first record of its key.
+    fn next_fetch(&self, with_key: bool) -> Fetch {
+        let writes = self.transaction.writes(self.effective_object_store().id());
+        let unique_steps = self.direction == IDBCursorDirection::Nextunique &&
+            matches!(&self.source, ObjectStoreOrIndex::Index(index) if !index.Unique());
+        let records = match self.last_fetch.get() {
+            Some(last) if last.writes == writes && !with_key && !unique_steps => {
+                (last.records * 2).min(MAX_PREFETCHED_RECORDS)
+            },
+            _ => 1,
+        };
+        Fetch { records, writes }
+    }
+
     /// The operation of <https://w3c.github.io/IndexedDB/#iterate-a-cursor> with this cursor,
     /// `key`, `primary_key` and `count`: the backend finds the record from the cursor's position
-    /// (step 9), which `iterate_cursor` then moves the cursor to.
+    /// (step 9), which `iterate_cursor` then moves the cursor to, and returns the records that the
+    /// next steps without a key would find after it, which the cursor keeps.
     pub(crate) fn iterate_operation(
         &self,
         key: Option<IndexedDBKeyType>,
@@ -253,6 +312,10 @@ impl IDBCursor {
             ObjectStoreOrIndex::ObjectStore(_) => None,
             ObjectStoreOrIndex::Index(index) => Some(index.id()),
         };
+        let fetch = self.next_fetch(key.is_some());
+        self.last_fetch.set(Some(fetch));
+        self.fetch_pending.set(true);
+        self.prefetched.borrow_mut().records.clear();
         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
             index,
             key_range: self.range.clone(),
@@ -264,9 +327,104 @@ impl IDBCursor {
                 primary_key,
                 count,
             },
-            records: 1,
+            records: fetch.records,
             key_only: self.key_only,
         })
+    }
+
+    /// Takes the record that <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9 finds
+    /// with `key`, `primary_key` and `count` from the prefetched records, with those before it, if
+    /// they are current and hold it; returns `None` and drops them otherwise.
+    ///
+    /// The prefetched records are the records that the steps without a key find one after the
+    /// other, from the cursor's position, as of the cursor's last request to the backend; no
+    /// write was made in the transaction since, so the records are still those. Step 9 with a key
+    /// (and a primary key) finds the first of them that meets its requirements for the key (and
+    /// primary key) as well, and with count n, the nth.
+    fn take_prefetched(
+        &self,
+        key: Option<&IndexedDBKeyType>,
+        primary_key: Option<&IndexedDBKeyType>,
+        count: u32,
+    ) -> Option<IndexedDBRecord> {
+        let mut prefetched = self.prefetched.borrow_mut();
+        if prefetched.writes != self.transaction.writes(self.effective_object_store().id()) {
+            prefetched.records.clear();
+            return None;
+        }
+        let reverse = matches!(
+            self.direction,
+            IDBCursorDirection::Prev | IDBCursorDirection::Prevunique
+        );
+        let beyond = |a: &IndexedDBKeyType, b: &IndexedDBKeyType| {
+            if reverse { a < b } else { a > b }
+        };
+        let found = match (key, primary_key) {
+            (None, _) => (count as usize).checked_sub(1),
+            // "If key is defined, the record’s key is greater than or equal to key", or less for
+            // "prev" and "prevunique".
+            (Some(key), None) => prefetched
+                .records
+                .iter()
+                .position(|record| record.key == *key || beyond(&record.key, key)),
+            // "If primaryKey is defined, the record’s key is equal to key and the record’s value
+            // is greater than or equal to primaryKey, or the record’s key is greater than key",
+            // or less for "prev".
+            (Some(key), Some(primary_key)) => prefetched.records.iter().position(|record| {
+                beyond(&record.key, key) ||
+                    (record.key == *key &&
+                        (record.primary_key == *primary_key ||
+                            beyond(&record.primary_key, primary_key)))
+            }),
+        };
+        match found.filter(|found| *found < prefetched.records.len()) {
+            Some(found) => {
+                prefetched.records.drain(..found);
+                prefetched.records.pop_front()
+            },
+            None => {
+                prefetched.records.clear();
+                None
+            },
+        }
+    }
+
+    /// Drops the records that the cursor keeps, which its transaction, once finished, can't use.
+    pub(crate) fn drop_prefetched_records(&self) {
+        self.prefetched.borrow_mut().records = VecDeque::new();
+    }
+
+    /// Runs <https://w3c.github.io/IndexedDB/#asynchronously-execute-a-request> with this
+    /// cursor's source, its request and the steps to iterate this cursor with `key`,
+    /// `primary_key` and `count`: with the record that the prefetched records give, or else
+    /// with the backend.
+    fn iterate(
+        &self,
+        cx: &mut JSContext,
+        key: Option<IndexedDBKeyType>,
+        primary_key: Option<IndexedDBKeyType>,
+        count: u32,
+    ) -> ErrorResult {
+        let request = self.Request();
+        let iteration_param = IterationParam {
+            cursor: Trusted::new(self),
+        };
+        if let Some(record) = self.take_prefetched(key.as_ref(), primary_key.as_ref(), count) {
+            return IDBRequest::execute_with_result(
+                self.request_source(),
+                Ok(RequestOutput::Records(vec![record])),
+                request,
+                iteration_param,
+            );
+        }
+        IDBRequest::execute_async(
+            cx,
+            self.request_source(),
+            self.iterate_operation(key, primary_key, count),
+            Some(request),
+            Some(iteration_param),
+        )?;
+        Ok(())
     }
 }
 
@@ -370,27 +528,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         self.got_value.set(false);
 
         // Step 8: Let request be the request created when this cursor was created.
-        let request = self.Request();
-
         // Step 9: Unset the request's done flag on request.
-        request.unset_done_flag();
+        self.Request().unset_done_flag();
 
         // Step 10: Run the steps to asynchronously execute a request with the cursor's source as
         // source, the steps to iterate a cursor as operation and request, using the current Realm
         // as targetRealm, this cursor and count.
-        let iteration_param = IterationParam {
-            cursor: Trusted::new(self),
-        };
-
-        IDBRequest::execute_async(
-            cx,
-            self.request_source(),
-            self.iterate_operation(None, None, count),
-            Some(request),
-            Some(iteration_param),
-        )?;
-
-        Ok(())
+        self.iterate(cx, None, None, count)
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-continue>
@@ -452,27 +596,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         self.got_value.set(false);
 
         // Step 7: Let request be the request created when this cursor was created.
-        let request = self.Request();
-
         // Step 8: Unset the request's done flag on request.
-        request.unset_done_flag();
+        self.Request().unset_done_flag();
 
         // Step 9: Run the steps to asynchronously execute a request with the cursor's source as
         // source, the steps to iterate a cursor as operation and request, using the current Realm
         // as targetRealm, this cursor and key (if given).
-        let iteration_param = IterationParam {
-            cursor: Trusted::new(self),
-        };
-
-        IDBRequest::execute_async(
-            cx,
-            self.request_source(),
-            self.iterate_operation(key, None, 1),
-            Some(request),
-            Some(iteration_param),
-        )?;
-
-        Ok(())
+        self.iterate(cx, key, None, 1)
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-continueprimarykey>
@@ -586,27 +716,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         self.got_value.set(false);
 
         // Step 18: Let request be the request created when this cursor was created.
-        let request = self.Request();
-
         // Step 19: Unset the request's done flag on request.
-        request.unset_done_flag();
+        self.Request().unset_done_flag();
 
         // Step 20: Run the steps to asynchronously execute a request with the cursor's source as
         // source, the steps to iterate a cursor as operation and request, using the current Realm
         // as targetRealm, this cursor, key and primaryKey.
-        let iteration_param = IterationParam {
-            cursor: Trusted::new(self),
-        };
-
-        IDBRequest::execute_async(
-            cx,
-            self.request_source(),
-            self.iterate_operation(Some(key), Some(primary_key), 1),
-            Some(request),
-            Some(iteration_param),
-        )?;
-
-        Ok(())
+        self.iterate(cx, Some(key), Some(primary_key), 1)
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-update>
@@ -780,7 +896,18 @@ pub(crate) fn iterate_cursor(
     let source = &cursor.source;
 
     // Steps 2-9.1: the backend found the record, after count - 1 rounds of step 9.
-    let Some(found_record) = records.into_iter().next() else {
+    let mut records = VecDeque::from(records);
+    let found_record = records.pop_front();
+    // The records after it are those that the next steps without a key find, as of the request.
+    // A transaction that is finishing or finished takes no more steps.
+    if cursor.fetch_pending.replace(false) && cursor.transaction.is_usable() {
+        let writes = cursor.last_fetch.get().map_or(0, |fetch| fetch.writes);
+        if !records.is_empty() {
+            cursor.transaction.note_prefetching_cursor(&cursor);
+        }
+        *cursor.prefetched.borrow_mut() = Prefetched { records, writes };
+    }
+    let Some(found_record) = found_record else {
         // Step 9.2. If found record is not defined, then:
         // Step 9.2.1. Set cursor’s key to undefined.
         cursor.set_key(None);

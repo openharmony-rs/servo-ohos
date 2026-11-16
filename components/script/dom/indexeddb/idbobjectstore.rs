@@ -627,6 +627,7 @@ impl IDBObjectStore {
     /// Sends the schema operation `operation` of this handle's object store to the backend, in
     /// the handle's transaction.
     fn send_schema_operation(&self, operation: AsyncSchemaOperation) -> Fallible<()> {
+        self.transaction.note_write(None);
         self.get_idb_thread()
             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
                 origin: self.global().origin().immutable().clone(),

@@ -319,6 +319,10 @@ impl IDBRequest {
             );
         }
 
+        if matches!(operation, AsyncOperation::ReadWrite(_)) {
+            transaction.note_write(Some(object_store.id()));
+        }
+
         let request_id = transaction.allocate_request_id();
 
         // Step 3: If request was not given, let request be a new request with source as source.
@@ -356,6 +360,31 @@ impl IDBRequest {
 
         // Step 6: Return request.
         Ok(request)
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#asynchronously-execute-a-request> for a cursor's
+    /// `request`, whose operation's `result` script knows from the records the cursor prefetched:
+    /// like [`Self::execute_async`], but the result is delivered without asking the backend.
+    pub(crate) fn execute_with_result(
+        source: RequestSource,
+        result: BackendResult<RequestOutput>,
+        request: DomRoot<IDBRequest>,
+        iteration_param: IterationParam,
+    ) -> ErrorResult {
+        // Step 1: Let transaction be the transaction associated with source.
+        let transaction = source.object_store().transaction();
+        // Step 2: Assert: transaction is active.
+        if !transaction.is_active() || !transaction.is_usable() {
+            return Err(Error::TransactionInactive(Some(
+                "Transaction is not active".to_owned(),
+            )));
+        }
+        // Step 4: Add request to the end of transaction’s request list.
+        // Step 5: Run these steps in parallel: [...] Let result be the result of performing
+        // operation.
+        let request_id = transaction.allocate_request_id();
+        transaction.add_request_with_result(&request, request_id, iteration_param, result);
+        Ok(())
     }
 
     /// <https://w3c.github.io/IndexedDB/#create-a-request-to-retrieve-multiple-items>, from an

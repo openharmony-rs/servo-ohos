@@ -37,6 +37,8 @@ pub(crate) trait SqlRow {
     #[cfg(test)]
     fn optional_text(&self, column: usize) -> Result<Option<String>, SqlError>;
     fn optional_blob(&self, column: usize) -> Result<Option<Vec<u8>>, SqlError>;
+    /// The size in bytes of a BLOB or TEXT column, 0 for NULL, without reading its content.
+    fn size(&self, column: usize) -> Result<usize, SqlError>;
 
     fn integer(&self, column: usize) -> Result<i64, SqlError> {
         self.optional_integer(column)?

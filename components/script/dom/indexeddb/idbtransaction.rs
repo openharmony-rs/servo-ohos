@@ -34,7 +34,7 @@ use crate::dom::domstringlist::DOMStringList;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::indexeddb::idbcursor::IterationParam;
+use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam};
 use crate::dom::indexeddb::idbdatabase::IDBDatabase;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
 use crate::dom::indexeddb::idbrequest::IDBRequest;
@@ -114,6 +114,14 @@ pub struct IDBTransaction {
     cleanup_event_loop: Cell<Option<ScriptEventLoopId>>,
     registered_in_global: Cell<bool>,
     next_request_id: Cell<u64>,
+    /// The number of schema operations made in this transaction, and of the requests that write
+    /// to each object store, which tell cursors whether the records they prefetched are still
+    /// current.
+    schema_writes: Cell<u64>,
+    store_writes: DomRefCell<HashMap<IndexedDBObjectStoreId, u64>>,
+    /// The cursors of this transaction that keep prefetched records, which it drops when it
+    /// finishes.
+    prefetching_cursors: DomRefCell<Vec<Dom<IDBCursor>>>,
 
     /// The id the backend knows this transaction by.
     #[no_trace]
@@ -155,6 +163,9 @@ impl IDBTransaction {
             cleanup_event_loop: Cell::new(None),
             registered_in_global: Cell::new(false),
             next_request_id: Cell::new(0),
+            schema_writes: Cell::new(0),
+            store_writes: Default::default(),
+            prefetching_cursors: Default::default(),
             id,
         }
     }
@@ -412,6 +423,44 @@ impl IDBTransaction {
         id
     }
 
+    /// Notes that a request that writes to the object store `store`, or a schema operation if
+    /// `store` is `None`, was made in this transaction. The requests after it see its changes, so
+    /// the records that cursors over the store, or over any store, prefetched before are no
+    /// longer current.
+    pub(crate) fn note_write(&self, store: Option<IndexedDBObjectStoreId>) {
+        match store {
+            Some(store) => *self.store_writes.borrow_mut().entry(store).or_default() += 1,
+            None => self.schema_writes.set(self.schema_writes.get() + 1),
+        }
+    }
+
+    /// The number of schema operations, and of requests that write to the object store `store`,
+    /// made in this transaction.
+    pub(crate) fn writes(&self, store: IndexedDBObjectStoreId) -> u64 {
+        self.schema_writes.get() + self.store_writes.borrow().get(&store).copied().unwrap_or(0)
+    }
+
+    /// Notes that `cursor` keeps prefetched records, which the transaction drops when it
+    /// finishes.
+    pub(crate) fn note_prefetching_cursor(&self, cursor: &IDBCursor) {
+        let mut cursors = self.prefetching_cursors.borrow_mut();
+        if !cursors.iter().any(|kept| &**kept == cursor) {
+            cursors.push(Dom::from_ref(cursor));
+        }
+    }
+
+    fn drop_prefetched_records(&self) {
+        let cursors: Vec<DomRoot<IDBCursor>> = self
+            .prefetching_cursors
+            .borrow_mut()
+            .drain(..)
+            .map(|cursor| cursor.as_rooted())
+            .collect();
+        for cursor in cursors {
+            cursor.drop_prefetched_records();
+        }
+    }
+
     /// <https://w3c.github.io/IndexedDB/#asynchronously-execute-a-request>
     /// Step 4: Add request to the end of transaction’s request list.
     pub(crate) fn add_request(
@@ -426,6 +475,24 @@ impl IDBTransaction {
             iteration_param,
             result: None,
         });
+    }
+
+    /// Adds `request` to the end of the request list with `result`, which script knows without
+    /// asking the backend, and delivers it in request order.
+    pub(crate) fn add_request_with_result(
+        &self,
+        request: &IDBRequest,
+        id: u64,
+        iteration_param: IterationParam,
+        result: BackendResult<RequestOutput>,
+    ) {
+        self.requests.borrow_mut().push_back(PendingRequest {
+            request: Some(Dom::from_ref(request)),
+            id,
+            iteration_param: Some(iteration_param),
+            result: Some(result),
+        });
+        self.queue_delivery();
     }
 
     /// Notes that this upgrade transaction created the object store `store`, which has no
@@ -662,14 +729,20 @@ impl IDBTransaction {
             .front()
             .is_some_and(|pending| pending.result.is_some())
         {
-            let this = Trusted::new(self);
-            self.global()
-                .task_manager()
-                .database_access_task_source()
-                .queue(task!(deliver_indexeddb_result: move |cx| {
-                    this.root().deliver_next_result(cx);
-                }));
+            self.queue_delivery();
         }
+    }
+
+    /// Queues a task that delivers the result of the first request in the request list, if it
+    /// is there by then.
+    fn queue_delivery(&self) {
+        let this = Trusted::new(self);
+        self.global()
+            .task_manager()
+            .database_access_task_source()
+            .queue(task!(deliver_indexeddb_result: move |cx| {
+                this.root().deliver_next_result(cx);
+            }));
     }
 
     /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>, the steps after the backend
@@ -807,6 +880,7 @@ impl IDBTransaction {
         // https://w3c.github.io/IndexedDB/#transaction-lifetime
         // Step 6: When a transaction is committed or aborted, its state is set to finished.
         self.finished.set(true);
+        self.drop_prefetched_records();
         self.version_change_old_version.set(None);
         self.version_change_old_object_stores
             .safe_borrow_mut(cx.no_gc())
@@ -839,6 +913,7 @@ impl IDBTransaction {
             return;
         }
         self.finished.set(true);
+        self.drop_prefetched_records();
         self.requests.borrow_mut().clear();
         self.index_populations.borrow_mut().clear();
         self.send_abort_to_backend();
@@ -873,6 +948,7 @@ impl IDBTransaction {
         }
         // Step 2.5.2: Set transaction’s state to finished.
         self.finished.set(true);
+        self.drop_prefetched_records();
         let global = self.global();
         let event = Event::new(
             cx,

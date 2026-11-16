@@ -139,6 +139,10 @@ impl SqlRow for RdbRow<'_, '_> {
     fn optional_blob(&self, column: usize) -> Result<Option<Vec<u8>>, SqlError> {
         Ok(self.0.blob(column)?)
     }
+
+    fn size(&self, column: usize) -> Result<usize, SqlError> {
+        Ok(self.0.size(column)?)
+    }
 }
 
 impl SqlExecutor for RdbExecutor {

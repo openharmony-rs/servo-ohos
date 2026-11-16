@@ -143,6 +143,7 @@ executor_tests!(
     test_cursor_steps_find_what_the_spec_finds,
     test_cursor_steps_see_the_writes_between_them,
     test_get_all_retrieves_what_a_cursor_visits,
+    test_cursor_steps_stop_at_the_bytes_limit,
 );
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -6008,4 +6009,99 @@ fn pref_selects_the_executor() {
         let executor = TwinExecutor::open(dir.path()).unwrap();
         assert_eq!(matches!(executor, TwinExecutor::Rdb(_)), rdb_enabled);
     }
+}
+
+/// A cursor step returns the records after the one it finds only while their keys, primary keys
+/// and values fit in [`queries::CURSOR_RECORDS_BYTES`] as stored: the record that would cross it
+/// is left out, also when it has no value but large keys, and the found record comes back
+/// whatever its size.
+fn test_cursor_steps_stop_at_the_bytes_limit<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let values = create_store(&db, "values", None, false).unwrap();
+    let keys = create_store(&db, "keys", None, false).unwrap();
+    let limit = queries::CURSOR_RECORDS_BYTES;
+    let mut connection = db.connection();
+    let mut put = |store: i64, key: IndexedDBKeyType, value: &[u8]| {
+        let mut object_store = queries::object_store(&mut *connection, store)
+            .unwrap()
+            .unwrap();
+        queries::put_record(
+            &mut *connection,
+            &mut object_store,
+            Some(key),
+            value,
+            true,
+            vec![],
+        )
+        .unwrap();
+    };
+    for (key, size) in [(1.0, 10), (2.0, limit), (3.0, 10), (4.0, 10)] {
+        put(values, number(key), &vec![1; size]);
+    }
+    for n in 1..=4 {
+        put(keys, IndexedDBKeyType::Binary(vec![n; limit / 3]), &[n]);
+    }
+    for n in 5..=8 {
+        put(keys, IndexedDBKeyType::Binary(vec![n; 16]), &[n]);
+    }
+    let found = |connection: &mut X, store: i64, position: Option<IndexedDBKeyType>, key_only| {
+        let object_store = queries::object_store(connection, store).unwrap().unwrap();
+        let step = IndexedDBCursorStep {
+            position,
+            object_store_position: None,
+            key: None,
+            primary_key: None,
+            count: 1,
+        };
+        queries::cursor_records(
+            connection,
+            RecordSource::ObjectStore(&object_store),
+            &IndexedDBKeyRange::default(),
+            IndexedDBCursorDirection::Next,
+            &step,
+            64,
+            key_only,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|record| record.primary_key)
+        .collect::<Vec<_>>()
+    };
+    let connection = &mut *connection;
+    assert_eq!(
+        found(connection, values, None, false),
+        [number(1.0)],
+        "the record over the limit after the found one is left out"
+    );
+    assert_eq!(
+        found(connection, values, Some(number(1.0)), false),
+        [number(2.0)],
+        "the found record comes back whatever its size, and nothing after it"
+    );
+    assert_eq!(
+        found(connection, values, Some(number(2.0)), false),
+        [number(3.0), number(4.0)]
+    );
+    assert_eq!(
+        found(connection, values, None, true),
+        [number(1.0), number(2.0), number(3.0), number(4.0)],
+        "a key-only step reads no values"
+    );
+    assert_eq!(
+        found(connection, keys, None, true),
+        [IndexedDBKeyType::Binary(vec![1; limit / 3])],
+        "a key-only step counts the keys"
+    );
+    assert_eq!(
+        found(
+            connection,
+            keys,
+            Some(IndexedDBKeyType::Binary(vec![4; limit / 3])),
+            true
+        )
+        .len(),
+        4,
+        "small keys fit"
+    );
 }

@@ -132,6 +132,13 @@ impl SqlRow for SqliteRow<'_, '_> {
     fn optional_blob(&self, column: usize) -> Result<Option<Vec<u8>>, SqlError> {
         Ok(self.0.get(column)?)
     }
+
+    fn size(&self, column: usize) -> Result<usize, SqlError> {
+        Ok(match self.0.get_ref(column)? {
+            ValueRef::Blob(bytes) | ValueRef::Text(bytes) => bytes.len(),
+            _ => 0,
+        })
+    }
 }
 
 impl SqlExecutor for SqliteExecutor {

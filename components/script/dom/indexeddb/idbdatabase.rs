@@ -548,6 +548,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
             key_path,
             auto_increment,
         };
+        transaction.note_write(None);
         if self
             .get_idb_thread()
             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
@@ -608,6 +609,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
 
         // Step 7. Destroy store.
         let operation = AsyncSchemaOperation::DeleteObjectStore;
+        transaction.note_write(None);
         if self
             .get_idb_thread()
             .send(IndexedDBThreadMsg::AsyncSchemaOperation {

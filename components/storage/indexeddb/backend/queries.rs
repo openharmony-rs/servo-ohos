@@ -700,6 +700,19 @@ fn select<X: SqlExecutor, T>(
     offset: u32,
     map_row: impl Fn(&dyn SqlRow) -> Result<T, SqlError>,
 ) -> Result<Vec<T>, SqlError> {
+    let (sql, params) = select_statement(source, columns, condition, reverse, count, offset);
+    query_rows(executor, &sql, &params, map_row)
+}
+
+/// The statement of [`select`], and its parameters.
+fn select_statement<'a>(
+    source: RecordSource,
+    columns: RecordColumns,
+    condition: &'a RangeCondition,
+    reverse: bool,
+    count: Option<u32>,
+    offset: u32,
+) -> (String, Vec<SqlParam<'a>>) {
     let (table_and_condition, selected) = source.table_and_condition(columns, condition);
     let mut sql = format!(
         "SELECT {selected} FROM {table_and_condition} ORDER BY {}",
@@ -714,7 +727,7 @@ fn select<X: SqlExecutor, T>(
             params.push(SqlParam::Integer(offset.into()));
         }
     }
-    query_rows(executor, &sql, &params, map_row)
+    (sql, params)
 }
 
 fn primary_key_of_row(row: &dyn SqlRow) -> Result<IndexedDBKeyType, SqlError> {
@@ -1010,10 +1023,14 @@ impl StepBounds {
     }
 }
 
+/// The most bytes of keys, primary keys and values, as stored, that a cursor step returns with
+/// the records after the one it finds; that one comes back whatever its size.
+pub(crate) const CURSOR_RECORDS_BYTES: usize = 1 << 20;
+
 /// <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9, for a cursor over the records of
 /// `source` in `range`: the record that `step` moves the cursor to in `direction`, then the
-/// records that further steps without a key would move it to, at most `records` records in all,
-/// in the order of the steps. Without values if `key_only`.
+/// records that further steps without a key would move it to, at most `records` records in all
+/// and [`CURSOR_RECORDS_BYTES`] bytes, in the order of the steps. Without values if `key_only`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cursor_records<X: SqlExecutor>(
     executor: &mut X,
@@ -1097,16 +1114,71 @@ pub(crate) fn cursor_records<X: SqlExecutor>(
     } else {
         RecordColumns::Record
     };
-    select(
-        executor,
-        source,
-        columns,
-        &condition,
-        reverse,
-        Some(records),
-        offset,
-        |row| record_of_row(source, row, !key_only),
-    )
+    let (sql, params) =
+        select_statement(source, columns, &condition, reverse, Some(records), offset);
+    let mut found = Vec::new();
+    let mut bytes = 0;
+    executor.query(&sql, &params, &mut |row| {
+        let limit = if found.is_empty() {
+            usize::MAX
+        } else {
+            CURSOR_RECORDS_BYTES - bytes
+        };
+        let Some((record, size)) = record_of_row_within(source, row, !key_only, limit)? else {
+            return Ok(ControlFlow::Break(()));
+        };
+        bytes += size;
+        found.push(record);
+        Ok(if bytes >= CURSOR_RECORDS_BYTES {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        })
+    })?;
+    Ok(found)
+}
+
+/// [`record_of_row`] and the bytes that its key, primary key and value take as stored, or `None`
+/// if they take more than `limit`, in which case the value isn't read.
+fn record_of_row_within(
+    source: RecordSource,
+    row: &dyn SqlRow,
+    with_value: bool,
+    limit: usize,
+) -> Result<Option<(IndexedDBRecord, usize)>, SqlError> {
+    let encoded_key = row.blob(0)?;
+    let (encoded_primary_key, value_column) = match source {
+        RecordSource::ObjectStore(_) => (None, 1),
+        RecordSource::Index(_) => (Some(row.blob(1)?), 2),
+    };
+    let mut size = encoded_key.len() +
+        encoded_primary_key
+            .as_ref()
+            .map_or(encoded_key.len(), Vec::len);
+    if with_value {
+        size += row.size(value_column)?;
+    }
+    if size > limit {
+        return Ok(None);
+    }
+    let key = decode_key(&encoded_key)?;
+    let primary_key = match encoded_primary_key {
+        Some(encoded_primary_key) => decode_key(&encoded_primary_key)?,
+        None => key.clone(),
+    };
+    let value = if with_value {
+        Some(row.blob(value_column)?)
+    } else {
+        None
+    };
+    Ok(Some((
+        IndexedDBRecord {
+            key,
+            primary_key,
+            value,
+        },
+        size,
+    )))
 }
 
 /// <https://w3c.github.io/IndexedDB/#count-the-records-in-a-range>

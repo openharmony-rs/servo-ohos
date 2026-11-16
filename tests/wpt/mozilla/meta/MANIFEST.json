@@ -11683,6 +11683,89 @@
       }
      ]
     ],
+    "cursor-prefetch.any.js": [
+     "a387d66729d5358ea2a4f4e57b73519d5a2d4926",
+     [
+      "IndexedDB/cursor-prefetch.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursor steps see the records as they are when they run"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/cursor-prefetch.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursor steps see the records as they are when they run"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/cursor-prefetch.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursor steps see the records as they are when they run"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/cursor-prefetch.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursor steps see the records as they are when they run"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
     "generated-key-value-kinds.any.js": [
      "93e646d1ad6073457e3aa79c4751b7ab82b16066",
      [
