@@ -4,15 +4,17 @@
 
 use std::cmp::Ordering;
 use std::ffi::CString;
+use std::sync::atomic::{self, AtomicU8};
 use std::{ptr, slice};
 
 use itertools::Itertools;
 use js::context::JSContext;
 use js::conversions::ToJSValConvertible;
 use js::jsapi::{
-    ClippedTime, ESClass, IsArrayBufferObject, IsDetachedArrayBufferObject,
+    ClippedTime, ESClass, GetArrayBufferMaybeSharedLengthAndData, GetArrayBufferViewLengthAndData,
+    IsArrayBufferObject, IsDetachedArrayBufferObject, IsSharedArrayBufferObject,
     JS_DeprecatedStringHasLatin1Chars, JS_GetArrayBufferViewBuffer, JS_GetStringLength,
-    JS_IsArrayBufferViewObject, JSString, NewArrayObject1, PropertyKey,
+    JS_IsArrayBufferViewObject, JSObject, JSString, NewArrayObject1, PropertyKey,
 };
 use js::jsval::{DoubleValue, ObjectValue, StringValue, UndefinedValue};
 use js::rust::wrappers2::{
@@ -414,12 +416,17 @@ pub fn convert_value_to_key(
             }
 
             // If input is a buffer source type:
-            if IsArrayBufferObject(*object) || JS_IsArrayBufferViewObject(*object) {
+            let is_shared_array_buffer = IsSharedArrayBufferObject(*object);
+            if IsArrayBufferObject(*object) ||
+                is_shared_array_buffer ||
+                JS_IsArrayBufferViewObject(*object)
+            {
+                let mut is_shared = is_shared_array_buffer;
                 let is_detached = if IsArrayBufferObject(*object) {
                     IsDetachedArrayBufferObject(*object)
+                } else if is_shared_array_buffer {
+                    false
                 } else {
-                    // Shared ArrayBuffers are not supported here, so this stays false.
-                    let mut is_shared = false;
                     rooted!(
                         in (cx.raw_cx()) let view_buffer =
                             JS_GetArrayBufferViewBuffer(
@@ -436,7 +443,9 @@ pub fn convert_value_to_key(
                 }
                 // 3.2. Let bytes be the result of getting a copy of the bytes held
                 // by the buffer source input.
-                let bytes = if IsArrayBufferObject(*object) {
+                let bytes = if is_shared {
+                    Some(shared_memory_bytes(*object))
+                } else if IsArrayBufferObject(*object) {
                     let array_buffer = ArrayBuffer::from(*object).map_err(|()| Error::JSFailed)?;
                     array_buffer.to_vec()
                 } else {
@@ -509,6 +518,32 @@ pub fn convert_value_to_key(
 
     // Otherwise, return "invalid type".
     Ok(ConversionResult::Invalid)
+}
+
+/// A copy of the bytes of `object`, a SharedArrayBuffer or a view on one. Shared memory may change
+/// at any time, so the bytes are read as atomics.
+#[expect(unsafe_code)]
+fn shared_memory_bytes(object: *mut JSObject) -> Vec<u8> {
+    let mut length = 0;
+    let mut is_shared = false;
+    let mut data = ptr::null_mut();
+    // SAFETY: `object` is a live SharedArrayBuffer or view, and the out-parameters are valid.
+    unsafe {
+        if JS_IsArrayBufferViewObject(object) {
+            GetArrayBufferViewLengthAndData(object, &mut length, &mut is_shared, &mut data);
+        } else {
+            GetArrayBufferMaybeSharedLengthAndData(object, &mut length, &mut is_shared, &mut data);
+        }
+    }
+    if data.is_null() {
+        return Vec::new();
+    }
+    (0..length)
+        // SAFETY: `data` points to `length` bytes of the buffer, which no JavaScript code runs to
+        // detach or shrink (a SharedArrayBuffer can only grow) while they are read, and a u8 is
+        // always aligned for AtomicU8.
+        .map(|i| unsafe { AtomicU8::from_ptr(data.add(i)) }.load(atomic::Ordering::Relaxed))
+        .collect()
 }
 
 /// <https://w3c.github.io/IndexedDB/#convert-a-value-to-a-multientry-key>, except that the keys
@@ -658,7 +693,13 @@ pub(crate) fn is_potentially_valid_key_range(
         return Err(Error::JSFailed);
     }
     // SAFETY: `object` is a live object.
-    if is_date || unsafe { IsArrayBufferObject(*object) || JS_IsArrayBufferViewObject(*object) } {
+    if is_date ||
+        unsafe {
+            IsArrayBufferObject(*object) ||
+                IsSharedArrayBufferObject(*object) ||
+                JS_IsArrayBufferViewObject(*object)
+        }
+    {
         return Ok(true);
     }
     let mut is_array = false;

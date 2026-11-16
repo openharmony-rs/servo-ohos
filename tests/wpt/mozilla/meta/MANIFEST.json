@@ -12283,6 +12283,54 @@
       }
      ]
     ],
+    "shared-array-buffer-keys.any.js": [
+     "6b2ed1767083155b9561f81d150943ec2549bec5",
+     [
+      "IndexedDB/shared-array-buffer-keys.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: SharedArrayBuffers and views on them as keys"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/shared-array-buffer-keys.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: SharedArrayBuffers and views on them as keys"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/shared-array-buffer-keys.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: SharedArrayBuffers and views on them as keys"
+        ]
+       ]
+      }
+     ]
+    ],
     "shared-array-buffer-values.any.js": [
      "b2f83dd5e354cfa08f29737b723234e9754078b1",
      [
