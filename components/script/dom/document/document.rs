@@ -211,6 +211,7 @@ use crate::dom::sanitizer::Sanitizer;
 use crate::dom::selection::Selection;
 use crate::dom::servoparser::ServoParser;
 use crate::dom::shadowroot::shadowroot::ShadowRoot;
+use crate::dom::sharedworker::SharedWorker;
 use crate::dom::storageevent::StorageEvent;
 use crate::dom::svg::svgsvgelement::SVGSVGElement;
 use crate::dom::text::Text;
@@ -3062,6 +3063,7 @@ impl Document {
         exited_window
             .as_global_scope()
             .disable_owned_worker_animation_frame_providers();
+        SharedWorker::remove_owner_from_owner_sets(exited_window.pipeline_id());
 
         // Step 11. For each workletGlobalScope in document's worklet global scopes,
         // terminate workletGlobalScope.

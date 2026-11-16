@@ -8579,6 +8579,10 @@
       "728c70ad75c2804ca49320cd69afec1026e7fad8",
       []
      ],
+     "shared-worker-connection-frame.html": [
+      "4bebc8581a9020d53b1c6f82a9370e45a4fa0161",
+      []
+     ],
      "upgrade-frame.html": [
       "3e3e64899775946887e3efbfcc6d5e6bf5d3de24",
       []
@@ -12464,6 +12468,15 @@
          "IndexedDB: values holding shared memory can't be stored"
         ]
        ]
+      }
+     ]
+    ],
+    "shared-worker-owners.html": [
+     "b13748d238e4413c2085d52207c9e977c52a55ba",
+     [
+      null,
+      {
+       "timeout": "long"
       }
      ]
     ],

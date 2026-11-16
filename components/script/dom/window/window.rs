@@ -185,6 +185,7 @@ use crate::dom::selection::Selection;
 use crate::dom::selection_range::RootedSelectionBoundary;
 use crate::dom::serviceworker::cachestorage::CacheStorage;
 use crate::dom::shadowroot::shadowroot::ShadowRoot;
+use crate::dom::sharedworker::SharedWorker;
 use crate::dom::storage::Storage;
 #[cfg(feature = "bluetooth")]
 use crate::dom::testrunner::TestRunner;
@@ -598,6 +599,9 @@ impl Window {
         self.stop_geolocation_watches();
         self.as_global_scope()
             .remove_web_messaging_and_dedicated_workers_infra();
+        // <https://html.spec.whatwg.org/multipage/#destroy-a-document> step 10, for documents
+        // that go away without being destroyed.
+        SharedWorker::remove_owner_from_owner_sets(self.pipeline_id());
         self.current_state.set(WindowState::Zombie);
         self.as_global_scope()
             .task_manager()
