@@ -90,6 +90,9 @@ backend_tests!(
     test_indexeddb_close_during_the_upgrade_fails_the_open,
     test_indexeddb_connection_of_a_gone_global_counts_as_closed,
     test_indexeddb_upgrade_committed_before_its_global_went_away_stays,
+    test_indexeddb_databases_of_an_earlier_session_are_listed_deleted_and_opened,
+    test_indexeddb_database_of_an_earlier_session_is_deleted_without_being_listed,
+    test_indexeddb_database_left_at_version_0_by_an_earlier_session_opens_as_new,
 );
 
 static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -149,8 +152,9 @@ fn shutdown_storage_group(threads: &StorageThreads) {
 }
 
 struct IndexedDbTestContext {
-    _client_handle: storage_traits::client_storage::ClientStorageThreadHandle,
-    _temp_dir: TempDir,
+    client_handle: storage_traits::client_storage::ClientStorageThreadHandle,
+    /// The config directory, which [`Self::restart`] hands on.
+    temp_dir: Option<TempDir>,
     private_threads: StorageThreads,
     public_threads: StorageThreads,
     bottle_source: StorageBottleSource,
@@ -163,8 +167,12 @@ struct IndexedDbTestContext {
 
 impl IndexedDbTestContext {
     fn new() -> Self {
+        Self::in_dir(tempfile::tempdir().unwrap())
+    }
+
+    /// A context whose storage threads keep their data in `temp_dir`.
+    fn in_dir(temp_dir: TempDir) -> Self {
         install_test_namespace();
-        let temp_dir = tempfile::tempdir().unwrap();
         let config_dir = temp_dir.path().to_path_buf();
         let client_handle: storage_traits::client_storage::ClientStorageThreadHandle =
             ClientStorageThreadFactory::new(Some(config_dir.clone()), false);
@@ -178,8 +186,8 @@ impl IndexedDbTestContext {
         };
 
         Self {
-            _client_handle: client_handle,
-            _temp_dir: temp_dir,
+            client_handle,
+            temp_dir: Some(temp_dir),
             private_threads,
             public_threads,
             bottle_source,
@@ -196,6 +204,22 @@ impl IndexedDbTestContext {
 
         shutdown_storage_group(&self.private_threads);
         shutdown_storage_group(&self.public_threads);
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        self.client_handle
+            .send(storage_traits::client_storage::ClientStorageThreadMessage::Exit(sender))
+            .expect("failed to send client storage exit");
+        receiver
+            .recv()
+            .expect("failed to receive client storage exit ack");
+    }
+
+    /// Shuts the storage threads down and starts new ones on the same data, as a restart of the
+    /// browser does.
+    fn restart(mut self) -> Self {
+        self.shutdown();
+        let restarted = Self::in_dir(self.temp_dir.take().expect("The data is still there"));
+        restarted.indexes.replace(self.indexes.take());
+        restarted
     }
 }
 
@@ -3056,5 +3080,189 @@ fn test_indexeddb_upgrade_committed_before_its_global_went_away_stays() {
     let reopened = reopen_database(&ctx, db_name, "a");
     put_and_commit(&ctx, db_name, reopened, A);
     close_database(&ctx, reopened, db_name);
+    ctx.shutdown();
+}
+
+/// What databases() lists, as (name, version), by name.
+fn databases(ctx: &IndexedDbTestContext) -> Vec<(String, u64)> {
+    let (sender, receiver) = mpsc::channel();
+    let callback = ProfileGenericCallback::new(move |result| {
+        let _ = sender.send(result.ok());
+    })
+    .unwrap();
+    GenericSend::send(
+        &ctx.private_threads,
+        IndexedDBThreadMsg::Sync(SyncOperation::GetDatabases(
+            callback,
+            ctx.origin.clone(),
+            ctx.bottle_source.clone(),
+        )),
+    )
+    .unwrap();
+    let mut databases: Vec<(String, u64)> = recv_callback_timeout(&receiver, "databases")
+        .expect("databases() failed")
+        .into_iter()
+        .map(|info| (info.name.to_string(), info.version))
+        .collect();
+    databases.sort();
+    databases
+}
+
+/// The directory of `db_name` in the client storage registry, if it has one.
+fn database_directory(ctx: &IndexedDbTestContext, db_name: &str) -> Option<std::path::PathBuf> {
+    let proxy_map = ctx
+        .client_handle
+        .obtain_a_storage_bottle_map(
+            storage_traits::client_storage::StorageType::Local,
+            ctx.bottle_source.webview,
+            storage_traits::client_storage::StorageIdentifier::IndexedDB,
+            ctx.origin.clone(),
+        )
+        .recv()
+        .unwrap()
+        .unwrap();
+    proxy_map
+        .handle
+        .find_database(proxy_map.bottle_id, db_name)
+        .recv()
+        .unwrap()
+        .unwrap()
+}
+
+fn delete_result(ctx: &IndexedDbTestContext, db_name: &str) -> BackendResult<u64> {
+    match recv_callback_timeout(&delete_database(ctx, db_name).1, "delete result") {
+        DeleteDatabaseEvent::Done(result) => result,
+        other => panic!("unexpected delete event: {other:?}"),
+    }
+}
+
+/// Opens `db_name` at `version`, which must upgrade it from `old_version` to `version`, without
+/// changes, and closes the connection.
+fn upgrade_and_close(ctx: &IndexedDbTestContext, db_name: &str, version: u64, old_version: u64) {
+    let receiver = open_database(ctx, db_name, Some(version));
+    let (connection, upgraded_from) = upgrade_without_changes(ctx, db_name, &receiver, version);
+    assert_eq!(upgraded_from, old_version);
+    close_database(ctx, connection, db_name);
+}
+
+/// The databases in storage that the manager hasn't opened since it started, such as those of an
+/// earlier session, are found in the client storage registry: databases() lists them with their
+/// committed versions, deleteDatabase reports the version and deletes the database with its
+/// files and registry entry, and open opens one with its data.
+fn test_indexeddb_databases_of_an_earlier_session_are_listed_deleted_and_opened() {
+    let ctx = IndexedDbTestContext::new();
+    let connection =
+        expect_upgrade_and_initialize_database(&ctx, "kept", "books", "by_author", None);
+    let txn = create_transaction(
+        &ctx,
+        "kept",
+        connection,
+        IndexedDBTxnMode::Readwrite,
+        vec![STORE],
+    );
+    let put = put_item(
+        &ctx,
+        "kept",
+        STORE,
+        txn,
+        IndexedDBKeyType::String("book-1".into()),
+        b"Moby Dick".to_vec(),
+    );
+    let commit = commit_transaction(&ctx, "kept", txn);
+    assert!(recv_callback_timeout(&put, "put reply").is_ok());
+    assert!(recv_callback_timeout(&commit, "commit reply").is_ok());
+    finish_transaction(&ctx, "kept", txn);
+    close_database(&ctx, connection, "kept");
+    upgrade_and_close(&ctx, "deleted", 3, 0);
+    upgrade_and_close(&ctx, "upgraded", 2, 0);
+    let deleted_directory = database_directory(&ctx, "deleted").expect("A registry entry");
+    assert!(deleted_directory.is_dir());
+
+    let ctx = ctx.restart();
+    assert_eq!(
+        databases(&ctx),
+        vec![
+            ("deleted".to_owned(), 3),
+            ("kept".to_owned(), 1),
+            ("upgraded".to_owned(), 2)
+        ]
+    );
+    assert_eq!(delete_result(&ctx, "deleted"), Ok(3));
+    assert!(!deleted_directory.exists());
+    assert_eq!(database_directory(&ctx, "deleted"), None);
+    assert_eq!(delete_result(&ctx, "deleted"), Ok(0));
+    assert_eq!(delete_result(&ctx, "never-created"), Ok(0));
+    upgrade_and_close(&ctx, "upgraded", 4, 2);
+    assert_eq!(
+        databases(&ctx),
+        vec![("kept".to_owned(), 1), ("upgraded".to_owned(), 4)]
+    );
+
+    let connection = reopen_database(&ctx, "kept", "books");
+    assert_eq!(
+        get_item_in_new_readonly_transaction(
+            &ctx,
+            "kept",
+            connection,
+            STORE,
+            IndexedDBKeyType::String("book-1".into())
+        ),
+        Some(b"Moby Dick".to_vec())
+    );
+    close_database(&ctx, connection, "kept");
+    upgrade_and_close(&ctx, "deleted", 1, 0);
+    assert_eq!(
+        databases(&ctx),
+        vec![
+            ("deleted".to_owned(), 1),
+            ("kept".to_owned(), 1),
+            ("upgraded".to_owned(), 4)
+        ]
+    );
+    ctx.shutdown();
+}
+
+/// A delete of a database of an earlier session finds it in the client storage registry also
+/// when it is the first request after the restart, and an open after it, queued behind it,
+/// creates the database anew.
+fn test_indexeddb_database_of_an_earlier_session_is_deleted_without_being_listed() {
+    let ctx = IndexedDbTestContext::new();
+    upgrade_and_close(&ctx, "earlier", 5, 0);
+
+    let ctx = ctx.restart();
+    let (_, delete) = delete_database(&ctx, "earlier");
+    let open = open_database(&ctx, "earlier", None);
+    match recv_callback_timeout(&delete, "delete result") {
+        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(5)),
+        other => panic!("unexpected delete event: {other:?}"),
+    }
+    let (connection, old_version) = upgrade_without_changes(&ctx, "earlier", &open, 1);
+    assert_eq!(old_version, 0);
+    close_database(&ctx, connection, "earlier");
+    assert_eq!(databases(&ctx), vec![("earlier".to_owned(), 1)]);
+    ctx.shutdown();
+}
+
+/// A database whose first upgrade an earlier session never committed, as the browser stopped
+/// during it, is stored with version 0. databases() skips it, and an open without a version
+/// upgrades it from 0 to 1, as it does a new database.
+fn test_indexeddb_database_left_at_version_0_by_an_earlier_session_opens_as_new() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-left-at-version-0";
+    let open = open_database(&ctx, db_name, Some(1));
+    let transaction = match recv_callback_timeout(&open, "upgrade") {
+        ConnectionMsg::Upgrade { transaction, .. } => transaction,
+        other => panic!("unexpected open message: {other:?}"),
+    };
+    create_object_store(&ctx, db_name, A, "a", transaction, None, false);
+
+    let ctx = ctx.restart();
+    assert!(database_directory(&ctx, db_name).is_some());
+    assert_eq!(databases(&ctx), vec![]);
+    let open = open_database(&ctx, db_name, None);
+    let (connection, old_version) = upgrade_without_changes(&ctx, db_name, &open, 1);
+    assert_eq!(old_version, 0);
+    close_database(&ctx, connection, db_name);
+    assert_eq!(databases(&ctx), vec![(db_name.to_owned(), 1)]);
     ctx.shutdown();
 }

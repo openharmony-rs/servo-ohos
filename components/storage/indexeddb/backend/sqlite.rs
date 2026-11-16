@@ -168,6 +168,10 @@ impl SqlExecutor for SqliteExecutor {
         Ok(())
     }
 
+    fn exists(directory: &Path) -> bool {
+        directory.join(DATABASE_FILE_NAME).exists()
+    }
+
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
         let result = match self.connection.prepare_cached(sql) {
             Ok(mut statement) => {

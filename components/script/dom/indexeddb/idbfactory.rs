@@ -478,7 +478,11 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
         })
         .expect("Could not create databases callback");
 
-        let get_operation = SyncOperation::GetDatabases(callback, storage_key);
+        let get_operation = SyncOperation::GetDatabases(
+            callback,
+            storage_key,
+            Self::storage_bottle_source(&global),
+        );
         if global
             .storage_threads()
             .send(IndexedDBThreadMsg::Sync(get_operation))

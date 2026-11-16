@@ -9,6 +9,7 @@ use log::info;
 use super::executor::{
     SqlError, SqlExecutor, SqlParam, TransactionBehavior, query_row, with_transaction,
 };
+use super::queries;
 use crate::indexeddb::IndexedDBDescription;
 use crate::shared::DB_INIT_PRAGMAS;
 
@@ -118,6 +119,21 @@ pub(crate) fn open_database<X: SqlExecutor>(
     }
     let created = init_database(&mut executor, description)?;
     Ok((executor, created))
+}
+
+/// The version of the database in `directory` as of its last commit, read without opening the
+/// database as [`open_database`] does: 0 for a database without tables or of another
+/// [`SCHEMA_VERSION`], which that would create anew, and for a directory without one, where
+/// nothing is created. Nothing else may have the database open.
+pub(crate) fn committed_version<X: SqlExecutor>(directory: &Path) -> Result<u64, SqlError> {
+    if !X::exists(directory) {
+        return Ok(0);
+    }
+    let mut executor = X::open(directory)?;
+    if stored_schema_version(&mut executor)? != SCHEMA_VERSION {
+        return Ok(0);
+    }
+    queries::version(&mut executor)
 }
 
 /// The schema version a database was stored with, 0 if it has none.

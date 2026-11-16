@@ -6,6 +6,7 @@ use std::cmp::{Ordering, PartialEq, PartialOrd};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
+use std::path::PathBuf;
 
 use malloc_size_of_derive::MallocSizeOf;
 use profile_traits::generic_callback::GenericCallback;
@@ -848,6 +849,7 @@ pub enum SyncOperation {
     GetDatabases(
         GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
         ImmutableOrigin,
+        StorageBottleSource,
     ),
     /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>: commits the transaction once its
     /// requests have run, and reports [`TransactionEvent::Committed`]. Script sends it once the
@@ -971,6 +973,23 @@ pub enum IndexedDBThreadMsg {
         db_name: Utf16String,
         request: Uuid,
         result: BackendResult<StorageProxyMap>,
+    },
+    /// The open or delete request `request` at the front of its connection queue looked its
+    /// database up in the client storage registry, which the manager does in parallel: the
+    /// database's directory and, for an open, which creates a database that doesn't exist,
+    /// whether it was created; `None` if a delete found no database.
+    DatabaseLocated {
+        origin: ImmutableOrigin,
+        db_name: Utf16String,
+        request: Uuid,
+        result: BackendResult<Option<(PathBuf, bool)>>,
+    },
+    /// The databases in the storage bottle of `origin` were listed in the client storage
+    /// registry, each with its directory, for the databases() call that `sender` answers.
+    DatabasesListed {
+        origin: ImmutableOrigin,
+        sender: GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
+        result: BackendResult<Vec<(Utf16String, PathBuf)>>,
     },
 
     /// Measure memory used by this thread and send the report over the provided channel.

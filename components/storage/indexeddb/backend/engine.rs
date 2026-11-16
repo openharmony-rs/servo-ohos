@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 
@@ -77,6 +77,12 @@ impl<X: SqlExecutor> SqlEngine<X> {
             unusable,
             created_db_path: created || created_database,
         })
+    }
+
+    /// The version of the database stored in `path` as of its last commit, for a database that
+    /// no engine has open; see [`schema::committed_version`].
+    pub(crate) fn committed_version(path: &Path) -> Result<u64, SqlError> {
+        schema::committed_version::<X>(path)
     }
 
     /// Returns whether the physical db was created as part of `new`, which includes recreating

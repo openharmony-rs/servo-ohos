@@ -84,6 +84,7 @@ executor_tests!(
     schema_version_mismatch_resets_the_database,
     indexeddb_version_is_independent_of_the_schema_version,
     schema_reset_that_keeps_the_old_database_fails,
+    committed_version_of_a_stored_database,
     test_cycle,
     test_create_store,
     test_create_store_empty_name,
@@ -696,6 +697,35 @@ fn schema_version_mismatch_resets_the_database<X: SqlExecutor>() {
             "The database file should have been deleted"
         );
     }
+}
+
+/// The version of a stored database that no engine has open is the one its last commit wrote,
+/// and 0 for a new database and for one of another schema version, which is left as it is.
+fn committed_version_of_a_stored_database<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(SqlEngine::<X>::committed_version(dir.path()).unwrap(), 0);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert!(!X::exists(dir.path()));
+    let db = open_engine_in::<X>(dir.path(), true);
+    assert!(X::exists(dir.path()));
+    create_store(&db, "store", None, false).unwrap();
+    set_version(&db, 3).unwrap();
+    drop(db);
+    assert_eq!(SqlEngine::<X>::committed_version(dir.path()).unwrap(), 3);
+
+    let set_schema_version = |version: i64| {
+        let mut executor = X::open(dir.path()).unwrap();
+        executor
+            .execute(&format!("PRAGMA user_version = {version}"), &[])
+            .unwrap();
+        queries::version(&mut executor).unwrap()
+    };
+    assert_eq!(set_schema_version(SCHEMA_VERSION + 1), 3);
+    assert_eq!(SqlEngine::<X>::committed_version(dir.path()).unwrap(), 0);
+    assert_eq!(set_schema_version(SCHEMA_VERSION), 3);
+    let db = open_engine_in::<X>(dir.path(), false);
+    assert_eq!(db.version().unwrap(), 3);
+    assert_eq!(store_names(&db), vec!["store".to_owned()]);
 }
 
 fn indexeddb_version_is_independent_of_the_schema_version<X: SqlExecutor>() {
@@ -2718,6 +2748,10 @@ impl<X: SqlExecutor> SqlExecutor for Faulty<X> {
             return Ok(());
         }
         self.inner.delete()
+    }
+
+    fn exists(directory: &Path) -> bool {
+        X::exists(directory)
     }
 
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {

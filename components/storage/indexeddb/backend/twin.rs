@@ -56,6 +56,14 @@ impl SqlExecutor for TwinExecutor {
         delegate!(self, |executor| executor.delete())
     }
 
+    fn exists(directory: &Path) -> bool {
+        if use_ohos_rdb_backend() {
+            RdbExecutor::exists(directory)
+        } else {
+            SqliteExecutor::exists(directory)
+        }
+    }
+
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
         delegate!(self, |executor| executor.execute(sql, params))
     }

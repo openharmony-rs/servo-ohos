@@ -196,6 +196,10 @@ impl SqlExecutor for RdbExecutor {
         Ok(())
     }
 
+    fn exists(directory: &Path) -> bool {
+        directory.join("rdb").join(DATABASE_FILE_NAME).exists()
+    }
+
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
         let values = values(params)?;
         // RDB returns the number of changed rows for UPDATE and DELETE, and the row id or -1 for

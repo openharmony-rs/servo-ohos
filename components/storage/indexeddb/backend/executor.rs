@@ -87,6 +87,9 @@ pub(crate) trait SqlExecutor: Send + Sized + 'static {
     /// to the database may be open.
     fn delete(self) -> Result<(), SqlError>;
 
+    /// Whether a database is stored in `directory`, which [`Self::open`] would otherwise create.
+    fn exists(directory: &Path) -> bool;
+
     /// Runs a statement that returns no rows. Returns the number of rows an `UPDATE` or `DELETE`
     /// changed; the value is unspecified for other statements.
     ///
