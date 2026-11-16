@@ -70,6 +70,22 @@ fn test_exit() {
     std::thread::sleep(std::time::Duration::from_millis(1000));
 }
 
+/// Requests to a client storage thread that has exited report the disconnection.
+#[test]
+fn test_requests_after_exit_fail() {
+    let handle: ClientStorageThreadHandle = ClientStorageThreadFactory::new(None, false);
+    let (sender, receiver) = generic_channel::channel().unwrap();
+    handle
+        .send(ClientStorageThreadMessage::Exit(sender))
+        .unwrap();
+    receiver.recv().unwrap();
+
+    assert!(handle.find_database(1, "db").recv().is_err());
+    assert!(handle.list_databases(1).recv().is_err());
+    assert!(handle.create_database(1, "db").recv().is_err());
+    assert!(handle.delete_database(1, "db").recv().is_err());
+}
+
 #[test]
 fn test_workflow() {
     install_test_namespace();
@@ -205,6 +221,72 @@ fn test_database_names_with_unpaired_surrogates() {
         .unwrap();
     assert!(!paths[0].exists());
     assert!(paths[1..].iter().all(|path| path.exists()));
+}
+
+/// The registry finds and lists the databases of a bottle, also those whose names it holds as
+/// BLOBs, and no longer once they are deleted.
+#[test]
+fn test_find_and_list_databases() {
+    install_test_namespace();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let handle: ClientStorageThreadHandle =
+        ClientStorageThreadFactory::new(Some(tmp_dir.path().to_path_buf()), false);
+    let bottle_of = |url: &str| {
+        obtain_bottle_map(
+            &handle,
+            StorageType::Local,
+            Some(WebViewId::new(servo_base::id::TEST_PAINTER_ID)),
+            StorageIdentifier::IndexedDB,
+            ServoUrl::parse(url).unwrap().origin(),
+        )
+        .bottle_id
+    };
+    let (bottle, other_bottle) = (
+        bottle_of("https://example.com"),
+        bottle_of("https://example.org"),
+    );
+    let create = |bottle_id: i64, name: &Utf16String| {
+        handle
+            .create_database(bottle_id, name.clone())
+            .recv()
+            .unwrap()
+            .unwrap()
+            .0
+    };
+    let find = |bottle_id: i64, name: &Utf16String| {
+        handle
+            .find_database(bottle_id, name.clone())
+            .recv()
+            .unwrap()
+            .unwrap()
+    };
+    let list = |bottle_id: i64| handle.list_databases(bottle_id).recv().unwrap().unwrap();
+
+    let names = [
+        Utf16String::from("one"),
+        Utf16String::from_units(vec![0xD800, u16::from(b'x')]),
+        Utf16String::from("two"),
+    ];
+    let other = Utf16String::from("other");
+    let paths: Vec<PathBuf> = names.iter().map(|name| create(bottle, name)).collect();
+    let other_path = create(other_bottle, &other);
+
+    assert_eq!(find(bottle, &names[1]), Some(paths[1].clone()));
+    assert_eq!(find(bottle, &Utf16String::from("missing")), None);
+    assert_eq!(find(bottle, &other), None);
+    assert_eq!(find(other_bottle, &other), Some(other_path.clone()));
+    let listed: Vec<(Utf16String, PathBuf)> =
+        names.iter().cloned().zip(paths.iter().cloned()).collect();
+    assert_eq!(list(bottle), listed);
+    assert_eq!(list(other_bottle), vec![(other, other_path)]);
+
+    handle
+        .delete_database(bottle, names[0].clone())
+        .recv()
+        .unwrap()
+        .unwrap();
+    assert_eq!(find(bottle, &names[0]), None);
+    assert_eq!(list(bottle), listed[1..].to_vec());
 }
 
 #[test]

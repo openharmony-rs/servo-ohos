@@ -25,6 +25,12 @@ impl ClientStorageThreadHandle {
         ClientStorageThreadHandle { sender }
     }
 
+    /// Sends `message`, whose reply sender is dropped with it if the client storage thread is
+    /// gone, so that its receiver reports the disconnection.
+    fn send_request(&self, message: ClientStorageThreadMessage) {
+        let _ = self.sender.send(message);
+    }
+
     pub fn obtain_a_storage_bottle_map(
         &self,
         storage_type: StorageType,
@@ -40,7 +46,7 @@ impl ClientStorageThreadHandle {
             origin,
             sender,
         };
-        self.sender.send(message).unwrap();
+        self.send_request(message);
         receiver
     }
 
@@ -55,7 +61,7 @@ impl ClientStorageThreadHandle {
             name: name.into(),
             sender,
         };
-        self.sender.send(message).unwrap();
+        self.send_request(message);
         receiver
     }
 
@@ -70,7 +76,34 @@ impl ClientStorageThreadHandle {
             name: name.into(),
             sender,
         };
-        self.sender.send(message).unwrap();
+        self.send_request(message);
+        receiver
+    }
+
+    /// The directory of the database `name` in the bottle `bottle_id`, if it exists.
+    pub fn find_database(
+        &self,
+        bottle_id: i64,
+        name: impl Into<Utf16String>,
+    ) -> GenericReceiver<Result<Option<PathBuf>, String>> {
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        let message = ClientStorageThreadMessage::FindDatabase {
+            bottle_id,
+            name: name.into(),
+            sender,
+        };
+        self.send_request(message);
+        receiver
+    }
+
+    /// The databases in the bottle `bottle_id`, each with its directory.
+    pub fn list_databases(
+        &self,
+        bottle_id: i64,
+    ) -> GenericReceiver<Result<Vec<(Utf16String, PathBuf)>, String>> {
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        let message = ClientStorageThreadMessage::ListDatabases { bottle_id, sender };
+        self.send_request(message);
         receiver
     }
 
@@ -257,6 +290,15 @@ pub enum ClientStorageThreadMessage {
         bottle_id: i64,
         name: Utf16String,
         sender: GenericSender<Result<(), String>>,
+    },
+    FindDatabase {
+        bottle_id: i64,
+        name: Utf16String,
+        sender: GenericSender<Result<Option<PathBuf>, String>>,
+    },
+    ListDatabases {
+        bottle_id: i64,
+        sender: GenericSender<Result<Vec<(Utf16String, PathBuf)>, String>>,
     },
     Persisted {
         origin: ImmutableOrigin,

@@ -55,6 +55,33 @@ impl From<&Utf16String> for RegistryDatabaseName {
     }
 }
 
+impl RegistryDatabaseName {
+    /// The name that the registry holds as `self`; `None` for a BLOB that holds no name.
+    fn into_name(self) -> Option<Utf16String> {
+        match self {
+            Self::Text(text) => Some(Utf16String::from(text)),
+            Self::Blob(blob) => Utf16String::from_be_bytes(&blob),
+        }
+    }
+}
+
+/// The directory of the database named `?2` in the bottle `?1`.
+const FIND_DATABASE_SQL: &str = "SELECT directories.path FROM databases
+     JOIN directories ON directories.database_id = databases.id
+     WHERE databases.bottle_id = ?1 AND databases.name = ?2;";
+
+/// The databases in the bottle `?1`, in the order they were created: whether the name is a BLOB
+/// rather than text, the name and the directory. (RDB fails to read the size of a NULL that an
+/// expression gives, so each kind of name doesn't get a column of its own.)
+const LIST_DATABASES_SQL: &str = "SELECT
+         typeof(databases.name) = 'blob',
+         databases.name,
+         directories.path
+     FROM databases
+     JOIN directories ON directories.database_id = databases.id
+     WHERE databases.bottle_id = ?1
+     ORDER BY databases.id;";
+
 #[cfg(feature = "sqlite-backend")]
 impl From<RegistryDatabaseName> for rusqlite::types::Value {
     fn from(name: RegistryDatabaseName) -> Self {
@@ -77,6 +104,17 @@ trait RegistryEngine {
         bottle_id: i64,
         name: Utf16String,
     ) -> Result<(), ClientStorageErrorr<Self::Error>>;
+    /// The directory of the database `name` in the bottle `bottle_id`, if it exists.
+    fn find_database(
+        &mut self,
+        bottle_id: i64,
+        name: Utf16String,
+    ) -> Result<Option<PathBuf>, ClientStorageErrorr<Self::Error>>;
+    /// The databases in the bottle `bottle_id`, each with its directory.
+    fn list_databases(
+        &mut self,
+        bottle_id: i64,
+    ) -> Result<Vec<(Utf16String, PathBuf)>, ClientStorageErrorr<Self::Error>>;
     fn obtain_a_storage_bottle_map(
         &mut self,
         storage_type: StorageType,
@@ -587,6 +625,50 @@ impl RegistryEngine for SqliteEngine {
         Ok(())
     }
 
+    fn find_database(
+        &mut self,
+        bottle_id: i64,
+        name: Utf16String,
+    ) -> Result<Option<PathBuf>, ClientStorageErrorr<Self::Error>> {
+        let args = [
+            rusqlite::types::Value::Integer(bottle_id),
+            RegistryDatabaseName::from(&name).into(),
+        ];
+        let path: Option<String> = self
+            .connection
+            .query_row(
+                FIND_DATABASE_SQL,
+                rusqlite::params_from_iter(&args),
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(path.map(PathBuf::from))
+    }
+
+    fn list_databases(
+        &mut self,
+        bottle_id: i64,
+    ) -> Result<Vec<(Utf16String, PathBuf)>, ClientStorageErrorr<Self::Error>> {
+        let mut statement = self.connection.prepare(LIST_DATABASES_SQL)?;
+        let rows = statement.query_map([bottle_id], |row| {
+            let name = if row.get::<_, bool>(0)? {
+                RegistryDatabaseName::Blob(row.get(1)?)
+            } else {
+                RegistryDatabaseName::Text(row.get(1)?)
+            };
+            Ok((name, row.get::<_, String>(2)?))
+        })?;
+        let mut databases = Vec::new();
+        for row in rows {
+            let (name, path) = row?;
+            match name.into_name() {
+                Some(name) => databases.push((name, PathBuf::from(path))),
+                None => warn!("Skipped a database whose registry name can't be read"),
+            }
+        }
+        Ok(databases)
+    }
+
     /// <https://storage.spec.whatwg.org/#obtain-a-storage-bottle-map>
     fn obtain_a_storage_bottle_map(
         &mut self,
@@ -847,6 +929,18 @@ where
                     sender,
                 } => {
                     let result = self.engine.delete_database(bottle_id, name);
+                    let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
+                },
+                ClientStorageThreadMessage::FindDatabase {
+                    bottle_id,
+                    name,
+                    sender,
+                } => {
+                    let result = self.engine.find_database(bottle_id, name);
+                    let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
+                },
+                ClientStorageThreadMessage::ListDatabases { bottle_id, sender } => {
+                    let result = self.engine.list_databases(bottle_id);
                     let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
                 },
                 ClientStorageThreadMessage::Persisted { origin, sender } => {

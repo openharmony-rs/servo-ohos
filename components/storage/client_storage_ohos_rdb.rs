@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use log::warn;
 use servo_base::generic_channel::GenericSender;
 use servo_base::id::{BrowsingContextId, WebViewId};
 use servo_url::ImmutableOrigin;
@@ -17,7 +18,7 @@ use storage_traits::client_storage::{
 use storage_traits::indexeddb::Utf16String;
 use uuid::Uuid;
 
-use super::{RegistryDatabaseName, RegistryEngine};
+use super::{FIND_DATABASE_SQL, LIST_DATABASES_SQL, RegistryDatabaseName, RegistryEngine};
 use crate::client_storage_shared::{self, StorageShelf};
 use crate::ohos_rdb::{
     OhosRdbError, OhosRdbStore, OhosRdbTransaction, OhosRdbValues, Result as OhosRdbResult,
@@ -300,6 +301,46 @@ impl RegistryEngine for OhosRdbEngine {
         fs::remove_dir_all(&path).map_err(|_| ClientStorageErrorr::DirectoryDeletionFailed)?;
 
         Ok(())
+    }
+
+    fn find_database(
+        &mut self,
+        bottle_id: i64,
+        name: Utf16String,
+    ) -> Result<Option<PathBuf>, ClientStorageErrorr<Self::Error>> {
+        let mut args = OhosRdbValues::new()?;
+        args.push_int(bottle_id)?;
+        push_database_name(&mut args, &name)?;
+        let mut cursor = self.store.query_sql(FIND_DATABASE_SQL, &args)?;
+        if !cursor.next_row()? {
+            return Ok(None);
+        }
+        Ok(cursor.text(0)?.map(PathBuf::from))
+    }
+
+    fn list_databases(
+        &mut self,
+        bottle_id: i64,
+    ) -> Result<Vec<(Utf16String, PathBuf)>, ClientStorageErrorr<Self::Error>> {
+        let mut args = OhosRdbValues::new()?;
+        args.push_int(bottle_id)?;
+        let mut cursor = self.store.query_sql(LIST_DATABASES_SQL, &args)?;
+        let mut databases = Vec::new();
+        while cursor.next_row()? {
+            let name = if cursor.int64(0)? == Some(1) {
+                cursor.blob(1)?.map(RegistryDatabaseName::Blob)
+            } else {
+                cursor.text(1)?.map(RegistryDatabaseName::Text)
+            };
+            let path = cursor
+                .text(2)?
+                .ok_or_else(|| missing_row("database directory"))?;
+            match name.and_then(RegistryDatabaseName::into_name) {
+                Some(name) => databases.push((name, PathBuf::from(path))),
+                None => warn!("Skipped a database whose registry name can't be read"),
+            }
+        }
+        Ok(databases)
     }
 
     /// <https://storage.spec.whatwg.org/#obtain-a-storage-bottle-map>
@@ -586,6 +627,73 @@ mod tests {
             .unwrap();
         assert!(!paths[0].exists());
         assert!(paths[1].exists() && paths[2].exists());
+    }
+
+    /// The registry finds and lists the databases of a bottle, also those whose names it holds
+    /// as BLOBs, and no longer once they are deleted.
+    #[cfg(ohos_rdb)]
+    #[test]
+    fn test_ohos_registry_finds_and_lists_databases() {
+        install_test_namespace();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let handle: ClientStorageThreadHandle =
+            ClientStorageThreadFactory::new(Some(tmp_dir.path().to_path_buf()), false);
+        let bottle_of = |url: &str| {
+            obtain_bottle_map(
+                &handle,
+                StorageType::Local,
+                Some(WebViewId::new(servo_base::id::TEST_PAINTER_ID)),
+                StorageIdentifier::IndexedDB,
+                ServoUrl::parse(url).unwrap().origin(),
+            )
+            .bottle_id
+        };
+        let (bottle, other_bottle) = (
+            bottle_of("https://example.com"),
+            bottle_of("https://example.org"),
+        );
+        let create = |bottle_id: i64, name: &Utf16String| {
+            handle
+                .create_database(bottle_id, name.clone())
+                .recv()
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        let find = |bottle_id: i64, name: &Utf16String| {
+            handle
+                .find_database(bottle_id, name.clone())
+                .recv()
+                .unwrap()
+                .unwrap()
+        };
+        let list = |bottle_id: i64| handle.list_databases(bottle_id).recv().unwrap().unwrap();
+
+        let names = [
+            Utf16String::from("one"),
+            Utf16String::from_units(vec![0xD800, u16::from(b'x')]),
+            Utf16String::from("two"),
+        ];
+        let other = Utf16String::from("other");
+        let paths: Vec<PathBuf> = names.iter().map(|name| create(bottle, name)).collect();
+        let other_path = create(other_bottle, &other);
+
+        assert_eq!(find(bottle, &names[1]), Some(paths[1].clone()));
+        assert_eq!(find(bottle, &Utf16String::from("missing")), None);
+        assert_eq!(find(bottle, &other), None);
+        assert_eq!(find(other_bottle, &other), Some(other_path.clone()));
+        let listed: Vec<(Utf16String, PathBuf)> =
+            names.iter().cloned().zip(paths.iter().cloned()).collect();
+        assert_eq!(list(bottle), listed);
+        assert_eq!(list(other_bottle), vec![(other, other_path)]);
+
+        handle
+            .delete_database(bottle, names[0].clone())
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(find(bottle, &names[0]), None);
+        assert_eq!(list(bottle), listed[1..].to_vec());
     }
 
     #[cfg(ohos_rdb)]
