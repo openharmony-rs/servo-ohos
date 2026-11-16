@@ -93,6 +93,9 @@ backend_tests!(
     test_indexeddb_databases_of_an_earlier_session_are_listed_deleted_and_opened,
     test_indexeddb_database_of_an_earlier_session_is_deleted_without_being_listed,
     test_indexeddb_database_left_at_version_0_by_an_earlier_session_opens_as_new,
+    test_indexeddb_delete_blocked_by_a_closing_connection_asks_it_to_evict,
+    test_indexeddb_held_back_transaction_asks_the_holder_to_evict,
+    test_indexeddb_request_queued_behind_an_upgrade_asks_it_to_evict,
 );
 
 static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2843,7 +2846,10 @@ fn test_indexeddb_open_and_delete_requests_run_in_order() {
 
     let (open1_connection, old_version) = upgrade_without_changes(&ctx, db_name, &open1, 2);
     assert_eq!((open1_connection, old_version), (open1_id, 1));
-    wait_for_events(open1_connection, 3);
+    // Upgrade, EvictIfInactive for the requests queued behind the upgrade, Connection,
+    // VersionChange.
+    wait_for_events(open1_connection, 4);
+    assert_eq!(evict_requests(open1_connection), 1);
     assert_eq!(
         versionchange_events(open1_connection),
         vec![format!(
@@ -2865,7 +2871,8 @@ fn test_indexeddb_open_and_delete_requests_run_in_order() {
 
     let (open2_connection, old_version) = upgrade_without_changes(&ctx, db_name, &open2, 3);
     assert_eq!(old_version, 0, "delete1 deleted the database");
-    wait_for_events(open2_connection, 3);
+    wait_for_events(open2_connection, 4);
+    assert_eq!(evict_requests(open2_connection), 1);
     assert_eq!(
         versionchange_events(open2_connection),
         vec![format!(
@@ -2978,11 +2985,22 @@ fn test_indexeddb_closed_connection_holds_back_the_upgrade_until_its_transaction
     close_database(&ctx, connection, db_name);
 
     let upgrade = open_database(&ctx, db_name, Some(2));
+    // The closing connection gets no versionchange event, so it blocks the open, and its
+    // document is asked to leave the back/forward cache if it is there.
+    match recv_callback_timeout(&upgrade, "blocked") {
+        ConnectionMsg::Blocked {
+            version,
+            old_version,
+            ..
+        } => assert_eq!((version, old_version), (2, 1)),
+        other => panic!("unexpected open message: {other:?}"),
+    }
     assert_nothing(
         &upgrade,
         "upgrade while a transaction of the closed connection runs",
     );
     assert!(versionchange_events(connection).is_empty());
+    assert_eq!(evict_requests(connection), 1);
 
     let commit = commit_transaction(&ctx, db_name, txn);
     assert!(recv_callback_timeout(&commit, "commit").is_ok());
@@ -3264,5 +3282,156 @@ fn test_indexeddb_database_left_at_version_0_by_an_earlier_session_opens_as_new(
     assert_eq!(old_version, 0);
     close_database(&ctx, connection, db_name);
     assert_eq!(databases(&ctx), vec![(db_name.to_owned(), 1)]);
+    ctx.shutdown();
+}
+
+/// How often the backend asked the document of `connection` to leave the back/forward cache if it
+/// is there.
+fn evict_requests(connection: Uuid) -> usize {
+    ROUTES
+        .lock()
+        .unwrap()
+        .events
+        .get(&connection)
+        .into_iter()
+        .flatten()
+        .filter(|event| *event == "EvictIfInactive")
+        .count()
+}
+
+/// A delete that waits for a connection whose close is pending, as its transaction still runs, is
+/// blocked, and asks the connection's document to leave the back/forward cache if it is there:
+/// a cached document never finishes its transactions (WPT back-forward-cache-open-transaction's
+/// pagehide pattern followed by a delete).
+fn test_indexeddb_delete_blocked_by_a_closing_connection_asks_it_to_evict() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-delete-blocked-by-a-closing-connection";
+    let connection = open_database_with_two_stores(&ctx, db_name);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection,
+        IndexedDBTxnMode::Readwrite,
+        vec![A],
+    );
+    let put = put_item(
+        &ctx,
+        db_name,
+        A,
+        txn,
+        IndexedDBKeyType::Number(1.0),
+        b"written on pagehide".to_vec(),
+    );
+    assert!(recv_callback_timeout(&put, "put").is_ok());
+    close_database(&ctx, connection, db_name);
+
+    let (_, delete) = delete_database(&ctx, db_name);
+    match recv_callback_timeout(&delete, "blocked") {
+        DeleteDatabaseEvent::Blocked { old_version } => assert_eq!(old_version, 1),
+        other => panic!("unexpected delete event: {other:?}"),
+    }
+    assert_eq!(evict_requests(connection), 1);
+    assert_nothing(
+        &delete,
+        "delete while the closing connection's transaction runs",
+    );
+
+    abort_transaction(&ctx, db_name, txn);
+    finish_transaction(&ctx, db_name, txn);
+    match recv_callback_timeout(&delete, "delete result") {
+        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(1)),
+        other => panic!("unexpected delete event: {other:?}"),
+    }
+    assert_eq!(evict_requests(connection), 1);
+    ctx.shutdown();
+}
+
+/// A transaction that waits for a live transaction of another connection asks that connection's
+/// document, once, to leave the back/forward cache if it is there (Chromium's
+/// DisallowInactiveClient); one that doesn't wait asks nothing.
+fn test_indexeddb_held_back_transaction_asks_the_holder_to_evict() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-held-back-transaction";
+    let holder = open_database_with_two_stores(&ctx, db_name);
+    let other = match recv_callback_timeout(&open_database(&ctx, db_name, None), "open") {
+        ConnectionMsg::Connection { id, .. } => id,
+        message => panic!("unexpected open message: {message:?}"),
+    };
+    let writer = create_transaction(&ctx, db_name, holder, IndexedDBTxnMode::Readwrite, vec![A]);
+    let put = put_item(
+        &ctx,
+        db_name,
+        A,
+        writer,
+        IndexedDBKeyType::Number(1.0),
+        b"written on pagehide".to_vec(),
+    );
+    assert!(recv_callback_timeout(&put, "put").is_ok());
+
+    assert_eq!(
+        get_item_in_new_readonly_transaction(
+            &ctx,
+            db_name,
+            other,
+            B,
+            IndexedDBKeyType::Number(1.0)
+        ),
+        None
+    );
+    assert_eq!(evict_requests(holder), 0);
+
+    let reader = create_transaction(&ctx, db_name, other, IndexedDBTxnMode::Readonly, vec![A]);
+    let get = get_item(&ctx, db_name, A, reader, IndexedDBKeyType::Number(1.0));
+    let reader_commit = commit_transaction(&ctx, db_name, reader);
+    assert_nothing(&get, "read while an earlier writer runs");
+    assert_eq!(evict_requests(holder), 1);
+    assert_eq!(evict_requests(other), 0);
+
+    let commit = commit_transaction(&ctx, db_name, writer);
+    assert!(recv_callback_timeout(&commit, "commit").is_ok());
+    finish_transaction(&ctx, db_name, writer);
+    assert_eq!(
+        recv_callback_timeout(&get, "get")
+            .unwrap()
+            .map(|value| value.value),
+        Some(b"written on pagehide".to_vec())
+    );
+    assert!(recv_callback_timeout(&reader_commit, "reader commit").is_ok());
+    finish_transaction(&ctx, db_name, reader);
+    assert_eq!(evict_requests(holder), 1);
+    for connection in [holder, other] {
+        close_database(&ctx, connection, db_name);
+    }
+    ctx.shutdown();
+}
+
+/// A request queued behind an open request whose upgrade runs asks that request's document to
+/// leave the back/forward cache if it is there: the queue waits for the upgrade to finish.
+fn test_indexeddb_request_queued_behind_an_upgrade_asks_it_to_evict() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-queued-behind-an-upgrade";
+    let (upgrading, first) = open_database_request(&ctx, db_name, Some(1), ());
+    let transaction = match recv_callback_timeout(&first, "upgrade") {
+        ConnectionMsg::Upgrade { transaction, .. } => transaction,
+        other => panic!("unexpected open message: {other:?}"),
+    };
+    assert_eq!(evict_requests(upgrading), 0);
+
+    let second = open_database(&ctx, db_name, None);
+    assert_nothing(&second, "open behind a running upgrade");
+    assert_eq!(evict_requests(upgrading), 1);
+
+    commit_upgrade_transaction(&ctx, db_name, transaction);
+    let ConnectionMsg::Connection { id, .. } = recv_callback_timeout(&first, "connection") else {
+        panic!("expected the upgraded connection");
+    };
+    let ConnectionMsg::Connection { id: second_id, .. } =
+        recv_callback_timeout(&second, "second connection")
+    else {
+        panic!("expected the second connection");
+    };
+    for connection in [id, second_id] {
+        close_database(&ctx, connection, db_name);
+    }
     ctx.shutdown();
 }

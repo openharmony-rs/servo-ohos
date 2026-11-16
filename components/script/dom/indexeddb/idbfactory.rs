@@ -247,11 +247,18 @@ impl IDBFactory {
             // A versionchange event at a connection of a document in the back/forward cache would
             // wait there until the document is shown again, and the upgrade or delete with it.
             // Like Gecko and Chromium, Servo evicts the document instead, which closes the
-            // connection; the IndexedDB specification doesn't say. A forced close is the same.
+            // connection; the IndexedDB specification doesn't say. A forced close is the same,
+            // and so is the backend's request to evict a document that holds back another
+            // request or transaction, which is all that it asks for. Workers aren't cached.
+            if matches!(event, ConnectionEvent::EvictIfInactive) && !in_window {
+                return;
+            }
             if in_window &&
                 matches!(
                     event,
-                    ConnectionEvent::VersionChange { .. } | ConnectionEvent::ForcedClose
+                    ConnectionEvent::VersionChange { .. } |
+                        ConnectionEvent::ForcedClose |
+                        ConnectionEvent::EvictIfInactive
                 )
             {
                 let event_task_source = task_source.clone();
@@ -261,6 +268,9 @@ impl IDBFactory {
                             !window.Document().is_fully_active()
                         {
                             window.Document().evict_from_back_forward_cache();
+                        }
+                        if matches!(event, ConnectionEvent::EvictIfInactive) {
+                            return;
                         }
                         // The event itself is a normal task, behind the tasks held back so far,
                         // such as the open request's success that created the connection. It is

@@ -88,6 +88,9 @@ struct TxnInfo {
     started: bool,
     /// The result channel of the transaction's connection.
     results: GenericCallback<ConnectionEvent>,
+    /// Whether the connections of the transactions that keep this one from starting were asked
+    /// to evict their documents if they aren't fully active.
+    holders_asked: bool,
 }
 
 #[derive(MallocSizeOf)]
@@ -153,6 +156,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 live: true,
                 started: false,
                 results,
+                holders_asked: false,
             },
         );
         self.transactions
@@ -263,6 +267,54 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
         }
     }
 
+    /// Whether the transaction `other` keeps `waiting` from starting, by the rules of
+    /// [`Self::can_start_by_spec`].
+    fn holds_back(waiting: &TxnInfo, other: &TxnInfo) -> bool {
+        if !other.live {
+            return false;
+        }
+        let earlier_overlapping =
+            other.created_seq < waiting.created_seq && Self::scopes_overlap(waiting, other);
+        match waiting.mode {
+            IndexedDBTxnMode::Readonly => {
+                earlier_overlapping && other.mode != IndexedDBTxnMode::Readonly
+            },
+            IndexedDBTxnMode::Readwrite | IndexedDBTxnMode::Versionchange => {
+                earlier_overlapping || (other.started && other.mode != IndexedDBTxnMode::Readonly)
+            },
+        }
+    }
+
+    /// Asks the connections of the transactions that keep `txn` from starting to evict their
+    /// documents if they aren't fully active, once for each transaction that waits: a cached
+    /// document never finishes its transactions, as its tasks are held back, so `txn` would wait
+    /// until the user goes back to that page.
+    fn ask_holders_to_evict_if_inactive(&mut self, txn: IndexedDBTxnId) {
+        let Some(waiting) = self
+            .txn_info
+            .get(&txn)
+            .filter(|waiting| !waiting.holders_asked)
+        else {
+            return;
+        };
+        let holders: Vec<GenericCallback<ConnectionEvent>> = self
+            .txn_info
+            .iter()
+            .filter(|(other_txn, other)| {
+                other_txn.connection != txn.connection && Self::holds_back(waiting, other)
+            })
+            .map(|(_, other)| other.results.clone())
+            .collect();
+        if let Some(waiting) = self.txn_info.get_mut(&txn) {
+            waiting.holders_asked = true;
+        }
+        for results in holders {
+            if results.send(ConnectionEvent::EvictIfInactive).is_err() {
+                debug!("Script went away before it was asked to evict a page");
+            }
+        }
+    }
+
     /// Whether a readwrite or versionchange transaction other than `txn` has started and is
     /// still live. The engine runs each such transaction as the one SQL transaction of its
     /// connection, so writers run one after another, also those with disjoint scopes.
@@ -352,6 +404,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 if self.queued_readonly_set.insert(txn) {
                     self.queued_readonly.push_back(txn);
                 }
+                self.ask_holders_to_evict_if_inactive(txn);
                 continue;
             }
 
@@ -391,6 +444,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 if self.queued_readwrite_set.insert(txn) {
                     self.queued_readwrite.push_back(txn);
                 }
+                self.ask_holders_to_evict_if_inactive(txn);
                 continue;
             }
 
@@ -747,6 +801,8 @@ enum OpenRequestState {
 struct ConnectionsToClose {
     /// openConnections.
     connections: Vec<Uuid>,
+    /// The connections that were fired a versionchange event at.
+    fired: HashSet<Uuid>,
     /// The connections that were fired a versionchange event at, and that have neither reported
     /// it dispatched nor closed.
     versionchange: HashSet<Uuid>,
@@ -754,8 +810,8 @@ struct ConnectionsToClose {
     old_version: u64,
     /// The version that the open request asks for, or `None` for a delete.
     new_version: Option<u64>,
-    /// Whether a blocked event was fired at the request.
-    blocked: bool,
+    /// Whether the request checked if it is blocked, once all versionchange events were fired.
+    checked_blocked: bool,
 }
 
 impl OpenRequest {
@@ -816,6 +872,17 @@ impl OpenRequest {
                 id: self.id,
             }),
             OpenRequestKind::Delete { .. } => self.send_delete_result(Err(BackendError::Abort)),
+        }
+    }
+
+    /// Asks the global of this open request, whose upgrade runs, to evict its document if it
+    /// isn't fully active: the requests queued behind it wait for the upgrade, which a document
+    /// in the back/forward cache never finishes.
+    fn ask_to_evict_if_inactive(&self) {
+        if let OpenRequestKind::Open { results, .. } = &self.kind &&
+            results.send(ConnectionEvent::EvictIfInactive).is_err()
+        {
+            debug!("Script went away during an IndexedDB open request");
         }
     }
 
@@ -1223,10 +1290,13 @@ impl IndexedDBManager {
             });
         // Step 1: Let queue be the connection queue for storageKey and name.
         // Step 2: Add request to queue.
-        self.connection_queues
-            .entry(key.clone())
-            .or_default()
-            .push_back(request);
+        let queue = self.connection_queues.entry(key.clone()).or_default();
+        if let Some(front) = queue.front() &&
+            matches!(front.state, OpenRequestState::Upgrading(_))
+        {
+            front.ask_to_evict_if_inactive();
+        }
+        queue.push_back(request);
         if failed {
             self.advance_connection_queue(key);
         }
@@ -1420,24 +1490,37 @@ impl IndexedDBManager {
             return false;
         }
 
-        let still_open: Vec<&Connection> = wait
+        let still_open: Vec<(&Uuid, &Connection)> = wait
             .connections
             .iter()
-            .filter_map(|id| connections.and_then(|connections| connections.get(id)))
+            .filter_map(|id| connections.and_then(|connections| connections.get_key_value(id)))
             .collect();
-        let (old_version, new_version) = (wait.old_version, wait.new_version);
         // Open step 10.4, delete step 8: If any of the connections in openConnections are still
         // not closed, queue a database task to fire a version change event named blocked at
         // request with db’s version and version (null for a delete).
-        // Note: as in Gecko and Chromium, a connection whose close is pending doesn't block: it
-        // closes once its transactions have finished, without the page doing anything.
-        let blocked = !wait.blocked &&
-            still_open
-                .iter()
-                .any(|connection| !connection.close_pending);
-        wait.blocked |= blocked;
-        if blocked {
-            request.fire_blocked(&key.name, old_version, new_version);
+        // Note: as in Gecko and Chromium, a connection that the page closed in its versionchange
+        // handler doesn't block while its transactions finish. One whose close was pending
+        // before, which got no versionchange event, does, as in Chromium. A connection whose
+        // close is pending waits for its transactions, which a document in the back/forward cache
+        // never finishes, so its document is asked to leave the cache if it isn't fully active.
+        let (old_version, new_version) = (wait.old_version, wait.new_version);
+        if !wait.checked_blocked {
+            wait.checked_blocked = true;
+            let mut blocked = false;
+            for (id, connection) in &still_open {
+                blocked |= !connection.close_pending || !wait.fired.contains(id);
+                if connection.close_pending &&
+                    connection
+                        .results
+                        .send(ConnectionEvent::EvictIfInactive)
+                        .is_err()
+                {
+                    debug!("Script went away before it was asked to evict a page");
+                }
+            }
+            if blocked {
+                request.fire_blocked(&key.name, old_version, new_version);
+            }
         }
 
         // Open step 10.5, delete step 9: Wait until all connections in openConnections are
@@ -1771,6 +1854,15 @@ impl IndexedDBManager {
             object_stores,
         });
 
+        if self
+            .connection_queues
+            .get(key)
+            .is_some_and(|queue| queue.len() > 1) &&
+            let Some(open_request) = self.front_request(key)
+        {
+            open_request.ask_to_evict_if_inactive();
+        }
+
         // Step 11: Wait for transaction to finish.
         // Note: see `handle_upgrade_transaction_finished`.
     }
@@ -2019,10 +2111,11 @@ impl IndexedDBManager {
             if let Some(request) = self.front_request_mut(key) {
                 request.state = OpenRequestState::WaitingForConnections(ConnectionsToClose {
                     connections,
+                    fired: versionchange.clone(),
                     versionchange,
                     old_version: db_version,
                     new_version: Some(version),
-                    blocked: false,
+                    checked_blocked: false,
                 });
             }
 
@@ -2094,10 +2187,11 @@ impl IndexedDBManager {
         if let Some(request) = self.front_request_mut(key) {
             request.state = OpenRequestState::WaitingForConnections(ConnectionsToClose {
                 connections,
+                fired: versionchange.clone(),
                 versionchange,
                 old_version,
                 new_version: None,
-                blocked: false,
+                checked_blocked: false,
             });
         }
 
@@ -2343,6 +2437,9 @@ impl IndexedDBManager {
                             db.commit(txn);
                         } else {
                             db.pending_commits.insert(txn);
+                            if !db.can_start_by_spec(txn) {
+                                db.ask_holders_to_evict_if_inactive(txn);
+                            }
                         }
                         db.schedule_transactions(origin, &db_name);
                     },

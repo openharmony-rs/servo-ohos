@@ -11640,6 +11640,45 @@
   },
   "testharness": {
    "IndexedDB": {
+    "back-forward-cache-held-back.window.js": [
+     "1d953d7479412a537bfe7c1ef6016f342ca7bdb6",
+     [
+      "IndexedDB/back-forward-cache-held-back.window.html",
+      {
+       "script_metadata": [
+        [
+         "title",
+         "IndexedDB: a cached page that holds back another page's request or transaction is evicted"
+        ],
+        [
+         "script",
+         "/common/dispatcher/dispatcher.js"
+        ],
+        [
+         "script",
+         "/common/utils.js"
+        ],
+        [
+         "script",
+         "/IndexedDB/resources/support.js"
+        ],
+        [
+         "script",
+         "/html/browsers/browsing-the-web/back-forward-cache/resources/rc-helper.js"
+        ],
+        [
+         "script",
+         "/html/browsers/browsing-the-web/remote-context-helper/resources/remote-context-helper.js"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
     "back-forward-cache-versionchange.window.js": [
      "2a30ff98ff0f8105c0d67766a5a158a5137e95f8",
      [

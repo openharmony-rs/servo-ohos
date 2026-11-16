@@ -773,6 +773,12 @@ pub enum ConnectionEvent {
     /// backend can't use the database any more and has set the connection's close pending flag.
     /// Script aborts the connection's transactions and fires close once they have finished.
     ForcedClose,
+    /// Another request or transaction waits for this connection: for its transaction, for it to
+    /// close, or for the upgrade that its open request runs. Script evicts the connection's
+    /// document from the back/forward cache if it isn't fully active, as a cached document's
+    /// tasks are held back and it would never finish, and ignores the event otherwise. This is
+    /// Chromium's DisallowInactiveClient; the IndexedDB specification doesn't cover it.
+    EvictIfInactive,
 }
 
 /// What the backend reports about a request to delete a database

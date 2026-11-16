@@ -200,6 +200,7 @@ impl IDBDatabase {
                 }
             },
             ConnectionEvent::ForcedClose => self.close_by_user_agent(cx),
+            ConnectionEvent::EvictIfInactive => {},
         }
     }
 
