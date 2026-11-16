@@ -165,13 +165,11 @@ impl<'trans> OhosRdbCursor<'trans> {
     }
 
     pub(crate) fn blob(&self, index: usize) -> Result<Option<Vec<u8>>> {
-        if self.is_null(index)? {
-            return Ok(None);
-        }
-
+        // A NULL has the size 0, so only an empty value needs the NULL check, which costs
+        // another call per value.
         let size = self.size(index)?;
         if size == 0 {
-            return Ok(Some(Vec::new()));
+            return Ok((!self.is_null(index)?).then(Vec::new));
         }
 
         let mut buffer = vec![0u8; size];
