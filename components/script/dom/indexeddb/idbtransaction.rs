@@ -276,6 +276,12 @@ impl IDBTransaction {
         self.finished.get()
     }
 
+    /// Whether the transaction's state is finished in the spec's sense, which "abort a transaction"
+    /// sets in step 4, before the task that fires the abort event sets `finished`.
+    pub(crate) fn state_is_finished(&self) -> bool {
+        self.finished.get() || self.abort_initiated.get()
+    }
+
     pub(crate) fn set_cleanup_event_loop(&self) {
         // https://w3c.github.io/IndexedDB/#transaction-concept
         // A transaction optionally has a cleanup event loop which is an event loop.

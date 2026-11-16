@@ -1127,7 +1127,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         self.verify_not_deleted()?;
 
         // Step 4. If the transaction's state is finished, then throw an "InvalidStateError" DOMException.
-        if self.transaction.is_finished() {
+        if self.transaction.state_is_finished() {
             return Err(Error::InvalidState(None));
         }
 
