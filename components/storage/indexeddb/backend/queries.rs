@@ -56,22 +56,90 @@ impl StoreIndex {
     /// record per key; `index_data`'s is `(index_id, value, object_data_key)`. Both read in
     /// (key, primary key) order.
     pub(crate) fn table(&self) -> &'static str {
-        if self.unique {
-            "unique_index_data"
-        } else {
-            "index_data"
-        }
+        index_table(self.unique)
     }
+}
 
-    fn insert_statement(&self) -> &'static str {
-        if self.unique {
-            "INSERT INTO unique_index_data (index_id, value, object_data_key, object_store_id) \
-             VALUES (?, ?, ?, ?)"
+/// The table of the records of unique indexes, or of the other indexes.
+fn index_table(unique: bool) -> &'static str {
+    if unique {
+        "unique_index_data"
+    } else {
+        "index_data"
+    }
+}
+
+/// The most keys that one statement checks for a unique index.
+const KEYS_PER_CHECK: usize = 500;
+
+/// The most index records that one statement inserts, four parameters each, so that a statement
+/// stays below SQLite's oldest limit of 999 parameters.
+const RECORDS_PER_INSERT: usize = 200;
+
+/// `count` comma-separated placeholders.
+fn placeholders(count: usize) -> String {
+    vec!["?"; count].join(", ")
+}
+
+/// Whether the unique index `index` has a record with one of `keys`, the encoded index keys,
+/// for another record than the one with the encoded key `primary_key`, if given. Each statement
+/// checks many keys, since on RDB each statement costs about 0.2 ms.
+fn unique_keys_taken<X: SqlExecutor>(
+    executor: &mut X,
+    index: IndexedDBIndexId,
+    keys: &[&[u8]],
+    primary_key: Option<&[u8]>,
+) -> Result<bool, SqlError> {
+    for chunk in keys.chunks(KEYS_PER_CHECK) {
+        let other_record = if primary_key.is_some() {
+            " AND object_data_key != ?"
         } else {
-            "INSERT INTO index_data (index_id, value, object_data_key, object_store_id) \
-             VALUES (?, ?, ?, ?)"
+            ""
+        };
+        let sql = format!(
+            "SELECT 1 FROM unique_index_data WHERE index_id = ? AND value IN ({}){other_record} \
+             LIMIT 1",
+            placeholders(chunk.len())
+        );
+        let params: Vec<_> = std::iter::once(SqlParam::Integer(index))
+            .chain(chunk.iter().map(|key| SqlParam::Blob(key)))
+            .chain(primary_key.map(SqlParam::Blob))
+            .collect();
+        if query_row(executor, &sql, &params, |_| Ok(()))?.is_some() {
+            return Ok(true);
         }
     }
+    Ok(false)
+}
+
+/// Inserts `rows`, each the id of an index, an encoded index key and the encoded primary key of
+/// the record of the store `store_id` that it refers to, into the index table `table`, with as
+/// few statements as SQLite's parameter limit allows.
+fn insert_index_rows<X: SqlExecutor>(
+    executor: &mut X,
+    table: &str,
+    store_id: IndexedDBObjectStoreId,
+    rows: &[(IndexedDBIndexId, &[u8], &[u8])],
+) -> Result<(), SqlError> {
+    for chunk in rows.chunks(RECORDS_PER_INSERT) {
+        let sql = format!(
+            "INSERT INTO {table} (index_id, value, object_data_key, object_store_id) VALUES {}",
+            vec!["(?, ?, ?, ?)"; chunk.len()].join(", ")
+        );
+        let params: Vec<_> = chunk
+            .iter()
+            .flat_map(|&(index, key, primary_key)| {
+                [
+                    SqlParam::Integer(index),
+                    SqlParam::Blob(key),
+                    SqlParam::Blob(primary_key),
+                    SqlParam::Integer(store_id),
+                ]
+            })
+            .collect();
+        executor.execute(&sql, &params)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn encode_key_path(key_path: &KeyPath) -> Result<Vec<u8>, SqlError> {
@@ -1121,49 +1189,36 @@ pub(crate) fn unique_index_conflict<X: SqlExecutor>(
     primary_key: &[u8],
 ) -> Result<Option<IndexedDBIndexId>, SqlError> {
     for records in records.iter().filter(|records| records.index.unique) {
-        for key in &records.keys {
-            let taken = query_row(
-                executor,
-                "SELECT 1 FROM unique_index_data \
-                 WHERE index_id = ? AND value = ? AND object_data_key != ?",
-                &[
-                    SqlParam::Integer(records.index.id),
-                    SqlParam::Blob(key),
-                    SqlParam::Blob(primary_key),
-                ],
-                |_| Ok(()),
-            )?
-            .is_some();
-            if taken {
-                return Ok(Some(records.index.id));
-            }
+        let keys: Vec<&[u8]> = records.keys.iter().map(Vec::as_slice).collect();
+        if unique_keys_taken(executor, records.index.id, &keys, Some(primary_key))? {
+            return Ok(Some(records.index.id));
         }
     }
     Ok(None)
 }
 
 /// Stores `records`, the index records of the record of `store` with the encoded key
-/// `primary_key`. The record must be stored already. A unique index's primary key rejects a key
-/// that another record has: callers check with [`unique_index_conflict`] first, and the failed
-/// statement fails the transaction.
+/// `primary_key`, with one statement per index table. The record must be stored already. A
+/// unique index's primary key rejects a key that another record has: callers check with
+/// [`unique_index_conflict`] first, and the failed statement fails the transaction.
 pub(crate) fn insert_index_records<X: SqlExecutor>(
     executor: &mut X,
     store: &ObjectStore,
     primary_key: &[u8],
     records: &[IndexRecords],
 ) -> Result<(), SqlError> {
-    for records in records {
-        for key in &records.keys {
-            executor.execute(
-                records.index.insert_statement(),
-                &[
-                    SqlParam::Integer(records.index.id),
-                    SqlParam::Blob(key),
-                    SqlParam::Blob(primary_key),
-                    SqlParam::Integer(store.id),
-                ],
-            )?;
-        }
+    for unique in [false, true] {
+        let rows: Vec<_> = records
+            .iter()
+            .filter(|records| records.index.unique == unique)
+            .flat_map(|records| {
+                records
+                    .keys
+                    .iter()
+                    .map(|key| (records.index.id, key.as_slice(), primary_key))
+            })
+            .collect();
+        insert_index_rows(executor, index_table(unique), store.id, &rows)?;
     }
     Ok(())
 }
@@ -1200,6 +1255,7 @@ pub(crate) fn put_record<X: SqlExecutor>(
 ) -> Result<PutItemResult, SqlError> {
     let has_key_generator = store.auto_increment != 0;
     debug_assert!(key.is_some() || has_key_generator);
+    let generated = key.is_none();
     // Step 1. If store uses a key generator, then:
     let (key, new_current_number) = match key {
         // Step 1.1. If key is undefined, then:
@@ -1228,13 +1284,16 @@ pub(crate) fn put_record<X: SqlExecutor>(
     // exists in store with its key equal to key, then this operation failed with a
     // "ConstraintError" DOMException. Abort this algorithm without taking any further steps.
     let encoded_key = encoding::serialize(&key);
-    let exists = query_row(
-        executor,
-        "SELECT 1 FROM object_data WHERE object_store_id = ? AND key = ?",
-        &[SqlParam::Integer(store.id), SqlParam::Blob(&encoded_key)],
-        |_| Ok(()),
-    )?
-    .is_some();
+    // NOTE: No record has a generated key yet: the current number is above every number key
+    // stored, as each stored key possibly updated the key generator.
+    let exists = !generated &&
+        query_row(
+            executor,
+            "SELECT 1 FROM object_data WHERE object_store_id = ? AND key = ?",
+            &[SqlParam::Integer(store.id), SqlParam::Blob(&encoded_key)],
+            |_| Ok(()),
+        )?
+        .is_some();
     if exists && !overwrite {
         return Ok(PutItemResult::CannotOverwrite);
     }
@@ -1354,13 +1413,6 @@ pub(crate) fn population_records<X: SqlExecutor>(
     Ok((records, last))
 }
 
-/// The most keys that one statement of [`set_index_keys`] checks.
-const POPULATION_KEYS_PER_CHECK: usize = 500;
-
-/// The most index records that one statement of [`set_index_keys`] inserts, four parameters
-/// each, so that a statement stays below SQLite's oldest limit of 999 parameters.
-const POPULATION_RECORDS_PER_INSERT: usize = 200;
-
 /// Stores the records of `index`, which is being populated, for the records of `store` that
 /// `records` has the index keys of. Returns false, having stored none of them, if the index is
 /// unique and two of the records, or one of them and a record stored before, have the same key.
@@ -1385,38 +1437,16 @@ pub(crate) fn set_index_keys<X: SqlExecutor>(
         if !rows.iter().all(|(key, _)| keys.insert(key.as_slice())) {
             return Ok(false);
         }
-        for chunk in rows.chunks(POPULATION_KEYS_PER_CHECK) {
-            let sql = format!(
-                "SELECT 1 FROM unique_index_data WHERE index_id = ? AND value IN ({}) LIMIT 1",
-                vec!["?"; chunk.len()].join(", ")
-            );
-            let params: Vec<_> = std::iter::once(SqlParam::Integer(index.id))
-                .chain(chunk.iter().map(|(key, _)| SqlParam::Blob(key)))
-                .collect();
-            if query_row(executor, &sql, &params, |_| Ok(()))?.is_some() {
-                return Ok(false);
-            }
+        let keys: Vec<&[u8]> = rows.iter().map(|(key, _)| key.as_slice()).collect();
+        if unique_keys_taken(executor, index.id, &keys, None)? {
+            return Ok(false);
         }
     }
-    for chunk in rows.chunks(POPULATION_RECORDS_PER_INSERT) {
-        let sql = format!(
-            "INSERT INTO {} (index_id, value, object_data_key, object_store_id) VALUES {}",
-            index.table(),
-            vec!["(?, ?, ?, ?)"; chunk.len()].join(", ")
-        );
-        let params: Vec<_> = chunk
-            .iter()
-            .flat_map(|(key, primary_key)| {
-                [
-                    SqlParam::Integer(index.id),
-                    SqlParam::Blob(key),
-                    SqlParam::Blob(primary_key),
-                    SqlParam::Integer(store.id),
-                ]
-            })
-            .collect();
-        executor.execute(&sql, &params)?;
-    }
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|(key, primary_key)| (index.id, key.as_slice(), primary_key.as_slice()))
+        .collect();
+    insert_index_rows(executor, index.table(), store.id, &rows)?;
     Ok(true)
 }
 

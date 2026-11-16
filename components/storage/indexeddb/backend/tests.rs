@@ -121,6 +121,7 @@ executor_tests!(
     test_deleted_records_take_their_index_records_along,
     test_deleted_indexes_take_their_records_along,
     test_unique_index_conflict_changes_nothing,
+    test_put_index_records_of_many_keys,
     test_placeholders_become_the_record_key,
     test_abort_reverts_index_records,
     test_index_keys_for_other_indexes_fail_the_transaction,
@@ -3520,6 +3521,62 @@ fn test_unique_index_conflict_changes_nothing<X: SqlExecutor>() {
         index_records_of(&db, store, by_tag),
         string_records(&[("t1", 1.0), ("t2", 1.0), ("t3", 2.0), ("t4", 3.0)])
     );
+    assert_eq!(dangling_index_records(&db), 0);
+}
+
+/// A put whose record has more index keys than one statement checks or inserts stores all of
+/// them, finds a unique key taken in a later check, and is checked against other records only.
+fn test_put_index_records_of_many_keys<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "posts", None, false).unwrap();
+    let tags = KeyPath::String("tags".to_owned());
+    let words = KeyPath::String("words".to_owned());
+    let by_tag = create_index(&db, store, "tags".to_owned(), tags, true, true).unwrap();
+    let by_word = create_index(&db, store, "words".to_owned(), words, false, true).unwrap();
+    let keys = |prefix: &str, count: usize| {
+        (0..count)
+            .map(|i| string(&format!("{prefix}{i:03}")))
+            .collect::<Vec<_>>()
+    };
+    let put = |key: f64, tags: Vec<IndexedDBKeyType>| {
+        let index_keys = vec![
+            index_keys(by_tag, tags),
+            index_keys(by_word, keys("w", 300)),
+        ];
+        (Some(number(key)), vec![key as u8], index_keys)
+    };
+    // The taken key "t699" sorts last of the second record's keys, so the second check finds it.
+    let mut taken_last = keys("s", 699);
+    taken_last.push(string("t699"));
+    let replies = run_indexed_puts(
+        &db,
+        1,
+        store,
+        vec![
+            put(1.0, keys("t", 700)),
+            put(2.0, taken_last),
+            put(3.0, keys("u", 700)),
+            put(1.0, keys("t", 700)),
+        ],
+        true,
+    );
+    assert_eq!(
+        replies,
+        vec![
+            key_reply(1.0),
+            Ok(PutItemResult::UniqueIndexKeyExists(by_tag)),
+            key_reply(3.0),
+            key_reply(1.0),
+        ]
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+    assert_eq!(stored_keys(&db, store), number_keys([1, 3]));
+    assert_eq!(index_record_count(&db, by_tag), 1400);
+    assert_eq!(index_record_count(&db, by_word), 600);
+    let records = index_records_of(&db, store, by_tag);
+    assert_eq!(records.first(), Some(&(string("t000"), number(1.0))));
+    assert_eq!(records.last(), Some(&(string("u699"), number(3.0))));
     assert_eq!(dangling_index_records(&db), 0);
 }
 
