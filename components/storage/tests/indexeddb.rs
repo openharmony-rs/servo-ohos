@@ -20,11 +20,12 @@ use storage::ClientStorageThreadFactory;
 use storage_traits::StorageThreads;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
-    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexPopulationEvent,
-    IndexPopulationStep, IndexedDBCursorDirection, IndexedDBCursorStep, IndexedDBIndexKey,
-    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord,
-    IndexedDBRecordIndexKeys, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue,
-    KeyPath, PutItemResult, RequestOutput, StorageBottleSource, SyncOperation, TransactionEvent,
+    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, DeleteDatabaseEvent,
+    IndexPopulationEvent, IndexPopulationStep, IndexedDBCursorDirection, IndexedDBCursorStep,
+    IndexedDBIndexKey, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
+    IndexedDBObjectStore, IndexedDBRecord, IndexedDBRecordIndexKeys, IndexedDBThreadMsg,
+    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput,
+    StorageBottleSource, SyncOperation, TransactionEvent,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -83,6 +84,12 @@ backend_tests!(
     test_indexeddb_versionchange_follows_the_open_result_on_one_channel,
     test_indexeddb_create_index_population_runs_before_later_requests,
     test_indexeddb_aborted_pending_upgrade_lets_the_next_open_run,
+    test_indexeddb_open_and_delete_requests_run_in_order,
+    test_indexeddb_delete_waits_for_the_connections_to_close,
+    test_indexeddb_closed_connection_holds_back_the_upgrade_until_its_transactions_finish,
+    test_indexeddb_close_during_the_upgrade_fails_the_open,
+    test_indexeddb_connection_of_a_gone_global_counts_as_closed,
+    test_indexeddb_upgrade_committed_before_its_global_went_away_stays,
 );
 
 static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -342,7 +349,7 @@ fn open_database(
     db_name: &str,
     version: Option<u64>,
 ) -> mpsc::Receiver<Option<ConnectionMsg>> {
-    open_database_with(ctx, db_name, version, ())
+    open_database_request(ctx, db_name, version, ()).1
 }
 
 /// [`open_database`], whose result channel keeps `owned` until the backend drops the channel.
@@ -352,6 +359,17 @@ fn open_database_with(
     version: Option<u64>,
     owned: impl Send + 'static,
 ) -> mpsc::Receiver<Option<ConnectionMsg>> {
+    open_database_request(ctx, db_name, version, owned).1
+}
+
+/// [`open_database_with`], which also returns the id of the request, which is the id of the
+/// connection it opens.
+fn open_database_request(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    version: Option<u64>,
+    owned: impl Send + 'static,
+) -> (Uuid, mpsc::Receiver<Option<ConnectionMsg>>) {
     let (forward, receiver) = mpsc::channel();
     let id = Uuid::new_v4();
     let results = ProfileGenericCallback::new(move |event| {
@@ -386,7 +404,33 @@ fn open_database_with(
         )),
     )
     .unwrap();
-    receiver
+    (id, receiver)
+}
+
+/// Deletes `db_name` and returns the id of the request and the receiver of what the backend
+/// reports about it.
+fn delete_database(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+) -> (Uuid, mpsc::Receiver<Option<DeleteDatabaseEvent>>) {
+    let (forward, receiver) = mpsc::channel();
+    let id = Uuid::new_v4();
+    let results = ProfileGenericCallback::new(move |event| {
+        let _ = forward.send(event.ok());
+    })
+    .unwrap();
+    GenericSend::send(
+        &ctx.private_threads,
+        IndexedDBThreadMsg::Sync(SyncOperation::DeleteDatabase(
+            results,
+            ctx.origin.clone(),
+            db_name.into(),
+            ctx.bottle_source.clone(),
+            id,
+        )),
+    )
+    .unwrap();
+    (id, receiver)
 }
 
 /// The id script gives the first store of a database, in tests that have one store.
@@ -585,6 +629,26 @@ fn abort_upgrade_transaction(
     abort_transaction(ctx, db_name, transaction);
     finish_upgrade_transaction(ctx, transaction, db_name, false);
     finish_transaction(ctx, db_name, transaction);
+}
+
+/// Reports that the versionchange event of the request `request` was fired at the connection
+/// `connection`, as script does.
+fn notify_end_of_versionchange(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    connection: Uuid,
+    request: Uuid,
+) {
+    GenericSend::send(
+        &ctx.private_threads,
+        IndexedDBThreadMsg::Sync(SyncOperation::NotifyEndOfVersionChange {
+            name: db_name.into(),
+            id: connection,
+            request,
+            origin: ctx.origin.clone(),
+        }),
+    )
+    .unwrap();
 }
 
 fn close_database(ctx: &IndexedDbTestContext, id: Uuid, db_name: &str) {
@@ -2080,17 +2144,9 @@ fn test_indexeddb_upgrade_waits_for_no_versionchange_of_a_closed_connection() {
         other => panic!("unexpected second open message: {other:?}"),
     };
 
-    let upgrade = open_database(&ctx, db_name, Some(2));
-    GenericSend::send(
-        &ctx.private_threads,
-        IndexedDBThreadMsg::Sync(SyncOperation::NotifyEndOfVersionChange {
-            name: db_name.into(),
-            id: stays,
-            old_version: 1,
-            origin: ctx.origin.clone(),
-        }),
-    )
-    .unwrap();
+    let (request, upgrade) = open_database_request(&ctx, db_name, Some(2), ());
+    wait_for_events(stays, 2);
+    notify_end_of_versionchange(&ctx, db_name, stays, request);
     close_database(&ctx, gone, db_name);
     match recv_callback_timeout(&upgrade, "blocked event") {
         ConnectionMsg::Blocked {
@@ -2493,7 +2549,7 @@ fn test_indexeddb_versionchange_follows_the_open_result_on_one_channel() {
     let events = wait_for_events(connection_id, 2);
     assert!(events[0].starts_with("Connection {"), "{events:?}");
     assert!(
-        events[1].starts_with("VersionChange { old_version: 1, new_version: 2 }"),
+        events[1].starts_with("VersionChange { old_version: 1, new_version: Some(2)"),
         "{events:?}"
     );
 
@@ -2683,5 +2739,322 @@ fn test_indexeddb_aborted_pending_upgrade_lets_the_next_open_run() {
         panic!("expected the connection");
     };
     close_database(&ctx, id, db_name);
+    ctx.shutdown();
+}
+
+/// Runs the upgrade that `receiver`'s open request reports, without changes, and returns the
+/// connection it opens and the old version.
+fn upgrade_without_changes(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    receiver: &mpsc::Receiver<Option<ConnectionMsg>>,
+    version: u64,
+) -> (Uuid, u64) {
+    let (transaction, old_version) = match recv_callback_timeout(receiver, "upgrade") {
+        ConnectionMsg::Upgrade {
+            transaction,
+            version: new_version,
+            old_version,
+            ..
+        } => {
+            assert_eq!(new_version, version);
+            (transaction, old_version)
+        },
+        other => panic!("unexpected open message: {other:?}"),
+    };
+    commit_upgrade_transaction(ctx, db_name, transaction);
+    match recv_callback_timeout(receiver, "upgraded connection") {
+        ConnectionMsg::Connection {
+            id,
+            version: opened,
+            upgraded,
+            ..
+        } => {
+            assert_eq!((opened, upgraded), (version, true));
+            (id, old_version)
+        },
+        other => panic!("unexpected open message: {other:?}"),
+    }
+}
+
+/// The versionchange events that the connection `connection` was sent, as
+/// `(old version, new version, request)`.
+fn versionchange_events(connection: Uuid) -> Vec<String> {
+    ROUTES
+        .lock()
+        .unwrap()
+        .events
+        .get(&connection)
+        .into_iter()
+        .flatten()
+        .filter(|event| event.starts_with("VersionChange"))
+        .cloned()
+        .collect()
+}
+
+/// Asserts that nothing arrives on `receiver` for a while.
+fn assert_nothing<T: std::fmt::Debug>(receiver: &mpsc::Receiver<Option<T>>, what: &str) {
+    if let Ok(event) = receiver.recv_timeout(Duration::from_millis(200)) {
+        panic!("{what}: unexpected {event:?}");
+    }
+}
+
+/// <https://w3c.github.io/IndexedDB/#connection-queue>: open and delete requests are processed
+/// one after another, in the order they were made; each waits until the ones before it are
+/// done, including an upgrade, and a request that needs the other connections closed fires
+/// versionchange at them and blocked at itself (WPT open-request-queue.any.js).
+fn test_indexeddb_open_and_delete_requests_run_in_order() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-request-queue";
+    let held = open_database_with_two_stores(&ctx, db_name);
+
+    let (open1_id, open1) = open_database_request(&ctx, db_name, Some(2), ());
+    let (delete1_id, delete1) = delete_database(&ctx, db_name);
+    let (_, open2) = open_database_request(&ctx, db_name, Some(3), ());
+    let (delete2_id, delete2) = delete_database(&ctx, db_name);
+    wait_for_events(held, 3);
+    assert_eq!(versionchange_events(held).len(), 1);
+    assert_nothing(&open1, "open1 while the held connection is open");
+    close_database(&ctx, held, db_name);
+
+    let (open1_connection, old_version) = upgrade_without_changes(&ctx, db_name, &open1, 2);
+    assert_eq!((open1_connection, old_version), (open1_id, 1));
+    wait_for_events(open1_connection, 3);
+    assert_eq!(
+        versionchange_events(open1_connection),
+        vec![format!(
+            "VersionChange {{ old_version: 2, new_version: None, request: {delete1_id} }}"
+        )]
+    );
+    assert_nothing(&delete1, "delete1 before the versionchange event was fired");
+    notify_end_of_versionchange(&ctx, db_name, open1_connection, delete1_id);
+    match recv_callback_timeout(&delete1, "delete1 blocked") {
+        DeleteDatabaseEvent::Blocked { old_version } => assert_eq!(old_version, 2),
+        other => panic!("unexpected delete1 event: {other:?}"),
+    }
+    assert_nothing(&open2, "open2 while delete1 is blocked");
+    close_database(&ctx, open1_connection, db_name);
+    match recv_callback_timeout(&delete1, "delete1 result") {
+        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(2)),
+        other => panic!("unexpected delete1 event: {other:?}"),
+    }
+
+    let (open2_connection, old_version) = upgrade_without_changes(&ctx, db_name, &open2, 3);
+    assert_eq!(old_version, 0, "delete1 deleted the database");
+    wait_for_events(open2_connection, 3);
+    assert_eq!(
+        versionchange_events(open2_connection),
+        vec![format!(
+            "VersionChange {{ old_version: 3, new_version: None, request: {delete2_id} }}"
+        )]
+    );
+    close_database(&ctx, open2_connection, db_name);
+    match recv_callback_timeout(&delete2, "delete2 result") {
+        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(3)),
+        other => panic!("unexpected delete2 event: {other:?}"),
+    }
+    ctx.shutdown();
+}
+
+/// <https://w3c.github.io/IndexedDB/#delete-a-database>: a delete fires versionchange with a null
+/// new version at every open connection, fires blocked once they have all been fired and some
+/// is still open, and deletes the database once all have closed; the database then opens empty.
+/// A report for another request's event doesn't count.
+fn test_indexeddb_delete_waits_for_the_connections_to_close() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-delete-waits";
+    let first = open_database_with_two_stores(&ctx, db_name);
+    put_and_commit(&ctx, db_name, first, A);
+    let second = match recv_callback_timeout(&open_database(&ctx, db_name, None), "second") {
+        ConnectionMsg::Connection { id, .. } => id,
+        other => panic!("unexpected open message: {other:?}"),
+    };
+
+    let (request, delete) = delete_database(&ctx, db_name);
+    wait_for_events(first, 3);
+    wait_for_events(second, 2);
+    for connection in [first, second] {
+        assert_eq!(
+            versionchange_events(connection),
+            vec![format!(
+                "VersionChange {{ old_version: 1, new_version: None, request: {request} }}"
+            )]
+        );
+    }
+    notify_end_of_versionchange(&ctx, db_name, first, request);
+    notify_end_of_versionchange(&ctx, db_name, second, Uuid::new_v4());
+    assert_nothing(
+        &delete,
+        "delete before the second connection's event was fired",
+    );
+    close_database(&ctx, first, db_name);
+    notify_end_of_versionchange(&ctx, db_name, second, request);
+    match recv_callback_timeout(&delete, "blocked") {
+        DeleteDatabaseEvent::Blocked { old_version } => assert_eq!(old_version, 1),
+        other => panic!("unexpected delete event: {other:?}"),
+    }
+    assert_nothing(&delete, "delete while the second connection is open");
+    close_database(&ctx, second, db_name);
+    match recv_callback_timeout(&delete, "delete result") {
+        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(1)),
+        other => panic!("unexpected delete event: {other:?}"),
+    }
+
+    let reopened = open_database(&ctx, db_name, None);
+    match recv_callback_timeout(&reopened, "reopen") {
+        ConnectionMsg::Upgrade {
+            version,
+            old_version,
+            transaction,
+            object_stores,
+            ..
+        } => {
+            assert_eq!((version, old_version), (1, 0));
+            assert!(object_stores.is_empty());
+            commit_upgrade_transaction(&ctx, db_name, transaction);
+        },
+        other => panic!("unexpected reopen message: {other:?}"),
+    }
+    match recv_callback_timeout(&reopened, "reopened connection") {
+        ConnectionMsg::Connection {
+            id, object_stores, ..
+        } => {
+            assert!(object_stores.is_empty());
+            close_database(&ctx, id, db_name);
+        },
+        other => panic!("unexpected reopen message: {other:?}"),
+    }
+    ctx.shutdown();
+}
+
+/// <https://w3c.github.io/IndexedDB/#close-a-database-connection>: a connection whose close is
+/// pending is closed once the transactions created using it have finished. Until then an
+/// upgrade waits; the connection gets no versionchange event, and doesn't make the request
+/// blocked.
+fn test_indexeddb_closed_connection_holds_back_the_upgrade_until_its_transactions_finish() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-close-pending";
+    let connection = open_database_with_two_stores(&ctx, db_name);
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection,
+        IndexedDBTxnMode::Readwrite,
+        vec![A],
+    );
+    let put = put_item(
+        &ctx,
+        db_name,
+        A,
+        txn,
+        IndexedDBKeyType::Number(1.0),
+        b"written while closing".to_vec(),
+    );
+    assert!(recv_callback_timeout(&put, "put").is_ok());
+    close_database(&ctx, connection, db_name);
+
+    let upgrade = open_database(&ctx, db_name, Some(2));
+    assert_nothing(
+        &upgrade,
+        "upgrade while a transaction of the closed connection runs",
+    );
+    assert!(versionchange_events(connection).is_empty());
+
+    let commit = commit_transaction(&ctx, db_name, txn);
+    assert!(recv_callback_timeout(&commit, "commit").is_ok());
+    assert_nothing(&upgrade, "upgrade before the transaction finished");
+    finish_transaction(&ctx, db_name, txn);
+    let (upgraded, old_version) = upgrade_without_changes(&ctx, db_name, &upgrade, 2);
+    assert_eq!(old_version, 1);
+    assert_eq!(
+        get_item_in_new_readonly_transaction(
+            &ctx,
+            db_name,
+            upgraded,
+            A,
+            IndexedDBKeyType::Number(1.0)
+        ),
+        Some(b"written while closing".to_vec())
+    );
+    close_database(&ctx, upgraded, db_name);
+    ctx.shutdown();
+}
+
+/// <https://w3c.github.io/IndexedDB/#open-a-database-connection> step 10.7: a connection closed
+/// during its upgrade lets the upgrade transaction commit, and the open request fails with
+/// AbortError; the database keeps the upgrade (WPT close-in-upgradeneeded.any.js).
+fn test_indexeddb_close_during_the_upgrade_fails_the_open() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-close-in-upgrade";
+    let (id, open) = open_database_request(&ctx, db_name, Some(1), ());
+    let transaction = match recv_callback_timeout(&open, "upgrade") {
+        ConnectionMsg::Upgrade { transaction, .. } => transaction,
+        other => panic!("unexpected open message: {other:?}"),
+    };
+    create_object_store(&ctx, db_name, A, "a", transaction, None, false);
+    close_database(&ctx, id, db_name);
+    commit_upgrade_transaction(&ctx, db_name, transaction);
+    assert!(matches!(
+        recv_callback_timeout(&open, "open result"),
+        ConnectionMsg::AbortError { .. }
+    ));
+
+    let reopened = reopen_database(&ctx, db_name, "a");
+    close_database(&ctx, reopened, db_name);
+    ctx.shutdown();
+}
+
+/// A connection whose global went away is closed, also for a delete that waits for it.
+fn test_indexeddb_connection_of_a_gone_global_counts_as_closed() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-gone-global";
+    let connection = open_database_with_two_stores(&ctx, db_name);
+    let (_, delete) = delete_database(&ctx, db_name);
+    wait_for_events(connection, 3);
+    GenericSend::send(
+        &ctx.private_threads,
+        IndexedDBThreadMsg::Sync(SyncOperation::AbortPendingUpgrades {
+            pending_upgrades: HashMap::from([(db_name.into(), HashSet::from([connection]))]),
+            origin: ctx.origin.clone(),
+        }),
+    )
+    .unwrap();
+    match recv_callback_timeout(&delete, "delete result") {
+        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(1)),
+        other => panic!("unexpected delete event: {other:?}"),
+    }
+    ctx.shutdown();
+}
+
+/// An upgrade transaction that committed before its global went away, and so before script
+/// reported it finished, stays committed: the open request fails, but the database keeps its
+/// version and stores.
+fn test_indexeddb_upgrade_committed_before_its_global_went_away_stays() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-committed-upgrade-of-a-gone-global";
+    let (id, open) = open_database_request(&ctx, db_name, Some(1), ());
+    let transaction = match recv_callback_timeout(&open, "upgrade") {
+        ConnectionMsg::Upgrade { transaction, .. } => transaction,
+        other => panic!("unexpected open message: {other:?}"),
+    };
+    create_object_store(&ctx, db_name, A, "a", transaction, None, false);
+    let commit = commit_transaction(&ctx, db_name, transaction);
+    recv_callback_timeout(&commit, "upgrade commit reply").expect("the upgrade committed");
+    GenericSend::send(
+        &ctx.private_threads,
+        IndexedDBThreadMsg::Sync(SyncOperation::AbortPendingUpgrades {
+            pending_upgrades: HashMap::from([(db_name.into(), HashSet::from([id]))]),
+            origin: ctx.origin.clone(),
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        recv_callback_timeout(&open, "open result"),
+        ConnectionMsg::AbortError { .. }
+    ));
+
+    let reopened = reopen_database(&ctx, db_name, "a");
+    put_and_commit(&ctx, db_name, reopened, A);
+    close_database(&ctx, reopened, db_name);
     ctx.shutdown();
 }

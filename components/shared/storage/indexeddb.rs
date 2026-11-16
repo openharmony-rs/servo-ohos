@@ -753,9 +753,26 @@ pub enum ConnectionEvent {
         serial: u64,
         event: TransactionEvent,
     },
-    /// <https://w3c.github.io/IndexedDB/#eventdef-idbdatabase-versionchange>: another
-    /// connection waits for this one to close, to open the database with `new_version`.
-    VersionChange { old_version: u64, new_version: u64 },
+    /// <https://w3c.github.io/IndexedDB/#eventdef-idbdatabase-versionchange>: the open or delete
+    /// request `request` waits for this connection to close, to open the database with
+    /// `new_version`, or to delete it if that is `None`. Script reports with
+    /// [`SyncOperation::NotifyEndOfVersionChange`] once the event was fired.
+    VersionChange {
+        old_version: u64,
+        new_version: Option<u64>,
+        request: Uuid,
+    },
+}
+
+/// What the backend reports about a request to delete a database
+/// (<https://w3c.github.io/IndexedDB/#delete-a-database>).
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum DeleteDatabaseEvent {
+    /// Step 8: connections to the database are still open after their versionchange events, so
+    /// a blocked event is fired at the request.
+    Blocked { old_version: u64 },
+    /// The request's result: the version the deleted database had, or 0 if there was none.
+    Done(BackendResult<u64>),
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -886,7 +903,7 @@ pub enum SyncOperation {
 
     /// Deletes the database
     DeleteDatabase(
-        GenericCallback<BackendResult<u64>>,
+        GenericCallback<DeleteDatabaseEvent>,
         ImmutableOrigin,
         // Database name.
         Utf16String,
@@ -901,10 +918,12 @@ pub enum SyncOperation {
         origin: ImmutableOrigin,
     },
 
+    /// The versionchange event that the open or delete request `request` fired at the connection
+    /// `id` was dispatched, or skipped as the connection's close is pending.
     NotifyEndOfVersionChange {
         id: Uuid,
         name: Utf16String,
-        old_version: u64,
+        request: Uuid,
         origin: ImmutableOrigin,
     },
 

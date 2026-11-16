@@ -12,8 +12,8 @@ use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::GenericSend;
 use servo_url::origin::ImmutableOrigin;
 use storage_traits::indexeddb::{
-    BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBObjectStore, IndexedDBThreadMsg,
-    IndexedDBTxnId, SyncOperation, Utf16String,
+    BackendResult, ConnectionEvent, ConnectionMsg, DeleteDatabaseEvent, IndexedDBObjectStore,
+    IndexedDBThreadMsg, IndexedDBTxnId, SyncOperation, Utf16String,
 };
 use stylo_atoms::Atom;
 use uuid::Uuid;
@@ -364,8 +364,24 @@ impl IDBOpenDBRequest {
         };
         let callback = GenericCallback::new(move |message| {
             let response_listener = response_listener.clone();
+            let event = match message {
+                Ok(event) => event,
+                Err(error) => return error!("Error in IndexedDB delete channel {error:?}."),
+            };
             task_source.queue(task!(request_callback: move |cx| {
-                response_listener.handle_delete_db(cx, message.unwrap());
+                match event {
+                    // https://w3c.github.io/IndexedDB/#delete-a-database
+                    // Step 8: If any of the connections in openConnections are still not closed,
+                    // queue a database task to fire a version change event named blocked at
+                    // request with db’s version and null.
+                    DeleteDatabaseEvent::Blocked { old_version } => response_listener
+                        .open_request
+                        .root()
+                        .dispatch_blocked(cx, old_version, None),
+                    DeleteDatabaseEvent::Done(result) => {
+                        response_listener.handle_delete_db(cx, result)
+                    },
+                }
             }))
         })
         .expect("Could not create delete database callback");

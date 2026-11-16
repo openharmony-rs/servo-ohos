@@ -8567,6 +8567,14 @@
    ],
    "IndexedDB": {
     "resources": {
+     "connection-holder.html": [
+      "1d7d4bf2b54269b1567797b3aec069002d0c10c5",
+      []
+     ],
+     "connection-holder.js": [
+      "cb8eab6592c3acf547b9194a1a6a5fcbf92952c1",
+      []
+     ],
      "removed-iframe-writer.html": [
       "728c70ad75c2804ca49320cd69afec1026e7fad8",
       []
@@ -11680,6 +11688,78 @@
          "IndexedDB: the connection of an aborted upgrade is closed"
         ]
        ]
+      }
+     ]
+    ],
+    "connection-queue-globals.html": [
+     "90a2a65a21d4fdd3bae6c41602b2526dd1463272",
+     [
+      null,
+      {
+       "timeout": "long"
+      }
+     ]
+    ],
+    "connection-queue.any.js": [
+     "bb994aef8f3c32ce8d6d1e858b9c5266b4e55df3",
+     [
+      "IndexedDB/connection-queue.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: connection queues, versionchange, blocked and close pending"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/connection-queue.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: connection queues, versionchange, blocked and close pending"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/connection-queue.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: connection queues, versionchange, blocked and close pending"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
       }
      ]
     ],

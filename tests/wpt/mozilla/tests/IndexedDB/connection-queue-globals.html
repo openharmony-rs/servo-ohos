@@ -1,0 +1,108 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>IndexedDB: versionchange and blocked across globals</title>
+<link rel="help" href="https://w3c.github.io/IndexedDB/#delete-a-database">
+<link rel="help" href="https://w3c.github.io/IndexedDB/#open-a-database-connection">
+<meta name="timeout" content="long">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+// Connections to one database from a window, a dedicated worker, a shared worker and an iframe:
+// an open or delete in the window fires versionchange at the connections of the other globals and
+// waits for them to close; the connection of a removed iframe counts as closed.
+
+function requestDone(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function createDatabase(t) {
+  const name = 'connection-queue-globals-' + Math.random();
+  t.add_cleanup(() => {
+    indexedDB.deleteDatabase(name);
+  });
+  const request = indexedDB.open(name, 1);
+  request.onupgradeneeded = () => request.result.createObjectStore('store');
+  (await requestDone(request)).close();
+  return name;
+}
+
+// Returns a function that resolves with the next message of `target`, in order.
+function messages(target) {
+  const queue = [];
+  const waiting = [];
+  target.onmessage = event => {
+    if (waiting.length) {
+      waiting.shift()(event.data);
+    } else {
+      queue.push(event.data);
+    }
+  };
+  return () => queue.length ? Promise.resolve(queue.shift()) :
+      new Promise(resolve => waiting.push(resolve));
+}
+
+promise_test(async t => {
+  const name = await createDatabase(t);
+  const worker = new Worker('resources/connection-holder.js');
+  t.add_cleanup(() => worker.terminate());
+  const next = messages(worker);
+  worker.postMessage({name, close: true});
+  assert_equals(await next(), 'opened');
+
+  const deletion = indexedDB.deleteDatabase(name);
+  deletion.onblocked = t.unreached_func('the worker closes its connection');
+  const deleted = await new Promise((resolve, reject) => {
+    deletion.onsuccess = resolve;
+    deletion.onerror = () => reject(deletion.error);
+  });
+  assert_equals(deleted.oldVersion, 1);
+  assert_equals(await next(), 'versionchange 1 null');
+}, 'A delete fires versionchange at a dedicated worker\'s connection, which closes');
+
+promise_test(async t => {
+  const name = await createDatabase(t);
+  const worker = new SharedWorker('resources/connection-holder.js?' + Math.random());
+  const next = messages(worker.port);
+  worker.port.postMessage({name, close: false});
+  assert_equals(await next(), 'opened');
+
+  const events = [];
+  const upgrade = indexedDB.open(name, 2);
+  upgrade.onblocked = event => {
+    events.push(`blocked ${event.oldVersion} ${event.newVersion}`);
+    worker.port.postMessage('close');
+  };
+  upgrade.onupgradeneeded = () => events.push('upgradeneeded');
+  (await requestDone(upgrade)).close();
+  events.push(await next());
+  events.push(await next());
+  assert_array_equals(events, ['blocked 1 2', 'upgradeneeded', 'versionchange 1 2', 'closed']);
+}, 'An upgrade is blocked by a shared worker\'s connection until it closes');
+
+promise_test(async t => {
+  const name = await createDatabase(t);
+  const frame = document.createElement('iframe');
+  const opened = new Promise(resolve => window.onmessage = event => resolve(event.data));
+  frame.src = 'resources/connection-holder.html?' + encodeURIComponent(name);
+  document.body.appendChild(frame);
+  t.add_cleanup(() => frame.remove());
+  assert_equals(await opened, 'opened');
+
+  const events = [];
+  const deletion = indexedDB.deleteDatabase(name);
+  deletion.onblocked = event => {
+    events.push(`blocked ${event.oldVersion} ${event.newVersion}`);
+    frame.remove();
+  };
+  await new Promise((resolve, reject) => {
+    deletion.onsuccess = resolve;
+    deletion.onerror = () => reject(deletion.error);
+  });
+  events.push('deleted');
+  assert_array_equals(events, ['blocked 1 null', 'deleted']);
+}, 'The connection of a removed iframe counts as closed');
+</script>
+<body></body>

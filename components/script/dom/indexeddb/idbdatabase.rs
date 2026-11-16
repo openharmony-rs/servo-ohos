@@ -166,11 +166,20 @@ impl IDBDatabase {
             ConnectionEvent::VersionChange {
                 old_version,
                 new_version,
+                request,
             } => {
                 // https://w3c.github.io/IndexedDB/#open-a-database-connection
-                // Step 10.2: fire a version change event named versionchange at entry with db’s
-                // version and version.
-                self.dispatch_versionchange(cx, old_version, Some(new_version));
+                // Step 10.2: For each entry of openConnections that does not have its close
+                // pending flag set to true, queue a database task to fire a version change event
+                // named versionchange at entry with db’s version and version.
+                // https://w3c.github.io/IndexedDB/#delete-a-database
+                // Step 6: [...] with db’s version and null.
+                // Note: "Firing this event might cause one or more of the other objects in
+                // openConnections to be closed, in which case the versionchange event is not
+                // fired at those objects, even if that hasn’t yet been done."
+                if !self.close_pending.get() {
+                    self.dispatch_versionchange(cx, old_version, new_version);
+                }
 
                 // Step 10.3: Wait for all of the events to be fired.
                 // Note: backend is at this step; sending a message to continue algo there.
@@ -178,7 +187,7 @@ impl IDBDatabase {
                 let operation = SyncOperation::NotifyEndOfVersionChange {
                     id: self.id,
                     name: self.name.clone(),
-                    old_version,
+                    request,
                     origin: global.origin().immutable().clone(),
                 };
                 if self
