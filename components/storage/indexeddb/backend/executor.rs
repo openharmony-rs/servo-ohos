@@ -204,6 +204,9 @@ pub(crate) enum SqlError {
     /// A statement that the RDB executor would reject, which the SQLite executor refuses too.
     #[cfg(feature = "sqlite-backend")]
     NotOnRdb(String),
+    /// A corrupt database, injected by a test.
+    #[cfg(test)]
+    InjectedCorruption,
 }
 
 impl fmt::Display for SqlError {
@@ -225,6 +228,8 @@ impl fmt::Display for SqlError {
             Self::Io(error) => error.fmt(formatter),
             #[cfg(feature = "sqlite-backend")]
             Self::NotOnRdb(sql) => write!(formatter, "statement that RDB would reject: {sql}"),
+            #[cfg(test)]
+            Self::InjectedCorruption => write!(formatter, "injected corruption"),
         }
     }
 }
@@ -270,10 +275,30 @@ impl SqlError {
         }
     }
 
-    /// The error to report for this one: QuotaExceeded for a full disk, DbErr otherwise.
+    /// Whether the error says that the database file is damaged (SQLITE_CORRUPT or
+    /// SQLITE_NOTADB), so that no statement on the database can be trusted any more.
+    fn makes_database_unusable(&self) -> bool {
+        match self {
+            #[cfg(feature = "sqlite-backend")]
+            Self::Sqlite(error) => matches!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+            ),
+            #[cfg(ohos_rdb)]
+            Self::Rdb(error) => super::rdb::is_corruption_error(error),
+            #[cfg(test)]
+            Self::InjectedCorruption => true,
+            _ => false,
+        }
+    }
+
+    /// The error to report for this one: QuotaExceeded for a full disk, Unusable for a damaged
+    /// database, DbErr otherwise.
     pub(crate) fn to_backend_error(&self) -> BackendError {
         if self.is_disk_full() {
             BackendError::QuotaExceeded
+        } else if self.makes_database_unusable() {
+            BackendError::Unusable(format!("{self:?}"))
         } else {
             BackendError::DbErr(format!("{self:?}"))
         }

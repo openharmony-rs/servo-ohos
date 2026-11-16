@@ -76,6 +76,12 @@ fn may_have_ended_transaction(error: &SqlError) -> bool {
         .any(|ended| ended.0 == *code))
 }
 
+/// Whether an RDB error reports a damaged database file.
+pub(crate) fn is_corruption_error(error: &OhosRdbError) -> bool {
+    matches!(error, OhosRdbError::Api { code, .. }
+        if *code == OH_Rdb_ErrCode::RDB_E_SQLITE_CORRUPT.0)
+}
+
 /// Whether an RDB error reports a full disk or an exceeded size limit.
 pub(crate) fn is_disk_full_error(error: &OhosRdbError) -> bool {
     matches!(error, OhosRdbError::Api { code, .. }

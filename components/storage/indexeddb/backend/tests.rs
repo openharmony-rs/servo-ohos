@@ -112,6 +112,7 @@ executor_tests!(
     test_begin_failure_fails_the_transaction,
     test_statement_failure_that_ends_the_transaction_fails_it,
     test_readonly_failure_that_ends_the_sql_transaction_fails_the_writer,
+    test_corrupt_database_makes_the_engine_unusable,
     test_commit_failure_rolls_back,
     test_batches_reply_in_dispatch_order,
     test_job_that_ends_the_sql_transaction_fails_the_writer,
@@ -2645,6 +2646,8 @@ pub(crate) struct Faults {
     /// Fail the statement or query whose SQL contains this text, after letting the given number
     /// of them through, and end the open transaction the way SQLite does after SQLITE_FULL.
     statement: Option<(&'static str, usize)>,
+    /// Make that failure report a corrupt database.
+    corrupt: bool,
     /// Leave the database in place on delete, as RDB does when it can't remove the files.
     keep_on_delete: bool,
 }
@@ -2674,8 +2677,12 @@ impl<X: SqlExecutor> Faulty<X> {
         match &mut faults.statement {
             Some((text, 0)) if sql.contains(*text) => {
                 faults.statement = None;
+                let corrupt = faults.corrupt;
                 drop(faults);
                 let _ = self.inner.rollback();
+                if corrupt {
+                    return Err(SqlError::InjectedCorruption);
+                }
                 Err(SqlError::TransactionState("injected statement failure"))
             },
             Some((text, before)) if sql.contains(*text) => {
@@ -2870,6 +2877,43 @@ fn test_statement_failure_that_ends_the_transaction_fails_it<X: SqlExecutor>() {
     assert!(recv(&gets[1].1).is_err());
     assert_eq!(recv(&gets[2].1), Ok(Some(stored_value(1.0, vec![1]))));
     assert_eq!(commit(&db, 2), Ok(()));
+}
+
+/// A failure that reports a corrupt database fails its request with Unusable and marks the
+/// engine unusable, so that the manager closes the database's connections; other failures don't.
+fn test_corrupt_database_makes_the_engine_unusable<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_faulty_engine::<X>(&dir);
+    let puts = [get_callback()];
+    run_batch(&db, 1, IndexedDBTxnMode::Readwrite, put_requests(&puts, 2));
+    assert!(recv(&puts[0].1).is_ok());
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    faults_for(dir.path()).lock().unwrap().statement = Some(("FROM object_data", 0));
+    let get = get_callback::<GetReply>();
+    run_batch(
+        &db,
+        2,
+        IndexedDBTxnMode::Readonly,
+        vec![get_request(get.0, 1.0)],
+    );
+    assert!(matches!(recv(&get.1), Err(BackendError::DbErr(_))));
+    assert!(!db.is_unusable());
+
+    let faults = faults_for(dir.path());
+    let mut injected = faults.lock().unwrap();
+    injected.statement = Some(("FROM object_data", 0));
+    injected.corrupt = true;
+    drop(injected);
+    let get = get_callback::<GetReply>();
+    run_batch(
+        &db,
+        3,
+        IndexedDBTxnMode::Readonly,
+        vec![get_request(get.0, 1.0)],
+    );
+    assert!(matches!(recv(&get.1), Err(BackendError::Unusable(_))));
+    assert!(db.is_unusable());
 }
 
 /// A readonly request runs inside the open SQL transaction of a writer with a disjoint scope. If

@@ -38,6 +38,10 @@ pub enum BackendError {
     /// A unique index got the same key for two records while it was populated, which aborts the
     /// upgrade transaction with a "ConstraintError" DOMException.
     Constraint,
+    /// The database can't be used any more, for example because its file is corrupt: the
+    /// transaction fails, and the backend closes every connection to the database with the
+    /// forced flag (<https://w3c.github.io/IndexedDB/#close-a-database-connection>).
+    Unusable(DbError),
 
     DbErr(DbError),
 }
@@ -56,6 +60,7 @@ impl Display for BackendError {
             BackendError::QuotaExceeded => write!(f, "QuotaExceeded"),
             BackendError::Abort => write!(f, "Abort"),
             BackendError::Constraint => write!(f, "Constraint"),
+            BackendError::Unusable(err) => write!(f, "Unusable database: {err}"),
             BackendError::DbErr(err) => write!(f, "{err}"),
         }
     }
@@ -762,6 +767,10 @@ pub enum ConnectionEvent {
         new_version: Option<u64>,
         request: Uuid,
     },
+    /// <https://w3c.github.io/IndexedDB/#close-a-database-connection> with the forced flag: the
+    /// backend can't use the database any more and has set the connection's close pending flag.
+    /// Script aborts the connection's transactions and fires close once they have finished.
+    ForcedClose,
 }
 
 /// What the backend reports about a request to delete a database

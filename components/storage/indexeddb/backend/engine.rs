@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 
 use log::{error, warn};
@@ -39,6 +40,7 @@ use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction, Transac
 pub(crate) struct SqlEngine<X: SqlExecutor> {
     actor: Arc<Actor<X>>,
     metadata: Arc<Mutex<Metadata>>,
+    unusable: Arc<AtomicBool>,
     created_db_path: bool,
 }
 
@@ -51,6 +53,7 @@ impl<X: SqlExecutor> SqlEngine<X> {
     ) -> Result<Self, SqlError> {
         let (mut executor, created_database) = schema::open_database::<X>(&path, db_info)?;
         let metadata = Arc::new(Mutex::new(Metadata::load(&mut executor)?));
+        let unusable = Arc::new(AtomicBool::new(false));
         Ok(Self {
             actor: Arc::new(Actor {
                 pool,
@@ -64,12 +67,14 @@ impl<X: SqlExecutor> SqlEngine<X> {
                     upgrade: None,
                     versionchange: None,
                     metadata: metadata.clone(),
+                    unusable: unusable.clone(),
                     failed: FxHashMap::default(),
                     population: None,
                     stores: StoreRows::default(),
                 })),
             }),
             metadata,
+            unusable,
             created_db_path: created || created_database,
         })
     }
@@ -296,6 +301,8 @@ pub(super) struct Database<X> {
     versionchange: Option<IndexedDBTxnId>,
     /// The metadata as of the last commit, which the [`SqlEngine`] reads.
     metadata: Arc<Mutex<Metadata>>,
+    /// Set once a failure showed that the database can't be used any more.
+    unusable: Arc<AtomicBool>,
     /// Transactions whose changes were rolled back by a failure, with the error that their later
     /// requests and their commit report, until the transaction aborts.
     failed: FxHashMap<IndexedDBTxnId, BackendError>,
@@ -442,6 +449,7 @@ impl<X: SqlExecutor> Database<X> {
             return results.send(request.failure_event(error.clone()));
         }
         if writes && let Err(error) = self.begin(transaction) {
+            self.note_failure(&error);
             return results.send(request.failure_event(error));
         }
         let populating = self
@@ -450,6 +458,9 @@ impl<X: SqlExecutor> Database<X> {
             .filter(|population| population.transaction == transaction)
             .and_then(|population| population.index);
         let outcome = run_request(&mut self.executor, &mut self.stores, request, populating);
+        if let Some(failure) = &outcome.failure {
+            self.note_failure(failure.error());
+        }
         if let Some(event) = outcome.event {
             results.send(event);
         }
@@ -482,6 +493,13 @@ impl<X: SqlExecutor> Database<X> {
                 }
             },
             None => {},
+        }
+    }
+
+    /// Notes a failure that shows that the database can't be used any more.
+    fn note_failure(&self, error: &BackendError) {
+        if matches!(error, BackendError::Unusable(_)) {
+            self.unusable.store(true, Ordering::Release);
         }
     }
 
@@ -676,8 +694,13 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
         transaction: IndexedDBTxnId,
         on_done: Box<dyn FnOnce(BackendResult<()>) + Send>,
     ) {
-        self.actor
-            .spawn(move |database| on_done(database.commit(transaction)));
+        self.actor.spawn(move |database| {
+            let result = database.commit(transaction);
+            if let Err(error) = &result {
+                database.note_failure(error);
+            }
+            on_done(result)
+        });
     }
 
     fn rollback(&self, transaction: IndexedDBTxnId, on_done: Box<dyn FnOnce() + Send>) {
@@ -685,6 +708,10 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
             database.abort(transaction);
             on_done();
         });
+    }
+
+    fn is_unusable(&self) -> bool {
+        self.unusable.load(Ordering::Acquire)
     }
 
     fn object_stores(&self) -> Vec<IndexedDBObjectStore> {

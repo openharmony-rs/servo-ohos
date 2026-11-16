@@ -152,6 +152,12 @@ pub trait KvsEngine: MallocSizeOf {
     /// `on_done` once it is undone.
     fn rollback(&self, transaction: IndexedDBTxnId, on_done: Box<dyn FnOnce() + Send>);
 
+    /// Whether a failure has shown that the database can't be used any more
+    /// ([`BackendError::Unusable`]), so that its connections must be closed.
+    fn is_unusable(&self) -> bool {
+        false
+    }
+
     // The metadata reads answer as of the last commit, without waiting for the work handed over.
     /// The object stores of the database, in the order they were created.
     fn object_stores(&self) -> Vec<IndexedDBObjectStore>;

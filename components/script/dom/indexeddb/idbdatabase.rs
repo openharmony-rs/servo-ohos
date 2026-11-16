@@ -24,6 +24,7 @@ use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::IDBTransacti
 use crate::dom::bindings::codegen::UnionTypes::StringOrStringSequence;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
@@ -198,7 +199,42 @@ impl IDBDatabase {
                     error!("Failed to send SyncOperation::NotifyEndOfVersionChange.");
                 }
             },
+            ConnectionEvent::ForcedClose => self.close_by_user_agent(cx),
         }
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#close-a-database-connection> with the forced flag, run
+    /// when the backend can't use the database any more.
+    fn close_by_user_agent(&self, cx: &mut JSContext) {
+        // Step 1: Set connection’s close pending flag to true.
+        self.close_pending.set(true);
+
+        // Step 2: If the forced flag is true, then for each transaction created using connection
+        // run abort a transaction with transaction and newly created "AbortError" DOMException.
+        let transactions: Vec<DomRoot<IDBTransaction>> = self
+            .transactions
+            .borrow()
+            .iter()
+            .map(|transaction| transaction.as_rooted())
+            .collect();
+        for transaction in transactions {
+            transaction.abort(
+                cx,
+                Error::Abort(Some("The database connection was closed".to_owned())),
+            );
+        }
+
+        // Step 3: Wait for all transactions created using connection to complete. Once they are
+        // complete, connection is closed.
+        // Step 4: If the forced flag is true, then fire an event named close at connection.
+        // Note: the tasks that finish the aborted transactions were queued before this one.
+        let this = Trusted::new(self);
+        self.global()
+            .task_manager()
+            .database_access_task_source()
+            .queue(task!(fire_indexeddb_close: move |cx| {
+                this.root().upcast::<EventTarget>().fire_event(cx, atom!("close"));
+            }));
     }
 
     /// The names of the connection's object stores, sorted.

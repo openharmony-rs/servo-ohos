@@ -889,9 +889,13 @@ impl IndexedDBManager {
 
                         // If more requests were queued while this batch was running,
                         // schedule again now.
-                        db.schedule_transactions(origin, &db_name);
+                        db.schedule_transactions(origin.clone(), &db_name);
                         db.commit_ready_transactions();
                     }
+                    self.close_connections_if_unusable(IndexedDBDescription {
+                        origin,
+                        name: db_name,
+                    });
                 },
                 IndexedDBThreadMsg::CollectMemoryReport(sender) => {
                     let reports = self.collect_memory_reports();
@@ -1372,6 +1376,63 @@ impl IndexedDBManager {
         self.remove_connection(key, &id);
     }
 
+    /// <https://w3c.github.io/IndexedDB/#database-connection>: "A connection may be closed by a
+    /// user agent in exceptional circumstances, for example due to loss of access to the file
+    /// system, a permission change, or clearing of the storage key's storage. If this occurs the
+    /// user agent must run close a database connection with the connection and with the forced
+    /// flag set to true." Servo does so for the connections to a database that a failure has
+    /// shown to be unusable, such as a corrupt one.
+    fn close_connections_if_unusable(&mut self, key: IndexedDBDescription) {
+        if !self
+            .databases
+            .get(&key)
+            .is_some_and(|db| db.engine.is_unusable())
+        {
+            return;
+        }
+        let Some(connections) = self.connections.get_mut(&key) else {
+            return;
+        };
+        let mut closing = Vec::new();
+        let mut gone = Vec::new();
+        for (id, connection) in connections.iter_mut() {
+            if connection.close_pending {
+                continue;
+            }
+            // <https://w3c.github.io/IndexedDB/#close-a-database-connection>
+            // Step 1: Set connection’s close pending flag to true.
+            connection.close_pending = true;
+            // Step 2: If the forced flag is true, then for each transaction created using
+            // connection run abort a transaction with transaction and newly created
+            // "AbortError" DOMException.
+            // Step 4: If the forced flag is true, then fire an event named close at connection.
+            // Note: script does both, and reports each aborted transaction as finished.
+            if connection
+                .results
+                .send(ConnectionEvent::ForcedClose)
+                .is_err()
+            {
+                debug!("Script went away before its connection was closed");
+                gone.push(*id);
+            }
+            closing.push(*id);
+        }
+        if closing.is_empty() {
+            return;
+        }
+        warn!("Closing the connections to an unusable IndexedDB database");
+        for id in gone {
+            self.close_connection_of_gone_global(&key, id);
+        }
+        // Step 3: Wait for all transactions created using connection to complete. Once they are
+        // complete, connection is closed.
+        for id in closing {
+            self.versionchange_settled(&key, id, None);
+            self.remove_connection_if_closed(&key, id);
+        }
+        self.advance_connection_queue(key);
+    }
+
     /// Revert the backing database state after aborting an upgrade transaction.
     ///
     /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
@@ -1644,6 +1705,19 @@ impl IndexedDBManager {
             debug_assert!(false, "The request's storage proxy map should be there.");
             return false;
         };
+
+        // A database that a failure showed to be unusable is opened again, once its connections
+        // are closed.
+        if self
+            .databases
+            .get(key)
+            .is_some_and(|db| db.engine.is_unusable())
+        {
+            if self.connections.contains_key(key) {
+                return false;
+            }
+            self.databases.remove(key);
+        }
 
         // Step 4: Let db be the database named name in storageKey, or null otherwise.
         let created = if self.databases.contains_key(key) {
@@ -2046,6 +2120,7 @@ impl IndexedDBManager {
                     name: db_name,
                 };
                 self.remove_connection_if_closed(&key, txn.connection);
+                self.close_connections_if_unusable(key.clone());
                 self.advance_connection_queue(key);
             },
             SyncOperation::CreateTransaction {
