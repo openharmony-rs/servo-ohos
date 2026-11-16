@@ -431,9 +431,9 @@ impl RangeCondition {
         self.sql.replace("{}", column)
     }
 
-    /// The parameters for `object_store_id = ?` followed by this condition.
-    fn params(&self, store: &ObjectStore) -> Vec<SqlParam<'_>> {
-        std::iter::once(SqlParam::Integer(store.id))
+    /// The parameters for an `id = ?` condition with `id` followed by this condition.
+    fn params(&self, id: i64) -> Vec<SqlParam<'_>> {
+        std::iter::once(SqlParam::Integer(id))
             .chain(self.bounds.iter().map(|bound| SqlParam::Blob(bound)))
             .collect()
     }
@@ -464,29 +464,117 @@ fn range_condition(range: &IndexedDBKeyRange) -> RangeCondition {
     condition
 }
 
-/// Selects `columns` of the records of `store` in `range`, in ascending key order or descending
+/// The records that a read reads: those of an object store, or those of an index, whose keys are
+/// index keys and whose values are the keys of the records of the index's store, which hold the
+/// referenced values. Both are in key order, and an index's secondarily in value order.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RecordSource<'a> {
+    ObjectStore(&'a ObjectStore),
+    Index(StoreIndex),
+}
+
+/// What a read selects of each record, in this order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RecordColumns {
+    /// The primary key: the key of a store's record, the value of an index's record.
+    PrimaryKey,
+    /// The primary key and the (referenced) value.
+    Value,
+    /// The key, the primary key and the (referenced) value.
+    Record,
+}
+
+impl RecordSource<'_> {
+    /// The `FROM` and `WHERE` clause of a read of `columns` of the records whose keys meet
+    /// `condition`, which needs [`RecordSource::id`] and the condition's bounds as parameters,
+    /// and the selected columns.
+    fn table_and_condition(
+        &self,
+        columns: RecordColumns,
+        condition: &RangeCondition,
+    ) -> (String, String) {
+        let (from, key, primary_key, value) = match self {
+            Self::ObjectStore(_) => (
+                "object_data AS o WHERE o.object_store_id = ?".to_owned(),
+                "o.key",
+                "o.key",
+                "o.data",
+            ),
+            Self::Index(index) if columns == RecordColumns::PrimaryKey => (
+                format!("{} AS i WHERE i.index_id = ?", index.table()),
+                "i.value",
+                "i.object_data_key",
+                "",
+            ),
+            Self::Index(index) => (
+                format!(
+                    "{} AS i JOIN object_data AS o \
+                     ON o.object_store_id = i.object_store_id AND o.key = i.object_data_key \
+                     WHERE i.index_id = ?",
+                    index.table()
+                ),
+                "i.value",
+                "i.object_data_key",
+                "o.data",
+            ),
+        };
+        let selected = match columns {
+            RecordColumns::PrimaryKey => primary_key.to_owned(),
+            RecordColumns::Value => format!("{primary_key}, {value}"),
+            RecordColumns::Record => format!("{key}, {primary_key}, {value}"),
+        };
+        (format!("{from}{}", condition.on(key)), selected)
+    }
+
+    /// The `ORDER BY` terms of the records in key order, or in reverse order.
+    fn order(&self, reverse: bool) -> &'static str {
+        match (self, reverse) {
+            (Self::ObjectStore(_), false) => "o.key ASC",
+            (Self::ObjectStore(_), true) => "o.key DESC",
+            // A unique index has one record per key.
+            (Self::Index(StoreIndex { unique: true, .. }), false) => "i.value ASC",
+            (Self::Index(StoreIndex { unique: true, .. }), true) => "i.value DESC",
+            (Self::Index(_), false) => "i.value ASC, i.object_data_key ASC",
+            (Self::Index(_), true) => "i.value DESC, i.object_data_key DESC",
+        }
+    }
+
+    /// The id that the `WHERE` clause of [`RecordSource::table_and_condition`] compares.
+    fn id(&self) -> i64 {
+        match self {
+            Self::ObjectStore(store) => store.id,
+            Self::Index(index) => index.id,
+        }
+    }
+}
+
+/// Selects `columns` of the records of `source` in `range`, in ascending key order or descending
 /// if `reverse` is set, at most `count` of them.
 fn select_records<X: SqlExecutor, T>(
     executor: &mut X,
-    columns: &str,
-    store: &ObjectStore,
+    source: RecordSource,
+    columns: RecordColumns,
     range: &IndexedDBKeyRange,
     count: Option<u32>,
     reverse: bool,
     map_row: impl Fn(&dyn SqlRow) -> Result<T, SqlError>,
 ) -> Result<Vec<T>, SqlError> {
     let condition = range_condition(range);
+    let (table_and_condition, selected) = source.table_and_condition(columns, &condition);
     let mut sql = format!(
-        "SELECT {columns} FROM object_data WHERE object_store_id = ?{} ORDER BY key {}",
-        condition.on("key"),
-        if reverse { "DESC" } else { "ASC" }
+        "SELECT {selected} FROM {table_and_condition} ORDER BY {}",
+        source.order(reverse)
     );
-    let mut params = condition.params(store);
+    let mut params = condition.params(source.id());
     if let Some(count) = count {
         sql.push_str(" LIMIT ?");
         params.push(SqlParam::Integer(count.into()));
     }
     query_rows(executor, &sql, &params, map_row)
+}
+
+fn primary_key_of_row(row: &dyn SqlRow) -> Result<IndexedDBKeyType, SqlError> {
+    decode_key(&row.blob(0)?)
 }
 
 fn value_of_row(row: &dyn SqlRow) -> Result<IndexedDBValue, SqlError> {
@@ -496,15 +584,23 @@ fn value_of_row(row: &dyn SqlRow) -> Result<IndexedDBValue, SqlError> {
     })
 }
 
+/// <https://w3c.github.io/IndexedDB/#retrieve-a-value-from-an-object-store> and
+/// <https://w3c.github.io/IndexedDB/#retrieve-a-referenced-value-from-an-index>, with the
+/// primary key of the record, which script needs to inject a generated key.
 pub(crate) fn get_value<X: SqlExecutor>(
     executor: &mut X,
-    store: &ObjectStore,
+    source: RecordSource,
     range: &IndexedDBKeyRange,
 ) -> Result<Option<IndexedDBValue>, SqlError> {
+    // Step 1. Let record be the first record in source’s list of records whose key is in range,
+    // if any.
+    // Step 2. If record was not found, return undefined.
+    // Step 3. Let serialized be record’s (referenced) value.
+    // NOTE: Script deserializes it.
     Ok(select_records(
         executor,
-        "key, data",
-        store,
+        source,
+        RecordColumns::Value,
         range,
         Some(1),
         false,
@@ -513,82 +609,116 @@ pub(crate) fn get_value<X: SqlExecutor>(
     .pop())
 }
 
+/// <https://w3c.github.io/IndexedDB/#retrieve-a-key-from-an-object-store> and
+/// <https://w3c.github.io/IndexedDB/#retrieve-a-value-from-an-index>: the primary key of the
+/// first record in `range`.
 pub(crate) fn get_key<X: SqlExecutor>(
     executor: &mut X,
-    store: &ObjectStore,
+    source: RecordSource,
     range: &IndexedDBKeyRange,
 ) -> Result<Option<IndexedDBKeyType>, SqlError> {
-    Ok(
-        select_records(executor, "key", store, range, Some(1), false, |row| {
-            decode_key(&row.blob(0)?)
-        })?
-        .pop(),
-    )
+    Ok(select_records(
+        executor,
+        source,
+        RecordColumns::PrimaryKey,
+        range,
+        Some(1),
+        false,
+        primary_key_of_row,
+    )?
+    .pop())
 }
 
+/// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-object-store> and
+/// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-index>, step 1: a count
+/// that is not given or 0 means every record.
+fn retrieved_count(count: Option<u32>) -> Option<u32> {
+    count.filter(|count| *count != 0)
+}
+
+/// The primary keys of the first `count` records of `source` in `range`: retrieve multiple
+/// items with kind "key" and direction "next".
 pub(crate) fn get_all_keys<X: SqlExecutor>(
     executor: &mut X,
-    store: &ObjectStore,
+    source: RecordSource,
     range: &IndexedDBKeyRange,
     count: Option<u32>,
 ) -> Result<Vec<IndexedDBKeyType>, SqlError> {
-    select_records(executor, "key", store, range, count, false, |row| {
-        decode_key(&row.blob(0)?)
-    })
+    select_records(
+        executor,
+        source,
+        RecordColumns::PrimaryKey,
+        range,
+        retrieved_count(count),
+        false,
+        primary_key_of_row,
+    )
 }
 
+/// The (referenced) values of the first `count` records of `source` in `range`, with their
+/// primary keys: retrieve multiple items with kind "value" and direction "next".
 pub(crate) fn get_all_values<X: SqlExecutor>(
     executor: &mut X,
-    store: &ObjectStore,
+    source: RecordSource,
     range: &IndexedDBKeyRange,
     count: Option<u32>,
 ) -> Result<Vec<IndexedDBValue>, SqlError> {
     select_records(
         executor,
-        "key, data",
-        store,
+        source,
+        RecordColumns::Value,
         range,
-        count,
+        retrieved_count(count),
         false,
         value_of_row,
     )
 }
 
-/// The records of `store` in `range` in ascending key order: the first `count` of them, or the
+/// The records of `source` in `range` in ascending key order: the first `count` of them, or the
 /// last `count` if `reverse` is set.
 pub(crate) fn get_records<X: SqlExecutor>(
     executor: &mut X,
-    store: &ObjectStore,
+    source: RecordSource,
     range: &IndexedDBKeyRange,
     count: Option<u32>,
     reverse: bool,
 ) -> Result<Vec<IndexedDBRecord>, SqlError> {
-    let mut records = select_records(executor, "key, data", store, range, count, reverse, |row| {
-        let key = decode_key(&row.blob(0)?)?;
-        Ok(IndexedDBRecord {
-            key: key.clone(),
-            primary_key: key,
-            value: row.blob(1)?,
-        })
-    })?;
+    let mut records = select_records(
+        executor,
+        source,
+        RecordColumns::Record,
+        range,
+        count,
+        reverse,
+        |row| {
+            Ok(IndexedDBRecord {
+                key: decode_key(&row.blob(0)?)?,
+                primary_key: decode_key(&row.blob(1)?)?,
+                value: row.blob(2)?,
+            })
+        },
+    )?;
     if reverse {
         records.reverse();
     }
     Ok(records)
 }
 
+/// <https://w3c.github.io/IndexedDB/#count-the-records-in-a-range>
 pub(crate) fn count<X: SqlExecutor>(
     executor: &mut X,
-    store: &ObjectStore,
+    source: RecordSource,
     range: &IndexedDBKeyRange,
 ) -> Result<u64, SqlError> {
+    // Step 1. Let count be the number of records, if any, in source’s list of records with key
+    // in range.
     let condition = range_condition(range);
-    let sql = format!(
-        "SELECT COUNT(*) FROM object_data WHERE object_store_id = ?{}",
-        condition.on("key")
-    );
-    let params = condition.params(store);
+    let (table_and_condition, _) =
+        source.table_and_condition(RecordColumns::PrimaryKey, &condition);
+    let sql = format!("SELECT COUNT(*) FROM {table_and_condition}");
+    let params = condition.params(source.id());
     let count = query_row(executor, &sql, &params, |row| row.integer(0))?.unwrap_or_default();
+    // Step 2. Return count.
     Ok(count as u64)
 }
 
@@ -723,7 +853,7 @@ fn delete_index_records<X: SqlExecutor>(
     store: &ObjectStore,
     condition: &RangeCondition,
 ) -> Result<(), SqlError> {
-    let params = condition.params(store);
+    let params = condition.params(store.id);
     for table in store.index_tables() {
         let sql = format!(
             "DELETE FROM {table} WHERE object_store_id = ?{}",
@@ -983,7 +1113,7 @@ pub(crate) fn delete_records<X: SqlExecutor>(
         "DELETE FROM object_data WHERE object_store_id = ?{}",
         condition.on("key")
     );
-    executor.execute(&sql, &condition.params(store))?;
+    executor.execute(&sql, &condition.params(store.id))?;
     // Step 3. Return undefined.
     Ok(())
 }

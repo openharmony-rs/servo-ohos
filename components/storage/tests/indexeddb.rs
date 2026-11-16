@@ -719,6 +719,7 @@ fn get_all_keys_request(
         request_id,
         IndexedDBTxnMode::Readonly,
         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
+            index: None,
             key_range,
             count: None,
         }),
@@ -766,6 +767,7 @@ fn get_item(
         1,
         IndexedDBTxnMode::Readonly,
         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+            index: None,
             key_range: IndexedDBKeyRange::only(key),
         }),
     )
@@ -2158,6 +2160,7 @@ fn test_indexeddb_results_reach_the_connection_in_request_order() {
         0,
         IndexedDBTxnMode::Readonly,
         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
+            index: None,
             key_range: IndexedDBKeyRange::default(),
             count: None,
         }),

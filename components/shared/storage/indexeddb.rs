@@ -500,26 +500,47 @@ pub enum PutItemResult {
     UniqueIndexKeyExists(IndexedDBIndexId),
 }
 
+/// The reads of the records of the object store that [`IndexedDBThreadMsg::Async`] names, or,
+/// with `index`, of the records of that index of the store: in (index key, primary key) order,
+/// with the index key as the key of each record and the primary key as its value, which refers
+/// to the store's record and its value.
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum AsyncReadOnlyOperation {
-    /// Gets the value associated with the given key in the associated idb data
+    /// The primary key of the first record in `key_range`:
+    /// <https://w3c.github.io/IndexedDB/#retrieve-a-key-from-an-object-store> and
+    /// <https://w3c.github.io/IndexedDB/#retrieve-a-value-from-an-index>.
     GetKey {
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
     },
+    /// The (referenced) value of the first record in `key_range`:
+    /// <https://w3c.github.io/IndexedDB/#retrieve-a-value-from-an-object-store> and
+    /// <https://w3c.github.io/IndexedDB/#retrieve-a-referenced-value-from-an-index>.
     GetItem {
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
     },
 
+    /// The primary keys of the first `count` records in `key_range`, or of all of them if
+    /// `count` is `None` or 0: <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-object-store>
+    /// and <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-index> with kind
+    /// "key" and direction "next".
     GetAllKeys {
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
     },
+    /// The (referenced) values of the records that [`AsyncReadOnlyOperation::GetAllKeys`] gets
+    /// the keys of: kind "value".
     GetAllItems {
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
     },
 
+    /// <https://w3c.github.io/IndexedDB/#count-the-records-in-a-range>
     Count {
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
     },
     /// Gets the records in `key_range` in ascending key order: the first `count` of them, or the

@@ -18,7 +18,7 @@ use storage_traits::indexeddb::{
 };
 
 use super::executor::{SqlError, SqlExecutor, TransactionBehavior};
-use super::queries::{self, ObjectStore};
+use super::queries::{self, ObjectStore, RecordSource};
 use super::schema;
 use crate::indexeddb::IndexedDBDescription;
 use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction, TransactionResults};
@@ -769,41 +769,53 @@ fn run_read_only<X: SqlExecutor>(
     store: &ObjectStore,
     operation: AsyncReadOnlyOperation,
 ) -> (BackendResult<RequestOutput>, Option<Failure>) {
-    match operation {
-        AsyncReadOnlyOperation::GetKey { key_range } => outcome(
-            queries::get_key(executor, store, &key_range),
-            RequestOutput::Key,
-            Failure::Read,
-        ),
-        AsyncReadOnlyOperation::GetItem { key_range } => outcome(
-            queries::get_value(executor, store, &key_range),
-            RequestOutput::Value,
-            Failure::Read,
-        ),
-        AsyncReadOnlyOperation::GetAllKeys { key_range, count } => outcome(
-            queries::get_all_keys(executor, store, &key_range, count),
-            RequestOutput::Keys,
-            Failure::Read,
-        ),
-        AsyncReadOnlyOperation::GetAllItems { key_range, count } => outcome(
-            queries::get_all_values(executor, store, &key_range, count),
-            RequestOutput::Values,
-            Failure::Read,
-        ),
-        AsyncReadOnlyOperation::Count { key_range } => outcome(
-            queries::count(executor, store, &key_range),
-            RequestOutput::Count,
-            Failure::Read,
-        ),
+    // The records the request reads: the store's, or those of one of its indexes, which must
+    // exist, since script and the backend agree on the indexes of the store.
+    let source = |index: Option<IndexedDBIndexId>| match index {
+        None => Ok(RecordSource::ObjectStore(store)),
+        Some(index) => store
+            .index(index)
+            .map(RecordSource::Index)
+            .ok_or_else(|| BackendError::DbErr(format!("The object store has no index {index}"))),
+    };
+    let result = match operation {
+        AsyncReadOnlyOperation::GetKey { index, key_range } => source(index)
+            .map(|source| queries::get_key(executor, source, &key_range).map(RequestOutput::Key)),
+        AsyncReadOnlyOperation::GetItem { index, key_range } => source(index).map(|source| {
+            queries::get_value(executor, source, &key_range).map(RequestOutput::Value)
+        }),
+        AsyncReadOnlyOperation::GetAllKeys {
+            index,
+            key_range,
+            count,
+        } => source(index).map(|source| {
+            queries::get_all_keys(executor, source, &key_range, count).map(RequestOutput::Keys)
+        }),
+        AsyncReadOnlyOperation::GetAllItems {
+            index,
+            key_range,
+            count,
+        } => source(index).map(|source| {
+            queries::get_all_values(executor, source, &key_range, count).map(RequestOutput::Values)
+        }),
+        AsyncReadOnlyOperation::Count { index, key_range } => source(index)
+            .map(|source| queries::count(executor, source, &key_range).map(RequestOutput::Count)),
         AsyncReadOnlyOperation::Iterate {
             key_range,
             count,
             reverse,
-        } => outcome(
-            queries::get_records(executor, store, &key_range, count, reverse),
-            RequestOutput::Records,
-            Failure::Read,
-        ),
+        } => Ok(queries::get_records(
+            executor,
+            RecordSource::ObjectStore(store),
+            &key_range,
+            count,
+            reverse,
+        )
+        .map(RequestOutput::Records)),
+    };
+    match result {
+        Ok(result) => outcome(result, |output| output, Failure::Read),
+        Err(error) => (Err(error), None),
     }
 }
 

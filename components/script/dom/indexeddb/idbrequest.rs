@@ -27,7 +27,7 @@ use crate::dom::bindings::codegen::Bindings::IDBRequestBinding::{
 };
 use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::IDBTransactionMode;
 use crate::dom::bindings::codegen::UnionTypes::IDBObjectStoreOrIDBIndexOrIDBCursor;
-use crate::dom::bindings::error::{Error, Fallible, create_dom_exception};
+use crate::dom::bindings::error::{Error, ErrorResult, Fallible, create_dom_exception};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
@@ -40,7 +40,7 @@ use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
 use crate::dom::indexeddb::idbindex::IDBIndex;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
-use crate::dom::indexeddb::key::key_type_to_jsval;
+use crate::dom::indexeddb::key::{convert_value_to_key_range, key_type_to_jsval};
 
 pub enum IdbResult {
     Key(IndexedDBKeyType),
@@ -155,6 +155,14 @@ impl RequestSource<'_> {
             Self::Cursor(cursor) => cursor.effective_object_store(),
         }
     }
+
+    fn verify_not_deleted(&self) -> ErrorResult {
+        match self {
+            Self::ObjectStore(store) => store.verify_not_deleted(),
+            Self::Index(index) => index.verify_not_deleted(),
+            Self::Cursor(cursor) => cursor.verify_not_deleted(),
+        }
+    }
 }
 
 /// A [`RequestSource`] that a request keeps.
@@ -164,6 +172,14 @@ enum SourceHandle {
     ObjectStore(Dom<IDBObjectStore>),
     Index(Dom<IDBIndex>),
     Cursor(Dom<IDBCursor>),
+}
+
+/// <https://w3c.github.io/IndexedDB/#create-a-request-to-retrieve-multiple-items>: what the
+/// request retrieves of each record.
+#[derive(Clone, Copy)]
+pub(crate) enum RetrievalKind {
+    Key,
+    Value,
 }
 
 #[dom_struct]
@@ -321,6 +337,79 @@ impl IDBRequest {
 
         // Step 6: Return request.
         Ok(request)
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#create-a-request-to-retrieve-multiple-items>, for a
+    /// `queryOrOptions` that is a query: from an object store or an index `source_handle`.
+    pub(crate) fn retrieve_multiple_items(
+        cx: &mut JSContext,
+        source_handle: RequestSource,
+        kind: RetrievalKind,
+        query: HandleValue,
+        count: Option<u32>,
+    ) -> Fallible<DomRoot<IDBRequest>> {
+        // Step 1. Let source be an index or an object store from sourceHandle. If sourceHandle
+        // is an index handle, then source is the index handle’s associated index. Otherwise,
+        // source is the object store handle’s associated object store.
+        let index = match source_handle {
+            RequestSource::ObjectStore(_) => None,
+            RequestSource::Index(index) => Some(index.id()),
+            RequestSource::Cursor(_) => unreachable!("Only object stores and indexes get all"),
+        };
+
+        // Step 2. If source has been deleted, throw an "InvalidStateError" DOMException.
+        // Step 3. If source is an index and source’s object store has been deleted, throw an
+        // "InvalidStateError" DOMException.
+        source_handle.verify_not_deleted()?;
+
+        // Step 4. Let transaction be sourceHandle’s transaction.
+        let transaction = source_handle.object_store().transaction();
+
+        // Step 5. If transaction’s state is not active, then throw a "TransactionInactiveError"
+        // DOMException.
+        if !transaction.is_active() || !transaction.is_usable() {
+            return Err(Error::TransactionInactive(Some(
+                "Transaction is not active".to_owned(),
+            )));
+        }
+
+        // Step 6. Let range be a key range.
+        // Step 7. Let direction be a cursor direction.
+        // Step 8. If running is a potentially valid key range with queryOrOptions is true, then:
+        // Step 8.1. Set range to the result of converting a value to a key range with
+        // queryOrOptions. Rethrow any exceptions.
+        // Step 8.2. Set direction to "next".
+        // NOTE: IDBGetAllOptions isn't supported yet, so queryOrOptions is a query, and step 9
+        // doesn't apply.
+        let key_range = convert_value_to_key_range(cx, query, None)?;
+
+        // Step 10. Let operation be an algorithm to run.
+        // Step 11. If source is an index, set operation to retrieve multiple items from an index
+        // with targetRealm, source, range, kind, direction, and count if given.
+        // Step 12. Else set operation to retrieve multiple items from an object store with
+        // targetRealm, source, range, kind, direction, and count if given.
+        let operation = match kind {
+            RetrievalKind::Key => AsyncReadOnlyOperation::GetAllKeys {
+                index,
+                key_range,
+                count,
+            },
+            RetrievalKind::Value => AsyncReadOnlyOperation::GetAllItems {
+                index,
+                key_range,
+                count,
+            },
+        };
+
+        // Step 13. Return the result (an IDBRequest) of running asynchronously execute a request
+        // with sourceHandle and operation.
+        Self::execute_async(
+            cx,
+            source_handle,
+            AsyncOperation::ReadOnly(operation),
+            None,
+            None,
+        )
     }
 
     /// Converts the result of this request, as the backend reported it, into `answer`, or

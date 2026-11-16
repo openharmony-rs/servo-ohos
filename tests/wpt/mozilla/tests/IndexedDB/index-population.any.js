@@ -5,8 +5,8 @@
 // https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex: creating an index is "processed
 // as an asynchronous request within the upgrade transaction", which gives the index the records
 // of the store's records; if a unique index would get a key twice, the upgrade transaction aborts
-// with a ConstraintError. Requests made after createIndex see the whole index. Index reads aren't
-// implemented yet, so these tests observe the index records through unique conflicts.
+// with a ConstraintError. Requests made after createIndex see the whole index. These tests observe
+// the index records through unique conflicts; index-reads.any.js reads them.
 
 'use strict';
 

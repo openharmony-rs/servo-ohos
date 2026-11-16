@@ -39,7 +39,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
 use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
 use crate::dom::indexeddb::idbindex::IDBIndex;
-use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource};
+use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource, RetrievalKind};
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::key::{
     EvaluationResult, ExtractionResult, can_inject_key_into_value, clear_pending_exception,
@@ -767,7 +767,10 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             IDBRequest::execute_async(
                 cx,
                 RequestSource::ObjectStore(self),
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem { key_range: q }),
+                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+                    index: None,
+                    key_range: q,
+                }),
                 None,
                 None,
             )
@@ -794,7 +797,10 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             IDBRequest::execute_async(
                 cx,
                 RequestSource::ObjectStore(self),
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey { key_range: q }),
+                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey {
+                    index: None,
+                    key_range: q,
+                }),
                 None,
                 None,
             )
@@ -808,32 +814,16 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         query: HandleValue,
         count: Option<u32>,
     ) -> Fallible<DomRoot<IDBRequest>> {
-        // Step 1. Let transaction be this’s transaction.
-        // Step 2. Let store be this's object store.
-        // Step 3. If store has been deleted, throw an "InvalidStateError" DOMException.
-        self.verify_not_deleted()?;
-
-        // Step 4. If transaction’s state is not active, then throw a "TransactionInactiveError" DOMException.
-        self.check_transaction_active()?;
-
-        // Step 5. Let range be the result of converting a value to a key range with query and true. Rethrow any exceptions.
-        let serialized_query = convert_value_to_key_range(cx, query, None);
-
-        // Step 6. Run the steps to asynchronously execute a request and return the IDBRequest created by these steps.
-        // The steps are run with this object store handle as source and the steps to retrieve a key from an object
-        // store as operation, using store and range.
-        serialized_query.and_then(|q| {
-            IDBRequest::execute_async(
-                cx,
-                RequestSource::ObjectStore(self),
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
-                    key_range: q,
-                    count,
-                }),
-                None,
-                None,
-            )
-        })
+        // Step 1. Return the result of creating a request to retrieve multiple items with the
+        // current Realm record, this, "value", queryOrOptions, and count if given. Rethrow any
+        // exceptions.
+        IDBRequest::retrieve_multiple_items(
+            cx,
+            RequestSource::ObjectStore(self),
+            RetrievalKind::Value,
+            query,
+            count,
+        )
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-getallkeys>
@@ -843,32 +833,16 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         query: HandleValue,
         count: Option<u32>,
     ) -> Fallible<DomRoot<IDBRequest>> {
-        // Step 1. Let transaction be this’s transaction.
-        // Step 2. Let store be this's object store.
-        // Step 3. If store has been deleted, throw an "InvalidStateError" DOMException.
-        self.verify_not_deleted()?;
-
-        // Step 4. If transaction’s state is not active, then throw a "TransactionInactiveError" DOMException.
-        self.check_transaction_active()?;
-
-        // Step 5. Let range be the result of converting a value to a key range with query and true. Rethrow any exceptions.
-        let serialized_query = convert_value_to_key_range(cx, query, None);
-
-        // Step 6. Run the steps to asynchronously execute a request and return the IDBRequest created by these steps.
-        // The steps are run with this object store handle as source and the steps to retrieve a key from an object
-        // store as operation, using store and range.
-        serialized_query.and_then(|q| {
-            IDBRequest::execute_async(
-                cx,
-                RequestSource::ObjectStore(self),
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
-                    key_range: q,
-                    count,
-                }),
-                None,
-                None,
-            )
-        })
+        // Step 1. Return the result of creating a request to retrieve multiple items with the
+        // current Realm record, this, "key", queryOrOptions, and count if given. Rethrow any
+        // exceptions.
+        IDBRequest::retrieve_multiple_items(
+            cx,
+            RequestSource::ObjectStore(self),
+            RetrievalKind::Key,
+            query,
+            count,
+        )
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-count>
@@ -890,7 +864,10 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             IDBRequest::execute_async(
                 cx,
                 RequestSource::ObjectStore(self),
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count { key_range: q }),
+                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
+                    index: None,
+                    key_range: q,
+                }),
                 None,
                 None,
             )

@@ -11810,7 +11810,7 @@
      ]
     ],
     "index-population.any.js": [
-     "f1f53e3ac16114d0d37f4c28593bba2d2ae6a70b",
+     "669e877733e3cbeaa740d646ce2916b1a3b1831b",
      [
       "IndexedDB/index-population.any.html",
       {
@@ -11882,6 +11882,89 @@
         [
          "title",
          "IndexedDB: an index created on an object store with records is populated from them"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
+    "index-reads.any.js": [
+     "4696a5efe9e4378fdb089143407ff7c8100172cd",
+     [
+      "IndexedDB/index-reads.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: reading the records of an index"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/index-reads.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: reading the records of an index"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/index-reads.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: reading the records of an index"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/index-reads.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: reading the records of an index"
         ],
         [
          "timeout",

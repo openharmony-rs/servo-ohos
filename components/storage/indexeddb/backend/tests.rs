@@ -31,7 +31,7 @@ use super::executor::{
     Connector, OnRow, SqlError, SqlExecutor, SqlParam, TransactionBehavior, query_row, query_rows,
     with_transaction,
 };
-use super::queries;
+use super::queries::{self, RecordSource};
 use super::schema::{self, SCHEMA_VERSION};
 use crate::indexeddb::engines::{
     KvsEngine, KvsOperation, KvsTransaction, TransactionResults, encoding,
@@ -134,6 +134,9 @@ executor_tests!(
     test_population_of_an_empty_store_and_a_step_out_of_turn,
     test_population_batches_are_limited_in_size,
     test_population_finds_unique_conflicts_in_every_check,
+    test_index_reads_go_in_key_then_primary_key_order,
+    test_index_reads_see_the_writes_before_them,
+    test_index_reads_after_create_index_see_the_whole_index,
 );
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -901,7 +904,13 @@ fn test_unpaired_surrogates_in_names_and_keys<X: SqlExecutor>() {
     let mut connection = db.connection();
     let store = queries::object_store(&mut *connection, 1).unwrap().unwrap();
     assert_eq!(
-        queries::get_all_keys(&mut *connection, &store, &range, None).unwrap(),
+        queries::get_all_keys(
+            &mut *connection,
+            RecordSource::ObjectStore(&store),
+            &range,
+            None
+        )
+        .unwrap(),
         vec![
             IndexedDBKeyType::String(units(&[0xD834, 0xDD1E])),
             IndexedDBKeyType::String(trail),
@@ -1467,7 +1476,13 @@ fn abort<X: SqlExecutor>(db: &SqlEngine<X>, transaction: u64) {
 /// The keys of the store `store`, read on `executor`.
 fn keys_of<X: SqlExecutor>(executor: &mut X, store: i64) -> Vec<IndexedDBKeyType> {
     let store = queries::object_store(executor, store).unwrap().unwrap();
-    queries::get_all_keys(executor, &store, &IndexedDBKeyRange::default(), None).unwrap()
+    queries::get_all_keys(
+        executor,
+        RecordSource::ObjectStore(&store),
+        &IndexedDBKeyRange::default(),
+        None,
+    )
+    .unwrap()
 }
 
 fn number_keys(keys: impl IntoIterator<Item = i32>) -> Vec<IndexedDBKeyType> {
@@ -1559,6 +1574,7 @@ fn test_async_operations<X: SqlExecutor>() {
                 store_id,
                 get_item_some.0,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+                    index: None,
                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
                 }),
             ),
@@ -1566,6 +1582,7 @@ fn test_async_operations<X: SqlExecutor>() {
                 store_id,
                 get_item_none.0,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+                    index: None,
                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(5.0)),
                 }),
             ),
@@ -1573,6 +1590,7 @@ fn test_async_operations<X: SqlExecutor>() {
                 store_id,
                 get_all_items.0,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
+                    index: None,
                     key_range: IndexedDBKeyRange::lower_bound(IndexedDBKeyType::Number(0.0), false),
                     count: None,
                 }),
@@ -1581,6 +1599,7 @@ fn test_async_operations<X: SqlExecutor>() {
                 store_id,
                 count.0,
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
+                    index: None,
                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
                 }),
             ),
@@ -1676,7 +1695,7 @@ fn test_delete_item_range_respects_open_bounds<X: SqlExecutor>() {
 
         queries::get_all_keys(
             &mut *connection,
-            &store,
+            RecordSource::ObjectStore(&store),
             &IndexedDBKeyRange::default(),
             None,
         )
@@ -2374,6 +2393,7 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
             read,
             tagged::<BackendResult<u64>>(&order_sender, id),
             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
+                index: None,
                 key_range: IndexedDBKeyRange::default(),
             }),
         )
@@ -2428,6 +2448,7 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
             written,
             value.0,
             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+                index: None,
                 key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
             }),
         )],
@@ -2674,6 +2695,7 @@ fn get_request(request_id: ReplyId<GetReply>, key: f64) -> KvsOperation {
         TEST_STORE,
         request_id,
         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+            index: None,
             key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(key)),
         }),
     )
@@ -2784,6 +2806,7 @@ fn test_readonly_failure_that_ends_the_sql_transaction_fails_the_writer<X: SqlEx
             other,
             get.0,
             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+                index: None,
                 key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
             }),
         )],
@@ -3413,6 +3436,7 @@ fn test_unique_index_conflict_changes_nothing<X: SqlExecutor>() {
             store,
             get.0,
             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+                index: None,
                 key_range: IndexedDBKeyRange::only(number(1.0)),
             }),
         )],
@@ -4384,6 +4408,469 @@ fn test_population_batches_are_limited_in_size<X: SqlExecutor>() {
         after = Some(records.last().unwrap().primary_key.clone());
     }
     assert_eq!(batches, vec![(4, false), (4, false), (2, true)]);
+}
+
+fn read_request<T>(
+    store: i64,
+    request_id: ReplyId<T>,
+    operation: AsyncReadOnlyOperation,
+) -> KvsOperation {
+    request(store, request_id, AsyncOperation::ReadOnly(operation))
+}
+
+/// Runs `operation`, which reads `store` or one of its indexes, as the only request of a batch
+/// of the readonly `transaction`, and returns its result.
+fn read<X: SqlExecutor, T: TestReply>(
+    db: &SqlEngine<X>,
+    transaction: u64,
+    store: i64,
+    operation: AsyncReadOnlyOperation,
+) -> T {
+    let (id, receiver) = get_callback::<T>();
+    let read = read_request(store, id, operation);
+    run_batch(db, transaction, IndexedDBTxnMode::Readonly, vec![read]);
+    recv(&receiver)
+}
+
+fn date(time: f64) -> IndexedDBKeyType {
+    IndexedDBKeyType::Date(time)
+}
+
+/// The values of `values`, each with its number key, as the test stores them.
+fn number_values(values: &[(f64, u8)]) -> Vec<IndexedDBValue> {
+    values
+        .iter()
+        .map(|(key, value)| stored_value(*key, vec![*value]))
+        .collect()
+}
+
+/// Reads of an index see its records in (index key, primary key) order, whatever the order of
+/// the puts and the types of the keys, and stop at a count; a unique index's and a multiEntry
+/// index's reads too, and a read of an index the store doesn't have fails alone.
+fn test_index_reads_go_in_key_then_primary_key_order<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let index = |name: &str, unique, multi_entry| {
+        let key_path = KeyPath::String(name.to_owned());
+        create_index(&db, store, name.to_owned(), key_path, unique, multi_entry).unwrap()
+    };
+    let (by_kind, by_id, by_tag) = (
+        index("kind", false, false),
+        index("id", true, false),
+        index("tag", false, true),
+    );
+    // Index keys of every type, in key order: numbers, dates, strings (by code unit), binary and
+    // arrays; each kind has two records, put with the larger primary key first.
+    let kinds = [
+        number(f64::NEG_INFINITY),
+        number(-1.5),
+        number(0.0),
+        number(f64::INFINITY),
+        date(-1.0),
+        date(0.0),
+        string(""),
+        string("A"),
+        IndexedDBKeyType::String(units(&[0xD800])),
+        IndexedDBKeyType::String(units(&[0xFFFF])),
+        IndexedDBKeyType::Binary(vec![]),
+        IndexedDBKeyType::Binary(vec![0, 255]),
+        IndexedDBKeyType::Array(vec![]),
+        IndexedDBKeyType::Array(vec![number(1.0), IndexedDBKeyType::Array(vec![])]),
+    ];
+    let mut puts = Vec::new();
+    for (n, kind) in kinds.iter().enumerate().rev() {
+        for primary_key in [2 * n + 1, 2 * n] {
+            let tags = [
+                string("all"),
+                string(if n % 2 == 0 { "even" } else { "odd" }),
+            ];
+            puts.push((
+                Some(number(primary_key as f64)),
+                vec![primary_key as u8],
+                vec![
+                    index_keys(by_kind, [kind.clone()]),
+                    index_keys(by_id, [number(-(primary_key as f64) - 1.0)]),
+                    index_keys(by_tag, tags),
+                ],
+            ));
+        }
+    }
+    let record_count = 2 * kinds.len();
+    let replies = run_indexed_puts(&db, 1, store, puts, false);
+    assert!(replies.iter().all(Result::is_ok), "{replies:?}");
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    let all = IndexedDBKeyRange::default();
+    let get_all_keys = |index, key_range, count| -> Vec<IndexedDBKeyType> {
+        read::<X, BackendResult<Vec<IndexedDBKeyType>>>(
+            &db,
+            2,
+            store,
+            AsyncReadOnlyOperation::GetAllKeys {
+                index: Some(index),
+                key_range,
+                count,
+            },
+        )
+        .unwrap()
+    };
+    let count = |index, key_range| -> u64 {
+        read::<X, BackendResult<u64>>(
+            &db,
+            2,
+            store,
+            AsyncReadOnlyOperation::Count { index, key_range },
+        )
+        .unwrap()
+    };
+    let primary_keys = |keys: std::ops::Range<usize>| -> Vec<IndexedDBKeyType> {
+        keys.map(|key| number(key as f64)).collect()
+    };
+
+    // The primary keys in (index key, primary key) order, also with a count of 0 (every record).
+    assert_eq!(
+        get_all_keys(by_kind, all.clone(), None),
+        primary_keys(0..record_count)
+    );
+    assert_eq!(
+        get_all_keys(by_kind, all.clone(), Some(0)),
+        primary_keys(0..record_count)
+    );
+    assert_eq!(
+        get_all_keys(by_kind, all.clone(), Some(3)),
+        primary_keys(0..3)
+    );
+    // A range across key types: from the first date up to the strings, without "A".
+    let range = IndexedDBKeyRange::new(Some(date(-1.0)), Some(string("A")), false, true);
+    assert_eq!(
+        get_all_keys(by_kind, range.clone(), None),
+        primary_keys(8..14)
+    );
+    assert_eq!(count(Some(by_kind), range.clone()), 6);
+    assert_eq!(
+        get_all_keys(
+            by_kind,
+            IndexedDBKeyRange::only(IndexedDBKeyType::Array(vec![])),
+            None
+        ),
+        primary_keys(24..26)
+    );
+    // The values, with their primary keys, of the first records in the range.
+    assert_eq!(
+        read::<X, BackendResult<Vec<IndexedDBValue>>>(
+            &db,
+            2,
+            store,
+            AsyncReadOnlyOperation::GetAllItems {
+                index: Some(by_kind),
+                key_range: range.clone(),
+                count: Some(3),
+            },
+        ),
+        Ok(number_values(&[(8.0, 8), (9.0, 9), (10.0, 10)]))
+    );
+    // get and getKey take the first record: the lowest primary key of the lowest index key.
+    assert_eq!(
+        read::<X, GetReply>(
+            &db,
+            2,
+            store,
+            AsyncReadOnlyOperation::GetItem {
+                index: Some(by_kind),
+                key_range: range.clone(),
+            },
+        ),
+        Ok(Some(stored_value(8.0, vec![8])))
+    );
+    assert_eq!(
+        read::<X, BackendResult<Option<IndexedDBKeyType>>>(
+            &db,
+            2,
+            store,
+            AsyncReadOnlyOperation::GetKey {
+                index: Some(by_kind),
+                key_range: IndexedDBKeyRange::only(string("A")),
+            },
+        ),
+        Ok(Some(number(14.0)))
+    );
+    assert_eq!(
+        read::<X, BackendResult<Option<IndexedDBKeyType>>>(
+            &db,
+            2,
+            store,
+            AsyncReadOnlyOperation::GetKey {
+                index: Some(by_kind),
+                key_range: IndexedDBKeyRange::only(string("none")),
+            },
+        ),
+        Ok(None)
+    );
+
+    // The unique index's keys are the negated primary keys, minus one.
+    let descending: Vec<_> = primary_keys(0..record_count).into_iter().rev().collect();
+    assert_eq!(get_all_keys(by_id, all.clone(), None), descending);
+    assert_eq!(
+        get_all_keys(
+            by_id,
+            IndexedDBKeyRange::new(Some(number(-4.0)), Some(number(0.0)), true, false),
+            None
+        ),
+        primary_keys(0..3).into_iter().rev().collect::<Vec<_>>()
+    );
+    assert_eq!(count(Some(by_id), all.clone()), record_count as u64);
+
+    // A record has one record per subkey in a multiEntry index.
+    assert_eq!(count(Some(by_tag), all.clone()), 2 * record_count as u64);
+    assert_eq!(
+        count(Some(by_tag), IndexedDBKeyRange::only(string("all"))),
+        record_count as u64
+    );
+    let even: Vec<_> = (0..kinds.len())
+        .step_by(2)
+        .flat_map(|n| [2 * n, 2 * n + 1])
+        .map(|key| number(key as f64))
+        .collect();
+    assert_eq!(
+        get_all_keys(by_tag, IndexedDBKeyRange::only(string("even")), None),
+        even
+    );
+    assert_eq!(count(None, all.clone()), record_count as u64);
+
+    // A read of an index that the store doesn't have fails, and the reads after it run.
+    let (missing, missing_reply) = get_callback::<BackendResult<u64>>();
+    let (after, after_reply) = get_callback::<BackendResult<u64>>();
+    let count_request = |id, index| {
+        request(
+            store,
+            id,
+            AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
+                index,
+                key_range: IndexedDBKeyRange::default(),
+            }),
+        )
+    };
+    run_batch(
+        &db,
+        2,
+        IndexedDBTxnMode::Readonly,
+        vec![
+            count_request(missing, Some(by_tag + 1)),
+            count_request(after, Some(by_kind)),
+        ],
+    );
+    assert!(matches!(recv(&missing_reply), Err(BackendError::DbErr(_))));
+    assert_eq!(recv(&after_reply), Ok(record_count as u64));
+}
+
+/// Index reads in a readwrite transaction see the puts, overwrites, deletes and clears before
+/// them, and an aborted transaction's writes are gone from the index afterwards.
+fn test_index_reads_see_the_writes_before_them<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let index = create_index(
+        &db,
+        store,
+        "name".to_owned(),
+        KeyPath::String("name".to_owned()),
+        false,
+        false,
+    )
+    .unwrap();
+    let (order_sender, order) = mpsc::channel();
+    let put = |id, key: f64, name: &str| {
+        indexed_put_request(
+            store,
+            tagged(&order_sender, id),
+            Some(number(key)),
+            vec![key as u8],
+            true,
+            vec![index_keys(index, [string(name)])],
+        )
+    };
+    let (names, names_reply) = get_callback::<BackendResult<Vec<IndexedDBKeyType>>>();
+    let (moved, moved_reply) = get_callback::<BackendResult<Vec<IndexedDBValue>>>();
+    let (deleted, deleted_reply) = get_callback::<BackendResult<u64>>();
+    let (cleared, cleared_reply) = get_callback::<BackendResult<u64>>();
+    let (remove_id, _remove) = get_callback::<BackendResult<()>>();
+    let (clear_id, _clear) = get_callback::<BackendResult<()>>();
+    let ann = || IndexedDBKeyRange::only(string("ann"));
+    run_batch(
+        &db,
+        1,
+        IndexedDBTxnMode::Readwrite,
+        vec![
+            put(1, 1.0, "ann"),
+            put(2, 2.0, "bob"),
+            put(3, 3.0, "ann"),
+            read_request(
+                store,
+                names,
+                AsyncReadOnlyOperation::GetAllKeys {
+                    index: Some(index),
+                    key_range: ann(),
+                    count: None,
+                },
+            ),
+            put(4, 1.0, "cid"),
+            read_request(
+                store,
+                moved,
+                AsyncReadOnlyOperation::GetAllItems {
+                    index: Some(index),
+                    key_range: IndexedDBKeyRange::default(),
+                    count: None,
+                },
+            ),
+            remove_request(store, remove_id, IndexedDBKeyRange::only(number(3.0))),
+            read_request(
+                store,
+                deleted,
+                AsyncReadOnlyOperation::Count {
+                    index: Some(index),
+                    key_range: ann(),
+                },
+            ),
+            request(
+                store,
+                clear_id,
+                AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear),
+            ),
+            read_request(
+                store,
+                cleared,
+                AsyncReadOnlyOperation::Count {
+                    index: Some(index),
+                    key_range: IndexedDBKeyRange::default(),
+                },
+            ),
+        ],
+    );
+    assert_eq!(order.try_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    assert_eq!(recv(&names_reply), Ok(number_keys([1, 3])));
+    assert_eq!(
+        recv(&moved_reply),
+        Ok(number_values(&[(3.0, 3), (2.0, 2), (1.0, 1)]))
+    );
+    assert_eq!(recv(&deleted_reply), Ok(0));
+    assert_eq!(recv(&cleared_reply), Ok(0));
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    assert!(
+        run_batch(
+            &db,
+            2,
+            IndexedDBTxnMode::Readwrite,
+            vec![put(5, 5.0, "ann")]
+        )
+        .is_empty()
+    );
+    abort(&db, 2);
+    let count: BackendResult<u64> = read_count(&db, 3, store, index);
+    assert_eq!(count, Ok(0));
+}
+
+fn read_count<X: SqlExecutor>(
+    db: &SqlEngine<X>,
+    transaction: u64,
+    store: i64,
+    index: i64,
+) -> BackendResult<u64> {
+    read(
+        db,
+        transaction,
+        store,
+        AsyncReadOnlyOperation::Count {
+            index: Some(index),
+            key_range: IndexedDBKeyRange::default(),
+        },
+    )
+}
+
+/// Index reads made after a createIndex that populates the index wait until every batch of the
+/// population is stored, and then see the whole index.
+fn test_index_reads_after_create_index_see_the_whole_index<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let records = queries::POPULATION_BATCH_RECORDS as u32 * 2 + 1;
+    let puts = (0..records)
+        .map(|n| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
+        .collect();
+    assert!(
+        run_puts(&db, 1, store, puts, false)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert_eq!(commit(&db, 1), Ok(()));
+
+    db.upgrade_version(txn(2), 2);
+    let index = 1;
+    let events = run_upgrade_batch(
+        &db,
+        2,
+        vec![create_populated_index(store, index, "parity", false, false)],
+    );
+    let (keys, keys_reply) = get_callback::<BackendResult<Vec<IndexedDBKeyType>>>();
+    let (count, count_reply) = get_callback::<BackendResult<u64>>();
+    let (first, first_reply) = get_callback::<GetReply>();
+    let odd = || IndexedDBKeyRange::only(number(1.0));
+    assert!(
+        run_upgrade_batch(
+            &db,
+            2,
+            vec![
+                read_request(
+                    store,
+                    keys,
+                    AsyncReadOnlyOperation::GetAllKeys {
+                        index: Some(index),
+                        key_range: odd(),
+                        count: None,
+                    },
+                ),
+                read_request(
+                    store,
+                    count,
+                    AsyncReadOnlyOperation::Count {
+                        index: Some(index),
+                        key_range: IndexedDBKeyRange::default(),
+                    },
+                ),
+                read_request(
+                    store,
+                    first,
+                    AsyncReadOnlyOperation::GetItem {
+                        index: Some(index),
+                        key_range: odd(),
+                    },
+                ),
+            ],
+        )
+        .is_empty()
+    );
+    assert!(
+        keys_reply.try_recv().is_err(),
+        "The reads wait for the population"
+    );
+    let (result, _, batches) = populate(&db, 2, store, index, events, |record| {
+        vec![number(f64::from(value_number(record) % 2))]
+    });
+    assert_eq!(result, Ok(()));
+    assert_eq!(batches, 3);
+    let odd_keys: Vec<_> = (1..records)
+        .step_by(2)
+        .map(|n| number(f64::from(n)))
+        .collect();
+    assert_eq!(recv(&keys_reply), Ok(odd_keys));
+    assert_eq!(recv(&count_reply), Ok(u64::from(records)));
+    assert_eq!(
+        recv(&first_reply),
+        Ok(Some(stored_value(1.0, 1u32.to_be_bytes().to_vec())))
+    );
+    assert_eq!(commit(&db, 2), Ok(()));
 }
 
 #[test]
