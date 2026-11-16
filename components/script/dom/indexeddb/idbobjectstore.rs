@@ -7,7 +7,8 @@ use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::conversions::ToJSValConvertible;
 use js::gc::MutableHandleValue;
-use js::jsval::{NullValue, UndefinedValue};
+use js::jsapi::Heap;
+use js::jsval::{JSVal, NullValue, UndefinedValue};
 use js::rust::HandleValue;
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::IDBObjectStoreBinding::{
@@ -76,6 +77,27 @@ impl From<indexeddb::KeyPath> for KeyPath {
     }
 }
 
+impl KeyPath {
+    /// Sets `retval` to the key path converted to a value, which `cache` (undefined until then)
+    /// keeps, so that the keyPath getters of IDBObjectStore and IDBIndex return the same Array
+    /// every time.
+    pub(crate) fn to_jsval_cached(
+        &self,
+        cx: &mut JSContext,
+        cache: &Heap<JSVal>,
+        mut retval: MutableHandleValue,
+    ) {
+        if cache.get().is_undefined() {
+            match self {
+                KeyPath::String(path) => path.to_jsval(cx, retval.reborrow()),
+                KeyPath::StringSequence(paths) => paths.to_jsval(cx, retval.reborrow()),
+            }
+            cache.set(retval.get());
+        }
+        retval.set(cache.get());
+    }
+}
+
 impl From<KeyPath> for indexeddb::KeyPath {
     fn from(item: KeyPath) -> Self {
         match item {
@@ -95,6 +117,9 @@ pub struct IDBObjectStore {
     #[no_trace]
     name: DomRefCell<Utf16String>,
     key_path: Option<KeyPath>,
+    /// The key path converted to a value by the first `keyPath` getter, undefined before.
+    #[ignore_malloc_size_of = "mozjs"]
+    key_path_value: Heap<JSVal>,
     index_set: DomRefCell<HashMap<NoTrace<Utf16String>, Dom<IDBIndex>>>,
     /// Every index handle of this handle, also those of indexes deleted since, whose names an
     /// aborted upgrade transaction reverts.
@@ -115,6 +140,7 @@ impl IDBObjectStore {
             id: store.id,
             name: DomRefCell::new(store.name.clone()),
             key_path: store.key_path.clone().map(Into::into),
+            key_path_value: Heap::default(),
             index_set: DomRefCell::new(HashMap::new()),
             index_handles: Default::default(),
             transaction: Dom::from_ref(transaction),
@@ -959,9 +985,10 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-keypath>
     fn KeyPath(&self, cx: &mut JSContext, mut ret_val: MutableHandleValue) {
+        // NOTE: If this attribute returns an object (specifically an Array), it returns the same
+        // object instance every time it is inspected.
         match &self.key_path {
-            Some(KeyPath::String(path)) => path.to_jsval(cx, ret_val),
-            Some(KeyPath::StringSequence(paths)) => paths.to_jsval(cx, ret_val),
+            Some(key_path) => key_path.to_jsval_cached(cx, &self.key_path_value, ret_val),
             None => ret_val.set(NullValue()),
         }
     }

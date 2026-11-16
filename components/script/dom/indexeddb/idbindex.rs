@@ -3,8 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use js::conversions::ToJSValConvertible;
 use js::gc::MutableHandleValue;
+use js::jsapi::Heap;
+use js::jsval::JSVal;
 use js::rust::HandleValue;
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::IDBIndexBinding::IDBIndexMethods;
@@ -42,6 +43,9 @@ pub(crate) struct IDBIndex {
     multi_entry: bool,
     unique: bool,
     key_path: KeyPath,
+    /// The key path converted to a value by the first `keyPath` getter, undefined before.
+    #[ignore_malloc_size_of = "mozjs"]
+    key_path_value: Heap<JSVal>,
 }
 
 impl IDBIndex {
@@ -61,6 +65,7 @@ impl IDBIndex {
             multi_entry,
             unique,
             key_path,
+            key_path_value: Heap::default(),
         }
     }
 
@@ -307,14 +312,10 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
 
     /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-keypath>
     fn KeyPath(&self, cx: &mut JSContext, retval: MutableHandleValue) {
-        match &self.key_path {
-            KeyPath::String(string) => {
-                string.to_jsval(cx, retval);
-            },
-            KeyPath::StringSequence(sequence) => {
-                sequence.to_jsval(cx, retval);
-            },
-        }
+        // NOTE: If this attribute returns an object (specifically an Array), it returns the same
+        // object instance every time it is inspected.
+        self.key_path
+            .to_jsval_cached(cx, &self.key_path_value, retval);
     }
 
     /// <https://w3c.github.io/IndexedDB/#dom-idbindex-get>
