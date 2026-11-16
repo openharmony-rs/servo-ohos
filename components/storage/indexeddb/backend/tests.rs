@@ -115,6 +115,7 @@ executor_tests!(
     test_batches_reply_in_dispatch_order,
     test_job_that_ends_the_sql_transaction_fails_the_writer,
     test_metadata_reads_do_not_wait_for_the_connection,
+    test_requests_read_a_store_row_once,
     test_upgrade_without_requests_sets_the_version_at_commit,
     test_index_records_follow_puts_and_overwrites,
     test_deleted_records_take_their_index_records_along,
@@ -1041,12 +1042,12 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
     );
 
     in_own_transaction(&db, |executor| {
-        let store = queries::object_store(executor, books)?.unwrap();
+        let mut store = queries::object_store(executor, books)?.unwrap();
         let index_keys = vec![
             index_keys(by_title, []),
             index_keys(by_author, [IndexedDBKeyType::Number(1.0)]),
         ];
-        queries::put_record(executor, &store, None, &[7], false, index_keys)?;
+        queries::put_record(executor, &mut store, None, &[7], false, index_keys)?;
         Ok(())
     })
     .unwrap();
@@ -1167,12 +1168,12 @@ fn test_delete_store_removes_store_records<X: SqlExecutor>() {
     let store = create_store(&db, "test_store", None, false).expect("Failed to create store");
     let store_id = {
         let mut connection = db.connection();
-        let object_store = queries::object_store(&mut *connection, store)
+        let mut object_store = queries::object_store(&mut *connection, store)
             .expect("Failed to fetch store metadata")
             .expect("The store should exist");
         queries::put_record(
             &mut *connection,
-            &object_store,
+            &mut object_store,
             Some(IndexedDBKeyType::Number(1.0)),
             &[1, 2, 3],
             true,
@@ -1684,14 +1685,14 @@ fn test_delete_item_range_respects_open_bounds<X: SqlExecutor>() {
         let store_id =
             create_store(&db, "test_store", None, false).expect("Failed to create store");
         let mut connection = db.connection();
-        let store = queries::object_store(&mut *connection, store_id)
+        let mut store = queries::object_store(&mut *connection, store_id)
             .expect("Failed to get object store")
             .expect("The store should exist");
 
         for key in 1..=10 {
             queries::put_record(
                 &mut *connection,
-                &store,
+                &mut store,
                 Some(IndexedDBKeyType::Number(key as f64)),
                 &[key as u8],
                 false,
@@ -2936,6 +2937,51 @@ fn test_job_that_ends_the_sql_transaction_fails_the_writer<X: SqlExecutor>() {
             let _ = queries::object_store(executor, TEST_STORE);
         })
     });
+}
+
+/// Requests read the row of their object store once, and again only after a rollback, which may
+/// have reverted its key generator.
+fn test_requests_read_a_store_row_once<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_faulty_engine::<X>(&dir);
+    // Any read of the row from now on fails, until the fault has fired once.
+    faults_for(dir.path()).lock().unwrap().statement = Some(("FROM object_store", 0));
+
+    let puts: Vec<_> = (0..3).map(|_| get_callback()).collect();
+    run_batch(&db, 1, IndexedDBTxnMode::Readwrite, put_requests(&puts, 2));
+    assert!(puts.iter().all(|put| recv(&put.1).is_ok()));
+    let get = get_callback();
+    run_batch(
+        &db,
+        1,
+        IndexedDBTxnMode::Readwrite,
+        vec![get_request(get.0, 3.0)],
+    );
+    assert_eq!(recv(&get.1), Ok(Some(stored_value(3.0, vec![1]))));
+    assert_eq!(commit(&db, 1), Ok(()));
+    let get = get_callback();
+    run_batch(
+        &db,
+        2,
+        IndexedDBTxnMode::Readonly,
+        vec![get_request(get.0, 4.0)],
+    );
+    assert_eq!(recv(&get.1), Ok(Some(stored_value(4.0, vec![1]))));
+    assert_eq!(commit(&db, 2), Ok(()));
+
+    let put = [get_callback()];
+    run_batch(&db, 3, IndexedDBTxnMode::Readwrite, put_requests(&put, 9));
+    assert!(recv(&put[0].1).is_ok());
+    abort(&db, 3);
+    let gets = [get_callback(), get_callback()];
+    run_batch(
+        &db,
+        4,
+        IndexedDBTxnMode::Readonly,
+        vec![get_request(gets[0].0, 1.0), get_request(gets[1].0, 9.0)],
+    );
+    assert!(recv(&gets[0].1).is_err(), "The rollback drops the row");
+    assert_eq!(recv(&gets[1].1), Ok(None));
 }
 
 /// The manager's metadata reads answer from the committed metadata, so they neither wait for
@@ -5607,7 +5653,7 @@ fn test_cursor_steps_see_the_writes_between_them<X: SqlExecutor>() {
     let put = |connection: &mut X, primary_key: f64, kind: u8, id: u8| {
         queries::put_record(
             connection,
-            &object_store,
+            &mut object_store.clone(),
             Some(number(primary_key)),
             &[kind, id],
             true,

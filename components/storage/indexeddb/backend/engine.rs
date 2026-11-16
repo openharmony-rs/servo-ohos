@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 
@@ -65,6 +66,7 @@ impl<X: SqlExecutor> SqlEngine<X> {
                     metadata: metadata.clone(),
                     failed: FxHashMap::default(),
                     population: None,
+                    stores: FxHashMap::default(),
                 })),
             }),
             metadata,
@@ -140,8 +142,11 @@ impl<X> std::ops::Deref for TestConnection<'_, X> {
 
 #[cfg(test)]
 impl<X> std::ops::DerefMut for TestConnection<'_, X> {
+    /// The test may change the database, so the store rows that the actor keeps are dropped.
     fn deref_mut(&mut self) -> &mut X {
-        &mut self.0.as_mut().expect("The database is open").executor
+        let database = self.0.as_mut().expect("The database is open");
+        database.stores.clear();
+        &mut database.executor
     }
 }
 
@@ -290,6 +295,26 @@ pub(super) struct Database<X> {
     /// The index population of the upgrade transaction, while one runs or while the requests
     /// that waited for it run.
     population: Option<Population>,
+    /// The rows of the object stores that requests used, with their indexes and key generators,
+    /// as the connection sees them: inside the open SQL transaction, or as of the last commit.
+    /// Schema operations and rollbacks drop them, and puts keep the key generators up to date.
+    stores: StoreRows,
+}
+
+type StoreRows = FxHashMap<IndexedDBObjectStoreId, ObjectStore>;
+
+/// The row of the object store `id`, from `stores`, or read on `executor` and kept in `stores`.
+fn object_store<'a, X: SqlExecutor>(
+    executor: &mut X,
+    stores: &'a mut StoreRows,
+    id: IndexedDBObjectStoreId,
+) -> Result<Option<&'a mut ObjectStore>, SqlError> {
+    Ok(match stores.entry(id) {
+        Entry::Occupied(entry) => Some(entry.into_mut()),
+        Entry::Vacant(entry) => {
+            queries::object_store(executor, id)?.map(|store| entry.insert(store))
+        },
+    })
 }
 
 /// The population of an index that an upgrade transaction created on an object store that may
@@ -384,7 +409,7 @@ impl<X: SqlExecutor> Database<X> {
             .as_ref()
             .filter(|population| population.transaction == transaction)
             .and_then(|population| population.index);
-        let outcome = run_request(&mut self.executor, request, populating);
+        let outcome = run_request(&mut self.executor, &mut self.stores, request, populating);
         if let Some(event) = outcome.event {
             results.send(event);
         }
@@ -430,6 +455,7 @@ impl<X: SqlExecutor> Database<X> {
             !self.executor.in_transaction()
         {
             self.writer = None;
+            self.stores.clear();
             self.failed.insert(writer, error());
         }
     }
@@ -520,6 +546,7 @@ impl<X: SqlExecutor> Database<X> {
         // QuotaExceededError or an "UnknownError" DOMException, and terminate these steps.
         self.executor.commit().map_err(|error| {
             warn!("Failed to commit IndexedDB transaction {transaction}: {error:?}");
+            self.stores.clear();
             error.to_backend_error()
         })?;
         if let Some(metadata) = metadata {
@@ -559,6 +586,7 @@ impl<X: SqlExecutor> Database<X> {
             return;
         }
         self.writer = None;
+        self.stores.clear();
         if let Err(error) = self.executor.rollback() {
             warn!("Failed to roll back IndexedDB transaction {transaction}: {error:?}");
         }
@@ -725,6 +753,7 @@ impl Outcome {
 /// `populating` is the index that the request's transaction populates.
 fn run_request<X: SqlExecutor>(
     executor: &mut X,
+    stores: &mut StoreRows,
     request: KvsOperation,
     populating: Option<IndexedDBIndexId>,
 ) -> Outcome {
@@ -736,7 +765,7 @@ fn run_request<X: SqlExecutor>(
 
     let operation = match operation {
         AsyncOperation::Schema(operation) => {
-            return run_schema(executor, store, operation, populating);
+            return run_schema(executor, stores, store, operation, populating);
         },
         operation => operation,
     };
@@ -745,10 +774,10 @@ fn run_request<X: SqlExecutor>(
         return Outcome::default();
     };
 
-    let (result, failure) = match queries::object_store(executor, store) {
+    let (result, failure) = match object_store(executor, stores, store) {
         Ok(Some(store)) => match operation {
-            AsyncOperation::ReadOnly(operation) => run_read_only(executor, &store, operation),
-            AsyncOperation::ReadWrite(operation) => run_read_write(executor, &store, operation),
+            AsyncOperation::ReadOnly(operation) => run_read_only(executor, store, operation),
+            AsyncOperation::ReadWrite(operation) => run_read_write(executor, store, operation),
             AsyncOperation::Schema(_) => unreachable!("Schema operations run above"),
         },
         Ok(None) => (Err(BackendError::StoreNotFound), None),
@@ -835,7 +864,7 @@ fn run_read_only<X: SqlExecutor>(
 
 fn run_read_write<X: SqlExecutor>(
     executor: &mut X,
-    store: &ObjectStore,
+    store: &mut ObjectStore,
     operation: AsyncReadWriteOperation,
 ) -> (BackendResult<RequestOutput>, Option<Failure>) {
     match operation {
@@ -872,9 +901,31 @@ fn run_read_write<X: SqlExecutor>(
 /// transaction populates.
 fn run_schema<X: SqlExecutor>(
     executor: &mut X,
+    stores: &mut StoreRows,
     store: IndexedDBObjectStoreId,
     operation: AsyncSchemaOperation,
     populating: Option<IndexedDBIndexId>,
+) -> Outcome {
+    if let AsyncSchemaOperation::PopulateIndex { index_id, step } = operation {
+        if populating != Some(index_id) {
+            let error = SqlError::InvalidMetadata("a step of an index population that ended");
+            return Outcome::population_failure(index_id, error.to_backend_error());
+        }
+        return run_population_step(executor, stores, store, index_id, step);
+    }
+    // Every other schema operation changes the rows of the stores or their indexes.
+    stores.clear();
+    let outcome = run_metadata_change(executor, stores, store, operation);
+    stores.clear();
+    outcome
+}
+
+/// Runs a schema operation other than a step of an index population.
+fn run_metadata_change<X: SqlExecutor>(
+    executor: &mut X,
+    stores: &mut StoreRows,
+    store: IndexedDBObjectStoreId,
+    operation: AsyncSchemaOperation,
 ) -> Outcome {
     let result = match operation {
         AsyncSchemaOperation::CreateObjectStore {
@@ -907,7 +958,8 @@ fn run_schema<X: SqlExecutor>(
             );
             match result {
                 Ok(()) if populate => {
-                    let mut outcome = read_population_records(executor, store, index_id, None);
+                    let mut outcome =
+                        read_population_records(executor, stores, store, index_id, None);
                     if outcome.failure.is_none() {
                         outcome.population = Some(PopulationChange::Starts(index_id));
                     }
@@ -925,12 +977,8 @@ fn run_schema<X: SqlExecutor>(
         AsyncSchemaOperation::DeleteIndex { index_id } => {
             queries::delete_index(executor, store, index_id)
         },
-        AsyncSchemaOperation::PopulateIndex { index_id, step } => {
-            if populating != Some(index_id) {
-                let error = SqlError::InvalidMetadata("a step of an index population that ended");
-                return Outcome::population_failure(index_id, error.to_backend_error());
-            }
-            return run_population_step(executor, store, index_id, step);
+        AsyncSchemaOperation::PopulateIndex { .. } => {
+            unreachable!("Index population steps run in run_schema")
         },
     };
     match result {
@@ -943,13 +991,14 @@ fn run_schema<X: SqlExecutor>(
 /// the key `after`, or from the first one.
 fn read_population_records<X: SqlExecutor>(
     executor: &mut X,
+    stores: &mut StoreRows,
     store: IndexedDBObjectStoreId,
     index_id: IndexedDBIndexId,
     after: Option<&IndexedDBKeyType>,
 ) -> Outcome {
-    let result = queries::object_store(executor, store)
+    let result = object_store(executor, stores, store)
         .and_then(|store| store.ok_or(SqlError::MissingRow("object store")))
-        .and_then(|store| queries::population_records(executor, &store, after));
+        .and_then(|store| queries::population_records(executor, store, after));
     match result {
         Ok((records, last)) => Outcome {
             event: Some(TransactionEvent::IndexPopulation {
@@ -966,23 +1015,24 @@ fn read_population_records<X: SqlExecutor>(
 /// a key twice fails the transaction with [`BackendError::Constraint`].
 fn run_population_step<X: SqlExecutor>(
     executor: &mut X,
+    stores: &mut StoreRows,
     store: IndexedDBObjectStoreId,
     index_id: IndexedDBIndexId,
     step: IndexPopulationStep,
 ) -> Outcome {
     let (records, done) = match step {
         IndexPopulationStep::ReadRecords { after } => {
-            return read_population_records(executor, store, index_id, Some(&after));
+            return read_population_records(executor, stores, store, index_id, Some(&after));
         },
         IndexPopulationStep::SetIndexKeys { records, done } => (records, done),
     };
-    let result = queries::object_store(executor, store)
+    let result = object_store(executor, stores, store)
         .and_then(|store| store.ok_or(SqlError::MissingRow("object store")))
         .and_then(|store| {
             let index = store
                 .index(index_id)
                 .ok_or(SqlError::InvalidMetadata("population of a missing index"))?;
-            queries::set_index_keys(executor, &store, index, records)
+            queries::set_index_keys(executor, store, index, records)
         });
     match result {
         Ok(true) if done => Outcome {

@@ -1188,10 +1188,11 @@ fn delete_index_records<X: SqlExecutor>(
 /// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store>: stores `value` under
 /// `key`, or under a key from the store's key generator if `key` is `None`, which requires that
 /// the store has one, with `index_keys`, the keys script computed for each index of the store. A
-/// record that can't be stored changes nothing, not even the key generator.
+/// record that can't be stored changes nothing, not even the key generator; a stored record
+/// updates the key generator's current number in `store` along with the database.
 pub(crate) fn put_record<X: SqlExecutor>(
     executor: &mut X,
-    store: &ObjectStore,
+    store: &mut ObjectStore,
     key: Option<IndexedDBKeyType>,
     value: &[u8],
     overwrite: bool,
@@ -1305,6 +1306,7 @@ pub(crate) fn put_record<X: SqlExecutor>(
                 SqlParam::Integer(store.id),
             ],
         )?;
+        store.auto_increment = current_number;
     }
 
     // Step 6. Return key.
