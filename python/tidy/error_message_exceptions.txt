@@ -31,7 +31,7 @@
 ./components/script/dom/indexeddb/idbdatabase.rs 13
 ./components/script/dom/indexeddb/idbfactory.rs 5
 ./components/script/dom/indexeddb/idbkeyrange.rs 1
-./components/script/dom/indexeddb/idbobjectstore.rs 20
+./components/script/dom/indexeddb/idbobjectstore.rs 19
 ./components/script/dom/indexeddb/idbopendbrequest.rs 3
 ./components/script/dom/indexeddb/idbrequest.rs 5
 ./components/script/dom/indexeddb/idbtransaction.rs 6

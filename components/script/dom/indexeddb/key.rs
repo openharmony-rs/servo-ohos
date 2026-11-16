@@ -514,6 +514,10 @@ pub fn convert_value_to_key(
 /// <https://w3c.github.io/IndexedDB/#convert-a-value-to-a-multientry-key>, except that the keys
 /// of an array key are in key order rather than in the order of the array: each becomes a record
 /// of a multiEntry index, so their order isn't observable.
+///
+/// `input` is part of a clone, which the spec makes in a user-agent defined realm, whose
+/// prototypes have no indexed properties. Servo clones into the page's realm, so an index that
+/// `input` doesn't have reads as undefined here instead of reaching the page's `Array.prototype`.
 #[expect(unsafe_code)]
 pub(crate) fn convert_value_to_multientry_key(
     cx: &mut JSContext,
@@ -547,9 +551,13 @@ pub(crate) fn convert_value_to_multientry_key(
         // Step 1.5.1. Let entry be Get(input, index).
         rooted!(&in(cx) let mut id: PropertyKey);
         rooted!(&in(cx) let mut entry = UndefinedValue());
-        // SAFETY: `id` is rooted.
-        let got = unsafe { JS_IndexToId(cx, index, id.handle_mut()) } &&
-            JS_GetPropertyById(cx, object.handle(), id.handle(), entry.handle_mut());
+        let mut own = false;
+        // SAFETY: `id` and `object` are rooted.
+        let got = unsafe {
+            JS_IndexToId(cx, index, id.handle_mut()) &&
+                JS_HasOwnPropertyById(cx, object.handle(), id.handle(), &mut own)
+        } && (!own ||
+            JS_GetPropertyById(cx, object.handle(), id.handle(), entry.handle_mut()));
         // Step 1.5.2. If entry is not an abrupt completion, then:
         if !got {
             clear_pending_exception(cx);

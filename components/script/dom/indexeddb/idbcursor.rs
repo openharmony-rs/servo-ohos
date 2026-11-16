@@ -28,7 +28,6 @@ use crate::dom::bindings::codegen::UnionTypes::IDBObjectStoreOrIDBIndex;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
-use crate::dom::bindings::structuredclone;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbindex::IDBIndex;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
@@ -760,7 +759,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         // Step 8. Let clone be a clone of value in targetRealm during transaction. Rethrow any
         // exceptions.
         rooted!(&in(cx) let mut cloned_js_value = NullValue());
-        effective_object_store.clone_value_in_target_realm(
+        let serialized_value = effective_object_store.clone_value_in_target_realm(
             cx,
             value,
             cloned_js_value.handle_mut(),
@@ -795,13 +794,6 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
                 },
             }
         }
-
-        let cloned_value = structuredclone::write(cx, cloned_js_value.handle(), None)?;
-        let Ok(serialized_value) = postcard::to_stdvec(&cloned_value) else {
-            return Err(Error::InvalidState(Some(
-                "Failed to serialize cloned value".to_owned(),
-            )));
-        };
 
         // Step 10. Let operation be an algorithm to run store a record into an object store with
         // this's effective object store, clone, this's effective key, and false.

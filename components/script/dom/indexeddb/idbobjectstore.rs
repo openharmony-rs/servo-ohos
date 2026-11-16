@@ -225,13 +225,22 @@ impl IDBObjectStore {
         self.global().storage_threads().sender()
     }
 
-    /// <https://www.w3.org/TR/IndexedDB-3/#clone>
+    /// <https://w3c.github.io/IndexedDB/#clone>: sets `clone` to a clone of `value` and returns
+    /// the serialized value, encoded as it is stored.
+    ///
+    /// targetRealm is the page's realm rather than a user-agent defined one. The key work on the
+    /// clone (the primary key and the index keys) reads only its own properties, which are data
+    /// properties, so no page code runs and a property that the page defines on a prototype reads
+    /// as it would in a fresh realm (see `convert_value_to_multientry_key`). The record's value is
+    /// the serialization that the clone came from: nothing changes the clone, and serializing it
+    /// again would run page code, such as a getter of `Error.prototype.name`, with the
+    /// transaction active.
     pub(crate) fn clone_value_in_target_realm(
         &self,
         cx: &mut JSContext,
         value: HandleValue,
         clone: MutableHandleValue<'_>,
-    ) -> Fallible<()> {
+    ) -> Fallible<Vec<u8>> {
         // Step 1. Assert: transaction's state is active.
         debug_assert!(self.transaction.is_active());
 
@@ -244,28 +253,23 @@ impl IDBObjectStore {
 
         let result = (|| {
             // Step 3. Let serialized be ? StructuredSerializeForStorage(value).
+            // NOTE: `structuredclone::write` never serializes shared memory (its CloneDataPolicy
+            // doesn't allow it, and the QuickJS shim refuses it in every scope), and Servo has no
+            // [SameAgentCluster] interfaces, so it is StructuredSerializeForStorage as well.
             let serialized = structuredclone::write(cx, value, None)?;
+            let stored = postcard::to_stdvec(&serialized).map_err(|_| {
+                Error::InvalidState(Some("Failed to encode a cloned value".to_owned()))
+            })?;
 
             // Step 4. Let clone be ? StructuredDeserialize(serialized, targetRealm).
             let _ = structuredclone::read(cx, &self.global(), serialized, clone)?;
-            Ok(())
+            Ok(stored)
         })();
 
         // Step 5. Set transaction's state to active.
         self.transaction.set_active_flag(true);
 
         // Step 6. Return clone.
-        result
-    }
-
-    /// Runs `f` with the transaction inactive, as cloning a value does: computing index keys
-    /// runs in the page's realm, where a getter reached through a hole of an array or a
-    /// prototype could otherwise make requests that overtake the one being made.
-    fn with_transaction_inactive<T>(&self, f: impl FnOnce() -> T) -> T {
-        let active = self.transaction.is_active();
-        self.transaction.set_active_flag(false);
-        let result = f();
-        self.transaction.set_active_flag(active);
         result
     }
 
@@ -332,23 +336,21 @@ impl IDBObjectStore {
             Some(KeyPath::String(key_path)) if key_is_generated => Some(key_path.str()),
             _ => None,
         };
-        let indexes = self.transaction.get_db().indexes(self.id);
-        self.with_transaction_inactive(|| {
-            indexes
-                .iter()
-                .map(|index| IndexedDBIndexKeys {
-                    index_id: index.id,
-                    keys: index_keys(cx, value, index, generated_key_path.as_deref()),
-                })
-                .collect()
-        })
+        self.transaction
+            .get_db()
+            .indexes(self.id)
+            .iter()
+            .map(|index| IndexedDBIndexKeys {
+                index_id: index.id,
+                keys: index_keys(cx, value, index, generated_key_path.as_deref()),
+            })
+            .collect()
     }
 
     /// The keys that the records `records` of this store get in `index`, which is being
     /// populated: steps 5.1 and 5.2 of
     /// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store> on each stored
-    /// value, with its generated key injected. Records without keys are left out. Stops early if
-    /// page code that computing the keys reached aborted the transaction.
+    /// value, with its generated key injected. Records without keys are left out.
     pub(crate) fn index_keys_of_records(
         &self,
         cx: &mut JSContext,
@@ -358,9 +360,6 @@ impl IDBObjectStore {
         let mut keys_of_records = Vec::with_capacity(records.len());
         rooted!(&in(cx) let mut value = UndefinedValue());
         for record in records {
-            if !self.transaction.is_usable() {
-                break;
-            }
             if self
                 .deserialize_value(cx, &record.primary_key, &record.value, value.handle_mut())
                 .is_err()
@@ -370,8 +369,7 @@ impl IDBObjectStore {
                     "Failed to read a stored value to populate an index".to_owned(),
                 ));
             }
-            let keys =
-                self.with_transaction_inactive(|| index_keys(cx, value.handle(), index, None));
+            let keys = index_keys(cx, value.handle(), index, None);
             if !keys.is_empty() {
                 keys_of_records.push(IndexedDBRecordIndexKeys {
                     primary_key: record.primary_key,
@@ -490,7 +488,8 @@ impl IDBObjectStore {
         // Step 10. Let clone be a clone of value in targetRealm during transaction.
         // Rethrow any exceptions.
         rooted!(&in(cx) let mut cloned_js_value = NullValue());
-        self.clone_value_in_target_realm(cx, value, cloned_js_value.handle_mut())?;
+        let serialized_value =
+            self.clone_value_in_target_realm(cx, value, cloned_js_value.handle_mut())?;
 
         // Step 11. If store uses in-line keys, then:
         if let Some(key_path) = self.key_path.as_ref() {
@@ -520,10 +519,6 @@ impl IDBObjectStore {
                 },
             }
         }
-        let cloned_value = structuredclone::write(cx, cloned_js_value.handle(), None)?;
-        let Ok(serialized_value) = postcard::to_stdvec(&cloned_value) else {
-            return Err(Error::InvalidState(None));
-        };
         // Step 12. Let operation be an algorithm to run store a record into an object store with
         // store, clone, key, and no-overwrite flag.
         // NOTE: The backend generates the key if none was given, and the value is stored without

@@ -285,34 +285,32 @@ promise_test(async t => {
   assert_equals(await generated, 3);
 }, 'Records stored under generated keys are indexed with their values as they read back');
 
-// More records than one step of a population reads, whose `tags` arrays have a hole at index 1,
-// through which the multiEntry key conversion reaches Array.prototype[1].
+// More records than one step of a population reads, whose `tags` arrays have a hole at index 1.
+// The population reads the values in a user-agent defined realm in the spec, where the hole is
+// undefined, so a getter of Array.prototype[1] in the page's realm is never reached.
 const WITH_HOLES = 600;
 
 // A database at version 1 with the store `items` holding `WITH_HOLES` records
-// `{tags: ['a<i>', , 'b<i>']}` under the keys 0 to WITH_HOLES - 1, whose arrays are marked with a
-// `hole` property, which cloning keeps.
+// `{tags: ['a<i>', , 'b<i>']}` under the keys 0 to WITH_HOLES - 1.
 async function databaseWithHoles(t) {
   const db = await openDatabase(t, db => {
     const store = db.createObjectStore('items');
     for (let i = 0; i < WITH_HOLES; i++) {
-      const tags = ['a' + i, , 'b' + i];
-      tags.hole = true;
-      store.add({tags}, i);
+      store.add({tags: ['a' + i, , 'b' + i]}, i);
     }
   });
   db.close();
   return db.name;
 }
 
-// Defines `get` as the getter of Array.prototype[1] for the marked arrays until the returned
-// function removes it. Other arrays read undefined there, and assignments to index 1 create their
-// own property.
-function arrayGetter(t, get) {
+promise_test(async t => {
+  const name = await databaseWithHoles(t);
+  let calls = 0;
   Object.defineProperty(Array.prototype, 1, {
     configurable: true,
     get() {
-      return this.hole === true ? get() : undefined;
+      calls++;
+      return 'from-prototype';
     },
     set(value) {
       Object.defineProperty(this, 1, {value, writable: true, enumerable: true, configurable: true});
@@ -320,66 +318,19 @@ function arrayGetter(t, get) {
   });
   const remove = () => { delete Array.prototype[1]; };
   t.add_cleanup(remove);
-  return remove;
-}
-
-promise_test(async t => {
-  const name = await databaseWithHoles(t);
-  let tx = null;
-  const errors = new Set();
-  const remove = arrayGetter(t, () => {
-    try {
-      tx.objectStore('items').put({tags: ['inner']}, 'inner');
-      errors.add('none');
-    } catch (e) {
-      errors.add(e.name);
-    }
-    throw new Error('getter');
-  });
   let conflict, added;
   const db = await reopen(name, 2, (db, transaction) => {
-    tx = transaction;
     const store = transaction.objectStore('items');
     store.createIndex('tags', 'tags', {multiEntry: true, unique: true});
     conflict = failure(store.add({tags: ['b' + (WITH_HOLES - 1)]}, 'conflict'));
-    added = result(store.add({tags: ['new']}, 'new'));
+    added = result(store.add({tags: ['from-prototype']}, 'new'));
   });
   remove();
   t.add_cleanup(() => { db.close(); });
-  assert_array_equals([...errors], ['TransactionInactiveError']);
+  assert_equals(calls, 0, 'the population reaches no getter of Array.prototype');
   assert_equals(await conflict, 'ConstraintError', 'the subkeys around the hole are indexed');
-  assert_equals(await added, 'new');
+  assert_equals(await added, 'new', 'no record has the key from the prototype');
   const store = db.transaction('items').objectStore('items');
   assert_equals(await result(store.count()), WITH_HOLES + 1);
-  assert_equals(await result(store.get('inner')), undefined);
-}, 'A getter that a population reaches and that throws skips its subkey, and its requests throw');
-
-promise_test(async t => {
-  const name = await databaseWithHoles(t);
-  let tx = null;
-  let calls = 0;
-  const remove = arrayGetter(t, () => {
-    calls++;
-    if (tx) {
-      const transaction = tx;
-      tx = null;
-      transaction.abort();
-    }
-    return undefined;
-  });
-  const events = await failedUpgrade(name, 2, (db, transaction) => {
-    tx = transaction;
-    transaction.objectStore('items').createIndex('tags', 'tags', {multiEntry: true});
-  });
-  remove();
-  assert_array_equals(events, ['abort AbortError', 'open AbortError']);
-  assert_less_than_equal(calls, 1, 'no more keys are computed after the abort');
-
-  const db = await reopen(name, 1, () => assert_unreached('no upgrade'));
-  t.add_cleanup(() => { db.close(); });
-  const tx2 = db.transaction('items', 'readwrite');
-  const store = tx2.objectStore('items');
-  assert_array_equals([...store.indexNames], []);
-  await result(store.put({tags: ['z']}, 'z'));
-  await complete(tx2);
-}, 'A getter that a population reaches and that aborts the upgrade leaves the database as it was');
+  assert_equals(await result(store.index('tags').count()), 2 * WITH_HOLES + 1);
+}, 'A population skips holes without reaching the getters of Array.prototype');

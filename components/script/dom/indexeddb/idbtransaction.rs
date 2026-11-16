@@ -584,12 +584,7 @@ impl IDBTransaction {
         }
         let mut realm = enter_auto_realm(cx, &*store);
         let cx: &mut JSContext = &mut realm;
-        let keys = store.index_keys_of_records(cx, &index, records);
-        // Page code that computing the keys reached may have aborted the transaction.
-        if self.finished.get() || self.abort_initiated.get() {
-            return;
-        }
-        match keys {
+        match store.index_keys_of_records(cx, &index, records) {
             Ok(records) => store.send_index_population_step(
                 index_id,
                 IndexPopulationStep::SetIndexKeys {
