@@ -16,7 +16,7 @@ use servo_base::id::WebViewId;
 use servo_url::origin::ImmutableOrigin;
 use uuid::Uuid;
 
-use crate::client_storage::ClientStorageThreadHandle;
+use crate::client_storage::{ClientStorageThreadHandle, StorageProxyMap};
 
 // TODO Box<dyn Error> is not serializable, fix needs to be found
 pub type DbError = String;
@@ -954,6 +954,14 @@ pub enum IndexedDBThreadMsg {
         origin: ImmutableOrigin,
         db_name: Utf16String,
         txn: IndexedDBTxnId,
+    },
+    /// The storage proxy map of the queued open or delete request `request` was obtained, which
+    /// the manager does in parallel.
+    StorageProxyMapObtained {
+        origin: ImmutableOrigin,
+        db_name: Utf16String,
+        request: Uuid,
+        result: BackendResult<StorageProxyMap>,
     },
 
     /// Measure memory used by this thread and send the report over the provided channel.

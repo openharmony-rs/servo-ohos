@@ -635,8 +635,9 @@ struct OpenRequest {
     /// The id of the request, which is also the id of the connection that an open request opens.
     id: Uuid,
     kind: OpenRequestKind,
-    /// <https://storage.spec.whatwg.org/#storage-proxy-map>, or why it couldn't be obtained.
-    proxy_map: BackendResult<StorageProxyMap>,
+    /// <https://storage.spec.whatwg.org/#storage-proxy-map>, which the manager obtains in
+    /// parallel once the request is queued; `None` until it has arrived.
+    proxy_map: Option<BackendResult<StorageProxyMap>>,
     state: OpenRequestState,
 }
 
@@ -660,7 +661,8 @@ enum OpenRequestKind {
 /// gets past `Queued`.
 #[derive(MallocSizeOf)]
 enum OpenRequestState {
-    /// Step 3: waiting for the requests before it to be processed.
+    /// Step 3: waiting for the requests before it to be processed, and for its storage proxy
+    /// map.
     Queued,
     /// Waiting for the other connections to the database to close: steps 10.2 to 10.5 of open a
     /// database connection, steps 6 to 9 of delete a database.
@@ -686,21 +688,19 @@ struct ConnectionsToClose {
 }
 
 impl OpenRequest {
-    fn new(
-        id: Uuid,
-        kind: OpenRequestKind,
-        proxy_map: BackendResult<StorageProxyMap>,
-    ) -> OpenRequest {
+    fn new(id: Uuid, kind: OpenRequestKind) -> OpenRequest {
         OpenRequest {
             id,
             kind,
-            proxy_map,
+            proxy_map: None,
             state: OpenRequestState::Queued,
         }
     }
 
     fn proxy_map(&self) -> Option<&StorageProxyMap> {
-        self.proxy_map.as_ref().ok()
+        self.proxy_map
+            .as_ref()
+            .and_then(|proxy_map| proxy_map.as_ref().ok())
     }
 
     /// Sends `message` about an open request to script.
@@ -897,6 +897,18 @@ impl IndexedDBManager {
                     let reports = self.collect_memory_reports();
                     sender.send(ProcessReports::new(reports));
                 },
+                IndexedDBThreadMsg::StorageProxyMapObtained {
+                    origin,
+                    db_name,
+                    request,
+                    result,
+                } => {
+                    let key = IndexedDBDescription {
+                        origin,
+                        name: db_name,
+                    };
+                    self.storage_proxy_map_obtained(key, request, result);
+                },
                 IndexedDBThreadMsg::AsyncSchemaOperation {
                     origin,
                     database_name,
@@ -1065,7 +1077,7 @@ impl IndexedDBManager {
 
     /// Steps 1 and 2 of <https://w3c.github.io/IndexedDB/#open-a-database-connection> and of
     /// <https://w3c.github.io/IndexedDB/#delete-a-database>: adds the request `id` of `kind` to the
-    /// connection queue for `key`, with its storage proxy map, and runs the queue.
+    /// connection queue for `key`, and obtains its storage proxy map in parallel.
     fn queue_open_request(
         &mut self,
         key: IndexedDBDescription,
@@ -1073,13 +1085,55 @@ impl IndexedDBManager {
         kind: OpenRequestKind,
         bottle_source: StorageBottleSource,
     ) {
-        let proxy_map = obtain_a_local_storage_bottle_map(&bottle_source, &key.origin);
+        self.obtain_storage_proxy_map(&key, id, bottle_source);
         // Step 1: Let queue be the connection queue for storageKey and name.
         // Step 2: Add request to queue.
         self.connection_queues
-            .entry(key.clone())
+            .entry(key)
             .or_default()
-            .push_back(OpenRequest::new(id, kind, proxy_map));
+            .push_back(OpenRequest::new(id, kind));
+    }
+
+    /// Obtains the storage proxy map of the queued request `request` on the thread pool, which
+    /// waits for the client storage thread instead of this one, and hands it to this thread.
+    fn obtain_storage_proxy_map(
+        &self,
+        key: &IndexedDBDescription,
+        request: Uuid,
+        bottle_source: StorageBottleSource,
+    ) {
+        let manager_sender = self.manager_sender.clone();
+        let IndexedDBDescription { origin, name } = key.clone();
+        self.thread_pool.spawn(move || {
+            let result = obtain_a_local_storage_bottle_map(&bottle_source, &origin);
+            if manager_sender
+                .send(IndexedDBThreadMsg::StorageProxyMapObtained {
+                    origin,
+                    db_name: name,
+                    request,
+                    result,
+                })
+                .is_err()
+            {
+                debug!("IndexedDB manager went away while obtaining a storage proxy map");
+            }
+        });
+    }
+
+    fn storage_proxy_map_obtained(
+        &mut self,
+        key: IndexedDBDescription,
+        request: Uuid,
+        result: BackendResult<StorageProxyMap>,
+    ) {
+        let Some(queued) = self
+            .connection_queues
+            .get_mut(&key)
+            .and_then(|queue| queue.iter_mut().find(|queued| queued.id == request))
+        else {
+            return debug!("IndexedDB request {request} went away");
+        };
+        queued.proxy_map = Some(result);
         self.advance_connection_queue(key);
     }
 
@@ -1099,10 +1153,14 @@ impl IndexedDBManager {
                 return;
             };
             let next = match (&request.state, &request.proxy_map, &request.kind) {
-                (OpenRequestState::Upgrading(_), ..) => Next::Wait,
-                (OpenRequestState::Queued, Err(error), _) => Next::Fail(error.clone()),
-                (OpenRequestState::Queued, Ok(_), OpenRequestKind::Open { .. }) => Next::Open,
-                (OpenRequestState::Queued, Ok(_), OpenRequestKind::Delete { .. }) => Next::Delete,
+                (OpenRequestState::Queued, None, _) | (OpenRequestState::Upgrading(_), ..) => {
+                    Next::Wait
+                },
+                (OpenRequestState::Queued, Some(Err(error)), _) => Next::Fail(error.clone()),
+                (OpenRequestState::Queued, Some(Ok(_)), OpenRequestKind::Open { .. }) => Next::Open,
+                (OpenRequestState::Queued, Some(Ok(_)), OpenRequestKind::Delete { .. }) => {
+                    Next::Delete
+                },
                 (OpenRequestState::WaitingForConnections(_), ..) => {
                     Next::ContinueWhenConnectionsClosed
                 },
