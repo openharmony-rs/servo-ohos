@@ -508,10 +508,12 @@ impl SharedWorkerGlobalScope {
                 );
 
                 /// A data structure that ensures that a panicking SharedWorker will
-                /// always call `clear_js_runtime` in order to prevent it from leaking.
+                /// always close its IndexedDB connections and call `clear_js_runtime` in
+                /// order to prevent it from leaking.
                 struct ClearJsRuntime<'a>(&'a WorkerGlobalScope);
                 impl Drop for ClearJsRuntime<'_> {
                     fn drop(&mut self) {
+                        self.0.close_indexeddb_connections();
                         self.0.upcast::<GlobalScope>().tear_down();
                         self.0.clear_js_runtime();
                     }

@@ -1193,13 +1193,29 @@ impl WorkerGlobalScope {
             .task_manager()
             .cancel_all_tasks_and_ignore_future_tasks();
 
-        // From <https://w3c.github.io/IndexedDB/#database-connection>
-        // > The connection can be closed through several means. If the execution context where
-        // > the connection was created is destroyed (for example due to the user navigating away
-        // > from that page), the connection is closed.
+        self.close_indexeddb_connections();
+    }
+
+    /// Closes the IndexedDB connections of this worker, whose event loop ends.
+    ///
+    /// From <https://w3c.github.io/IndexedDB/#database-connection>
+    /// > The connection can be closed through several means. If the execution context where
+    /// > the connection was created is destroyed (for example due to the user navigating away
+    /// > from that page), the connection is closed.
+    pub(crate) fn close_indexeddb_connections(&self) {
         if let Some(factory) = self.upcast::<GlobalScope>().indexeddb_factory() {
             factory.abort_pending_upgrades_and_close_databases();
         }
+    }
+}
+
+/// Closes the IndexedDB connections of a worker when dropped, so that a worker whose thread ends
+/// with a panic closes them too.
+pub(crate) struct CloseIndexedDBConnections<'a>(pub(crate) &'a WorkerGlobalScope);
+
+impl Drop for CloseIndexedDBConnections<'_> {
+    fn drop(&mut self) {
+        self.0.close_indexeddb_connections();
     }
 }
 
