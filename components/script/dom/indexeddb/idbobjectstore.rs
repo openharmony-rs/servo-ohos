@@ -290,7 +290,7 @@ impl IDBObjectStore {
         mut value: MutableHandleValue,
     ) -> Fallible<()> {
         let data = postcard::from_bytes(serialized)
-            .map_err(|_| Error::Data(Some("Failed to decode a stored value".to_owned())))?;
+            .map_err(|_| Error::Unknown(Some("Failed to decode a stored value".to_owned())))?;
         structuredclone::read(cx, &self.global(), data, value.reborrow())?;
         let Some(key_path) = self.key_path.as_ref().filter(|_| self.has_key_generator) else {
             return Ok(());
@@ -314,7 +314,7 @@ impl IDBObjectStore {
             KeyPath::StringSequence(_) => false,
         };
         if !injected {
-            return Err(Error::Data(Some(
+            return Err(Error::Unknown(Some(
                 "Failed to inject the generated key into a stored value".to_owned(),
             )));
         }

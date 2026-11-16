@@ -36,8 +36,9 @@ pub enum BackendError {
     QuotaExceeded,
     /// The transaction was aborted
     Abort,
-    /// A unique index got the same key for two records while it was populated, which aborts the
-    /// upgrade transaction with a "ConstraintError" DOMException.
+    /// A constraint failed: a unique index got the same key for two records while it was
+    /// populated, which aborts the upgrade transaction, or a statement violated a constraint of
+    /// the database's tables. Reported as a "ConstraintError" DOMException.
     Constraint,
     /// The database can't be used any more, for example because its file is corrupt: the
     /// transaction fails, and the backend closes every connection to the database with the

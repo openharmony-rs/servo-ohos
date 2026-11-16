@@ -937,7 +937,7 @@ pub(crate) fn iterate_cursor(
         // Step 13.2. Set cursor’s value to ! StructuredDeserialize(serialized, targetRealm)
         let serialized = found_record
             .value
-            .ok_or_else(|| Error::Data(Some("A cursor record without its value".to_owned())))?;
+            .ok_or_else(|| Error::Unknown(Some("A cursor record without its value".to_owned())))?;
         rooted!(&in(cx) let mut new_cursor_value = UndefinedValue());
         cursor.effective_object_store().deserialize_value(
             cx,

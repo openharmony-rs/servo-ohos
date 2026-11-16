@@ -16,7 +16,7 @@ use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{DomObject, reflect_dom_object};
 use servo_base::generic_channel::GenericSend;
 use storage_traits::indexeddb::{
-    AsyncOperation, AsyncReadOnlyOperation, BackendError, BackendResult, IndexedDBCursorDirection,
+    AsyncOperation, AsyncReadOnlyOperation, BackendResult, IndexedDBCursorDirection,
     IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode,
     IndexedDBValue, PutItemResult, RequestOutput,
 };
@@ -46,6 +46,7 @@ use crate::dom::indexeddb::idbrecord::IDBRecord;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::key::{
     convert_value_to_key_range, is_potentially_valid_key_range, key_type_to_jsval,
+    map_transaction_error_to_dom_error,
 };
 
 pub enum IdbResult {
@@ -515,14 +516,7 @@ impl IDBRequest {
         iteration_param: Option<&IterationParam>,
         mut answer: MutableHandleValue,
     ) -> Result<(), Error> {
-        let result = result
-            .inspect_err(|error| {
-                if let BackendError::DbErr(error) = error {
-                    error!("Error in IndexedDB operation: {}", error);
-                }
-            })
-            // FIXME:(arihant2math) dispatch correct error
-            .map_err(|_| Error::Data(None))?;
+        let result = result.map_err(map_transaction_error_to_dom_error)?;
         match IdbResult::from(result) {
             IdbResult::Key(key) => key_type_to_jsval(cx, &key, answer),
             IdbResult::Keys(keys) => {

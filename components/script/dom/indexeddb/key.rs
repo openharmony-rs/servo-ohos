@@ -710,37 +710,39 @@ pub(crate) fn is_potentially_valid_key_range(
     Ok(is_array)
 }
 
+/// The error of an open or delete request that the backend failed, mapped as
+/// [`map_transaction_error_to_dom_error`] maps it: an "UnknownError" unless the disk is full, as
+/// the spec's examples for open step 6 and delete step 11 have it.
 pub(crate) fn map_backend_error_to_dom_error(error: BackendError) -> Error {
-    match error {
-        BackendError::QuotaExceeded => Error::QuotaExceeded {
-            quota: None,
-            requested: None,
-        },
-        BackendError::DbErr(details) => {
-            Error::Operation(Some(format!("IndexedDB open failed: {details}")))
-        },
-        other => Error::Operation(Some(format!("IndexedDB open failed: {other:?}"))),
-    }
+    map_backend_failure(error, "The IndexedDB open or delete request failed")
 }
 
-/// The error that a transaction aborts with when the backend, or script on its behalf, failed
-/// it: a "QuotaExceededError" for a full disk, a "ConstraintError" for a unique index that got
-/// the same key for two records while it was populated, and otherwise an "UnknownError" with a
-/// neutral message, as <https://w3c.github.io/IndexedDB/#commit-a-transaction> step 2.4 suggests;
-/// the details only go to the log.
+/// The error of a request, or of a transaction, that the backend, or script on its behalf, failed:
+/// a "QuotaExceededError" for a full disk, a "ConstraintError" for a key that a unique index or
+/// an object store would have had for two records, an "AbortError" for a transaction that was
+/// aborted, and otherwise an "UnknownError" with a neutral message, as
+/// <https://w3c.github.io/IndexedDB/#commit-a-transaction> step 2.4 suggests; the details only go
+/// to the log. No backend failure is a "DataError": the spec throws those before a request is
+/// made.
 pub(crate) fn map_transaction_error_to_dom_error(error: BackendError) -> Error {
+    map_backend_failure(error, "The IndexedDB transaction failed")
+}
+
+/// Maps `error` as [`map_transaction_error_to_dom_error`] describes, with `message` for an
+/// "UnknownError".
+fn map_backend_failure(error: BackendError, message: &str) -> Error {
     match error {
         BackendError::QuotaExceeded => Error::QuotaExceeded {
             quota: None,
             requested: None,
         },
         BackendError::Constraint => Error::Constraint(Some(
-            "A unique index has the same key for two records".to_owned(),
+            "A unique index or an object store has the same key for two records".to_owned(),
         )),
         BackendError::Abort => Error::Abort(Some("The transaction was aborted".to_owned())),
         other => {
-            warn!("IndexedDB transaction failed: {other}");
-            Error::Unknown(Some("The IndexedDB transaction failed".to_owned()))
+            warn!("IndexedDB backend failure: {other}");
+            Error::Unknown(Some(message.to_owned()))
         },
     }
 }

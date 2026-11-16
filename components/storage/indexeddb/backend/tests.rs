@@ -114,6 +114,8 @@ executor_tests!(
     test_statement_failure_that_ends_the_transaction_fails_it,
     test_readonly_failure_that_ends_the_sql_transaction_fails_the_writer,
     test_corrupt_database_makes_the_engine_unusable,
+    test_constraint_violation_fails_the_transaction_with_constraint,
+    test_full_database_fails_the_transaction_with_quota_exceeded,
     test_commit_failure_rolls_back,
     test_batches_reply_in_dispatch_order,
     test_job_that_ends_the_sql_transaction_fails_the_writer,
@@ -523,11 +525,10 @@ fn executor_constraint_violation_keeps_the_transaction<X: SqlExecutor>() {
     insert_into_t(&mut executor, 1);
     executor.begin(TransactionBehavior::Immediate).unwrap();
     insert_into_t(&mut executor, 2);
-    assert!(
-        executor
-            .execute("INSERT INTO t (k) VALUES (1)", &[])
-            .is_err()
-    );
+    let error = executor
+        .execute("INSERT INTO t (k) VALUES (1)", &[])
+        .unwrap_err();
+    assert_eq!(error.into_backend_error(), BackendError::Constraint);
     assert!(executor.in_transaction());
     insert_into_t(&mut executor, 3);
     executor.commit().unwrap();
@@ -2678,6 +2679,9 @@ pub(crate) struct Faults {
     statement: Option<(&'static str, usize)>,
     /// Make that failure report a corrupt database.
     corrupt: bool,
+    /// Run the statement whose SQL contains this text a second time, which fails if it violates
+    /// a constraint the first run made it violate, such as an INSERT of the same row.
+    duplicate: Option<&'static str>,
     /// Leave the database in place on delete, as RDB does when it can't remove the files.
     keep_on_delete: bool,
 }
@@ -2756,7 +2760,18 @@ impl<X: SqlExecutor> SqlExecutor for Faulty<X> {
 
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
         self.inject(sql)?;
-        self.inner.execute(sql, params)
+        let duplicate = self
+            .faults
+            .lock()
+            .unwrap()
+            .duplicate
+            .take_if(|text| sql.contains(*text))
+            .is_some();
+        let changed = self.inner.execute(sql, params)?;
+        if duplicate {
+            return self.inner.execute(sql, params);
+        }
+        Ok(changed)
     }
 
     fn query(
@@ -2948,6 +2963,71 @@ fn test_corrupt_database_makes_the_engine_unusable<X: SqlExecutor>() {
     );
     assert!(matches!(recv(&get.1), Err(BackendError::Unusable(_))));
     assert!(db.is_unusable());
+}
+
+/// A write that violates a constraint of the tables, which the engine's checks before writing
+/// should prevent, fails its request with Constraint, and so do the transaction's later requests
+/// and its commit; nothing of the transaction is stored.
+fn test_constraint_violation_fails_the_transaction_with_constraint<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_faulty_engine::<X>(&dir);
+    faults_for(dir.path()).lock().unwrap().duplicate = Some("INSERT INTO object_data");
+    let puts: Vec<_> = (0..2).map(|_| get_callback()).collect();
+    run_batch(&db, 1, IndexedDBTxnMode::Readwrite, put_requests(&puts, 2));
+    assert_eq!(recv(&puts[0].1), Err(BackendError::Constraint));
+    assert_eq!(recv(&puts[1].1), Err(BackendError::Constraint));
+    assert_eq!(commit(&db, 1), Err(BackendError::Constraint));
+    assert_eq!(stored_keys(&db, TEST_STORE), number_keys([1]));
+}
+
+/// A write that finds the database full fails its request with QuotaExceeded, and so do the
+/// transaction's later requests and its commit; nothing of the transaction is stored.
+fn test_full_database_fails_the_transaction_with_quota_exceeded<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    create_store(&db, "test_store", None, false).unwrap();
+    let first = [get_callback()];
+    run_batch(&db, 1, IndexedDBTxnMode::Readwrite, put_requests(&first, 1));
+    assert!(recv(&first[0].1).is_ok());
+    // RDB runs a transaction on a connection of its own, so the limit is set inside it.
+    let (limited, limit_set) = mpsc::channel();
+    db.spawn_on_connection(move |executor| {
+        let pages = query_row(executor, "PRAGMA page_count", &[], |row| row.integer(0))
+            .unwrap()
+            .unwrap();
+        executor
+            .execute(&format!("PRAGMA max_page_count = {pages}"), &[])
+            .unwrap();
+        let _ = limited.send(());
+    });
+    limit_set.recv_timeout(TIMEOUT).unwrap();
+
+    let (large, after) = (get_callback(), get_callback());
+    run_batch(
+        &db,
+        1,
+        IndexedDBTxnMode::Readwrite,
+        vec![
+            put_request(
+                TEST_STORE,
+                large.0,
+                IndexedDBKeyType::Number(2.0),
+                vec![0; 1 << 20],
+                false,
+            ),
+            put_request(
+                TEST_STORE,
+                after.0,
+                IndexedDBKeyType::Number(3.0),
+                vec![3],
+                false,
+            ),
+        ],
+    );
+    assert_eq!(recv(&large.1), Err(BackendError::QuotaExceeded));
+    assert_eq!(recv(&after.1), Err(BackendError::QuotaExceeded));
+    assert_eq!(commit(&db, 1), Err(BackendError::QuotaExceeded));
+    assert!(stored_keys(&db, TEST_STORE).is_empty());
 }
 
 /// A readonly request runs inside the open SQL transaction of a writer with a disjoint scope. If

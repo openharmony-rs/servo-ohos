@@ -33,7 +33,7 @@ use crate::dom::bindings::trace::HashMapTracedValues;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbopendbrequest::IDBOpenDBRequest;
 use crate::dom::indexeddb::key::{
-    convert_value_to_key, dom_string_from_name, map_backend_error_to_dom_error,
+    convert_value_to_key, dom_string_from_name, map_transaction_error_to_dom_error,
     name_from_dom_string,
 };
 use crate::dom::promise::Promise;
@@ -457,7 +457,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
                 let promise = trusted_promise.root(cx);
                 match result {
                     Err(err) => {
-                        let error = map_backend_error_to_dom_error(err);
+                        let error = map_transaction_error_to_dom_error(err);
                         rooted!(&in(cx) let mut rval = UndefinedValue());
                         error
                             .to_jsval(cx, &promise.global(), rval.handle_mut());

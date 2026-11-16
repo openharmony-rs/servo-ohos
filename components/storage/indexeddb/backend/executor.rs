@@ -295,13 +295,29 @@ impl SqlError {
         }
     }
 
+    /// Whether the error reports a constraint of the tables that a statement violated, such as
+    /// a primary key or a unique index that would have had the same key twice.
+    fn is_constraint_violation(&self) -> bool {
+        match self {
+            #[cfg(feature = "sqlite-backend")]
+            Self::Sqlite(error) => {
+                error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)
+            },
+            #[cfg(ohos_rdb)]
+            Self::Rdb(error) => super::rdb::is_constraint_error(error),
+            _ => false,
+        }
+    }
+
     /// The error to report for this one: QuotaExceeded for a full disk, Unusable for a damaged
-    /// database, DbErr otherwise.
+    /// database, Constraint for a violated constraint, DbErr otherwise.
     pub(crate) fn to_backend_error(&self) -> BackendError {
         if self.is_disk_full() {
             BackendError::QuotaExceeded
         } else if self.makes_database_unusable() {
             BackendError::Unusable(format!("{self:?}"))
+        } else if self.is_constraint_violation() {
+            BackendError::Constraint
         } else {
             BackendError::DbErr(format!("{self:?}"))
         }
