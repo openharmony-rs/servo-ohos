@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 
 use log::{error, warn};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::threadpool::ThreadPool;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
@@ -66,7 +66,7 @@ impl<X: SqlExecutor> SqlEngine<X> {
                     metadata: metadata.clone(),
                     failed: FxHashMap::default(),
                     population: None,
-                    stores: FxHashMap::default(),
+                    stores: StoreRows::default(),
                 })),
             }),
             metadata,
@@ -89,6 +89,9 @@ impl<X: SqlExecutor> SqlEngine<X> {
     ) -> Option<i64> {
         self.actor
             .call(move |database| {
+                if let Some(row) = database.stores.rows.get(&store) {
+                    return Ok((row.auto_increment != 0).then_some(row.auto_increment));
+                }
                 queries::key_generator_current_number(&mut database.executor, store)
             })
             .and_then(|result| result)
@@ -132,7 +135,7 @@ impl<X: SqlExecutor> Drop for SqlEngine<X> {
 pub(super) struct TestConnection<'a, X>(MutexGuard<'a, Option<Database<X>>>);
 
 #[cfg(test)]
-impl<X> std::ops::Deref for TestConnection<'_, X> {
+impl<X: SqlExecutor> std::ops::Deref for TestConnection<'_, X> {
     type Target = X;
 
     fn deref(&self) -> &X {
@@ -141,11 +144,15 @@ impl<X> std::ops::Deref for TestConnection<'_, X> {
 }
 
 #[cfg(test)]
-impl<X> std::ops::DerefMut for TestConnection<'_, X> {
-    /// The test may change the database, so the store rows that the actor keeps are dropped.
+impl<X: SqlExecutor> std::ops::DerefMut for TestConnection<'_, X> {
+    /// The test may change the database, so the store rows that the actor keeps are written and
+    /// dropped.
     fn deref_mut(&mut self) -> &mut X {
         let database = self.0.as_mut().expect("The database is open");
-        database.stores.clear();
+        database
+            .stores
+            .write_and_drop(&mut database.executor)
+            .expect("Failed to write the key generators");
         &mut database.executor
     }
 }
@@ -295,21 +302,54 @@ pub(super) struct Database<X> {
     /// The index population of the upgrade transaction, while one runs or while the requests
     /// that waited for it run.
     population: Option<Population>,
-    /// The rows of the object stores that requests used, with their indexes and key generators,
-    /// as the connection sees them: inside the open SQL transaction, or as of the last commit.
-    /// Schema operations and rollbacks drop them, and puts keep the key generators up to date.
     stores: StoreRows,
 }
 
-type StoreRows = FxHashMap<IndexedDBObjectStoreId, ObjectStore>;
+/// The rows of the object stores that requests used, with their indexes and key generators, as
+/// the connection sees them: inside the open SQL transaction, or as of the last commit. Puts move
+/// the key generators here, and their current numbers are written to the database before the
+/// transaction commits and before schema operations, which then drop the rows; a rollback drops
+/// them unwritten.
+#[derive(Default)]
+struct StoreRows {
+    rows: FxHashMap<IndexedDBObjectStoreId, ObjectStore>,
+    /// The stores whose key generator's current number differs from the one in the database.
+    unwritten: FxHashSet<IndexedDBObjectStoreId>,
+}
 
-/// The row of the object store `id`, from `stores`, or read on `executor` and kept in `stores`.
+impl StoreRows {
+    /// Writes the current numbers of the key generators that changed.
+    fn write<X: SqlExecutor>(&mut self, executor: &mut X) -> Result<(), SqlError> {
+        for id in std::mem::take(&mut self.unwritten) {
+            if let Some(store) = self.rows.get(&id) {
+                queries::set_key_generator_current_number(executor, id, store.auto_increment)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the key generators and drops the rows, which a schema operation may change. On
+    /// failure, the transaction has failed and the rows are dropped all the same.
+    fn write_and_drop<X: SqlExecutor>(&mut self, executor: &mut X) -> Result<(), SqlError> {
+        let result = self.write(executor);
+        self.drop_after_rollback();
+        result
+    }
+
+    /// Drops the rows and the key generators that changed, after a rollback.
+    fn drop_after_rollback(&mut self) {
+        self.rows.clear();
+        self.unwritten.clear();
+    }
+}
+
+/// The row of the object store `id`, from `rows`, or read on `executor` and kept in `rows`.
 fn object_store<'a, X: SqlExecutor>(
     executor: &mut X,
-    stores: &'a mut StoreRows,
+    rows: &'a mut FxHashMap<IndexedDBObjectStoreId, ObjectStore>,
     id: IndexedDBObjectStoreId,
 ) -> Result<Option<&'a mut ObjectStore>, SqlError> {
-    Ok(match stores.entry(id) {
+    Ok(match rows.entry(id) {
         Entry::Occupied(entry) => Some(entry.into_mut()),
         Entry::Vacant(entry) => {
             queries::object_store(executor, id)?.map(|store| entry.insert(store))
@@ -455,7 +495,7 @@ impl<X: SqlExecutor> Database<X> {
             !self.executor.in_transaction()
         {
             self.writer = None;
-            self.stores.clear();
+            self.stores.drop_after_rollback();
             self.failed.insert(writer, error());
         }
     }
@@ -528,6 +568,10 @@ impl<X: SqlExecutor> Database<X> {
         if self.writer != Some(transaction) {
             return Ok(());
         }
+        if let Err(error) = self.stores.write(&mut self.executor) {
+            self.roll_back(transaction);
+            return Err(error.to_backend_error());
+        }
         let metadata = if changes_metadata {
             match Metadata::load(&mut self.executor) {
                 Ok(metadata) => Some(metadata),
@@ -546,7 +590,7 @@ impl<X: SqlExecutor> Database<X> {
         // QuotaExceededError or an "UnknownError" DOMException, and terminate these steps.
         self.executor.commit().map_err(|error| {
             warn!("Failed to commit IndexedDB transaction {transaction}: {error:?}");
-            self.stores.clear();
+            self.stores.drop_after_rollback();
             error.to_backend_error()
         })?;
         if let Some(metadata) = metadata {
@@ -586,7 +630,7 @@ impl<X: SqlExecutor> Database<X> {
             return;
         }
         self.writer = None;
-        self.stores.clear();
+        self.stores.drop_after_rollback();
         if let Err(error) = self.executor.rollback() {
             warn!("Failed to roll back IndexedDB transaction {transaction}: {error:?}");
         }
@@ -774,10 +818,17 @@ fn run_request<X: SqlExecutor>(
         return Outcome::default();
     };
 
-    let (result, failure) = match object_store(executor, stores, store) {
-        Ok(Some(store)) => match operation {
-            AsyncOperation::ReadOnly(operation) => run_read_only(executor, store, operation),
-            AsyncOperation::ReadWrite(operation) => run_read_write(executor, store, operation),
+    let (result, failure) = match object_store(executor, &mut stores.rows, store) {
+        Ok(Some(object_store)) => match operation {
+            AsyncOperation::ReadOnly(operation) => run_read_only(executor, object_store, operation),
+            AsyncOperation::ReadWrite(operation) => {
+                let current_number = object_store.auto_increment;
+                let outcome = run_read_write(executor, object_store, operation);
+                if object_store.auto_increment != current_number {
+                    stores.unwritten.insert(store);
+                }
+                outcome
+            },
             AsyncOperation::Schema(_) => unreachable!("Schema operations run above"),
         },
         Ok(None) => (Err(BackendError::StoreNotFound), None),
@@ -914,9 +965,11 @@ fn run_schema<X: SqlExecutor>(
         return run_population_step(executor, stores, store, index_id, step);
     }
     // Every other schema operation changes the rows of the stores or their indexes.
-    stores.clear();
+    if let Err(error) = stores.write_and_drop(executor) {
+        return Outcome::schema_failure(error.to_backend_error());
+    }
     let outcome = run_metadata_change(executor, stores, store, operation);
-    stores.clear();
+    stores.drop_after_rollback();
     outcome
 }
 
@@ -996,7 +1049,7 @@ fn read_population_records<X: SqlExecutor>(
     index_id: IndexedDBIndexId,
     after: Option<&IndexedDBKeyType>,
 ) -> Outcome {
-    let result = object_store(executor, stores, store)
+    let result = object_store(executor, &mut stores.rows, store)
         .and_then(|store| store.ok_or(SqlError::MissingRow("object store")))
         .and_then(|store| queries::population_records(executor, store, after));
     match result {
@@ -1026,7 +1079,7 @@ fn run_population_step<X: SqlExecutor>(
         },
         IndexPopulationStep::SetIndexKeys { records, done } => (records, done),
     };
-    let result = object_store(executor, stores, store)
+    let result = object_store(executor, &mut stores.rows, store)
         .and_then(|store| store.ok_or(SqlError::MissingRow("object store")))
         .and_then(|store| {
             let index = store

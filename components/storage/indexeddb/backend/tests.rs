@@ -102,6 +102,7 @@ executor_tests!(
     test_large_explicit_keys_and_the_key_generator,
     test_failed_add_changes_nothing,
     test_abort_reverts_the_key_generator,
+    test_key_generator_is_written_before_commit_and_schema_changes,
     test_abort_rolls_back_data_schema_and_version,
     test_invalid_schema_operation_fails_the_transaction,
     test_transaction_spanning_batches_commits_atomically,
@@ -1049,7 +1050,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
             index_keys(by_author, [IndexedDBKeyType::Number(1.0)]),
         ];
         queries::put_record(executor, &mut store, None, &[7], false, index_keys)?;
-        Ok(())
+        queries::set_key_generator_current_number(executor, store.id, store.auto_increment)
     })
     .unwrap();
 
@@ -2082,6 +2083,70 @@ fn test_abort_reverts_the_key_generator<X: SqlExecutor>() {
     assert_eq!(replies[0], key_reply(1.0));
     assert_eq!(commit(&db, 2), Ok(()));
     assert_eq!(db.key_generator_current_number(TEST_STORE), Some(2));
+}
+
+/// The key generator's current number, which puts move in the actor, is written to the database
+/// before the transaction commits and before a schema operation.
+fn test_key_generator_is_written_before_commit_and_schema_changes<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    create_store(&db, "test_store", None, true).unwrap();
+    let replies = run_puts(
+        &db,
+        1,
+        TEST_STORE,
+        vec![(None, vec![1]), (None, vec![2])],
+        false,
+    );
+    assert_eq!(replies, vec![key_reply(1.0), key_reply(2.0)]);
+    assert_eq!(commit(&db, 1), Ok(()));
+    drop(db);
+    let db = open_engine_in::<X>(dir.path(), false);
+    assert_eq!(db.key_generator_current_number(TEST_STORE), Some(3));
+
+    db.upgrade_version(txn(2), 2);
+    let puts: Vec<_> = (0..3).map(|_| get_callback()).collect();
+    let put = |index: usize| {
+        indexed_put_request(
+            TEST_STORE,
+            puts[index].0,
+            None,
+            vec![index as u8],
+            false,
+            vec![],
+        )
+    };
+    let rename = |name: &str| {
+        schema(
+            TEST_STORE,
+            AsyncSchemaOperation::RenameObjectStore {
+                new_name: name.into(),
+            },
+        )
+    };
+    let failures = run_batch(
+        &db,
+        2,
+        IndexedDBTxnMode::Versionchange,
+        vec![
+            put(0),
+            rename("renamed"),
+            put(1),
+            rename("test_store"),
+            put(2),
+        ],
+    );
+    assert_eq!(failures, vec![]);
+    let replies: Vec<_> = puts.iter().map(|put| recv(&put.1)).collect();
+    assert_eq!(
+        replies,
+        vec![key_reply(3.0), key_reply(4.0), key_reply(5.0)]
+    );
+    assert_eq!(commit(&db, 2), Ok(()));
+    drop(db);
+    let db = open_engine_in::<X>(dir.path(), false);
+    assert_eq!(db.key_generator_current_number(TEST_STORE), Some(6));
+    assert_eq!(stored_keys(&db, TEST_STORE), number_keys([1, 2, 3, 4, 5]));
 }
 
 /// Aborting a transaction rolls back everything it did in all its batches, and for an upgrade

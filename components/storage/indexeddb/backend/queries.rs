@@ -361,6 +361,22 @@ pub(crate) fn key_generator_current_number<X: SqlExecutor>(
         .and_then(|store| (store.auto_increment != 0).then_some(store.auto_increment)))
 }
 
+/// Writes `current_number` as the current number of the key generator of the store `store_id`.
+pub(crate) fn set_key_generator_current_number<X: SqlExecutor>(
+    executor: &mut X,
+    store_id: IndexedDBObjectStoreId,
+    current_number: i64,
+) -> Result<(), SqlError> {
+    let changed = executor.execute(
+        "UPDATE object_store SET auto_increment = ? WHERE id = ?",
+        &[
+            SqlParam::Integer(current_number),
+            SqlParam::Integer(store_id),
+        ],
+    )?;
+    expect_one_changed_row(changed, "key generator update")
+}
+
 /// The id of the index named `name` of the store `store_id`, if there is one.
 fn index_named<X: SqlExecutor>(
     executor: &mut X,
@@ -1244,7 +1260,8 @@ fn delete_index_records<X: SqlExecutor>(
 /// `key`, or under a key from the store's key generator if `key` is `None`, which requires that
 /// the store has one, with `index_keys`, the keys script computed for each index of the store. A
 /// record that can't be stored changes nothing, not even the key generator; a stored record
-/// updates the key generator's current number in `store` along with the database.
+/// updates the key generator's current number in `store`, which the caller writes to the database
+/// with [`set_key_generator_current_number`] before the transaction commits.
 pub(crate) fn put_record<X: SqlExecutor>(
     executor: &mut X,
     store: &mut ObjectStore,
@@ -1358,13 +1375,6 @@ pub(crate) fn put_record<X: SqlExecutor>(
     insert_index_records(executor, store, &encoded_key, &index_records)?;
 
     if let Some(current_number) = new_current_number {
-        executor.execute(
-            "UPDATE object_store SET auto_increment = ? WHERE id = ?",
-            &[
-                SqlParam::Integer(current_number),
-                SqlParam::Integer(store.id),
-            ],
-        )?;
         store.auto_increment = current_number;
     }
 
