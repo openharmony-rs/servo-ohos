@@ -98,6 +98,8 @@ backend_tests!(
     test_indexeddb_held_back_transaction_asks_the_holder_to_evict,
     test_indexeddb_request_queued_behind_an_upgrade_asks_it_to_evict,
     test_indexeddb_connections_of_a_crashed_window_close,
+    test_indexeddb_corrupt_database_is_reset_when_opened,
+    test_indexeddb_corrupt_database_of_an_earlier_session_is_deleted,
 );
 
 static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3515,5 +3517,71 @@ fn test_indexeddb_connections_of_a_crashed_window_close() {
     let (connection, old_version) = upgrade_without_changes(&ctx, db_name, &next, 1);
     assert_eq!(old_version, 0);
     close_database(&ctx, connection, db_name);
+    ctx.shutdown();
+}
+
+/// Overwrites the database file in `directory` with bytes that aren't an SQLite database and
+/// removes the files SQLite keeps next to it.
+fn overwrite_database_with_garbage(directory: &std::path::Path) {
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            overwrite_database_with_garbage(&path);
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.starts_with("indexeddb.") {
+            continue;
+        }
+        if name.contains('-') {
+            std::fs::remove_file(&path).unwrap();
+        } else {
+            std::fs::write(&path, b"not an SQLite database, ".repeat(1000)).unwrap();
+        }
+    }
+}
+
+/// A database that turns out to be corrupt when it is opened is deleted and created anew in its
+/// directory, so the open upgrades it from version 0, and its registry entry stays: databases()
+/// lists it with its new version, also after a restart. databases() omits it while it is corrupt.
+fn test_indexeddb_corrupt_database_is_reset_when_opened() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-corrupt";
+    upgrade_and_close(&ctx, db_name, 3, 0);
+    let directory = database_directory(&ctx, db_name).expect("A registry entry");
+
+    let ctx = ctx.restart();
+    overwrite_database_with_garbage(&directory);
+    assert_eq!(databases(&ctx), vec![]);
+    upgrade_and_close(&ctx, db_name, 1, 0);
+    assert_eq!(database_directory(&ctx, db_name), Some(directory));
+    assert_eq!(databases(&ctx), vec![(db_name.to_owned(), 1)]);
+
+    let ctx = ctx.restart();
+    assert_eq!(databases(&ctx), vec![(db_name.to_owned(), 1)]);
+    let open = open_database(&ctx, db_name, None);
+    match recv_callback_timeout(&open, "open") {
+        ConnectionMsg::Connection { id, version, .. } => {
+            assert_eq!(version, 1);
+            close_database(&ctx, id, db_name);
+        },
+        other => panic!("unexpected open message: {other:?}"),
+    }
+    ctx.shutdown();
+}
+
+/// A delete of a corrupt database of an earlier session deletes it and reports version 0, as its
+/// version can't be read.
+fn test_indexeddb_corrupt_database_of_an_earlier_session_is_deleted() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-corrupt-deleted";
+    upgrade_and_close(&ctx, db_name, 3, 0);
+    let directory = database_directory(&ctx, db_name).expect("A registry entry");
+
+    let ctx = ctx.restart();
+    overwrite_database_with_garbage(&directory);
+    assert_eq!(delete_result(&ctx, db_name), Ok(0));
+    assert!(!directory.exists());
+    assert_eq!(database_directory(&ctx, db_name), None);
     ctx.shutdown();
 }

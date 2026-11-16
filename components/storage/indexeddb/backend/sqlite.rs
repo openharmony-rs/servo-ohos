@@ -106,6 +106,21 @@ impl SqliteExecutor {
     }
 }
 
+/// Removes the database file `path` and the files SQLite keeps next to it.
+fn remove_database_files(path: &Path) -> Result<(), SqlError> {
+    for suffix in DATABASE_FILE_SUFFIXES {
+        let mut file = path.to_owned().into_os_string();
+        file.push(suffix);
+        match fs::remove_file(&file) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(SqlError::Io(error));
+            },
+            _ => {},
+        }
+    }
+    Ok(())
+}
+
 impl ToSql for SqlParam<'_> {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(ToSqlOutput::Borrowed(match *self {
@@ -155,21 +170,15 @@ impl SqlExecutor for SqliteExecutor {
     fn delete(self) -> Result<(), SqlError> {
         let Self { path, connection } = self;
         connection.close().map_err(|(_, error)| error)?;
-        for suffix in DATABASE_FILE_SUFFIXES {
-            let mut file = path.clone().into_os_string();
-            file.push(suffix);
-            match fs::remove_file(&file) {
-                Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                    return Err(SqlError::Io(error));
-                },
-                _ => {},
-            }
-        }
-        Ok(())
+        remove_database_files(&path)
     }
 
     fn exists(directory: &Path) -> bool {
         directory.join(DATABASE_FILE_NAME).exists()
+    }
+
+    fn delete_files(directory: &Path) -> Result<(), SqlError> {
+        remove_database_files(&directory.join(DATABASE_FILE_NAME))
     }
 
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {

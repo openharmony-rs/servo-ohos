@@ -64,6 +64,14 @@ impl SqlExecutor for TwinExecutor {
         }
     }
 
+    fn delete_files(directory: &Path) -> Result<(), SqlError> {
+        if use_ohos_rdb_backend() {
+            RdbExecutor::delete_files(directory)
+        } else {
+            SqliteExecutor::delete_files(directory)
+        }
+    }
+
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
         delegate!(self, |executor| executor.execute(sql, params))
     }

@@ -84,6 +84,8 @@ executor_tests!(
     schema_version_mismatch_resets_the_database,
     indexeddb_version_is_independent_of_the_schema_version,
     schema_reset_that_keeps_the_old_database_fails,
+    corrupt_database_is_reset_when_opened,
+    injected_corruption_at_open_resets_the_database,
     committed_version_of_a_stored_database,
     test_cycle,
     test_create_store,
@@ -768,6 +770,76 @@ fn schema_reset_that_keeps_the_old_database_fails<X: SqlExecutor>() {
     faults_for(dir.path()).lock().unwrap().keep_on_delete = false;
     let db = open_engine_in::<Faulty<X>>(dir.path(), false);
     assert!(db.created_db_path());
+    assert!(store_names(&db).is_empty());
+}
+
+/// Overwrites the database file in `directory` with bytes that aren't an SQLite database and
+/// removes the files SQLite keeps next to it.
+fn overwrite_database_with_garbage(directory: &Path) {
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            overwrite_database_with_garbage(&path);
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.starts_with("indexeddb.") {
+            continue;
+        }
+        if name.contains('-') {
+            std::fs::remove_file(&path).unwrap();
+        } else {
+            std::fs::write(&path, b"not an SQLite database, ".repeat(1000)).unwrap();
+        }
+    }
+}
+
+/// A database that turns out to be corrupt when it is opened is deleted and created anew, so the
+/// page gets an upgrade from version 0 instead of an error on every open.
+fn corrupt_database_is_reset_when_opened<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine_in::<X>(dir.path(), true);
+    create_store(&db, "store", None, false).unwrap();
+    set_version(&db, 3).unwrap();
+    drop(db);
+
+    overwrite_database_with_garbage(dir.path());
+    let db = open_engine_in::<X>(dir.path(), false);
+    assert!(db.created_db_path());
+    assert_eq!(db.version().unwrap(), 0);
+    assert!(store_names(&db).is_empty());
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
+}
+
+/// The same with a corruption that the [`Faulty`] executor reports for the first statement of
+/// the open; other failures at open don't reset the database.
+fn injected_corruption_at_open_resets_the_database<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine_in::<Faulty<X>>(dir.path(), true);
+    create_store(&db, "store", None, false).unwrap();
+    set_version(&db, 2).unwrap();
+    drop(db);
+
+    faults_for(dir.path()).lock().unwrap().statement = Some(("user_version", 0));
+    let open = SqlEngine::<Faulty<X>>::new(
+        dir.path().to_path_buf(),
+        false,
+        &test_description(),
+        ThreadPool::global(),
+    );
+    assert!(matches!(open, Err(SqlError::TransactionState(_))));
+    let db = open_engine_in::<Faulty<X>>(dir.path(), false);
+    assert_eq!(db.version().unwrap(), 2);
+    drop(db);
+
+    let faults = faults_for(dir.path());
+    let mut injected = faults.lock().unwrap();
+    injected.statement = Some(("user_version", 0));
+    injected.corrupt = true;
+    drop(injected);
+    let db = open_engine_in::<Faulty<X>>(dir.path(), false);
+    assert!(db.created_db_path());
+    assert_eq!(db.version().unwrap(), 0);
     assert!(store_names(&db).is_empty());
 }
 
@@ -2756,6 +2828,10 @@ impl<X: SqlExecutor> SqlExecutor for Faulty<X> {
 
     fn exists(directory: &Path) -> bool {
         X::exists(directory)
+    }
+
+    fn delete_files(directory: &Path) -> Result<(), SqlError> {
+        X::delete_files(directory)
     }
 
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {

@@ -90,6 +90,10 @@ pub(crate) trait SqlExecutor: Send + Sized + 'static {
     /// Whether a database is stored in `directory`, which [`Self::open`] would otherwise create.
     fn exists(directory: &Path) -> bool;
 
+    /// Deletes the database stored in `directory` with all its files without opening it, such as
+    /// a corrupt one. No connection to the database may be open.
+    fn delete_files(directory: &Path) -> Result<(), SqlError>;
+
     /// Runs a statement that returns no rows. Returns the number of rows an `UPDATE` or `DELETE`
     /// changed; the value is unspecified for other statements.
     ///
@@ -207,6 +211,10 @@ pub(crate) enum SqlError {
     /// A statement that the RDB executor would reject, which the SQLite executor refuses too.
     #[cfg(feature = "sqlite-backend")]
     NotOnRdb(String),
+    /// A database file that isn't an SQLite database, which RDB fails to open with a generic error
+    /// instead of RDB_E_SQLITE_CORRUPT.
+    #[cfg(ohos_rdb)]
+    NotADatabase,
     /// A corrupt database, injected by a test.
     #[cfg(test)]
     InjectedCorruption,
@@ -231,6 +239,8 @@ impl fmt::Display for SqlError {
             Self::Io(error) => error.fmt(formatter),
             #[cfg(feature = "sqlite-backend")]
             Self::NotOnRdb(sql) => write!(formatter, "statement that RDB would reject: {sql}"),
+            #[cfg(ohos_rdb)]
+            Self::NotADatabase => write!(formatter, "not an SQLite database"),
             #[cfg(test)]
             Self::InjectedCorruption => write!(formatter, "injected corruption"),
         }
@@ -280,7 +290,7 @@ impl SqlError {
 
     /// Whether the error says that the database file is damaged (SQLITE_CORRUPT or
     /// SQLITE_NOTADB), so that no statement on the database can be trusted any more.
-    fn makes_database_unusable(&self) -> bool {
+    pub(crate) fn makes_database_unusable(&self) -> bool {
         match self {
             #[cfg(feature = "sqlite-backend")]
             Self::Sqlite(error) => matches!(
@@ -289,6 +299,8 @@ impl SqlError {
             ),
             #[cfg(ohos_rdb)]
             Self::Rdb(error) => super::rdb::is_corruption_error(error),
+            #[cfg(ohos_rdb)]
+            Self::NotADatabase => true,
             #[cfg(test)]
             Self::InjectedCorruption => true,
             _ => false,

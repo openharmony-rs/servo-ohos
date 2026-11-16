@@ -4,6 +4,7 @@
 
 use std::error::Error as StdError;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -19,6 +20,24 @@ use crate::ohos_rdb::{
 use crate::shared::{DB_PRAGMAS, has_enospc};
 
 const DATABASE_FILE_NAME: &str = "indexeddb.rdb";
+
+/// The first bytes of every SQLite database file.
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// Whether the file `path` has content that doesn't start with [`SQLITE_HEADER`].
+fn is_not_a_database(path: &Path) -> bool {
+    let mut header = Vec::with_capacity(SQLITE_HEADER.len());
+    match fs::File::open(path) {
+        Ok(file) => {
+            file.take(SQLITE_HEADER.len() as u64)
+                .read_to_end(&mut header)
+                .is_ok() &&
+                !header.is_empty() &&
+                header != SQLITE_HEADER
+        },
+        Err(_) => false,
+    }
+}
 
 /// A [`SqlExecutor`] on an OpenHarmony RDB store.
 ///
@@ -160,7 +179,13 @@ impl SqlRow for RdbRow<'_, '_> {
 impl SqlExecutor for RdbExecutor {
     fn open(directory: &Path) -> Result<Self, SqlError> {
         fs::create_dir_all(directory).map_err(OhosRdbError::from)?;
-        let store = OhosRdbStore::open(directory, DATABASE_FILE_NAME)?;
+        let store = OhosRdbStore::open(directory, DATABASE_FILE_NAME).map_err(|error| {
+            if is_not_a_database(&directory.join("rdb").join(DATABASE_FILE_NAME)) {
+                SqlError::NotADatabase
+            } else {
+                error.into()
+            }
+        })?;
         for pragma in DB_PRAGMAS {
             let _ = store.execute(pragma);
         }
@@ -204,6 +229,11 @@ impl SqlExecutor for RdbExecutor {
 
     fn exists(directory: &Path) -> bool {
         directory.join("rdb").join(DATABASE_FILE_NAME).exists()
+    }
+
+    fn delete_files(directory: &Path) -> Result<(), SqlError> {
+        OhosRdbStore::delete(directory, DATABASE_FILE_NAME)?;
+        Ok(())
     }
 
     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {

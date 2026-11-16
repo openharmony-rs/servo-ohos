@@ -45,14 +45,27 @@ pub(crate) struct SqlEngine<X: SqlExecutor> {
 }
 
 impl<X: SqlExecutor> SqlEngine<X> {
+    /// Opens the database stored in `path`. A database that turns out to be corrupt while it is
+    /// opened is deleted and created anew, as Gecko does: its data can't be read anyway, and the
+    /// page gets an upgrade from version 0 instead of an error on every open.
     pub(crate) fn new(
         path: PathBuf,
         created: bool,
         db_info: &IndexedDBDescription,
         pool: Arc<ThreadPool>,
     ) -> Result<Self, SqlError> {
-        let (mut executor, created_database) = schema::open_database::<X>(&path, db_info)?;
-        let metadata = Arc::new(Mutex::new(Metadata::load(&mut executor)?));
+        let (executor, created_database, metadata) = match Self::open_database(&path, db_info) {
+            Err(error) if error.makes_database_unusable() => {
+                warn!(
+                    "Resetting IndexedDB database {:?}, which is corrupt: {error:?}",
+                    db_info.name
+                );
+                X::delete_files(&path)?;
+                Self::open_database(&path, db_info)?
+            },
+            result => result?,
+        };
+        let metadata = Arc::new(Mutex::new(metadata));
         let unusable = Arc::new(AtomicBool::new(false));
         Ok(Self {
             actor: Arc::new(Actor {
@@ -77,6 +90,22 @@ impl<X: SqlExecutor> SqlEngine<X> {
             unusable,
             created_db_path: created || created_database,
         })
+    }
+
+    /// Opens the database stored in `path` with [`schema::open_database`] and reads its metadata.
+    fn open_database(
+        path: &Path,
+        db_info: &IndexedDBDescription,
+    ) -> Result<(X, bool, Metadata), SqlError> {
+        let (mut executor, created) = schema::open_database::<X>(path, db_info)?;
+        let metadata = Metadata::load(&mut executor)?;
+        Ok((executor, created, metadata))
+    }
+
+    /// Deletes the database stored in `path` with all its files, without opening it. No engine
+    /// may have it open.
+    pub(crate) fn delete_files(path: &Path) -> Result<(), SqlError> {
+        X::delete_files(path)
     }
 
     /// The version of the database stored in `path` as of its last commit, for a database that

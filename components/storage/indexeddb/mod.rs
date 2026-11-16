@@ -763,6 +763,9 @@ struct OpenRequest {
     created: bool,
     /// The pipeline of the window that made the request, if a window did.
     pipeline: Option<PipelineId>,
+    /// Whether a failure showed the database to be unusable, so that the open request deletes
+    /// it and creates it anew.
+    reset: bool,
 }
 
 #[derive(MallocSizeOf)]
@@ -826,6 +829,7 @@ impl OpenRequest {
             state: OpenRequestState::Queued,
             created: false,
             pipeline,
+            reset: false,
         }
     }
 
@@ -1999,7 +2003,18 @@ impl IndexedDBManager {
                 // Step 6: If db is null, let db be a new database with name name, version 0
                 // (zero), and with no object stores. If this fails for any reason, return an
                 // appropriate error (e.g. a "QuotaExceededError" or "UnknownError" DOMException).
-                match ActiveKvsEngine::new(path, created, &key, self.thread_pool.clone()) {
+                let reset = if front.reset {
+                    warn!(
+                        "Resetting IndexedDB database {:?}, which is corrupt",
+                        key.name
+                    );
+                    ActiveKvsEngine::delete_files(&path)
+                } else {
+                    Ok(())
+                };
+                match reset.and_then(|()| {
+                    ActiveKvsEngine::new(path, created, &key, self.thread_pool.clone())
+                }) {
                     Ok(engine) => {
                         let created = engine.created_db_path();
                         let db = IndexedDBEnvironment::new(engine, self.manager_sender.clone());
@@ -2074,8 +2089,8 @@ impl IndexedDBManager {
             request.pipeline,
         );
 
-        // A database that a failure showed to be unusable is opened again, once its connections
-        // are closed.
+        // A database that a failure showed to be unusable is deleted and created anew, once its
+        // connections are closed, as one that turns out to be corrupt when it is opened.
         if self
             .databases
             .get(key)
@@ -2085,6 +2100,9 @@ impl IndexedDBManager {
                 return false;
             }
             self.databases.remove(key);
+            if let Some(request) = self.front_request_mut(key) {
+                request.reset = true;
+            }
         }
 
         // Step 4: Let db be the database named name in storageKey, or null otherwise.
