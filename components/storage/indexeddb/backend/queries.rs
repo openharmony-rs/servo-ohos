@@ -500,7 +500,8 @@ pub(crate) enum RecordSource<'a> {
     Index(StoreIndex),
 }
 
-/// What a read selects of each record, in this order.
+/// What a read selects of each record, in this order. A store's record has its key once, as it is
+/// also the primary key: see [`record_of_row`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum RecordColumns {
     /// The primary key: the key of a store's record, the value of an index's record.
@@ -551,10 +552,13 @@ impl RecordSource<'_> {
                 "o.data",
             ),
         };
+        let store = matches!(self, Self::ObjectStore(_));
         let selected = match columns {
             RecordColumns::PrimaryKey => primary_key.to_owned(),
             RecordColumns::Value => format!("{primary_key}, {value}"),
+            RecordColumns::Record if store => format!("{key}, {value}"),
             RecordColumns::Record => format!("{key}, {primary_key}, {value}"),
+            RecordColumns::Keys if store => key.to_owned(),
             RecordColumns::Keys => format!("{key}, {primary_key}"),
         };
         (format!("{from}{}", condition.on(key)), selected)
@@ -685,11 +689,26 @@ pub(crate) fn get_key<X: SqlExecutor>(
     .pop())
 }
 
-fn record_of_row(row: &dyn SqlRow, with_value: bool) -> Result<IndexedDBRecord, SqlError> {
+/// The record of `source` in a row of [`RecordColumns::Record`], or of [`RecordColumns::Keys`]
+/// without `with_value`.
+fn record_of_row(
+    source: RecordSource,
+    row: &dyn SqlRow,
+    with_value: bool,
+) -> Result<IndexedDBRecord, SqlError> {
+    let key = decode_key(&row.blob(0)?)?;
+    let (primary_key, value_column) = match source {
+        RecordSource::ObjectStore(_) => (key.clone(), 1),
+        RecordSource::Index(_) => (decode_key(&row.blob(1)?)?, 2),
+    };
     Ok(IndexedDBRecord {
-        key: decode_key(&row.blob(0)?)?,
-        primary_key: decode_key(&row.blob(1)?)?,
-        value: if with_value { Some(row.blob(2)?) } else { None },
+        key,
+        primary_key,
+        value: if with_value {
+            Some(row.blob(value_column)?)
+        } else {
+            None
+        },
     })
 }
 
@@ -811,7 +830,7 @@ pub(crate) fn get_all_records<X: SqlExecutor>(
         range,
         direction,
         count,
-        |row| record_of_row(row, true),
+        |row| record_of_row(source, row, true),
     )
 }
 
@@ -1002,7 +1021,7 @@ pub(crate) fn cursor_records<X: SqlExecutor>(
         reverse,
         Some(records),
         offset,
-        |row| record_of_row(row, !key_only),
+        |row| record_of_row(source, row, !key_only),
     )
 }
 
