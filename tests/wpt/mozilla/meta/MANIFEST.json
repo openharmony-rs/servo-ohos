@@ -11362,6 +11362,14 @@
      "worker-success.js": [
       "327986f34b9b20476b6a7b1189c732a9ea8b9f68",
       []
+     ],
+     "worker-terminate-idle-inner.js": [
+      "9f09be5800f061537fd41adf3bf4b82d0190a04b",
+      []
+     ],
+     "worker-terminate-idle-outer.js": [
+      "2682a6b67b775117a4fb39822fc1be0442335ca0",
+      []
      ]
     },
     "restyle-out-of-document-ref.html": [
@@ -16887,6 +16895,13 @@
     ],
     "windowproxy.html": [
      "d5c75899eb546d7243d65b6f55e876c5008c6292",
+     [
+      null,
+      {}
+     ]
+    ],
+    "worker-terminate-idle.html": [
+     "e938e5d87d2eed8295674c787409af96ecf73f5d",
      [
       null,
       {}
