@@ -8,7 +8,7 @@ mod engines;
 use std::borrow::ToOwned;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 use log::{debug, error, warn};
@@ -793,11 +793,42 @@ struct Connection {
     results: GenericCallback<ConnectionEvent>,
 }
 
+/// A thread of the manager's own for its calls to the client storage thread, which run there one
+/// after another and hand their results back to the manager as messages. Neither the manager
+/// thread, which serves every database, nor the thread pool, which runs the databases' work,
+/// waits for the client storage thread, whose registry writes are slow.
+struct ClientStorageCalls {
+    sender: mpsc::Sender<Box<dyn FnOnce() + Send>>,
+}
+
+impl ClientStorageCalls {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        thread::Builder::new()
+            .name("IndexedDBClientStorage".to_owned())
+            .spawn(move || {
+                while let Ok(call) = receiver.recv() {
+                    call();
+                }
+            })
+            .expect("Thread spawning failed");
+        Self { sender }
+    }
+
+    /// Runs `call` after the calls handed over before, unless the thread is gone.
+    fn run(&self, call: impl FnOnce() + Send + 'static) -> BackendResult<()> {
+        self.sender.send(Box::new(call)).map_err(|_| {
+            BackendError::DbErr("The IndexedDB manager's client storage thread is gone".to_owned())
+        })
+    }
+}
+
 struct IndexedDBManager {
     port: GenericReceiver<IndexedDBThreadMsg>,
     manager_sender: GenericSender<IndexedDBThreadMsg>,
     databases: HashMap<IndexedDBDescription, IndexedDBEnvironment<ActiveKvsEngine>>,
     thread_pool: Arc<ThreadPool>,
+    client_storage_calls: ClientStorageCalls,
 
     /// <https://w3c.github.io/IndexedDB/#connection-queue>
     connection_queues: HashMap<IndexedDBDescription, VecDeque<OpenRequest>>,
@@ -821,6 +852,7 @@ impl IndexedDBManager {
             manager_sender,
             databases: HashMap::new(),
             thread_pool: ThreadPool::global(),
+            client_storage_calls: ClientStorageCalls::new(),
             connection_queues: Default::default(),
             connections: Default::default(),
             next_connection: 0,
@@ -1089,26 +1121,36 @@ impl IndexedDBManager {
         kind: OpenRequestKind,
         bottle_source: StorageBottleSource,
     ) {
-        self.obtain_storage_proxy_map(&key, id, bottle_source);
+        let mut request = OpenRequest::new(id, kind);
+        let failed = self
+            .obtain_storage_proxy_map(&key, id, bottle_source)
+            .is_err_and(|error| {
+                request.proxy_map = Some(Err(error));
+                true
+            });
         // Step 1: Let queue be the connection queue for storageKey and name.
         // Step 2: Add request to queue.
         self.connection_queues
-            .entry(key)
+            .entry(key.clone())
             .or_default()
-            .push_back(OpenRequest::new(id, kind));
+            .push_back(request);
+        if failed {
+            self.advance_connection_queue(key);
+        }
     }
 
-    /// Obtains the storage proxy map of the queued request `request` on the thread pool, which
-    /// waits for the client storage thread instead of this one, and hands it to this thread.
+    /// Obtains the storage proxy map of the queued request `request` on the manager's client
+    /// storage thread, which waits for the client storage thread instead of this one, and hands
+    /// it to this thread.
     fn obtain_storage_proxy_map(
         &self,
         key: &IndexedDBDescription,
         request: Uuid,
         bottle_source: StorageBottleSource,
-    ) {
+    ) -> BackendResult<()> {
         let manager_sender = self.manager_sender.clone();
         let IndexedDBDescription { origin, name } = key.clone();
-        self.thread_pool.spawn(move || {
+        self.client_storage_calls.run(move || {
             let result = obtain_a_local_storage_bottle_map(&bottle_source, &origin);
             if manager_sender
                 .send(IndexedDBThreadMsg::StorageProxyMapObtained {
@@ -1121,7 +1163,7 @@ impl IndexedDBManager {
             {
                 debug!("IndexedDB manager went away while obtaining a storage proxy map");
             }
-        });
+        })
     }
 
     fn storage_proxy_map_obtained(
