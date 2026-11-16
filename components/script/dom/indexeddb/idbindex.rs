@@ -23,7 +23,7 @@ use crate::dom::idbobjectstore::KeyPath;
 use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
 use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
-use crate::dom::indexeddb::idbrequest::IDBRequest;
+use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource};
 use crate::dom::indexeddb::key::{
     convert_value_to_key_range, dom_string_from_name, name_from_dom_string,
 };
@@ -178,7 +178,7 @@ impl IDBIndex {
 
         IDBRequest::execute_async(
             cx,
-            &self.object_store,
+            RequestSource::Index(self),
             cursor.iterate_operation(None, 1),
             None,
             Some(iteration_param),

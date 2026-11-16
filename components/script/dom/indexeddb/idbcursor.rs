@@ -30,7 +30,7 @@ use crate::dom::bindings::structuredclone;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbindex::IDBIndex;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
-use crate::dom::indexeddb::idbrequest::IDBRequest;
+use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource};
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::key::{
     ExtractionResult, convert_value_to_key, extract_key, key_type_to_jsval,
@@ -175,6 +175,15 @@ impl IDBCursor {
         match &self.source {
             ObjectStoreOrIndex::ObjectStore(_) => self.position.borrow().clone(),
             ObjectStoreOrIndex::Index(_) => self.object_store_position.borrow().clone(),
+        }
+    }
+
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-source>, as the source of the requests that
+    /// iterate the cursor.
+    fn request_source(&self) -> RequestSource<'_> {
+        match &self.source {
+            ObjectStoreOrIndex::ObjectStore(store) => RequestSource::ObjectStore(store),
+            ObjectStoreOrIndex::Index(index) => RequestSource::Index(index),
         }
     }
 
@@ -373,12 +382,9 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
             count: Some(count),
         };
 
-        // NOTE: According to the spec, execute_async should take the cursor's source
-        // (which may be an index). Using effective_object_store here is a temporary
-        // workaround until execute_async supports ObjectStoreOrIndex as source.
         IDBRequest::execute_async(
             cx,
-            &self.effective_object_store(),
+            self.request_source(),
             self.iterate_operation(None, count),
             Some(request),
             Some(iteration_param),
@@ -462,12 +468,9 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
             count: None,
         };
 
-        // NOTE: According to the spec, execute_async should take the cursor's source
-        // (which may be an index). Using effective_object_store here is a temporary
-        // workaround until execute_async supports ObjectStoreOrIndex as source.
         IDBRequest::execute_async(
             cx,
-            &self.effective_object_store(),
+            self.request_source(),
             self.iterate_operation(operation_key.as_ref(), 1),
             Some(request),
             Some(iteration_param),
@@ -603,12 +606,9 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
             count: None,
         };
 
-        // NOTE: According to the spec, execute_async should take the cursor's source
-        // (which may be an index). Using effective_object_store here is a temporary
-        // workaround until execute_async supports ObjectStoreOrIndex as source.
         IDBRequest::execute_async(
             cx,
-            &self.effective_object_store(),
+            self.request_source(),
             self.iterate_operation(Some(&operation_key), 1),
             Some(request),
             Some(iteration_param),
@@ -702,7 +702,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         // with this and operation.
         IDBRequest::execute_async(
             cx,
-            &effective_object_store,
+            RequestSource::Cursor(self),
             AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
                 key: self.effective_key(),
                 value: serialized_value,
@@ -755,7 +755,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
 
         IDBRequest::execute_async(
             cx,
-            &effective_object_store,
+            RequestSource::Cursor(self),
             AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
                 key_range: IndexedDBKeyRange::only(effective_key),
             }),

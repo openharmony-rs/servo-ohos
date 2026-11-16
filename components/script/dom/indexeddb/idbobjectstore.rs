@@ -39,7 +39,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
 use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
 use crate::dom::indexeddb::idbindex::IDBIndex;
-use crate::dom::indexeddb::idbrequest::IDBRequest;
+use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource};
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::key::{
     EvaluationResult, ExtractionResult, can_inject_key_into_value, clear_pending_exception,
@@ -507,7 +507,7 @@ impl IDBObjectStore {
         // with handle and operation.
         IDBRequest::execute_async(
             cx,
-            self,
+            RequestSource::ObjectStore(self),
             AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
                 key: serialized_key,
                 value: serialized_value,
@@ -587,7 +587,7 @@ impl IDBObjectStore {
 
         IDBRequest::execute_async(
             cx,
-            self,
+            RequestSource::ObjectStore(self),
             cursor.iterate_operation(None, 1),
             None,
             Some(iteration_param),
@@ -718,7 +718,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         serialized_query.and_then(|key_range| {
             IDBRequest::execute_async(
                 cx,
-                self,
+                RequestSource::ObjectStore(self),
                 AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem { key_range }),
                 None,
                 None,
@@ -741,7 +741,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         // Step 7. Return the result (an IDBRequest) of running asynchronously execute a request with this and operation.
         IDBRequest::execute_async(
             cx,
-            self,
+            RequestSource::ObjectStore(self),
             AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear),
             None,
             None,
@@ -766,7 +766,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         serialized_query.and_then(|q| {
             IDBRequest::execute_async(
                 cx,
-                self,
+                RequestSource::ObjectStore(self),
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem { key_range: q }),
                 None,
                 None,
@@ -793,7 +793,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         serialized_query.and_then(|q| {
             IDBRequest::execute_async(
                 cx,
-                self,
+                RequestSource::ObjectStore(self),
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey { key_range: q }),
                 None,
                 None,
@@ -825,7 +825,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         serialized_query.and_then(|q| {
             IDBRequest::execute_async(
                 cx,
-                self,
+                RequestSource::ObjectStore(self),
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
                     key_range: q,
                     count,
@@ -860,7 +860,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         serialized_query.and_then(|q| {
             IDBRequest::execute_async(
                 cx,
-                self,
+                RequestSource::ObjectStore(self),
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
                     key_range: q,
                     count,
@@ -889,7 +889,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
         serialized_query.and_then(|q| {
             IDBRequest::execute_async(
                 cx,
-                self,
+                RequestSource::ObjectStore(self),
                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count { key_range: q }),
                 None,
                 None,
