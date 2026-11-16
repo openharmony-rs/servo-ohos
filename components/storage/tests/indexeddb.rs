@@ -21,10 +21,10 @@ use storage_traits::StorageThreads;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
     BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexPopulationEvent,
-    IndexPopulationStep, IndexedDBIndexKey, IndexedDBIndexKeys, IndexedDBKeyRange,
-    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBRecordIndexKeys,
-    IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
-    RequestOutput, StorageBottleSource, SyncOperation, TransactionEvent,
+    IndexPopulationStep, IndexedDBCursorDirection, IndexedDBCursorStep, IndexedDBIndexKey,
+    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord,
+    IndexedDBRecordIndexKeys, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue,
+    KeyPath, PutItemResult, RequestOutput, StorageBottleSource, SyncOperation, TransactionEvent,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -66,7 +66,7 @@ backend_tests!(
     test_indexeddb_aborted_transaction_restores_pre_transaction_state,
     test_indexeddb_aborted_upgrade_reverts_version_and_stores,
     test_indexeddb_cross_type_key_sort_order,
-    test_indexeddb_iterate_count_and_reverse,
+    test_indexeddb_cursor_steps_start_at_the_position,
     test_indexeddb_delete_item_range_respects_open_bounds,
     test_indexeddb_auto_increment_assigns_sequential_keys,
     test_indexeddb_batch_commit_failure_surfaces_an_error,
@@ -733,8 +733,9 @@ fn iterate_request(
     store: i64,
     txn: IndexedDBTxnId,
     key_range: IndexedDBKeyRange,
-    count: Option<u32>,
-    reverse: bool,
+    direction: IndexedDBCursorDirection,
+    step: IndexedDBCursorStep,
+    records: u32,
     request_id: u64,
 ) -> mpsc::Receiver<Option<BackendResult<Vec<IndexedDBRecord>>>> {
     send_request(
@@ -745,9 +746,12 @@ fn iterate_request(
         request_id,
         IndexedDBTxnMode::Readonly,
         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+            index: None,
             key_range,
-            count,
-            reverse,
+            direction,
+            step,
+            records,
+            key_only: false,
         }),
     )
 }
@@ -1430,7 +1434,7 @@ fn test_indexeddb_cross_type_key_sort_order() {
     ctx.shutdown();
 }
 
-fn test_indexeddb_iterate_count_and_reverse() {
+fn test_indexeddb_cursor_steps_start_at_the_position() {
     let ctx = IndexedDbTestContext::new();
     let db_name = "indexeddb-iterate";
     let store_name = "items";
@@ -1471,42 +1475,52 @@ fn test_indexeddb_iterate_count_and_reverse() {
     finish_transaction(&ctx, db_name, txn);
 
     let number = |n: f64| IndexedDBKeyType::Number(n);
+    let step = |position: Option<f64>, key: Option<f64>, count| IndexedDBCursorStep {
+        position: position.map(number),
+        object_store_position: None,
+        key: key.map(number),
+        primary_key: None,
+        count,
+    };
+    let (next, prev) = (
+        IndexedDBCursorDirection::Next,
+        IndexedDBCursorDirection::Prev,
+    );
+    let all = IndexedDBKeyRange::default();
     let cases = [
         (
-            IndexedDBKeyRange::default(),
-            None,
-            false,
+            all.clone(),
+            next,
+            step(None, None, 1),
+            5,
             vec![1, 2, 3, 4, 5],
         ),
         (
-            IndexedDBKeyRange::default(),
-            None,
-            true,
-            vec![1, 2, 3, 4, 5],
+            all.clone(),
+            prev,
+            step(None, None, 1),
+            5,
+            vec![5, 4, 3, 2, 1],
         ),
-        (
-            IndexedDBKeyRange::lower_bound(number(2.0), true),
-            Some(2),
-            false,
-            vec![3, 4],
-        ),
-        (
-            IndexedDBKeyRange::upper_bound(number(4.0), true),
-            Some(2),
-            true,
-            vec![2, 3],
-        ),
+        (all.clone(), next, step(Some(2.0), None, 1), 2, vec![3, 4]),
+        (all.clone(), prev, step(Some(4.0), None, 1), 2, vec![3, 2]),
         (
             IndexedDBKeyRange::new(Some(number(2.0)), Some(number(4.0)), false, false),
-            Some(10),
-            true,
-            vec![2, 3, 4],
+            prev,
+            step(None, None, 1),
+            10,
+            vec![4, 3, 2],
         ),
+        (all.clone(), next, step(Some(5.0), None, 1), 1, vec![]),
+        (all.clone(), next, step(Some(1.0), None, 3), 1, vec![4]),
+        (all.clone(), next, step(Some(1.0), Some(3.0), 1), 1, vec![3]),
+        (all.clone(), prev, step(Some(5.0), Some(2.5), 1), 1, vec![2]),
         (
-            IndexedDBKeyRange::lower_bound(number(5.0), true),
-            Some(1),
-            false,
-            vec![],
+            IndexedDBKeyRange::lower_bound(number(3.0), false),
+            IndexedDBCursorDirection::PrevUnique,
+            step(Some(5.0), None, 2),
+            5,
+            vec![3],
         ),
     ];
 
@@ -1520,35 +1534,40 @@ fn test_indexeddb_iterate_count_and_reverse() {
     let receivers: Vec<_> = cases
         .iter()
         .zip(1..)
-        .map(|((key_range, count, reverse, _), request_id)| {
+        .map(|((key_range, direction, step, records, _), request_id)| {
             iterate_request(
                 &ctx,
                 db_name,
                 STORE,
                 txn,
                 key_range.clone(),
-                *count,
-                *reverse,
+                *direction,
+                step.clone(),
+                *records,
                 request_id,
             )
         })
         .collect();
     let commit_result = commit_transaction(&ctx, db_name, txn);
-    for (receiver, (key_range, count, reverse, expected)) in receivers.iter().zip(&cases) {
-        let records = recv_callback_timeout(receiver, "iterate reply").unwrap();
-        let keys: Vec<_> = records.iter().map(|record| record.key.clone()).collect();
-        let values: Vec<_> = records.iter().map(|record| record.value.clone()).collect();
+    for (receiver, (key_range, direction, step, records, expected)) in receivers.iter().zip(&cases)
+    {
+        let found = recv_callback_timeout(receiver, "iterate reply").unwrap();
+        let keys: Vec<_> = found.iter().map(|record| record.key.clone()).collect();
+        let values: Vec<_> = found.iter().map(|record| record.value.clone()).collect();
         assert_eq!(
             keys,
             expected
                 .iter()
                 .map(|n| number(*n as f64))
                 .collect::<Vec<_>>(),
-            "{key_range:?} count {count:?} reverse {reverse}"
+            "{key_range:?} {direction:?} {step:?} records {records}"
         );
         assert_eq!(
             values,
-            expected.iter().map(|n| vec![*n as u8]).collect::<Vec<_>>()
+            expected
+                .iter()
+                .map(|n| Some(vec![*n as u8]))
+                .collect::<Vec<_>>()
         );
     }
     let commit_msg = recv_callback_timeout(&commit_result, "iterate read commit reply");

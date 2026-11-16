@@ -11746,6 +11746,69 @@
       }
      ]
     ],
+    "index-cursors.any.js": [
+     "d1c7658343402c0a2f3945385f88145a319dd867",
+     [
+      "IndexedDB/index-cursors.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursors over the records of an index"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-cursors.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursors over the records of an index"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-cursors.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursors over the records of an index"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-cursors.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursors over the records of an index"
+        ]
+       ]
+      }
+     ]
+    ],
     "index-keys-page-code.any.js": [
      "5a4fccd09b72cd07b55ce718e89055880f891ce9",
      [

@@ -17,10 +17,10 @@ use servo_url::ImmutableOrigin;
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
     BackendError, BackendResult, ConnectionEvent, IndexPopulationEvent, IndexPopulationStep,
-    IndexedDBIndex, IndexedDBIndexKey, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
-    IndexedDBObjectStore, IndexedDBRecord, IndexedDBRecordIndexKeys, IndexedDBTxnId,
-    IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput, TransactionEvent,
-    Utf16String,
+    IndexedDBCursorDirection, IndexedDBCursorStep, IndexedDBIndex, IndexedDBIndexKey,
+    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord,
+    IndexedDBRecordIndexKeys, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath,
+    PutItemResult, RequestOutput, TransactionEvent, Utf16String,
 };
 use tempfile::TempDir;
 use url::Host;
@@ -137,6 +137,8 @@ executor_tests!(
     test_index_reads_go_in_key_then_primary_key_order,
     test_index_reads_see_the_writes_before_them,
     test_index_reads_after_create_index_see_the_whole_index,
+    test_cursor_steps_find_what_the_spec_finds,
+    test_cursor_steps_see_the_writes_between_them,
 );
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -4871,6 +4873,688 @@ fn test_index_reads_after_create_index_see_the_whole_index<X: SqlExecutor>() {
         Ok(Some(stored_value(1.0, 1u32.to_be_bytes().to_vec())))
     );
     assert_eq!(commit(&db, 2), Ok(()));
+}
+
+/// A record of a cursor's source in the cursor tests: (key, value), where an index's record's
+/// value is the primary key and a store's record's value is its key.
+type SourceRecord = (IndexedDBKeyType, IndexedDBKeyType);
+
+/// <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9 as the spec words it, over
+/// `records`, the records of the source in (key, value) order: the record that the steps find.
+fn spec_found_record(
+    records: &[SourceRecord],
+    is_index: bool,
+    direction: IndexedDBCursorDirection,
+    range: &IndexedDBKeyRange,
+    step: &IndexedDBCursorStep,
+) -> Option<SourceRecord> {
+    let IndexedDBCursorStep {
+        key,
+        primary_key,
+        count,
+        ..
+    } = step;
+    let mut position = step.position.clone();
+    let mut object_store_position = step.object_store_position.clone();
+    let mut found = None;
+    for _ in 0..*count {
+        let forward = |record: &&SourceRecord| {
+            let (record_key, record_value) = *record;
+            key.as_ref().is_none_or(|key| record_key >= key) &&
+                primary_key.as_ref().is_none_or(|primary_key| {
+                    let key = key.as_ref().unwrap();
+                    (record_key == key && record_value >= primary_key) || record_key > key
+                }) &&
+                (is_index ||
+                    position
+                        .as_ref()
+                        .is_none_or(|position| record_key > position)) &&
+                (!is_index ||
+                    position.as_ref().is_none_or(|position| {
+                        (record_key == position &&
+                            object_store_position
+                                .as_ref()
+                                .is_some_and(|osp| record_value > osp)) ||
+                            record_key > position
+                    })) &&
+                range.contains(record_key)
+        };
+        let forward_unique = |record: &&SourceRecord| {
+            let record_key = &record.0;
+            key.as_ref().is_none_or(|key| record_key >= key) &&
+                position
+                    .as_ref()
+                    .is_none_or(|position| record_key > position) &&
+                range.contains(record_key)
+        };
+        let backward = |record: &&SourceRecord| {
+            let (record_key, record_value) = *record;
+            key.as_ref().is_none_or(|key| record_key <= key) &&
+                primary_key.as_ref().is_none_or(|primary_key| {
+                    let key = key.as_ref().unwrap();
+                    (record_key == key && record_value <= primary_key) || record_key < key
+                }) &&
+                (is_index ||
+                    position
+                        .as_ref()
+                        .is_none_or(|position| record_key < position)) &&
+                (!is_index ||
+                    position.as_ref().is_none_or(|position| {
+                        (record_key == position &&
+                            object_store_position
+                                .as_ref()
+                                .is_some_and(|osp| record_value < osp)) ||
+                            record_key < position
+                    })) &&
+                range.contains(record_key)
+        };
+        let backward_unique = |record: &&SourceRecord| {
+            let record_key = &record.0;
+            key.as_ref().is_none_or(|key| record_key <= key) &&
+                position
+                    .as_ref()
+                    .is_none_or(|position| record_key < position) &&
+                range.contains(record_key)
+        };
+        found = match direction {
+            IndexedDBCursorDirection::Next => records.iter().find(forward),
+            IndexedDBCursorDirection::NextUnique => records.iter().find(forward_unique),
+            IndexedDBCursorDirection::Prev => records.iter().rev().find(backward),
+            IndexedDBCursorDirection::PrevUnique => records
+                .iter()
+                .rev()
+                .find(backward_unique)
+                .map(|temp| records.iter().find(|record| record.0 == temp.0).unwrap()),
+        };
+        let (found_key, found_value) = found?;
+        position = Some(found_key.clone());
+        if is_index {
+            object_store_position = Some(found_value.clone());
+        }
+    }
+    found.cloned()
+}
+
+/// The records that a step that asks for `records` records gives by the spec: the one the step
+/// finds, then those of the steps without a key after it.
+fn spec_cursor_records(
+    records: &[SourceRecord],
+    is_index: bool,
+    direction: IndexedDBCursorDirection,
+    range: &IndexedDBKeyRange,
+    step: &IndexedDBCursorStep,
+    count: u32,
+) -> Vec<SourceRecord> {
+    let mut found = Vec::new();
+    let mut step = step.clone();
+    while found.len() < count as usize {
+        let Some(record) = spec_found_record(records, is_index, direction, range, &step) else {
+            break;
+        };
+        step = cursor_step_at(&record, is_index);
+        found.push(record);
+    }
+    found
+}
+
+/// A step without a key from the record `at`.
+fn cursor_step_at(at: &SourceRecord, is_index: bool) -> IndexedDBCursorStep {
+    IndexedDBCursorStep {
+        position: Some(at.0.clone()),
+        object_store_position: is_index.then(|| at.1.clone()),
+        key: None,
+        primary_key: None,
+        count: 1,
+    }
+}
+
+const CURSOR_DIRECTIONS: [IndexedDBCursorDirection; 4] = [
+    IndexedDBCursorDirection::Next,
+    IndexedDBCursorDirection::NextUnique,
+    IndexedDBCursorDirection::Prev,
+    IndexedDBCursorDirection::PrevUnique,
+];
+
+/// A cursor's source in the cursor tests, the store's row, and its records in order.
+fn cursor_source<X: SqlExecutor>(
+    db: &SqlEngine<X>,
+    store: i64,
+    index: Option<i64>,
+) -> (queries::ObjectStore, Vec<SourceRecord>) {
+    let mut connection = db.connection();
+    let object_store = queries::object_store(&mut *connection, store)
+        .unwrap()
+        .unwrap();
+    drop(connection);
+    let records = match index {
+        Some(index) => index_records_of(db, store, index),
+        None => keys_of(&mut *db.connection(), store)
+            .into_iter()
+            .map(|key| (key.clone(), key))
+            .collect(),
+    };
+    (object_store, records)
+}
+
+/// Runs a cursor step on `index` of `store`, or on the store, as [`queries::cursor_records`]
+/// does, and returns the records as (key, value) with their values, which `value_of` must give
+/// for the record's primary key.
+#[allow(clippy::too_many_arguments)]
+fn backend_cursor_records<X: SqlExecutor>(
+    connection: &mut X,
+    store: &queries::ObjectStore,
+    index: Option<i64>,
+    direction: IndexedDBCursorDirection,
+    range: &IndexedDBKeyRange,
+    step: &IndexedDBCursorStep,
+    records: u32,
+    key_only: bool,
+    value_of: &dyn Fn(&IndexedDBKeyType) -> Vec<u8>,
+) -> Vec<SourceRecord> {
+    let source = match index {
+        Some(index) => RecordSource::Index(store.index(index).unwrap()),
+        None => RecordSource::ObjectStore(store),
+    };
+    let found = queries::cursor_records(
+        connection, source, range, direction, step, records, key_only,
+    )
+    .unwrap_or_else(|error| {
+        panic!("{error:?}: {index:?} {direction:?} {range:?} {step:?} {records} {key_only}")
+    });
+    found
+        .into_iter()
+        .map(|record| {
+            let expected = (!key_only).then(|| value_of(&record.primary_key));
+            assert_eq!(record.value, expected, "the value of {record:?}");
+            if index.is_none() {
+                assert_eq!(record.key, record.primary_key);
+            }
+            (record.key, record.primary_key)
+        })
+        .collect()
+}
+
+/// Cursor steps find the records that the spec's steps to iterate a cursor find: on a store and
+/// on a non-unique, a unique and a multiEntry index, in every direction, over ranges, from every
+/// position, with continue(), advance(), continue(key) and continuePrimaryKey(), and asking for
+/// several records per step.
+fn test_cursor_steps_find_what_the_spec_finds<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let index = |name: &str, unique, multi_entry| {
+        let key_path = KeyPath::String(name.to_owned());
+        create_index(&db, store, name.to_owned(), key_path, unique, multi_entry).unwrap()
+    };
+    let (by_kind, by_id, by_tag) = (
+        index("kind", false, false),
+        index("id", true, false),
+        index("tag", false, true),
+    );
+    let primary_keys: Vec<_> = (0..10)
+        .map(|n| number(f64::from(n)))
+        .chain([string("x"), string("y")])
+        .collect();
+    let kinds = [
+        number(1.0),
+        number(2.0),
+        string("a"),
+        number(2.0),
+        string("b"),
+    ];
+    // Put in an order that is neither the key order nor any index's.
+    let order = [7, 2, 11, 0, 9, 4, 1, 10, 5, 8, 3, 6];
+    let puts = order
+        .iter()
+        .map(|&n| {
+            let tags = match n % 3 {
+                0 => vec![],
+                1 => vec![string("t"), number(f64::from(n % 4))],
+                _ => vec![string("t"), string("u")],
+            };
+            (
+                Some(primary_keys[n as usize].clone()),
+                vec![n as u8],
+                vec![
+                    index_keys(by_kind, [kinds[n as usize % kinds.len()].clone()]),
+                    index_keys(by_id, [number(100.0 - f64::from(n))]),
+                    index_keys(by_tag, tags),
+                ],
+            )
+        })
+        .collect();
+    let replies = run_indexed_puts(&db, 1, store, puts, false);
+    assert!(replies.iter().all(Result::is_ok), "{replies:?}");
+    assert_eq!(commit(&db, 1), Ok(()));
+    let value_of = |primary_key: &IndexedDBKeyType| {
+        let n = primary_keys
+            .iter()
+            .position(|key| key == primary_key)
+            .unwrap();
+        vec![n as u8]
+    };
+
+    // The request goes to the index it names, and one that the store doesn't have fails.
+    let first = |index| AsyncReadOnlyOperation::Iterate {
+        index,
+        key_range: IndexedDBKeyRange::default(),
+        direction: IndexedDBCursorDirection::Next,
+        step: IndexedDBCursorStep {
+            position: None,
+            object_store_position: None,
+            key: None,
+            primary_key: None,
+            count: 1,
+        },
+        records: 1,
+        key_only: false,
+    };
+    assert_eq!(
+        read::<X, BackendResult<Vec<IndexedDBRecord>>>(&db, 2, store, first(Some(by_id))),
+        Ok(vec![IndexedDBRecord {
+            key: number(89.0),
+            primary_key: string("y"),
+            value: Some(vec![11]),
+        }])
+    );
+    assert!(matches!(
+        read::<X, BackendResult<Vec<IndexedDBRecord>>>(&db, 2, store, first(Some(by_tag + 1))),
+        Err(BackendError::DbErr(_))
+    ));
+
+    let absent_primary_key = string("w");
+    let mut steps = 0;
+    for index in [None, Some(by_kind), Some(by_id), Some(by_tag)] {
+        let is_index = index.is_some();
+        let (object_store, records) = cursor_source(&db, store, index);
+        let mut keys: Vec<IndexedDBKeyType> = Vec::new();
+        for (key, _) in &records {
+            if keys.last() != Some(key) {
+                keys.push(key.clone());
+            }
+        }
+        // Keys that no record has, between and around the records' keys.
+        let absent_keys = [number(-1.0), number(1.5), string("aa"), string("zz")];
+        let (second, before_last) = (&keys[1], &keys[keys.len() - 2]);
+        let ranges = [
+            IndexedDBKeyRange::default(),
+            IndexedDBKeyRange::new(
+                Some(second.clone()),
+                Some(before_last.clone()),
+                false,
+                false,
+            ),
+            IndexedDBKeyRange::new(Some(second.clone()), Some(before_last.clone()), true, true),
+            IndexedDBKeyRange::only(second.clone()),
+        ];
+        let mut connection = db.connection();
+        for direction in CURSOR_DIRECTIONS {
+            let forward = matches!(
+                direction,
+                IndexedDBCursorDirection::Next | IndexedDBCursorDirection::NextUnique
+            );
+            let plain = matches!(
+                direction,
+                IndexedDBCursorDirection::Next | IndexedDBCursorDirection::Prev
+            );
+            for range in &ranges {
+                let mut check = |step: &IndexedDBCursorStep, count: u32, key_only: bool| {
+                    steps += 1;
+                    assert_eq!(
+                        backend_cursor_records(
+                            &mut *connection,
+                            &object_store,
+                            index,
+                            direction,
+                            range,
+                            step,
+                            count,
+                            key_only,
+                            &value_of,
+                        ),
+                        spec_cursor_records(&records, is_index, direction, range, step, count),
+                        "{index:?} {direction:?} {range:?} {step:?} records {count}"
+                    );
+                };
+                let first = IndexedDBCursorStep {
+                    position: None,
+                    object_store_position: None,
+                    key: None,
+                    primary_key: None,
+                    count: 1,
+                };
+                check(&first, 1, false);
+                check(&first, 1, true);
+                check(&first, 100, false);
+                let mut at = spec_found_record(&records, is_index, direction, range, &first);
+                while let Some(record) = at {
+                    let step = cursor_step_at(&record, is_index);
+                    // continue()
+                    check(&step, 1, false);
+                    // Several records per step, as a prefetch asks for.
+                    check(&step, 3, false);
+                    // advance()
+                    for count in [2, 3, 50] {
+                        check(
+                            &IndexedDBCursorStep {
+                                count,
+                                ..step.clone()
+                            },
+                            1,
+                            false,
+                        );
+                    }
+                    // continue(key), with keys beyond the position, which continue() requires.
+                    let beyond = |key: &&IndexedDBKeyType| {
+                        if forward {
+                            *key > &record.0
+                        } else {
+                            *key < &record.0
+                        }
+                    };
+                    let mut continue_keys: Vec<_> = keys.iter().filter(beyond).collect();
+                    if !forward {
+                        continue_keys.reverse();
+                    }
+                    continue_keys.truncate(2);
+                    continue_keys.extend(absent_keys.iter().filter(beyond).take(1));
+                    for key in continue_keys {
+                        let step = IndexedDBCursorStep {
+                            key: Some(key.clone()),
+                            ..step.clone()
+                        };
+                        check(&step, 1, false);
+                        check(&step, 2, false);
+                    }
+                    // continuePrimaryKey(), on indexes in the plain directions, with (key, primary
+                    // key) beyond the position, which it requires, and a primary key that no
+                    // record has.
+                    if is_index && plain {
+                        let beyond = |(key, primary_key): &&SourceRecord| {
+                            if forward {
+                                key > &record.0 || (key == &record.0 && primary_key > &record.1)
+                            } else {
+                                key < &record.0 || (key == &record.0 && primary_key < &record.1)
+                            }
+                        };
+                        let mut targets: Vec<_> = records.iter().filter(beyond).collect();
+                        if !forward {
+                            targets.reverse();
+                        }
+                        let absent = (record.0.clone(), absent_primary_key.clone());
+                        let targets = targets
+                            .into_iter()
+                            .take(2)
+                            .chain(Some(&absent).filter(beyond))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for (key, primary_key) in targets {
+                            check(
+                                &IndexedDBCursorStep {
+                                    key: Some(key),
+                                    primary_key: Some(primary_key),
+                                    ..step.clone()
+                                },
+                                1,
+                                false,
+                            );
+                        }
+                    }
+                    at = spec_found_record(&records, is_index, direction, range, &step);
+                }
+            }
+        }
+    }
+    assert!(steps > 1000, "{steps} steps");
+}
+
+/// A tiny pseudo-random generator for the tests, xorshift64.
+struct TestRandom(u64);
+
+impl TestRandom {
+    fn below(&mut self, bound: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % bound
+    }
+}
+
+/// Each cursor step reads the records as they are when it runs: records put, replaced and
+/// deleted between the steps, ahead of and behind the cursor and at its position, are found or
+/// skipped as the spec's steps find them on the records of the time.
+fn test_cursor_steps_see_the_writes_between_them<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let store = create_store(&db, "store", None, false).unwrap();
+    let by_kind = create_index(
+        &db,
+        store,
+        "kind".to_owned(),
+        KeyPath::String("kind".to_owned()),
+        false,
+        false,
+    )
+    .unwrap();
+    let by_id = create_index(
+        &db,
+        store,
+        "id".to_owned(),
+        KeyPath::String("id".to_owned()),
+        true,
+        false,
+    )
+    .unwrap();
+    let mut connection = db.connection();
+    let object_store = queries::object_store(&mut *connection, store)
+        .unwrap()
+        .unwrap();
+    // The value of a record is its kind and id, which give its index keys.
+    let put = |connection: &mut X, primary_key: f64, kind: u8, id: u8| {
+        queries::put_record(
+            connection,
+            &object_store,
+            Some(number(primary_key)),
+            &[kind, id],
+            true,
+            vec![
+                index_keys(by_kind, [number(f64::from(kind))]),
+                index_keys(by_id, [number(f64::from(id))]),
+            ],
+        )
+        .unwrap()
+    };
+    let delete = |connection: &mut X, primary_key: f64| {
+        queries::delete_records(
+            connection,
+            &object_store,
+            &IndexedDBKeyRange::only(number(primary_key)),
+        )
+        .unwrap()
+    };
+    let stored_values = |connection: &mut X| {
+        queries::get_all_values(
+            connection,
+            RecordSource::ObjectStore(&object_store),
+            &IndexedDBKeyRange::default(),
+            None,
+        )
+        .unwrap()
+    };
+    let records_of = |connection: &mut X, index: Option<i64>| -> Vec<SourceRecord> {
+        let source = match index {
+            Some(index) => RecordSource::Index(object_store.index(index).unwrap()),
+            None => RecordSource::ObjectStore(&object_store),
+        };
+        let all = IndexedDBCursorStep {
+            position: None,
+            object_store_position: None,
+            key: None,
+            primary_key: None,
+            count: 1,
+        };
+        queries::cursor_records(
+            connection,
+            source,
+            &IndexedDBKeyRange::default(),
+            IndexedDBCursorDirection::Next,
+            &all,
+            u32::MAX,
+            true,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|record| (record.key, record.primary_key))
+        .collect()
+    };
+    let step_and_check = |connection: &mut X,
+                          index: Option<i64>,
+                          direction: IndexedDBCursorDirection,
+                          step: &IndexedDBCursorStep|
+     -> Option<SourceRecord> {
+        let records = records_of(connection, index);
+        let values = stored_values(connection);
+        let expected = spec_found_record(
+            &records,
+            index.is_some(),
+            direction,
+            &IndexedDBKeyRange::default(),
+            step,
+        );
+        let found = backend_cursor_records(
+            connection,
+            &object_store,
+            index,
+            direction,
+            &IndexedDBKeyRange::default(),
+            step,
+            1,
+            false,
+            &|primary_key| {
+                let value = values
+                    .iter()
+                    .find(|value| &value.primary_key == primary_key);
+                value.unwrap().value.clone()
+            },
+        );
+        assert_eq!(
+            found.first(),
+            expected.as_ref(),
+            "{index:?} {direction:?} {step:?}"
+        );
+        expected
+    };
+    let reset = |connection: &mut X| {
+        queries::clear(connection, &object_store).unwrap();
+        for n in 0..8u8 {
+            assert!(matches!(
+                put(connection, f64::from(n), n % 3, 10 + n),
+                PutItemResult::Key(_)
+            ));
+        }
+    };
+
+    // A unique index whose record at the cursor's position goes, and another record gets its
+    // key with a larger primary key: "next" visits that record, "nextunique" doesn't.
+    for (direction, expected) in [
+        (
+            IndexedDBCursorDirection::Next,
+            Some((number(13.0), number(9.0))),
+        ),
+        (
+            IndexedDBCursorDirection::NextUnique,
+            Some((number(14.0), number(4.0))),
+        ),
+    ] {
+        reset(&mut *connection);
+        let at = (number(13.0), number(3.0));
+        delete(&mut *connection, 3.0);
+        assert!(matches!(
+            put(&mut *connection, 9.0, 0, 13),
+            PutItemResult::Key(_)
+        ));
+        assert_eq!(
+            step_and_check(
+                &mut *connection,
+                Some(by_id),
+                direction,
+                &cursor_step_at(&at, true)
+            ),
+            expected
+        );
+    }
+
+    // A reverse cursor over the non-unique index sees a record that moved behind it, and not one
+    // that moved ahead (idbindex_reverse_cursor).
+    reset(&mut *connection);
+    let at = spec_found_record(
+        &records_of(&mut *connection, Some(by_kind)),
+        true,
+        IndexedDBCursorDirection::Prev,
+        &IndexedDBKeyRange::default(),
+        &IndexedDBCursorStep {
+            position: None,
+            object_store_position: None,
+            key: None,
+            primary_key: None,
+            count: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(at, (number(2.0), number(5.0)));
+    assert!(matches!(
+        put(&mut *connection, 0.0, 2, 10),
+        PutItemResult::Key(_)
+    ));
+    assert!(matches!(
+        put(&mut *connection, 2.0, 2, 12),
+        PutItemResult::Key(_)
+    ));
+    assert_eq!(
+        step_and_check(
+            &mut *connection,
+            Some(by_kind),
+            IndexedDBCursorDirection::Prev,
+            &cursor_step_at(&at, true)
+        ),
+        Some((number(2.0), number(2.0)))
+    );
+
+    // Random writes between the steps of cursors over the store and both indexes.
+    let mut random = TestRandom(0x2545_f491_4f6c_dd1d);
+    for index in [None, Some(by_kind), Some(by_id)] {
+        for direction in CURSOR_DIRECTIONS {
+            for _ in 0..3 {
+                reset(&mut *connection);
+                let mut step = IndexedDBCursorStep {
+                    position: None,
+                    object_store_position: None,
+                    key: None,
+                    primary_key: None,
+                    count: 1,
+                };
+                for _ in 0..40 {
+                    let Some(record) = step_and_check(&mut *connection, index, direction, &step)
+                    else {
+                        break;
+                    };
+                    step = cursor_step_at(&record, index.is_some());
+                    for _ in 0..random.below(3) {
+                        let primary_key = random.below(12) as f64;
+                        match random.below(3) {
+                            0 => delete(&mut *connection, primary_key),
+                            _ => {
+                                let kind = random.below(4) as u8;
+                                let id = 10 + random.below(14) as u8;
+                                // A put whose id another record has changes nothing.
+                                put(&mut *connection, primary_key, kind, id);
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

@@ -801,17 +801,18 @@ fn run_read_only<X: SqlExecutor>(
         AsyncReadOnlyOperation::Count { index, key_range } => source(index)
             .map(|source| queries::count(executor, source, &key_range).map(RequestOutput::Count)),
         AsyncReadOnlyOperation::Iterate {
+            index,
             key_range,
-            count,
-            reverse,
-        } => Ok(queries::get_records(
-            executor,
-            RecordSource::ObjectStore(store),
-            &key_range,
-            count,
-            reverse,
-        )
-        .map(RequestOutput::Records)),
+            direction,
+            step,
+            records,
+            key_only,
+        } => source(index).map(|source| {
+            queries::cursor_records(
+                executor, source, &key_range, direction, &step, records, key_only,
+            )
+            .map(RequestOutput::Records)
+        }),
     };
     match result {
         Ok(result) => outcome(result, |output| output, Failure::Read),

@@ -402,12 +402,39 @@ pub struct IndexedDBValue {
     pub value: Vec<u8>,
 }
 
-/// <https://w3c.github.io/IndexedDB/#record-snapshot>
+/// <https://w3c.github.io/IndexedDB/#record-snapshot>: the key, the primary key (the key for a
+/// record of an object store) and the (referenced) value, which is `None` if the request read
+/// keys only.
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub struct IndexedDBRecord {
     pub key: IndexedDBKeyType,
     pub primary_key: IndexedDBKeyType,
-    pub value: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+}
+
+/// <https://w3c.github.io/IndexedDB/#cursor-direction>
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum IndexedDBCursorDirection {
+    Next,
+    NextUnique,
+    Prev,
+    PrevUnique,
+}
+
+/// A step of a cursor: the cursor's position and the arguments of
+/// <https://w3c.github.io/IndexedDB/#iterate-a-cursor>.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct IndexedDBCursorStep {
+    /// The cursor's position, undefined before its first step.
+    pub position: Option<IndexedDBKeyType>,
+    /// The cursor's object store position, for a cursor over an index.
+    pub object_store_position: Option<IndexedDBKeyType>,
+    /// The key given to continue() or continuePrimaryKey().
+    pub key: Option<IndexedDBKeyType>,
+    /// The primary key given to continuePrimaryKey().
+    pub primary_key: Option<IndexedDBKeyType>,
+    /// The count given to advance(), 1 otherwise.
+    pub count: u32,
 }
 
 /// The id of an object store, unique in its database. An upgrade transaction in script gives a
@@ -543,12 +570,17 @@ pub enum AsyncReadOnlyOperation {
         index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
     },
-    /// Gets the records in `key_range` in ascending key order: the first `count` of them, or the
-    /// last `count` if `reverse` is set, or all of them if `count` is `None`.
+    /// <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9 for a cursor over the records in
+    /// `key_range`: the record that `step` moves the cursor to in `direction`, none if it moves
+    /// past the end. Then the records that further steps without a key would move it to, up to
+    /// `records` records in all, in the order of the steps. With `key_only`, without values.
     Iterate {
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
-        count: Option<u32>,
-        reverse: bool,
+        direction: IndexedDBCursorDirection,
+        step: IndexedDBCursorStep,
+        records: u32,
+        key_only: bool,
     },
 }
 

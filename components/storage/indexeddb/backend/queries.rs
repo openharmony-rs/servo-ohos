@@ -9,9 +9,10 @@ use std::ops::ControlFlow;
 
 use rustc_hash::FxHashSet;
 use storage_traits::indexeddb::{
-    IndexedDBIndex, IndexedDBIndexId, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
-    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBRecordIndexKeys,
-    IndexedDBValue, KeyPath, PutItemResult, Utf16String,
+    IndexedDBCursorDirection, IndexedDBCursorStep, IndexedDBIndex, IndexedDBIndexId,
+    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore,
+    IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBRecordIndexKeys, IndexedDBValue, KeyPath,
+    PutItemResult, Utf16String,
 };
 
 use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
@@ -418,6 +419,32 @@ impl RangeCondition {
         self.bounds.push(encoding::serialize(bound));
     }
 
+    /// Adds the condition `operator` (such as `>`) on the (key, primary key) pairs of an index's
+    /// records, compared with (`key`, `primary_key`) in that order.
+    fn push_pair(
+        &mut self,
+        operator: &str,
+        key: &IndexedDBKeyType,
+        primary_key: &IndexedDBKeyType,
+    ) {
+        self.sql
+            .push_str(&format!(" AND ({{}}, i.object_data_key) {operator} (?, ?)"));
+        self.bounds.push(encoding::serialize(key));
+        self.bounds.push(encoding::serialize(primary_key));
+    }
+
+    /// Keeps, of the records of `index` with the same key, only the one with the lowest primary
+    /// key.
+    fn first_record_of_each_key(&mut self, index: StoreIndex) {
+        // NOTE: Not `MIN(i.object_data_key)` with `GROUP BY i.value`: RDB fails to read a column
+        // that holds the MIN() or MAX() of BLOBs (E_ERROR from OH_Cursor_IsNull).
+        self.sql.push_str(&format!(
+            " AND NOT EXISTS (SELECT 1 FROM {} AS f WHERE f.index_id = i.index_id \
+             AND f.value = i.value AND f.object_data_key < i.object_data_key)",
+            index.table()
+        ));
+    }
+
     /// The range of the one encoded key `key`.
     fn only(key: Vec<u8>) -> Self {
         Self {
@@ -482,6 +509,8 @@ pub(crate) enum RecordColumns {
     Value,
     /// The key, the primary key and the (referenced) value.
     Record,
+    /// The key and the primary key.
+    Keys,
 }
 
 impl RecordSource<'_> {
@@ -500,12 +529,16 @@ impl RecordSource<'_> {
                 "o.key",
                 "o.data",
             ),
-            Self::Index(index) if columns == RecordColumns::PrimaryKey => (
-                format!("{} AS i WHERE i.index_id = ?", index.table()),
-                "i.value",
-                "i.object_data_key",
-                "",
-            ),
+            Self::Index(index)
+                if matches!(columns, RecordColumns::PrimaryKey | RecordColumns::Keys) =>
+            {
+                (
+                    format!("{} AS i WHERE i.index_id = ?", index.table()),
+                    "i.value",
+                    "i.object_data_key",
+                    "",
+                )
+            },
             Self::Index(index) => (
                 format!(
                     "{} AS i JOIN object_data AS o \
@@ -522,6 +555,7 @@ impl RecordSource<'_> {
             RecordColumns::PrimaryKey => primary_key.to_owned(),
             RecordColumns::Value => format!("{primary_key}, {value}"),
             RecordColumns::Record => format!("{key}, {primary_key}, {value}"),
+            RecordColumns::Keys => format!("{key}, {primary_key}"),
         };
         (format!("{from}{}", condition.on(key)), selected)
     }
@@ -560,7 +594,25 @@ fn select_records<X: SqlExecutor, T>(
     map_row: impl Fn(&dyn SqlRow) -> Result<T, SqlError>,
 ) -> Result<Vec<T>, SqlError> {
     let condition = range_condition(range);
-    let (table_and_condition, selected) = source.table_and_condition(columns, &condition);
+    select(
+        executor, source, columns, &condition, reverse, count, 0, map_row,
+    )
+}
+
+/// Selects `columns` of the records of `source` whose keys meet `condition`, in ascending key
+/// order or descending if `reverse` is set, at most `count` of them, after skipping `offset`.
+#[allow(clippy::too_many_arguments)]
+fn select<X: SqlExecutor, T>(
+    executor: &mut X,
+    source: RecordSource,
+    columns: RecordColumns,
+    condition: &RangeCondition,
+    reverse: bool,
+    count: Option<u32>,
+    offset: u32,
+    map_row: impl Fn(&dyn SqlRow) -> Result<T, SqlError>,
+) -> Result<Vec<T>, SqlError> {
+    let (table_and_condition, selected) = source.table_and_condition(columns, condition);
     let mut sql = format!(
         "SELECT {selected} FROM {table_and_condition} ORDER BY {}",
         source.order(reverse)
@@ -569,6 +621,10 @@ fn select_records<X: SqlExecutor, T>(
     if let Some(count) = count {
         sql.push_str(" LIMIT ?");
         params.push(SqlParam::Integer(count.into()));
+        if offset > 0 {
+            sql.push_str(" OFFSET ?");
+            params.push(SqlParam::Integer(offset.into()));
+        }
     }
     query_rows(executor, &sql, &params, map_row)
 }
@@ -674,34 +730,207 @@ pub(crate) fn get_all_values<X: SqlExecutor>(
     )
 }
 
-/// The records of `source` in `range` in ascending key order: the first `count` of them, or the
-/// last `count` if `reverse` is set.
-pub(crate) fn get_records<X: SqlExecutor>(
+/// The bounds on the records that a step of a cursor can find, on the side of its position that
+/// it moves to: `range`'s bound there, or `pair`, a bound on the (key, primary key) pairs of an
+/// index's records, whichever is tighter, and `range`'s other bound.
+struct StepBounds {
+    range: IndexedDBKeyRange,
+    /// The (key, primary key) pair, and whether the bound excludes it.
+    pair: Option<(IndexedDBKeyType, IndexedDBKeyType, bool)>,
+    reverse: bool,
+}
+
+impl StepBounds {
+    /// Requires the records' keys to be at or beyond `key`, or beyond it if `open`.
+    fn restrict_key(&mut self, key: &IndexedDBKeyType, open: bool) {
+        if self.reverse {
+            self.range.restrict_upper(key.clone(), open);
+        } else {
+            self.range.restrict_lower(key.clone(), open);
+        }
+        self.drop_looser_bound();
+    }
+
+    /// Requires the records to be at or beyond (`key`, `primary_key`) in (key, primary key)
+    /// order, or beyond it if `open`.
+    fn restrict_pair(
+        &mut self,
+        key: &IndexedDBKeyType,
+        primary_key: &IndexedDBKeyType,
+        open: bool,
+    ) {
+        let tighter =
+            self.pair
+                .as_ref()
+                .is_none_or(|(current_key, current_primary_key, current_open)| {
+                    let beyond = |a: &IndexedDBKeyType, b: &IndexedDBKeyType| {
+                        if self.reverse { a < b } else { a > b }
+                    };
+                    beyond(key, current_key) ||
+                        (key == current_key &&
+                            (beyond(primary_key, current_primary_key) ||
+                                (primary_key == current_primary_key &&
+                                    open &&
+                                    !current_open)))
+                });
+        if tighter {
+            self.pair = Some((key.clone(), primary_key.clone(), open));
+        }
+        self.drop_looser_bound();
+    }
+
+    /// Keeps only the tighter of the range's bound on the side the cursor moves to and the
+    /// pair, so that the statement's seek starts at the tighter one.
+    fn drop_looser_bound(&mut self) {
+        let Some((pair_key, _, _)) = &self.pair else {
+            return;
+        };
+        let (bound, bound_open) = if self.reverse {
+            (&mut self.range.upper, self.range.upper_open)
+        } else {
+            (&mut self.range.lower, self.range.lower_open)
+        };
+        let Some(bound_key) = bound.as_ref() else {
+            return;
+        };
+        let pair_is_beyond = if self.reverse {
+            pair_key < bound_key
+        } else {
+            pair_key > bound_key
+        };
+        // At the same key, an open key bound excludes every pair with the key, a closed one none.
+        if pair_is_beyond || (pair_key == bound_key && !bound_open) {
+            *bound = None;
+        } else {
+            self.pair = None;
+        }
+    }
+
+    /// The conditions of these bounds on the records of an index or store.
+    fn condition(&self) -> RangeCondition {
+        let mut condition = range_condition(&self.range);
+        if let Some((key, primary_key, open)) = &self.pair {
+            let operator = match (self.reverse, open) {
+                (false, true) => ">",
+                (false, false) => ">=",
+                (true, true) => "<",
+                (true, false) => "<=",
+            };
+            condition.push_pair(operator, key, primary_key);
+        }
+        condition
+    }
+}
+
+/// <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9, for a cursor over the records of
+/// `source` in `range`: the record that `step` moves the cursor to in `direction`, then the
+/// records that further steps without a key would move it to, at most `records` records in all,
+/// in the order of the steps. Without values if `key_only`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cursor_records<X: SqlExecutor>(
     executor: &mut X,
     source: RecordSource,
     range: &IndexedDBKeyRange,
-    count: Option<u32>,
-    reverse: bool,
+    direction: IndexedDBCursorDirection,
+    step: &IndexedDBCursorStep,
+    records: u32,
+    key_only: bool,
 ) -> Result<Vec<IndexedDBRecord>, SqlError> {
-    let mut records = select_records(
+    let IndexedDBCursorStep {
+        position,
+        object_store_position,
+        key,
+        primary_key,
+        count,
+    } = step;
+    let reverse = matches!(
+        direction,
+        IndexedDBCursorDirection::Prev | IndexedDBCursorDirection::PrevUnique
+    );
+    let unique = matches!(
+        direction,
+        IndexedDBCursorDirection::NextUnique | IndexedDBCursorDirection::PrevUnique
+    );
+    // Step 9.1. Switch on direction:
+    // "next": Let found record be the first record in records which satisfy all of the following
+    // requirements:
+    // - If key is defined, the record’s key is greater than or equal to key.
+    // - If primaryKey is defined, the record’s key is equal to key and the record’s value is
+    //   greater than or equal to primaryKey, or the record’s key is greater than key.
+    // - If position is defined, and source is an object store, the record’s key is greater than
+    //   position.
+    // - If position is defined, and source is an index, the record’s key is equal to position and
+    //   the record’s value is greater than object store position or the record’s key is greater
+    //   than position.
+    // - The record’s key is in range.
+    // "nextunique": Let found record be the first record in records which satisfy all of the
+    // following requirements:
+    // - If key is defined, the record’s key is greater than or equal to key.
+    // - If position is defined, the record’s key is greater than position.
+    // - The record’s key is in range.
+    // "prev": Let found record be the last record in records which satisfy all of the following
+    // requirements: the requirements of "next", with "less" for "greater".
+    // "prevunique": Let temp record be the last record in records which satisfy all of the
+    // following requirements: those of "nextunique", with "less" for "greater". If temp record is
+    // defined, let found record be the first record in records whose key is equal to temp
+    // record’s key.
+    // NOTE: The requirements bound the records on the side the cursor moves to; the statement
+    // seeks to the tightest bound. The records of a source are in (key, primary key) order, so
+    // the found record is the first one in the direction, and for "prevunique" the one with the
+    // lowest primary key of the first key.
+    let mut bounds = StepBounds {
+        range: range.clone(),
+        pair: None,
+        reverse,
+    };
+    let index = match source {
+        RecordSource::Index(index) => Some(index),
+        RecordSource::ObjectStore(_) => None,
+    };
+    if let Some(key) = key {
+        match primary_key {
+            Some(primary_key) => bounds.restrict_pair(key, primary_key, false),
+            None => bounds.restrict_key(key, false),
+        }
+    }
+    if let Some(position) = position {
+        match object_store_position {
+            Some(object_store_position) if index.is_some() && !unique => {
+                bounds.restrict_pair(position, object_store_position, true)
+            },
+            _ => bounds.restrict_key(position, true),
+        }
+    }
+    // Step 9.5. Decrease count by 1.
+    // NOTE: Each of the count steps moves on to the next record that the steps find, or to the
+    // next key for the unique directions: the step skips count - 1 of them.
+    let offset = count.saturating_sub(1);
+    let mut condition = bounds.condition();
+    // A unique index has one record per key.
+    if let Some(index) = index.filter(|index| unique && !index.unique) {
+        condition.first_record_of_each_key(index);
+    }
+    let columns = if key_only {
+        RecordColumns::Keys
+    } else {
+        RecordColumns::Record
+    };
+    select(
         executor,
         source,
-        RecordColumns::Record,
-        range,
-        count,
+        columns,
+        &condition,
         reverse,
+        Some(records),
+        offset,
         |row| {
             Ok(IndexedDBRecord {
                 key: decode_key(&row.blob(0)?)?,
                 primary_key: decode_key(&row.blob(1)?)?,
-                value: row.blob(2)?,
+                value: if key_only { None } else { Some(row.blob(2)?) },
             })
         },
-    )?;
-    if reverse {
-        records.reverse();
-    }
-    Ok(records)
+    )
 }
 
 /// <https://w3c.github.io/IndexedDB/#count-the-records-in-a-range>

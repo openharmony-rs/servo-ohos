@@ -222,15 +222,12 @@ impl IDBIndex {
         // Step 6. Asynchronously execute a request with iteration_param.
         let iteration_param = IterationParam {
             cursor: Trusted::new(&cursor),
-            key: None,
-            primary_key: None,
-            count: None,
         };
 
         IDBRequest::execute_async(
             cx,
             RequestSource::Index(self),
-            cursor.iterate_operation(None, 1),
+            cursor.iterate_operation(None, None, 1),
             None,
             Some(iteration_param),
         )
