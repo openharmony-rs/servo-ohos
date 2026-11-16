@@ -12283,6 +12283,54 @@
       }
      ]
     ],
+    "shared-array-buffer-values.any.js": [
+     "b2f83dd5e354cfa08f29737b723234e9754078b1",
+     [
+      "IndexedDB/shared-array-buffer-values.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: values holding shared memory can't be stored"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/shared-array-buffer-values.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: values holding shared memory can't be stored"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/shared-array-buffer-values.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: values holding shared memory can't be stored"
+        ]
+       ]
+      }
+     ]
+    ],
     "string-keys-code-units.any.js": [
      "4959920d8f31f40d5d0a879a598d0888c74a09f5",
      [

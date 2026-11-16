@@ -783,7 +783,6 @@ impl Runtime {
             // TODO: handle js.asyncstack.enabled (needs new Spidermonkey)
             // TODO: handle js.throw_on_debugee_would_run (needs new Spidermonkey)
             // TODO: handle js.dump_stack_on_debugee_would_run (needs new Spidermonkey)
-            // TODO: handle js.shared_memory.enabled
             JS_SetGCParameter(
                 cx,
                 JSGCParamKey::JSGC_MAX_BYTES,
