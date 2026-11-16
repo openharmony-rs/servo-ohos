@@ -24,6 +24,7 @@ use profile_traits::path;
 use rusqlite::Error as RusqliteError;
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::generic_channel::{self, GenericReceiver, GenericSender, ReceiveError};
+use servo_base::id::PipelineId;
 use servo_base::threadpool::ThreadPool;
 use servo_url::origin::ImmutableOrigin;
 use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
@@ -760,6 +761,8 @@ struct OpenRequest {
     /// Whether the open request created its database, which then opens at version 1 if no
     /// version is asked for.
     created: bool,
+    /// The pipeline of the window that made the request, if a window did.
+    pipeline: Option<PipelineId>,
 }
 
 #[derive(MallocSizeOf)]
@@ -815,13 +818,14 @@ struct ConnectionsToClose {
 }
 
 impl OpenRequest {
-    fn new(id: Uuid, kind: OpenRequestKind) -> OpenRequest {
+    fn new(id: Uuid, kind: OpenRequestKind, pipeline: Option<PipelineId>) -> OpenRequest {
         OpenRequest {
             id,
             kind,
             proxy_map: None,
             state: OpenRequestState::Queued,
             created: false,
+            pipeline,
         }
     }
 
@@ -930,6 +934,9 @@ struct Connection {
 
     /// The result channel of the connection, for its transactions and versionchange events.
     results: GenericCallback<ConnectionEvent>,
+
+    /// The pipeline of the window that opened the connection, if a window did.
+    pipeline: Option<PipelineId>,
 }
 
 /// A thread of the manager's own for its calls to the client storage thread, which run there one
@@ -1280,8 +1287,9 @@ impl IndexedDBManager {
         id: Uuid,
         kind: OpenRequestKind,
         bottle_source: StorageBottleSource,
+        pipeline: Option<PipelineId>,
     ) {
-        let mut request = OpenRequest::new(id, kind);
+        let mut request = OpenRequest::new(id, kind, pipeline);
         let failed = self
             .obtain_storage_proxy_map(&key, id, bottle_source)
             .is_err_and(|error| {
@@ -1753,7 +1761,43 @@ impl IndexedDBManager {
         }
     }
 
+    /// Ends the open requests and closes the connections of the windows of `pipelines`, which
+    /// went away without the IndexedDB teardown, as their event loop died: their transactions
+    /// are rolled back, and the rest is what [`Self::abort_pending_upgrades`] does for a global
+    /// that went away.
+    fn close_connections_of_pipelines(&mut self, pipelines: Vec<PipelineId>) {
+        let of_pipelines = |pipeline: Option<PipelineId>| {
+            pipeline.is_some_and(|pipeline| pipelines.contains(&pipeline))
+        };
+        let mut gone: HashMap<IndexedDBDescription, HashSet<Uuid>> = HashMap::new();
+        for (key, connections) in &self.connections {
+            for (id, connection) in connections {
+                if of_pipelines(connection.pipeline) {
+                    gone.entry(key.clone()).or_default().insert(*id);
+                }
+            }
+        }
+        for (key, queue) in &self.connection_queues {
+            for request in queue {
+                if of_pipelines(request.pipeline) {
+                    gone.entry(key.clone()).or_default().insert(request.id);
+                }
+            }
+        }
+        for (key, ids) in gone {
+            warn!(
+                "Closing the IndexedDB connections to {:?} of a window whose event loop died",
+                key.name
+            );
+            for id in &ids {
+                self.close_connection_of_gone_global(&key, *id);
+            }
+            self.abort_pending_upgrades(HashMap::from([(key.name, ids)]), key.origin);
+        }
+    }
+
     /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>, steps 1 and 2.
+    #[expect(clippy::too_many_arguments)]
     fn open_a_database_connection(
         &mut self,
         origin: ImmutableOrigin,
@@ -1762,13 +1806,14 @@ impl IndexedDBManager {
         id: Uuid,
         bottle_source: StorageBottleSource,
         results: GenericCallback<ConnectionEvent>,
+        pipeline: Option<PipelineId>,
     ) {
         let key = IndexedDBDescription {
             name: db_name,
             origin,
         };
         let kind = OpenRequestKind::Open { version, results };
-        self.queue_open_request(key, id, kind, bottle_source);
+        self.queue_open_request(key, id, kind, bottle_source, pipeline);
     }
 
     fn get_database_mut(
@@ -2021,11 +2066,12 @@ impl IndexedDBManager {
             );
             return false;
         };
-        let (id, requested_version, results, created) = (
+        let (id, requested_version, results, created, pipeline) = (
             request.id,
             *requested_version,
             results.clone(),
             request.created,
+            request.pipeline,
         );
 
         // A database that a failure showed to be unusable is opened again, once its connections
@@ -2094,6 +2140,7 @@ impl IndexedDBManager {
                 close_pending: false,
                 opened,
                 results,
+                pipeline,
             },
         );
 
@@ -2150,7 +2197,7 @@ impl IndexedDBManager {
         results: GenericCallback<DeleteDatabaseEvent>,
     ) {
         let kind = OpenRequestKind::Delete { results };
-        self.queue_open_request(key, id, kind, bottle_source);
+        self.queue_open_request(key, id, kind, bottle_source, None);
     }
 
     /// <https://w3c.github.io/IndexedDB/#delete-a-database>, steps 4 to 12, for the request at the
@@ -2392,7 +2439,15 @@ impl IndexedDBManager {
             SyncOperation::CloseDatabase(origin, id, db_name) => {
                 self.close_database(origin, id, db_name);
             },
-            SyncOperation::OpenDatabase(origin, db_name, version, id, bottle_source, results) => {
+            SyncOperation::OpenDatabase(
+                origin,
+                db_name,
+                version,
+                id,
+                bottle_source,
+                results,
+                pipeline,
+            ) => {
                 self.open_a_database_connection(
                     origin,
                     db_name,
@@ -2400,7 +2455,11 @@ impl IndexedDBManager {
                     id,
                     bottle_source,
                     results,
+                    pipeline,
                 );
+            },
+            SyncOperation::CloseConnectionsOfPipelines(pipelines) => {
+                self.close_connections_of_pipelines(pipelines);
             },
             SyncOperation::AbortPendingUpgrades {
                 pending_upgrades,

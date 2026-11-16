@@ -211,6 +211,7 @@ impl IDBFactory {
             request.get_id(),
             Self::storage_bottle_source(&global),
             results,
+            global.downcast::<Window>().map(Window::pipeline_id),
         );
 
         // Note: algo continues in parallel.

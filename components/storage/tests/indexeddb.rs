@@ -12,7 +12,8 @@ use profile::mem as profile_mem;
 use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
 use servo_base::generic_channel::{self, GenericSend};
 use servo_base::id::{
-    PIPELINE_NAMESPACE, PipelineNamespace, PipelineNamespaceId, TEST_PAINTER_ID, WebViewId,
+    PIPELINE_NAMESPACE, PipelineId, PipelineNamespace, PipelineNamespaceId, TEST_PAINTER_ID,
+    WebViewId,
 };
 use servo_config::prefs;
 use servo_url::{ImmutableOrigin, ServoUrl};
@@ -96,6 +97,7 @@ backend_tests!(
     test_indexeddb_delete_blocked_by_a_closing_connection_asks_it_to_evict,
     test_indexeddb_held_back_transaction_asks_the_holder_to_evict,
     test_indexeddb_request_queued_behind_an_upgrade_asks_it_to_evict,
+    test_indexeddb_connections_of_a_crashed_window_close,
 );
 
 static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -397,6 +399,17 @@ fn open_database_request(
     version: Option<u64>,
     owned: impl Send + 'static,
 ) -> (Uuid, mpsc::Receiver<Option<ConnectionMsg>>) {
+    open_database_request_of(ctx, db_name, version, owned, None)
+}
+
+/// [`open_database_request`] for the window of `pipeline`.
+fn open_database_request_of(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    version: Option<u64>,
+    owned: impl Send + 'static,
+    pipeline: Option<PipelineId>,
+) -> (Uuid, mpsc::Receiver<Option<ConnectionMsg>>) {
     let (forward, receiver) = mpsc::channel();
     let id = Uuid::new_v4();
     let results = ProfileGenericCallback::new(move |event| {
@@ -428,6 +441,7 @@ fn open_database_request(
             id,
             ctx.bottle_source.clone(),
             results,
+            pipeline,
         )),
     )
     .unwrap();
@@ -3433,5 +3447,73 @@ fn test_indexeddb_request_queued_behind_an_upgrade_asks_it_to_evict() {
     for connection in [id, second_id] {
         close_database(&ctx, connection, db_name);
     }
+    ctx.shutdown();
+}
+
+/// The open requests and connections of a window whose event loop died without the IndexedDB
+/// teardown end when the constellation reports its pipeline: their transactions are rolled back,
+/// a delete that waits for such a connection goes on, and such an upgrade is reverted.
+fn test_indexeddb_connections_of_a_crashed_window_close() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-crashed-window";
+    let crashed = PipelineId::new();
+    let (connection, open) = open_database_request_of(&ctx, db_name, Some(1), (), Some(crashed));
+    let transaction = match recv_callback_timeout(&open, "upgrade") {
+        ConnectionMsg::Upgrade { transaction, .. } => transaction,
+        other => panic!("unexpected open message: {other:?}"),
+    };
+    create_object_store(&ctx, db_name, A, "a", transaction, None, false);
+    commit_upgrade_transaction(&ctx, db_name, transaction);
+    assert!(matches!(
+        recv_callback_timeout(&open, "connection"),
+        ConnectionMsg::Connection { .. }
+    ));
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        connection,
+        IndexedDBTxnMode::Readwrite,
+        vec![A],
+    );
+    let put = put_item(
+        &ctx,
+        db_name,
+        A,
+        txn,
+        IndexedDBKeyType::Number(1.0),
+        b"never committed".to_vec(),
+    );
+    assert!(recv_callback_timeout(&put, "put").is_ok());
+
+    let (_, delete) = delete_database(&ctx, db_name);
+    wait_for_events(connection, 3);
+    assert_nothing(
+        &delete,
+        "delete while the crashed window's connection is open",
+    );
+    let close_connections_of_crashed_window = || {
+        GenericSend::send(
+            &ctx.private_threads,
+            IndexedDBThreadMsg::Sync(SyncOperation::CloseConnectionsOfPipelines(vec![crashed])),
+        )
+        .unwrap()
+    };
+    close_connections_of_crashed_window();
+    match recv_callback_timeout(&delete, "delete result") {
+        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(1)),
+        other => panic!("unexpected delete event: {other:?}"),
+    }
+
+    let (_, open) = open_database_request_of(&ctx, db_name, Some(1), (), Some(crashed));
+    assert!(matches!(
+        recv_callback_timeout(&open, "upgrade"),
+        ConnectionMsg::Upgrade { .. }
+    ));
+    let next = open_database(&ctx, db_name, None);
+    assert_nothing(&next, "open behind the crashed window's upgrade");
+    close_connections_of_crashed_window();
+    let (connection, old_version) = upgrade_without_changes(&ctx, db_name, &next, 1);
+    assert_eq!(old_version, 0);
+    close_database(&ctx, connection, db_name);
     ctx.shutdown();
 }

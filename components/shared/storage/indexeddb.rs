@@ -13,7 +13,7 @@ use profile_traits::generic_callback::GenericCallback;
 use profile_traits::mem::ReportsChan;
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::GenericSender;
-use servo_base::id::WebViewId;
+use servo_base::id::{PipelineId, WebViewId};
 use servo_url::origin::ImmutableOrigin;
 use uuid::Uuid;
 
@@ -917,6 +917,8 @@ pub enum SyncOperation {
         StorageBottleSource,
         // The result channel of the open request and of the connection, if it opens.
         GenericCallback<ConnectionEvent>,
+        // The pipeline of the window that makes the request; `None` for a worker.
+        Option<PipelineId>,
     ),
 
     /// Deletes the database
@@ -935,6 +937,12 @@ pub enum SyncOperation {
         pending_upgrades: HashMap<Utf16String, HashSet<Uuid>>,
         origin: ImmutableOrigin,
     },
+
+    /// The windows of these pipelines went away without their IndexedDB teardown, as their
+    /// script thread or content process died: their open requests end and their connections
+    /// close, as with [`SyncOperation::AbortPendingUpgrades`], and their transactions are rolled
+    /// back.
+    CloseConnectionsOfPipelines(Vec<PipelineId>),
 
     /// The versionchange event that the open or delete request `request` fired at the connection
     /// `id` was dispatched, or skipped as the connection's close is pending.

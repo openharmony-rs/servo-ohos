@@ -3015,6 +3015,15 @@ where
             return;
         };
 
+        let event_loop = pipeline.event_loop.id();
+        let pipelines: Vec<PipelineId> = self
+            .pipelines
+            .values()
+            .filter(|pipeline| pipeline.event_loop.id() == event_loop)
+            .map(|pipeline| pipeline.id)
+            .collect();
+        self.close_indexeddb_connections_of(&pipelines);
+
         // Treat send error the same as receiving a panic message
         self.handle_panic_in_webview(
             pipeline.webview_id,
@@ -3055,6 +3064,7 @@ where
             self.handle_panic_in_webview(webview_id, &reason, &backtrace);
         }
 
+        self.close_indexeddb_connections_of(&crashed_pipelines);
         for pipeline_id in crashed_pipelines {
             self.close_pipeline(
                 pipeline_id,
@@ -3066,6 +3076,19 @@ where
             // that `Paint` cleans up the pipeline display immediately without waiting for
             // confirmation from the event loop.
             self.handle_pipeline_exited(pipeline_id, PipelineExitSource::all());
+        }
+    }
+
+    /// Tells the IndexedDB managers that the windows of `pipelines` are gone without their
+    /// IndexedDB teardown, as their event loop died, so that their connections close.
+    fn close_indexeddb_connections_of(&self, pipelines: &[PipelineId]) {
+        for storage_threads in [&self.public_storage_threads, &self.private_storage_threads] {
+            let message = IndexedDBThreadMsg::Sync(SyncOperation::CloseConnectionsOfPipelines(
+                pipelines.to_vec(),
+            ));
+            if let Err(error) = storage_threads.send(message) {
+                warn!("Failed to close the IndexedDB connections of crashed pipelines: {error}");
+            }
         }
     }
 
