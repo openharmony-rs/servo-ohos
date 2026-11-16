@@ -17,15 +17,11 @@ interface IDBIndex {
 
   [NewObject, Throws] IDBRequest get(any query);
   [NewObject, Throws] IDBRequest getKey(any query);
-  // [NewObject] IDBRequest getAll(optional any queryOrOptions,
-  //                               optional [EnforceRange] unsigned long count);
-  [NewObject, Throws] IDBRequest getAll(optional any query,
+  [NewObject, Throws] IDBRequest getAll(optional any queryOrOptions,
                                 optional [EnforceRange] unsigned long count);
-  // [NewObject] IDBRequest getAllKeys(optional any queryOrOptions,
-  //                                   optional [EnforceRange] unsigned long count);
-  [NewObject, Throws] IDBRequest getAllKeys(optional any query,
+  [NewObject, Throws] IDBRequest getAllKeys(optional any queryOrOptions,
                                     optional [EnforceRange] unsigned long count);
-  // [NewObject] IDBRequest getAllRecords(optional IDBGetAllOptions options = {});
+  [NewObject, Throws] IDBRequest getAllRecords(optional IDBGetAllOptions options = {});
   [NewObject, Throws] IDBRequest count(optional any query);
 
   [NewObject, Throws] IDBRequest openCursor(optional any query,

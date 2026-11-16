@@ -8,7 +8,7 @@ use std::cell::Cell;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use js::conversions::ToJSValConvertible;
+use js::conversions::{ConversionResult, ToJSValConvertible};
 use js::jsapi::Heap;
 use js::jsval::{DoubleValue, JSVal, NullValue, ObjectValue, UndefinedValue};
 use js::rust::{HandleValue, MutableHandleValue};
@@ -16,12 +16,13 @@ use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{DomObject, reflect_dom_object};
 use servo_base::generic_channel::GenericSend;
 use storage_traits::indexeddb::{
-    AsyncOperation, AsyncReadOnlyOperation, BackendError, BackendResult, IndexedDBKeyType,
-    IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, IndexedDBValue, PutItemResult,
-    RequestOutput,
+    AsyncOperation, AsyncReadOnlyOperation, BackendError, BackendResult, IndexedDBCursorDirection,
+    IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode,
+    IndexedDBValue, PutItemResult, RequestOutput,
 };
 use stylo_atoms::Atom;
 
+use crate::dom::bindings::codegen::Bindings::IDBObjectStoreBinding::IDBGetAllOptions;
 use crate::dom::bindings::codegen::Bindings::IDBRequestBinding::{
     IDBRequestMethods, IDBRequestReadyState,
 };
@@ -30,17 +31,22 @@ use crate::dom::bindings::codegen::UnionTypes::IDBObjectStoreOrIDBIndexOrIDBCurs
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible, create_dom_exception};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomGlobal;
-use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+use crate::dom::bindings::root::{AsHandleValue, Dom, DomRoot, MutNullableDom};
 use crate::dom::domexception::DOMException;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, iterate_cursor};
+use crate::dom::indexeddb::idbcursor::{
+    IDBCursor, IterationParam, backend_direction, iterate_cursor,
+};
 use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
 use crate::dom::indexeddb::idbindex::IDBIndex;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+use crate::dom::indexeddb::idbrecord::IDBRecord;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
-use crate::dom::indexeddb::key::{convert_value_to_key_range, key_type_to_jsval};
+use crate::dom::indexeddb::key::{
+    convert_value_to_key_range, is_potentially_valid_key_range, key_type_to_jsval,
+};
 
 pub enum IdbResult {
     Key(IndexedDBKeyType),
@@ -49,6 +55,7 @@ pub enum IdbResult {
     Values(Vec<IndexedDBValue>),
     Count(u64),
     Iterate(Vec<IndexedDBRecord>),
+    Records(Vec<IndexedDBRecord>),
     Error(Error),
     None,
 }
@@ -130,6 +137,7 @@ impl From<RequestOutput> for IdbResult {
             RequestOutput::Values(values) => values.into(),
             RequestOutput::Count(count) => count.into(),
             RequestOutput::Records(records) => records.into(),
+            RequestOutput::AllRecords(records) => IdbResult::Records(records),
             RequestOutput::Put(result) => result.into(),
             RequestOutput::Done => IdbResult::None,
         }
@@ -180,6 +188,17 @@ enum SourceHandle {
 pub(crate) enum RetrievalKind {
     Key,
     Value,
+    Record,
+}
+
+/// The `queryOrOptions` of
+/// <https://w3c.github.io/IndexedDB/#create-a-request-to-retrieve-multiple-items>, and its count.
+pub(crate) enum QueryOrOptions<'a> {
+    /// The arguments of getAll() and getAllKeys(): a query or an `IDBGetAllOptions` dictionary,
+    /// and the count, which the dictionary's count replaces.
+    Arguments(HandleValue<'a>, Option<u32>),
+    /// The options of getAllRecords().
+    Options(&'a IDBGetAllOptions),
 }
 
 #[dom_struct]
@@ -339,14 +358,13 @@ impl IDBRequest {
         Ok(request)
     }
 
-    /// <https://w3c.github.io/IndexedDB/#create-a-request-to-retrieve-multiple-items>, for a
-    /// `queryOrOptions` that is a query: from an object store or an index `source_handle`.
+    /// <https://w3c.github.io/IndexedDB/#create-a-request-to-retrieve-multiple-items>, from an
+    /// object store or an index `source_handle`.
     pub(crate) fn retrieve_multiple_items(
         cx: &mut JSContext,
         source_handle: RequestSource,
         kind: RetrievalKind,
-        query: HandleValue,
-        count: Option<u32>,
+        query_or_options: QueryOrOptions,
     ) -> Fallible<DomRoot<IDBRequest>> {
         // Step 1. Let source be an index or an object store from sourceHandle. If sourceHandle
         // is an index handle, then source is the index handle’s associated index. Otherwise,
@@ -375,13 +393,34 @@ impl IDBRequest {
 
         // Step 6. Let range be a key range.
         // Step 7. Let direction be a cursor direction.
-        // Step 8. If running is a potentially valid key range with queryOrOptions is true, then:
-        // Step 8.1. Set range to the result of converting a value to a key range with
-        // queryOrOptions. Rethrow any exceptions.
-        // Step 8.2. Set direction to "next".
-        // NOTE: IDBGetAllOptions isn't supported yet, so queryOrOptions is a query, and step 9
-        // doesn't apply.
-        let key_range = convert_value_to_key_range(cx, query, None)?;
+        let (key_range, direction, count) = match query_or_options {
+            // Step 8. If running is a potentially valid key range with queryOrOptions is true,
+            // then:
+            // NOTE: Also if queryOrOptions is undefined or null, which converts to an unbounded
+            // key range, so that getAll(null, count) keeps its count, as WPT expects; step 9
+            // would drop it.
+            QueryOrOptions::Arguments(query, count)
+                if query.is_null_or_undefined() || is_potentially_valid_key_range(cx, query)? =>
+            {
+                // Step 8.1. Set range to the result of converting a value to a key range with
+                // queryOrOptions. Rethrow any exceptions.
+                let key_range = convert_value_to_key_range(cx, query, None)?;
+                // Step 8.2. Set direction to "next".
+                (key_range, IndexedDBCursorDirection::Next, count)
+            },
+            // Step 9. Else:
+            QueryOrOptions::Arguments(options, _) => {
+                let options = match IDBGetAllOptions::new(cx, options) {
+                    Ok(ConversionResult::Success(options)) => options,
+                    Ok(ConversionResult::Failure(error)) => {
+                        return Err(Error::Type(error.into_owned()));
+                    },
+                    Err(()) => return Err(Error::JSFailed),
+                };
+                Self::retrieval_options(cx, &options)?
+            },
+            QueryOrOptions::Options(options) => Self::retrieval_options(cx, options)?,
+        };
 
         // Step 10. Let operation be an algorithm to run.
         // Step 11. If source is an index, set operation to retrieve multiple items from an index
@@ -393,11 +432,19 @@ impl IDBRequest {
                 index,
                 key_range,
                 count,
+                direction,
             },
             RetrievalKind::Value => AsyncReadOnlyOperation::GetAllItems {
                 index,
                 key_range,
                 count,
+                direction,
+            },
+            RetrievalKind::Record => AsyncReadOnlyOperation::GetAllRecords {
+                index,
+                key_range,
+                count,
+                direction,
             },
         };
 
@@ -410,6 +457,24 @@ impl IDBRequest {
             None,
             None,
         )
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#create-a-request-to-retrieve-multiple-items> step 9,
+    /// with the `IDBGetAllOptions` dictionary `options`: the range, direction and count.
+    fn retrieval_options(
+        cx: &mut JSContext,
+        options: &IDBGetAllOptions,
+    ) -> Fallible<(IndexedDBKeyRange, IndexedDBCursorDirection, Option<u32>)> {
+        // Step 9.1. Set range to the result of converting a value to a key range with
+        // queryOrOptions["query"]. Rethrow any exceptions.
+        let key_range = convert_value_to_key_range(cx, options.query.as_handle_value(), None)?;
+        // Step 9.2. Set count to queryOrOptions["count"].
+        // Step 9.3. Set direction to queryOrOptions["direction"].
+        Ok((
+            key_range,
+            backend_direction(options.direction),
+            options.count,
+        ))
     }
 
     /// Converts the result of this request, as the backend reported it, into `answer`, or
@@ -462,6 +527,35 @@ impl IDBRequest {
                         .inspect_err(|_| warn!("Error reading structuredclone data"))?;
                 }
                 values.to_jsval(cx, answer);
+            },
+            IdbResult::Records(records) => {
+                let store = self
+                    .source_object_store()
+                    .expect("Record requests have a source");
+                let global = self.global();
+                rooted!(&in(cx) let mut snapshots = vec![JSVal::default(); records.len()]);
+                for (i, record) in records.into_iter().enumerate() {
+                    let IndexedDBRecord {
+                        key,
+                        primary_key,
+                        value,
+                    } = record;
+                    rooted!(&in(cx) let mut deserialized = UndefinedValue());
+                    store
+                        .deserialize_value(
+                            cx,
+                            &primary_key,
+                            &value.expect("Record requests read values"),
+                            deserialized.handle_mut(),
+                        )
+                        .inspect_err(|_| warn!("Error reading structuredclone data"))?;
+                    let snapshot =
+                        IDBRecord::new(cx, &global, key, primary_key, deserialized.handle());
+                    snapshots
+                        .handle_mut_at(i)
+                        .set(ObjectValue(*snapshot.reflector().get_jsobject()));
+                }
+                snapshots.to_jsval(cx, answer);
             },
             IdbResult::Count(count) => {
                 answer.set(DoubleValue(count as f64));

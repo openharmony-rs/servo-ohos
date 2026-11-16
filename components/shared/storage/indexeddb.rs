@@ -548,14 +548,16 @@ pub enum AsyncReadOnlyOperation {
         key_range: IndexedDBKeyRange,
     },
 
-    /// The primary keys of the first `count` records in `key_range`, or of all of them if
-    /// `count` is `None` or 0: <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-object-store>
-    /// and <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-index> with kind
-    /// "key" and direction "next".
+    /// The primary keys of the first `count` records in `key_range` in `direction`, or of all
+    /// of them if `count` is `None` or 0:
+    /// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-object-store> and
+    /// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-index> with kind "key".
+    /// The unique directions take the record with the lowest primary key of each index key.
     GetAllKeys {
         index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
+        direction: IndexedDBCursorDirection,
     },
     /// The (referenced) values of the records that [`AsyncReadOnlyOperation::GetAllKeys`] gets
     /// the keys of: kind "value".
@@ -563,6 +565,15 @@ pub enum AsyncReadOnlyOperation {
         index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
+        direction: IndexedDBCursorDirection,
+    },
+    /// The records that [`AsyncReadOnlyOperation::GetAllKeys`] gets the keys of, with their
+    /// keys, primary keys and (referenced) values: kind "record".
+    GetAllRecords {
+        index: Option<IndexedDBIndexId>,
+        key_range: IndexedDBKeyRange,
+        count: Option<u32>,
+        direction: IndexedDBCursorDirection,
     },
 
     /// <https://w3c.github.io/IndexedDB/#count-the-records-in-a-range>
@@ -700,6 +711,8 @@ pub enum RequestOutput {
     Count(u64),
     /// Of [`AsyncReadOnlyOperation::Iterate`].
     Records(Vec<IndexedDBRecord>),
+    /// Of [`AsyncReadOnlyOperation::GetAllRecords`], each with its value.
+    AllRecords(Vec<IndexedDBRecord>),
     /// Of [`AsyncReadWriteOperation::PutItem`].
     Put(PutItemResult),
     /// Of [`AsyncReadWriteOperation::RemoveItem`] and [`AsyncReadWriteOperation::Clear`].

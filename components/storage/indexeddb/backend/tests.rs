@@ -139,6 +139,7 @@ executor_tests!(
     test_index_reads_after_create_index_see_the_whole_index,
     test_cursor_steps_find_what_the_spec_finds,
     test_cursor_steps_see_the_writes_between_them,
+    test_get_all_retrieves_what_a_cursor_visits,
 );
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -910,6 +911,7 @@ fn test_unpaired_surrogates_in_names_and_keys<X: SqlExecutor>() {
             &mut *connection,
             RecordSource::ObjectStore(&store),
             &range,
+            IndexedDBCursorDirection::Next,
             None
         )
         .unwrap(),
@@ -1211,6 +1213,19 @@ test_reply!(u64, Count);
 test_reply!(Vec<IndexedDBRecord>, Records);
 test_reply!(PutItemResult, Put);
 
+/// The records of [`AsyncReadOnlyOperation::GetAllRecords`].
+#[derive(Debug, PartialEq)]
+struct AllRecords(Vec<IndexedDBRecord>);
+
+impl TestReply for BackendResult<AllRecords> {
+    fn from_result(result: BackendResult<RequestOutput>) -> Self {
+        result.map(|output| match output {
+            RequestOutput::AllRecords(records) => AllRecords(records),
+            other => panic!("unexpected request output {other:?}"),
+        })
+    }
+}
+
 impl TestReply for BackendResult<()> {
     fn from_result(result: BackendResult<RequestOutput>) -> Self {
         result.map(|output| assert_eq!(output, RequestOutput::Done))
@@ -1482,6 +1497,7 @@ fn keys_of<X: SqlExecutor>(executor: &mut X, store: i64) -> Vec<IndexedDBKeyType
         executor,
         RecordSource::ObjectStore(&store),
         &IndexedDBKeyRange::default(),
+        IndexedDBCursorDirection::Next,
         None,
     )
     .unwrap()
@@ -1595,6 +1611,7 @@ fn test_async_operations<X: SqlExecutor>() {
                     index: None,
                     key_range: IndexedDBKeyRange::lower_bound(IndexedDBKeyType::Number(0.0), false),
                     count: None,
+                    direction: IndexedDBCursorDirection::Next,
                 }),
             ),
             request(
@@ -1699,6 +1716,7 @@ fn test_delete_item_range_respects_open_bounds<X: SqlExecutor>() {
             &mut *connection,
             RecordSource::ObjectStore(&store),
             &IndexedDBKeyRange::default(),
+            IndexedDBCursorDirection::Next,
             None,
         )
         .expect("Failed to read remaining keys")
@@ -4513,6 +4531,7 @@ fn test_index_reads_go_in_key_then_primary_key_order<X: SqlExecutor>() {
                 index: Some(index),
                 key_range,
                 count,
+                direction: IndexedDBCursorDirection::Next,
             },
         )
         .unwrap()
@@ -4568,6 +4587,7 @@ fn test_index_reads_go_in_key_then_primary_key_order<X: SqlExecutor>() {
                 index: Some(by_kind),
                 key_range: range.clone(),
                 count: Some(3),
+                direction: IndexedDBCursorDirection::Next,
             },
         ),
         Ok(number_values(&[(8.0, 8), (9.0, 9), (10.0, 10)]))
@@ -4714,6 +4734,7 @@ fn test_index_reads_see_the_writes_before_them<X: SqlExecutor>() {
                     index: Some(index),
                     key_range: ann(),
                     count: None,
+                    direction: IndexedDBCursorDirection::Next,
                 },
             ),
             put(4, 1.0, "cid"),
@@ -4724,6 +4745,7 @@ fn test_index_reads_see_the_writes_before_them<X: SqlExecutor>() {
                     index: Some(index),
                     key_range: IndexedDBKeyRange::default(),
                     count: None,
+                    direction: IndexedDBCursorDirection::Next,
                 },
             ),
             remove_request(store, remove_id, IndexedDBKeyRange::only(number(3.0))),
@@ -4831,6 +4853,7 @@ fn test_index_reads_after_create_index_see_the_whole_index<X: SqlExecutor>() {
                         index: Some(index),
                         key_range: odd(),
                         count: None,
+                        direction: IndexedDBCursorDirection::Next,
                     },
                 ),
                 read_request(
@@ -5074,17 +5097,17 @@ fn backend_cursor_records<X: SqlExecutor>(
         .collect()
 }
 
-/// Cursor steps find the records that the spec's steps to iterate a cursor find: on a store and
-/// on a non-unique, a unique and a multiEntry index, in every direction, over ranges, from every
-/// position, with continue(), advance(), continue(key) and continuePrimaryKey(), and asking for
-/// several records per step.
-fn test_cursor_steps_find_what_the_spec_finds<X: SqlExecutor>() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = open_engine::<X>(&dir);
-    let store = create_store(&db, "store", None, false).unwrap();
+/// Creates a store with a non-unique, a unique and a multiEntry index ("kind", "id", "tag"), and
+/// 12 records with number and string keys and repeated index keys, put in an order that is
+/// neither the key order nor any index's. Returns the store, the indexes and the primary keys;
+/// the record with the n-th primary key has the value `[n]`.
+fn store_with_three_indexes<X: SqlExecutor>(
+    db: &SqlEngine<X>,
+) -> (i64, [i64; 3], Vec<IndexedDBKeyType>) {
+    let store = create_store(db, "store", None, false).unwrap();
     let index = |name: &str, unique, multi_entry| {
         let key_path = KeyPath::String(name.to_owned());
-        create_index(&db, store, name.to_owned(), key_path, unique, multi_entry).unwrap()
+        create_index(db, store, name.to_owned(), key_path, unique, multi_entry).unwrap()
     };
     let (by_kind, by_id, by_tag) = (
         index("kind", false, false),
@@ -5123,16 +5146,34 @@ fn test_cursor_steps_find_what_the_spec_finds<X: SqlExecutor>() {
             )
         })
         .collect();
-    let replies = run_indexed_puts(&db, 1, store, puts, false);
+    let replies = run_indexed_puts(db, 1, store, puts, false);
     assert!(replies.iter().all(Result::is_ok), "{replies:?}");
-    assert_eq!(commit(&db, 1), Ok(()));
-    let value_of = |primary_key: &IndexedDBKeyType| {
-        let n = primary_keys
-            .iter()
-            .position(|key| key == primary_key)
-            .unwrap();
-        vec![n as u8]
-    };
+    assert_eq!(commit(db, 1), Ok(()));
+    (store, [by_kind, by_id, by_tag], primary_keys)
+}
+
+/// The value of the record with the key `primary_key` in [`store_with_three_indexes`].
+fn value_of_primary_key(
+    primary_keys: &[IndexedDBKeyType],
+    primary_key: &IndexedDBKeyType,
+) -> Vec<u8> {
+    let n = primary_keys
+        .iter()
+        .position(|key| key == primary_key)
+        .unwrap();
+    vec![n as u8]
+}
+
+/// Cursor steps find the records that the spec's steps to iterate a cursor find: on a store and
+/// on a non-unique, a unique and a multiEntry index, in every direction, over ranges, from every
+/// position, with continue(), advance(), continue(key) and continuePrimaryKey(), and asking for
+/// several records per step.
+fn test_cursor_steps_find_what_the_spec_finds<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let (store, [by_kind, by_id, by_tag], primary_keys) = store_with_three_indexes(&db);
+    let value_of =
+        |primary_key: &IndexedDBKeyType| value_of_primary_key(&primary_keys, primary_key);
 
     // The request goes to the index it names, and one that the store doesn't have fails.
     let first = |index| AsyncReadOnlyOperation::Iterate {
@@ -5308,6 +5349,219 @@ fn test_cursor_steps_find_what_the_spec_finds<X: SqlExecutor>() {
     assert!(steps > 1000, "{steps} steps");
 }
 
+/// The records of `records`, the records of a source in (key, value) order, that retrieve
+/// multiple items gets: those in `range`, of the unique directions the first of each key, in
+/// reverse order for the reverse directions, the first `count` of them (all for 0).
+fn expected_get_all(
+    records: &[SourceRecord],
+    direction: IndexedDBCursorDirection,
+    range: &IndexedDBKeyRange,
+    count: Option<u32>,
+) -> Vec<SourceRecord> {
+    let unique = matches!(
+        direction,
+        IndexedDBCursorDirection::NextUnique | IndexedDBCursorDirection::PrevUnique
+    );
+    let mut found: Vec<SourceRecord> = Vec::new();
+    for record in records.iter().filter(|record| range.contains(&record.0)) {
+        if !(unique && found.last().is_some_and(|last| last.0 == record.0)) {
+            found.push(record.clone());
+        }
+    }
+    if matches!(
+        direction,
+        IndexedDBCursorDirection::Prev | IndexedDBCursorDirection::PrevUnique
+    ) {
+        found.reverse();
+    }
+    if let Some(count) = count.filter(|count| *count != 0) {
+        found.truncate(count as usize);
+    }
+    found
+}
+
+/// getAllKeys(), getAll() and getAllRecords() of a store and of a non-unique, a unique and a
+/// multiEntry index retrieve the records in a range in every direction, up to a count, as a
+/// cursor in that direction visits them: the unique directions the first record of each key.
+fn test_get_all_retrieves_what_a_cursor_visits<X: SqlExecutor>() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_engine::<X>(&dir);
+    let (store, [by_kind, by_id, by_tag], primary_keys) = store_with_three_indexes(&db);
+    let value_of =
+        |primary_key: &IndexedDBKeyType| value_of_primary_key(&primary_keys, primary_key);
+    let first_step = IndexedDBCursorStep {
+        position: None,
+        object_store_position: None,
+        key: None,
+        primary_key: None,
+        count: 1,
+    };
+    let mut reads = 0;
+    for index in [None, Some(by_kind), Some(by_id), Some(by_tag)] {
+        let (object_store, records) = cursor_source(&db, store, index);
+        let source = match index {
+            Some(index) => RecordSource::Index(object_store.index(index).unwrap()),
+            None => RecordSource::ObjectStore(&object_store),
+        };
+        let mut keys: Vec<IndexedDBKeyType> = Vec::new();
+        for (key, _) in &records {
+            if keys.last() != Some(key) {
+                keys.push(key.clone());
+            }
+        }
+        let (second, before_last) = (&keys[1], &keys[keys.len() - 2]);
+        let ranges = [
+            IndexedDBKeyRange::default(),
+            IndexedDBKeyRange::new(
+                Some(second.clone()),
+                Some(before_last.clone()),
+                false,
+                false,
+            ),
+            IndexedDBKeyRange::new(Some(second.clone()), Some(before_last.clone()), true, true),
+            IndexedDBKeyRange::new(Some(second.clone()), None, false, false),
+            IndexedDBKeyRange::new(None, Some(before_last.clone()), false, true),
+            IndexedDBKeyRange::only(second.clone()),
+            IndexedDBKeyRange::only(string("absent")),
+        ];
+        let mut connection = db.connection();
+        for direction in CURSOR_DIRECTIONS {
+            for range in &ranges {
+                for count in [None, Some(0), Some(1), Some(2), Some(5), Some(u32::MAX)] {
+                    let context = format!("{index:?} {direction:?} {range:?} {count:?}");
+                    let expected = expected_get_all(&records, direction, range, count);
+                    let visited = spec_cursor_records(
+                        &records,
+                        index.is_some(),
+                        direction,
+                        range,
+                        &first_step,
+                        count.filter(|count| *count != 0).unwrap_or(u32::MAX),
+                    );
+                    assert_eq!(expected, visited, "{context}");
+                    reads += 1;
+                    assert_eq!(
+                        queries::get_all_keys(&mut *connection, source, range, direction, count)
+                            .unwrap(),
+                        expected
+                            .iter()
+                            .map(|(_, primary_key)| primary_key.clone())
+                            .collect::<Vec<_>>(),
+                        "keys {context}"
+                    );
+                    assert_eq!(
+                        queries::get_all_values(&mut *connection, source, range, direction, count)
+                            .unwrap(),
+                        expected
+                            .iter()
+                            .map(|(_, primary_key)| IndexedDBValue {
+                                primary_key: primary_key.clone(),
+                                value: value_of(primary_key),
+                            })
+                            .collect::<Vec<_>>(),
+                        "values {context}"
+                    );
+                    assert_eq!(
+                        queries::get_all_records(&mut *connection, source, range, direction, count)
+                            .unwrap(),
+                        expected
+                            .iter()
+                            .map(|(key, primary_key)| IndexedDBRecord {
+                                key: key.clone(),
+                                primary_key: primary_key.clone(),
+                                value: Some(value_of(primary_key)),
+                            })
+                            .collect::<Vec<_>>(),
+                        "records {context}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(reads > 500, "{reads} reads");
+
+    // Through the engine: the request reads the index it names, and one of an index that the
+    // store doesn't have fails.
+    let get_all_records = |index, direction, count| AsyncReadOnlyOperation::GetAllRecords {
+        index,
+        key_range: IndexedDBKeyRange::default(),
+        count,
+        direction,
+    };
+    let record = |key: IndexedDBKeyType, primary_key: IndexedDBKeyType| IndexedDBRecord {
+        value: Some(value_of(&primary_key)),
+        key,
+        primary_key,
+    };
+    assert_eq!(
+        read::<X, BackendResult<AllRecords>>(
+            &db,
+            2,
+            store,
+            get_all_records(Some(by_kind), IndexedDBCursorDirection::PrevUnique, Some(2)),
+        ),
+        Ok(AllRecords(vec![
+            record(string("b"), number(4.0)),
+            record(string("a"), number(2.0)),
+        ]))
+    );
+    assert_eq!(
+        read::<X, BackendResult<AllRecords>>(
+            &db,
+            2,
+            store,
+            get_all_records(None, IndexedDBCursorDirection::Prev, Some(1)),
+        ),
+        Ok(AllRecords(vec![record(string("y"), string("y"))]))
+    );
+    assert!(matches!(
+        read::<X, BackendResult<AllRecords>>(
+            &db,
+            2,
+            store,
+            get_all_records(Some(by_tag + 1), IndexedDBCursorDirection::Next, None),
+        ),
+        Err(BackendError::DbErr(_))
+    ));
+    assert_eq!(
+        read::<X, BackendResult<Vec<IndexedDBKeyType>>>(
+            &db,
+            2,
+            store,
+            AsyncReadOnlyOperation::GetAllKeys {
+                index: Some(by_id),
+                key_range: IndexedDBKeyRange::default(),
+                count: Some(2),
+                direction: IndexedDBCursorDirection::NextUnique,
+            },
+        ),
+        Ok(vec![string("y"), string("x")])
+    );
+    assert_eq!(
+        read::<X, BackendResult<Vec<IndexedDBValue>>>(
+            &db,
+            2,
+            store,
+            AsyncReadOnlyOperation::GetAllItems {
+                index: Some(by_tag),
+                key_range: IndexedDBKeyRange::only(string("t")),
+                count: Some(2),
+                direction: IndexedDBCursorDirection::Prev,
+            },
+        ),
+        Ok(vec![
+            IndexedDBValue {
+                primary_key: string("y"),
+                value: value_of(&string("y")),
+            },
+            IndexedDBValue {
+                primary_key: string("x"),
+                value: value_of(&string("x")),
+            },
+        ])
+    );
+}
+
 /// A tiny pseudo-random generator for the tests, xorshift64.
 struct TestRandom(u64);
 
@@ -5377,6 +5631,7 @@ fn test_cursor_steps_see_the_writes_between_them<X: SqlExecutor>() {
             connection,
             RecordSource::ObjectStore(&object_store),
             &IndexedDBKeyRange::default(),
+            IndexedDBCursorDirection::Next,
             None,
         )
         .unwrap()

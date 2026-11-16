@@ -11746,6 +11746,69 @@
       }
      ]
     ],
+    "get-all-options.any.js": [
+     "2db8edc497af355f9909687059f9c3ce8fb3626c",
+     [
+      "IndexedDB/get-all-options.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: getAll(), getAllKeys() and getAllRecords() with IDBGetAllOptions"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/get-all-options.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: getAll(), getAllKeys() and getAllRecords() with IDBGetAllOptions"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/get-all-options.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: getAll(), getAllKeys() and getAllRecords() with IDBGetAllOptions"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
     "index-cursors.any.js": [
      "d1c7658343402c0a2f3945385f88145a319dd867",
      [
@@ -15672,14 +15735,14 @@
      ]
     ],
     "interfaces.https.html": [
-     "6b86f9d8491d53915833b10c5c921a356fe8c7f1",
+     "b2b6a89c1568b30fe7fd1191241e5e0126b38653",
      [
       null,
       {}
      ]
     ],
     "interfaces.worker.js": [
-     "5acb874e8d8467ac450fb9569ee1a51c8cf7a7b1",
+     "db65d4a14b061f35e86f16f0976d39193d06267b",
      [
       "mozilla/interfaces.worker.html",
       {}

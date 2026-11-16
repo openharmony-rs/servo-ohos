@@ -685,48 +685,133 @@ pub(crate) fn get_key<X: SqlExecutor>(
     .pop())
 }
 
-/// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-object-store> and
-/// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-index>, step 1: a count
-/// that is not given or 0 means every record.
-fn retrieved_count(count: Option<u32>) -> Option<u32> {
-    count.filter(|count| *count != 0)
+fn record_of_row(row: &dyn SqlRow, with_value: bool) -> Result<IndexedDBRecord, SqlError> {
+    Ok(IndexedDBRecord {
+        key: decode_key(&row.blob(0)?)?,
+        primary_key: decode_key(&row.blob(1)?)?,
+        value: if with_value { Some(row.blob(2)?) } else { None },
+    })
 }
 
-/// The primary keys of the first `count` records of `source` in `range`: retrieve multiple
-/// items with kind "key" and direction "next".
+fn is_reverse(direction: IndexedDBCursorDirection) -> bool {
+    matches!(
+        direction,
+        IndexedDBCursorDirection::Prev | IndexedDBCursorDirection::PrevUnique
+    )
+}
+
+fn is_unique(direction: IndexedDBCursorDirection) -> bool {
+    matches!(
+        direction,
+        IndexedDBCursorDirection::NextUnique | IndexedDBCursorDirection::PrevUnique
+    )
+}
+
+/// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-object-store> and
+/// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-index>, steps 1–3:
+/// `columns` of the records of `source` in `range` that the steps retrieve in `direction`, at
+/// most `count` of them, in the order of the direction.
+fn retrieve_multiple_items<X: SqlExecutor, T>(
+    executor: &mut X,
+    source: RecordSource,
+    columns: RecordColumns,
+    range: &IndexedDBKeyRange,
+    direction: IndexedDBCursorDirection,
+    count: Option<u32>,
+    map_row: impl Fn(&dyn SqlRow) -> Result<T, SqlError>,
+) -> Result<Vec<T>, SqlError> {
+    // Step 1. If count is not given or is 0 (zero), let count be infinity.
+    let count = count.filter(|count| *count != 0);
+    // Step 2. Let records be an empty list of records.
+    // Step 3. Switching on direction:
+    // "next": Set records to the first count of index’s list of records whose key is in range.
+    // "nextunique": Let rangeRecords be a list containing the index’s list of records whose key
+    // is in range. [...] If the result of comparing two keys using the keys from |rangeRecords[i]|
+    // and |rangeRecords[i-1]| is equal, then continue. Else append |rangeRecords[i]| to records.
+    // "prev": Set records to the last count of index’s list of records whose key is in range.
+    // "prevunique": [...] Else prepend |rangeRecords[i]| to records.
+    // NOTE: An object store's keys are unique, so its unique directions are the plain ones. An
+    // index's unique directions keep the first record of each key, the one with the lowest
+    // primary key, and "prevunique" the last count of those in reverse order, as a "prevunique"
+    // cursor visits them and the WPT tests expect; the loop as written never takes
+    // rangeRecords[0] and, for "prevunique", would keep the first count keys. "prev" lists the
+    // records in reverse order too.
+    let mut condition = range_condition(range);
+    if let RecordSource::Index(index) = source {
+        // A unique index has one record per key.
+        if is_unique(direction) && !index.unique {
+            condition.first_record_of_each_key(index);
+        }
+    }
+    select(
+        executor,
+        source,
+        columns,
+        &condition,
+        is_reverse(direction),
+        count,
+        0,
+        map_row,
+    )
+}
+
+/// The primary keys of the records that retrieve multiple items gets from `source`: kind "key",
+/// the record's key for an object store and the record's value for an index.
 pub(crate) fn get_all_keys<X: SqlExecutor>(
     executor: &mut X,
     source: RecordSource,
     range: &IndexedDBKeyRange,
+    direction: IndexedDBCursorDirection,
     count: Option<u32>,
 ) -> Result<Vec<IndexedDBKeyType>, SqlError> {
-    select_records(
+    retrieve_multiple_items(
         executor,
         source,
         RecordColumns::PrimaryKey,
         range,
-        retrieved_count(count),
-        false,
+        direction,
+        count,
         primary_key_of_row,
     )
 }
 
-/// The (referenced) values of the first `count` records of `source` in `range`, with their
-/// primary keys: retrieve multiple items with kind "value" and direction "next".
+/// The (referenced) values of the records that retrieve multiple items gets from `source`, with
+/// their primary keys: kind "value". Script deserializes them.
 pub(crate) fn get_all_values<X: SqlExecutor>(
     executor: &mut X,
     source: RecordSource,
     range: &IndexedDBKeyRange,
+    direction: IndexedDBCursorDirection,
     count: Option<u32>,
 ) -> Result<Vec<IndexedDBValue>, SqlError> {
-    select_records(
+    retrieve_multiple_items(
         executor,
         source,
         RecordColumns::Value,
         range,
-        retrieved_count(count),
-        false,
+        direction,
+        count,
         value_of_row,
+    )
+}
+
+/// The records that retrieve multiple items gets from `source`, as record snapshots: kind
+/// "record". The key is the index key for an index, and the primary key otherwise.
+pub(crate) fn get_all_records<X: SqlExecutor>(
+    executor: &mut X,
+    source: RecordSource,
+    range: &IndexedDBKeyRange,
+    direction: IndexedDBCursorDirection,
+    count: Option<u32>,
+) -> Result<Vec<IndexedDBRecord>, SqlError> {
+    retrieve_multiple_items(
+        executor,
+        source,
+        RecordColumns::Record,
+        range,
+        direction,
+        count,
+        |row| record_of_row(row, true),
     )
 }
 
@@ -843,14 +928,8 @@ pub(crate) fn cursor_records<X: SqlExecutor>(
         primary_key,
         count,
     } = step;
-    let reverse = matches!(
-        direction,
-        IndexedDBCursorDirection::Prev | IndexedDBCursorDirection::PrevUnique
-    );
-    let unique = matches!(
-        direction,
-        IndexedDBCursorDirection::NextUnique | IndexedDBCursorDirection::PrevUnique
-    );
+    let reverse = is_reverse(direction);
+    let unique = is_unique(direction);
     // Step 9.1. Switch on direction:
     // "next": Let found record be the first record in records which satisfy all of the following
     // requirements:
@@ -923,13 +1002,7 @@ pub(crate) fn cursor_records<X: SqlExecutor>(
         reverse,
         Some(records),
         offset,
-        |row| {
-            Ok(IndexedDBRecord {
-                key: decode_key(&row.blob(0)?)?,
-                primary_key: decode_key(&row.blob(1)?)?,
-                value: if key_only { None } else { Some(row.blob(2)?) },
-            })
-        },
+        |row| record_of_row(row, !key_only),
     )
 }
 

@@ -722,6 +722,7 @@ fn get_all_keys_request(
             index: None,
             key_range,
             count: None,
+            direction: IndexedDBCursorDirection::Next,
         }),
     )
 }
@@ -2182,6 +2183,7 @@ fn test_indexeddb_results_reach_the_connection_in_request_order() {
             index: None,
             key_range: IndexedDBKeyRange::default(),
             count: None,
+            direction: IndexedDBCursorDirection::Next,
         }),
     );
     let small = get_item(&ctx, db_name, B, reads, IndexedDBKeyType::Number(1.0));

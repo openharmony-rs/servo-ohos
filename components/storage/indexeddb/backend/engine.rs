@@ -788,15 +788,28 @@ fn run_read_only<X: SqlExecutor>(
             index,
             key_range,
             count,
+            direction,
         } => source(index).map(|source| {
-            queries::get_all_keys(executor, source, &key_range, count).map(RequestOutput::Keys)
+            queries::get_all_keys(executor, source, &key_range, direction, count)
+                .map(RequestOutput::Keys)
         }),
         AsyncReadOnlyOperation::GetAllItems {
             index,
             key_range,
             count,
+            direction,
         } => source(index).map(|source| {
-            queries::get_all_values(executor, source, &key_range, count).map(RequestOutput::Values)
+            queries::get_all_values(executor, source, &key_range, direction, count)
+                .map(RequestOutput::Values)
+        }),
+        AsyncReadOnlyOperation::GetAllRecords {
+            index,
+            key_range,
+            count,
+            direction,
+        } => source(index).map(|source| {
+            queries::get_all_records(executor, source, &key_range, direction, count)
+                .map(RequestOutput::AllRecords)
         }),
         AsyncReadOnlyOperation::Count { index, key_range } => source(index)
             .map(|source| queries::count(executor, source, &key_range).map(RequestOutput::Count)),

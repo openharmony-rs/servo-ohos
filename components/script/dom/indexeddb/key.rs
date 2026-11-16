@@ -621,6 +621,46 @@ pub fn convert_value_to_key_range(
     Ok(IndexedDBKeyRange::only(key))
 }
 
+/// <https://w3c.github.io/IndexedDB/#is-a-potentially-valid-key-range>
+#[expect(unsafe_code)]
+pub(crate) fn is_potentially_valid_key_range(
+    cx: &mut JSContext,
+    value: HandleValue,
+) -> Result<bool, Error> {
+    // Step 1. If value is a key range, return true.
+    if root_from_handlevalue::<IDBKeyRange>(cx, value).is_ok() {
+        return Ok(true);
+    }
+    // Step 2. Let key be the result of converting a value to a key with value.
+    // Step 3. If key is "invalid type" return false.
+    // Step 4. Else return true.
+    // NOTE: Converting a value to a key gives "invalid type" exactly when the value has none of
+    // the types that `convert_value_to_key` converts, whose checks these are: an Array of
+    // anything else is "invalid value". So the conversion's getters don't run twice.
+    if value.is_number() || value.is_string() {
+        return Ok(true);
+    }
+    if !value.is_object() {
+        return Ok(false);
+    }
+    rooted!(&in(cx) let object = value.to_object());
+    let mut is_date = false;
+    // SAFETY: `object` is rooted.
+    if !unsafe { ObjectIsDate(cx, object.handle(), &mut is_date) } {
+        return Err(Error::JSFailed);
+    }
+    // SAFETY: `object` is a live object.
+    if is_date || unsafe { IsArrayBufferObject(*object) || JS_IsArrayBufferViewObject(*object) } {
+        return Ok(true);
+    }
+    let mut is_array = false;
+    // SAFETY: `value` is rooted.
+    if !unsafe { IsArrayObject(cx, value, &mut is_array) } {
+        return Err(Error::JSFailed);
+    }
+    Ok(is_array)
+}
+
 pub(crate) fn map_backend_error_to_dom_error(error: BackendError) -> Error {
     match error {
         BackendError::QuotaExceeded => Error::QuotaExceeded {

@@ -10,7 +10,9 @@ use js::gc::MutableHandleValue;
 use js::jsval::{NullValue, UndefinedValue};
 use js::rust::HandleValue;
 use script_bindings::cell::DomRefCell;
-use script_bindings::codegen::GenericBindings::IDBObjectStoreBinding::IDBIndexParameters;
+use script_bindings::codegen::GenericBindings::IDBObjectStoreBinding::{
+    IDBGetAllOptions, IDBIndexParameters,
+};
 use script_bindings::codegen::GenericUnionTypes::StringOrStringSequence;
 use script_bindings::error::ErrorResult;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
@@ -39,7 +41,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
 use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
 use crate::dom::indexeddb::idbindex::IDBIndex;
-use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource, RetrievalKind};
+use crate::dom::indexeddb::idbrequest::{IDBRequest, QueryOrOptions, RequestSource, RetrievalKind};
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::key::{
     EvaluationResult, ExtractionResult, can_inject_key_into_value, clear_pending_exception,
@@ -808,7 +810,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
     fn GetAll(
         &self,
         cx: &mut JSContext,
-        query: HandleValue,
+        query_or_options: HandleValue,
         count: Option<u32>,
     ) -> Fallible<DomRoot<IDBRequest>> {
         // Step 1. Return the result of creating a request to retrieve multiple items with the
@@ -818,8 +820,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             cx,
             RequestSource::ObjectStore(self),
             RetrievalKind::Value,
-            query,
-            count,
+            QueryOrOptions::Arguments(query_or_options, count),
         )
     }
 
@@ -827,7 +828,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
     fn GetAllKeys(
         &self,
         cx: &mut JSContext,
-        query: HandleValue,
+        query_or_options: HandleValue,
         count: Option<u32>,
     ) -> Fallible<DomRoot<IDBRequest>> {
         // Step 1. Return the result of creating a request to retrieve multiple items with the
@@ -837,8 +838,23 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
             cx,
             RequestSource::ObjectStore(self),
             RetrievalKind::Key,
-            query,
-            count,
+            QueryOrOptions::Arguments(query_or_options, count),
+        )
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#dom-idbobjectstore-getallrecords>
+    fn GetAllRecords(
+        &self,
+        cx: &mut JSContext,
+        options: &IDBGetAllOptions,
+    ) -> Fallible<DomRoot<IDBRequest>> {
+        // Step 1. Return the result of creating a request to retrieve multiple items with the
+        // current Realm record, this, "record", and options. Rethrow any exceptions.
+        IDBRequest::retrieve_multiple_items(
+            cx,
+            RequestSource::ObjectStore(self),
+            RetrievalKind::Record,
+            QueryOrOptions::Options(options),
         )
     }
 

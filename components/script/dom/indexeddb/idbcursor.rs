@@ -36,6 +36,16 @@ use crate::dom::indexeddb::key::{
     ExtractionResult, convert_value_to_key, extract_key, key_type_to_jsval,
 };
 
+/// The backend's form of `direction`.
+pub(crate) fn backend_direction(direction: IDBCursorDirection) -> IndexedDBCursorDirection {
+    match direction {
+        IDBCursorDirection::Next => IndexedDBCursorDirection::Next,
+        IDBCursorDirection::Nextunique => IndexedDBCursorDirection::NextUnique,
+        IDBCursorDirection::Prev => IndexedDBCursorDirection::Prev,
+        IDBCursorDirection::Prevunique => IndexedDBCursorDirection::PrevUnique,
+    }
+}
+
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) enum ObjectStoreOrIndex {
@@ -243,16 +253,10 @@ impl IDBCursor {
             ObjectStoreOrIndex::ObjectStore(_) => None,
             ObjectStoreOrIndex::Index(index) => Some(index.id()),
         };
-        let direction = match self.direction {
-            IDBCursorDirection::Next => IndexedDBCursorDirection::Next,
-            IDBCursorDirection::Nextunique => IndexedDBCursorDirection::NextUnique,
-            IDBCursorDirection::Prev => IndexedDBCursorDirection::Prev,
-            IDBCursorDirection::Prevunique => IndexedDBCursorDirection::PrevUnique,
-        };
         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
             index,
             key_range: self.range.clone(),
-            direction,
+            direction: backend_direction(self.direction),
             step: IndexedDBCursorStep {
                 position: self.position.borrow().clone(),
                 object_store_position: self.object_store_position.borrow().clone(),
