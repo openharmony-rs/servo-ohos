@@ -1,0 +1,3586 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 16:43:27 +0000
+Subject: [PATCH] indexeddb: Keep string keys and names as UTF-16 code units
+
+A JavaScript string is a sequence of UTF-16 code units and may contain
+unpaired surrogates, and IndexedDB string keys and the names of
+databases, object stores and indexes are such strings: string keys
+compare by code unit (compare two keys) and name lists sort by code
+unit. Servo turned them into Rust Strings, replacing each unpaired
+surrogate with U+FFFD, so "\uD800" and "\uDC00" were the same key, a
+key read back differed from the one stored, and indexedDB.cmp() called
+them equal.
+
+Utf16String (storage_traits) holds the code units and orders by them.
+It is the type of IndexedDBKeyType::String and of every database, store
+and index name in the protocol, the manager (IndexedDBDescription), the
+engine and the tables, and of the names script's IndexedDB objects keep
+(IDBDatabase, IDBObjectStore and its index set, IDBIndex, IDBFactory's
+maps). Script reads a string key's code units from the JS string and
+makes JS strings from code units, so keys are exact end to end. The
+order-preserving key encoding, Gecko's, already encoded UTF-16 code
+units; it now takes them directly, and decoding no longer rejects
+unpaired surrogates. Encoded keys of well-formed strings are unchanged.
+
+Names are stored as BLOBs of their code units in big-endian order
+(Utf16String::to_be_bytes), as text can't hold unpaired surrogates, in
+the database, object_store and object_store_index tables. That changes
+the schema: SCHEMA_VERSION is 2, and databases stored with version 1
+are deleted and created anew when opened (owner rule, no migration).
+The client storage registry keeps a well-formed database name as the
+text it was, so existing databases keep their entries, and a name with
+an unpaired surrogate as a BLOB of its code units, which SQLite never
+finds equal to text; both registry backends do this. Database
+directories are named by UUID, so names never reach a path.
+
+Names still enter and leave script as WebIDL DOMStrings, which Servo's
+bindings convert with U+FFFD replacement, so a name given by a page
+still loses its unpaired surrogates, and the six WPT subtests that
+rename a store to or create stores with such names stay expected FAIL.
+Only name_from_dom_string and dom_string_from_name in indexeddb/key.rs
+cross that boundary.
+IndexedDB sorts name lists itself (sorted_name_list), so
+DOMStringList::new_sorted, which only IndexedDB used, is gone.
+IDBTransaction.objectStore() checks its scope by store id instead of
+by name.
+
+Tests: on every executor, store and index names with unpaired
+surrogates, distinct from their U+FFFD forms, through create, rename,
+the metadata and a reopen, a database name stored as its code units,
+and string keys with unpaired surrogates stored, read in code unit
+order and selected by a key range; the encoding round-trips and sorts
+them. The registry keeps such database names apart and stores
+well-formed ones as text (host SQLite test inspecting the registry,
+and an RDB test for the device). A fork WPT test,
+tests/wpt/mozilla/tests/IndexedDB/string-keys-code-units.any.js,
+covers keys, ranges, cursors, in-line keys and cmp().
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 112 passed, 1 skipped (P2.2: 110). WPT IndexedDB/ (4,511 subtests), 8 processes, host SpiderMonkey: 3,287 pass, as P2.2, and all 837 tests including /_mozilla/IndexedDB/ as expected; the new fork test passes 16 of 16 subtests in its four globals, and the P2.1 binary fails all 16. `./mach clippy --locked -- -- --deny warnings`: no warning; `./mach check --ohos -- -p servo-storage --all-targets` with SQLite, RDB and both: no warning; `./mach test-tidy`: only the known libsqlite3-sys advisory. DAYU200 `./mach test-unit --ohos -p servo-storage`: RDB only 113 passed, 3 skipped (P2.2: 111), SQLite and RDB 195 passed, 4 skipped (P2.2: 192), the new RDB registry and backend tests included; /_mozilla/IndexedDB/ on the DAYU200 (QuickJS and RDB): 98 of 98.
+AI-assisted: Yes (agent session; the agent designed and wrote the change and the tests, and ran the host builds and test runs)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../script/dom/attributes/domstringlist.rs    |  20 --
+ .../script/dom/indexeddb/idbdatabase.rs       |  74 +++---
+ components/script/dom/indexeddb/idbfactory.rs |  25 +-
+ components/script/dom/indexeddb/idbindex.rs   |  32 ++-
+ .../script/dom/indexeddb/idbobjectstore.rs    | 110 ++++-----
+ .../script/dom/indexeddb/idbopendbrequest.rs  |  16 +-
+ components/script/dom/indexeddb/idbrequest.rs |   2 +-
+ .../script/dom/indexeddb/idbtransaction.rs    |  76 +++---
+ components/script/dom/indexeddb/key.rs        |  89 ++++++-
+ components/shared/storage/client_storage.rs   |  14 +-
+ components/shared/storage/indexeddb.rs        | 143 ++++++++---
+ components/storage/client_storage.rs          |  51 +++-
+ components/storage/client_storage_ohos_rdb.rs |  70 +++++-
+ .../storage/indexeddb/backend/executor.rs     |   5 +
+ .../storage/indexeddb/backend/queries.rs      |  40 ++--
+ components/storage/indexeddb/backend/rdb.rs   |   1 +
+ .../storage/indexeddb/backend/schema.rs       |  15 +-
+ .../storage/indexeddb/backend/sqlite.rs       |   1 +
+ components/storage/indexeddb/backend/tests.rs | 222 ++++++++++++++----
+ .../indexeddb/engines/sqlite/encoding.rs      |  44 ++--
+ components/storage/indexeddb/mod.rs           |  46 ++--
+ components/storage/tests/client_storage.rs    |  71 ++++++
+ components/storage/tests/indexeddb.rs         |  64 +++--
+ tests/wpt/mozilla/meta/MANIFEST.json          |  63 +++++
+ .../IndexedDB/string-keys-code-units.any.js   |  91 +++++++
+ 25 files changed, 1015 insertions(+), 370 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/string-keys-code-units.any.js
+
+diff --git a/components/script/dom/attributes/domstringlist.rs b/components/script/dom/attributes/domstringlist.rs
+index bc0874f01f9..565aeccf5ed 100644
+--- a/components/script/dom/attributes/domstringlist.rs
++++ b/components/script/dom/attributes/domstringlist.rs
+@@ -3,7 +3,6 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use dom_struct::dom_struct;
+-use itertools::Itertools;
+ use js::context::JSContext;
+ use script_bindings::domstring::TracedDOMString;
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+@@ -37,25 +36,6 @@ impl DOMStringList {
+     ) -> DomRoot<DOMStringList> {
+         reflect_dom_object(cx, Box::new(DOMStringList::new_inherited(strings)), global)
+     }
+-
+-    /// <https://www.w3.org/TR/IndexedDB-3/#sorted-name-list>
+-    pub(crate) fn new_sorted<'a>(
+-        cx: &mut JSContext,
+-        global: &GlobalScope,
+-        strings: impl IntoIterator<Item = &'a TracedDOMString>,
+-    ) -> DomRoot<DOMStringList> {
+-        let sorted = strings
+-            .into_iter()
+-            .map(|dom_string| dom_string.str().encode_utf16().collect::<Vec<u16>>())
+-            .sorted_unstable()
+-            .map(|utf16_str| {
+-                String::from_utf16(utf16_str.as_slice())
+-                    .expect("can't convert object store name from utf16 back to utf8")
+-                    .into()
+-            })
+-            .collect();
+-        Self::new(cx, global, sorted)
+-    }
+ }
+ 
+ // https://html.spec.whatwg.org/multipage/#domstringlist
+diff --git a/components/script/dom/indexeddb/idbdatabase.rs b/components/script/dom/indexeddb/idbdatabase.rs
+index f83296e0be0..9c637d90f6a 100644
+--- a/components/script/dom/indexeddb/idbdatabase.rs
++++ b/components/script/dom/indexeddb/idbdatabase.rs
+@@ -7,12 +7,12 @@ use std::cell::Cell;
+ use dom_struct::dom_struct;
+ use js::context::JSContext;
+ use script_bindings::cell::DomRefCell;
+-use script_bindings::domstring::TracedDOMString;
+ use script_bindings::reflector::reflect_dom_object;
+ use servo_base::generic_channel::{GenericSend, GenericSender};
+ use storage_traits::indexeddb::{
+     AsyncSchemaOperation, ConnectionEvent, IndexedDBIndex, IndexedDBIndexId, IndexedDBObjectStore,
+     IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId, KeyPath, SyncOperation,
++    Utf16String,
+ };
+ use stylo_atoms::Atom;
+ use uuid::Uuid;
+@@ -33,13 +33,16 @@ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::idbversionchangeevent::IDBVersionChangeEvent;
+-use crate::dom::indexeddb::key::is_valid_key_path;
++use crate::dom::indexeddb::key::{
++    dom_string_from_name, is_valid_key_path, name_from_dom_string, sorted_name_list,
++};
+ 
+ #[dom_struct]
+ pub struct IDBDatabase {
+     eventtarget: EventTarget,
+     /// <https://w3c.github.io/IndexedDB/#database-name>
+-    name: TracedDOMString,
++    #[no_trace]
++    name: Utf16String,
+     /// <https://w3c.github.io/IndexedDB/#database-version>
+     version: Cell<u64>,
+     /// <https://w3c.github.io/IndexedDB/#connection-object-store-set>: the object stores and
+@@ -71,7 +74,7 @@ pub struct IDBDatabase {
+ 
+ impl IDBDatabase {
+     pub fn new_inherited(
+-        name: DOMString,
++        name: Utf16String,
+         id: Uuid,
+         version: u64,
+         object_stores: Vec<IndexedDBObjectStore>,
+@@ -83,7 +86,7 @@ impl IDBDatabase {
+             .max();
+         IDBDatabase {
+             eventtarget: EventTarget::new_inherited(),
+-            name: name.traced(),
++            name,
+             id,
+             version: Cell::new(version),
+             object_stores: DomRefCell::new(object_stores),
+@@ -99,7 +102,7 @@ impl IDBDatabase {
+     pub fn new(
+         cx: &mut JSContext,
+         global: &GlobalScope,
+-        name: DOMString,
++        name: Utf16String,
+         id: Uuid,
+         version: u64,
+         object_stores: Vec<IndexedDBObjectStore>,
+@@ -115,8 +118,9 @@ impl IDBDatabase {
+         self.global().storage_threads().sender()
+     }
+ 
+-    pub fn get_name(&self) -> DOMString {
+-        self.name.clone().root()
++    /// <https://w3c.github.io/IndexedDB/#database-name>
++    pub(crate) fn name(&self) -> &Utf16String {
++        &self.name
+     }
+ 
+     /// The id of a new transaction of this connection, unique among them.
+@@ -173,7 +177,7 @@ impl IDBDatabase {
+                 let global = self.global();
+                 let operation = SyncOperation::NotifyEndOfVersionChange {
+                     id: self.id,
+-                    name: self.name.to_string(),
++                    name: self.name.clone(),
+                     old_version,
+                     origin: global.origin().immutable().clone(),
+                 };
+@@ -190,20 +194,21 @@ impl IDBDatabase {
+ 
+     /// The names of the connection's object stores, sorted.
+     pub(crate) fn object_store_names(&self, cx: &mut JSContext) -> DomRoot<DOMStringList> {
+-        rooted_vec!(let names <- self
++        let names: Vec<Utf16String> = self
+             .object_stores
+             .borrow()
+             .iter()
+-            .map(|store| TracedDOMString::from(store.name.clone())));
+-        DOMStringList::new_sorted(cx, &self.global(), names.iter())
++            .map(|store| store.name.clone())
++            .collect();
++        sorted_name_list(cx, &self.global(), names)
+     }
+ 
+     /// The object store named `name` in the connection's object store set.
+-    pub(crate) fn object_store_named(&self, name: &str) -> Option<IndexedDBObjectStore> {
++    pub(crate) fn object_store_named(&self, name: &Utf16String) -> Option<IndexedDBObjectStore> {
+         self.object_stores
+             .borrow()
+             .iter()
+-            .find(|store| store.name == name)
++            .find(|store| store.name == *name)
+             .cloned()
+     }
+ 
+@@ -216,11 +221,11 @@ impl IDBDatabase {
+             .cloned()
+     }
+ 
+-    pub(crate) fn object_store_exists(&self, name: &str) -> bool {
++    pub(crate) fn object_store_exists(&self, name: &Utf16String) -> bool {
+         self.object_stores
+             .borrow()
+             .iter()
+-            .any(|store| store.name == name)
++            .any(|store| store.name == *name)
+     }
+ 
+     /// Whether the object store `id` is in the connection's object store set, that is, hasn't
+@@ -267,7 +272,7 @@ impl IDBDatabase {
+         }
+     }
+ 
+-    pub(crate) fn rename_object_store(&self, id: IndexedDBObjectStoreId, name: String) {
++    pub(crate) fn rename_object_store(&self, id: IndexedDBObjectStoreId, name: Utf16String) {
+         self.change_object_store(id, |store| store.name = name);
+     }
+ 
+@@ -283,7 +288,7 @@ impl IDBDatabase {
+         &self,
+         store: IndexedDBObjectStoreId,
+         index: IndexedDBIndexId,
+-        name: String,
++        name: Utf16String,
+     ) {
+         self.change_object_store(store, |store| {
+             if let Some(index) = store.indexes.iter_mut().find(|i| i.id == index) {
+@@ -360,7 +365,7 @@ impl IDBDatabase {
+         let operation = SyncOperation::CloseDatabase(
+             self.global().origin().immutable().clone(),
+             self.id,
+-            self.name.to_string(),
++            self.name.clone(),
+         );
+         let _ = self
+             .get_idb_thread()
+@@ -391,20 +396,20 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+ 
+         // Step 3. Let scope be the set of unique strings in storeNames if it is
+         // a sequence, or a set containing one string equal to storeNames otherwise.
+-        let mut scope = match store_names {
+-            StringOrStringSequence::String(name) => vec![name],
+-            StringOrStringSequence::StringSequence(sequence) => sequence,
++        let mut scope: Vec<Utf16String> = match store_names {
++            StringOrStringSequence::String(name) => vec![name_from_dom_string(&name)],
++            StringOrStringSequence::StringSequence(sequence) => {
++                sequence.iter().map(name_from_dom_string).collect()
++            },
+         };
+-        scope.sort_unstable_by(|left, right| {
+-            left.str().encode_utf16().cmp(right.str().encode_utf16())
+-        });
++        scope.sort_unstable();
+         scope.dedup();
+ 
+         // Step 4. If any string in scope is not the name of an object store in
+         // the connected database, throw a "NotFoundError" DOMException.
+         let Some(store_ids) = scope
+             .iter()
+-            .map(|name| self.object_store_named(&name.str()).map(|store| store.id))
++            .map(|name| self.object_store_named(name).map(|store| store.id))
+             .collect::<Option<Vec<_>>>()
+         else {
+             return Err(Error::NotFound(None));
+@@ -424,7 +429,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+         // connection, mode, options’ durability member, and the set of object
+         // stores named in scope.
+         let durability = options.durability;
+-        let scope = DOMStringList::new(cx, &self.global(), scope);
++        let scope = sorted_name_list(cx, &self.global(), scope);
+         let transaction = IDBTransaction::new(
+             cx,
+             &self.global(),
+@@ -487,7 +492,8 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+ 
+         // Step 6. If an object store named name already exists in database throw
+         // a "ConstraintError" DOMException.
+-        if self.object_store_exists(&name.str()) {
++        let name = name_from_dom_string(&name);
++        if self.object_store_exists(&name) {
+             return Err(Error::Constraint(None));
+         }
+ 
+@@ -522,7 +528,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+         });
+         let store = IndexedDBObjectStore {
+             id: store_id,
+-            name: name.to_string(),
++            name,
+             key_path: key_path.clone(),
+             has_key_generator: auto_increment,
+             indexes: Vec::new(),
+@@ -536,7 +542,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+             .get_idb_thread()
+             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
+                 origin: self.global().origin().immutable().clone(),
+-                database_name: self.name.to_string(),
++                database_name: self.name.clone(),
+                 store_id,
+                 operation,
+                 transaction: transaction.id(),
+@@ -551,7 +557,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+             .safe_borrow_mut(cx.no_gc())
+             .push(store.clone());
+ 
+-        let object_store = IDBObjectStore::new(cx, &self.global(), name, &store, &transaction);
++        let object_store = IDBObjectStore::new(cx, &self.global(), &store, &transaction);
+         transaction.register_object_store_handle(&object_store);
+ 
+         // Step 10. Return a new object store handle associated with store and transaction.
+@@ -574,7 +580,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+ 
+         // Step 4. Let store be the object store named name in database, or throw a
+         // "NotFoundError" DOMException if none.
+-        let Some(store) = self.object_store_named(&name.str()) else {
++        let Some(store) = self.object_store_named(&name_from_dom_string(&name)) else {
+             return Err(Error::NotFound(None));
+         };
+ 
+@@ -595,7 +601,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+             .get_idb_thread()
+             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
+                 origin: self.global().origin().immutable().clone(),
+-                database_name: self.name.to_string(),
++                database_name: self.name.clone(),
+                 store_id: store.id,
+                 operation,
+                 transaction: transaction.id(),
+@@ -610,7 +616,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbdatabase-name>
+     fn Name(&self) -> DOMString {
+-        self.name.clone().root()
++        dom_string_from_name(&self.name)
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbdatabase-version>
+diff --git a/components/script/dom/indexeddb/idbfactory.rs b/components/script/dom/indexeddb/idbfactory.rs
+index 2c702062300..e9f280234ab 100644
+--- a/components/script/dom/indexeddb/idbfactory.rs
++++ b/components/script/dom/indexeddb/idbfactory.rs
+@@ -14,7 +14,7 @@ use servo_base::generic_channel::GenericSend;
+ use servo_url::origin::ImmutableOrigin;
+ use storage_traits::indexeddb::{
+     BackendResult, ConnectionEvent, DatabaseInfo, IndexedDBThreadMsg, StorageBottleSource,
+-    SyncOperation,
++    SyncOperation, Utf16String,
+ };
+ use uuid::Uuid;
+ 
+@@ -30,13 +30,16 @@ use crate::dom::bindings::str::DOMString;
+ use crate::dom::bindings::trace::HashMapTracedValues;
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::indexeddb::idbopendbrequest::IDBOpenDBRequest;
+-use crate::dom::indexeddb::key::{convert_value_to_key, map_backend_error_to_dom_error};
++use crate::dom::indexeddb::key::{
++    convert_value_to_key, dom_string_from_name, map_backend_error_to_dom_error,
++    name_from_dom_string,
++};
+ use crate::dom::promise::Promise;
+ use crate::dom::types::IDBTransaction;
+ 
+ /// A non-jstraceable string wrapper for use in `HashMapTracedValues`.
+ #[derive(Clone, Debug, Eq, Hash, MallocSizeOf, PartialEq)]
+-pub(crate) struct DBName(pub(crate) String);
++pub(crate) struct DBName(pub(crate) Utf16String);
+ 
+ #[dom_struct]
+ pub struct IDBFactory {
+@@ -63,7 +66,7 @@ impl IDBFactory {
+     }
+ 
+     pub(crate) fn register_indexeddb_transaction(&self, txn: &IDBTransaction) {
+-        let db_name = DBName(String::from(txn.get_db_name()));
++        let db_name = DBName(txn.get_db_name());
+         let mut map = self.indexeddb_transactions.borrow_mut();
+         let bucket = map.entry(db_name).or_default();
+         if !bucket.iter().any(|entry| &**entry == txn) {
+@@ -73,7 +76,7 @@ impl IDBFactory {
+     }
+ 
+     pub(crate) fn unregister_indexeddb_transaction(&self, txn: &IDBTransaction) {
+-        let db_name = DBName(String::from(txn.get_db_name()));
++        let db_name = DBName(txn.get_db_name());
+         let mut map = self.indexeddb_transactions.borrow_mut();
+         if let Some(bucket) = map.get_mut(&db_name) {
+             bucket.retain(|entry| &**entry != txn);
+@@ -180,7 +183,7 @@ impl IDBFactory {
+     fn open_database(
+         &self,
+         storage_key: ImmutableOrigin,
+-        name: DOMString,
++        name: Utf16String,
+         version: Option<u64>,
+         request: &IDBOpenDBRequest,
+     ) -> Result<(), ()> {
+@@ -189,7 +192,7 @@ impl IDBFactory {
+ 
+         {
+             let mut pending = self.connections.borrow_mut();
+-            let outer = pending.entry(DBName(name.to_string())).or_default();
++            let outer = pending.entry(DBName(name.clone())).or_default();
+             outer.insert(request_id, Dom::from_ref(request));
+         }
+ 
+@@ -200,7 +203,7 @@ impl IDBFactory {
+         // with storageKey, name, version if given and undefined otherwise, and request.
+         let open_operation = SyncOperation::OpenDatabase(
+             storage_key,
+-            String::from(name),
++            name,
+             version,
+             request.get_id(),
+             Self::storage_bottle_source(&global),
+@@ -337,7 +340,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
+ 
+         // Step 5: Runs in parallel
+         if self
+-            .open_database(storage_key, name, version, &request)
++            .open_database(storage_key, name_from_dom_string(&name), version, &request)
+             .is_err()
+         {
+             return Err(Error::Operation(None));
+@@ -371,7 +374,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
+ 
+         // Step 4: Runs in parallel
+         if request
+-            .delete_database(storage_key, String::from(name))
++            .delete_database(storage_key, name_from_dom_string(&name))
+             .is_err()
+         {
+             return Err(Error::Operation(None));
+@@ -431,7 +434,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
+                         let info_list: Vec<IDBDatabaseInfo> = info_list
+                             .into_iter()
+                             .map(|info| IDBDatabaseInfo {
+-                                name: Some(DOMString::from(info.name)),
++                                name: Some(dom_string_from_name(&info.name)),
+                                 version: Some(info.version),
+                         })
+                         .collect();
+diff --git a/components/script/dom/indexeddb/idbindex.rs b/components/script/dom/indexeddb/idbindex.rs
+index b716598364a..591812c24bc 100644
+--- a/components/script/dom/indexeddb/idbindex.rs
++++ b/components/script/dom/indexeddb/idbindex.rs
+@@ -9,11 +9,10 @@ use js::rust::HandleValue;
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::codegen::GenericBindings::IDBIndexBinding::IDBIndexMethods;
+ use script_bindings::codegen::GenericBindings::IDBTransactionBinding::IDBTransactionMode;
+-use script_bindings::domstring::TracedDOMString;
+ use script_bindings::error::{Error, ErrorResult, Fallible};
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use script_bindings::str::DOMString;
+-use storage_traits::indexeddb::IndexedDBIndexId;
++use storage_traits::indexeddb::{IndexedDBIndexId, Utf16String};
+ 
+ use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
+ use crate::dom::bindings::refcounted::Trusted;
+@@ -25,7 +24,9 @@ use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrI
+ use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+ use crate::dom::indexeddb::idbrequest::IDBRequest;
+-use crate::dom::indexeddb::key::convert_value_to_key_range;
++use crate::dom::indexeddb::key::{
++    convert_value_to_key_range, dom_string_from_name, name_from_dom_string,
++};
+ 
+ #[dom_struct]
+ pub(crate) struct IDBIndex {
+@@ -33,7 +34,8 @@ pub(crate) struct IDBIndex {
+     object_store: Dom<IDBObjectStore>,
+     /// The id of the handle's index.
+     id: IndexedDBIndexId,
+-    name: DomRefCell<TracedDOMString>,
++    #[no_trace]
++    name: DomRefCell<Utf16String>,
+     multi_entry: bool,
+     unique: bool,
+     key_path: KeyPath,
+@@ -43,7 +45,7 @@ impl IDBIndex {
+     pub fn new_inherited(
+         object_store: &IDBObjectStore,
+         id: IndexedDBIndexId,
+-        name: DOMString,
++        name: Utf16String,
+         multi_entry: bool,
+         unique: bool,
+         key_path: KeyPath,
+@@ -52,7 +54,7 @@ impl IDBIndex {
+             reflector_: Reflector::new(),
+             object_store: Dom::from_ref(object_store),
+             id,
+-            name: DomRefCell::new(name.traced()),
++            name: DomRefCell::new(name),
+             multi_entry,
+             unique,
+             key_path,
+@@ -65,7 +67,7 @@ impl IDBIndex {
+         global: &GlobalScope,
+         object_store: &IDBObjectStore,
+         id: IndexedDBIndexId,
+-        name: DOMString,
++        name: Utf16String,
+         multi_entry: bool,
+         unique: bool,
+         key_path: KeyPath,
+@@ -90,8 +92,13 @@ impl IDBIndex {
+ 
+     /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction> step 6: reverts the
+     /// handle's name.
+-    pub(crate) fn set_name(&self, name: DOMString) {
+-        *self.name.borrow_mut() = name.traced();
++    pub(crate) fn set_name(&self, name: Utf16String) {
++        *self.name.borrow_mut() = name;
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#index-handle-name>
++    pub(crate) fn name(&self) -> Utf16String {
++        self.name.borrow().clone()
+     }
+ 
+     pub(crate) fn object_store(&self) -> DomRoot<IDBObjectStore> {
+@@ -183,12 +190,13 @@ impl IDBIndex {
+ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+     /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-name>
+     fn Name(&self) -> DOMString {
+-        self.name.borrow().clone().root()
++        dom_string_from_name(&self.name.borrow())
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB/#ref-for-dom-idbindex-name%E2%91%A2>
+     fn SetName(&self, name: DOMString) -> ErrorResult {
+         // Step 1: Let name be the given value.
++        let name = name_from_dom_string(&name);
+         // Step 2: Let transaction be this’s transaction.
+         let transaction = self.object_store.transaction();
+ 
+@@ -214,7 +222,7 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+         let mut stored_name = self.name.borrow_mut();
+ 
+         // Step 7: If index’s name is equal to name, terminate these steps.
+-        if *stored_name == *name {
++        if *stored_name == name {
+             return Ok(());
+         }
+ 
+@@ -229,7 +237,7 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+         self.object_store.rename_index(self.id, &stored_name, &name);
+ 
+         // Step 10: Set this’s name to name.
+-        *stored_name = name.traced();
++        *stored_name = name;
+         Ok(())
+     }
+ 
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index 6f2ba6dcd8d..187d5c56b5a 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -12,18 +12,16 @@ use js::rust::HandleValue;
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::codegen::GenericBindings::IDBObjectStoreBinding::IDBIndexParameters;
+ use script_bindings::codegen::GenericUnionTypes::StringOrStringSequence;
+-use script_bindings::domstring::TracedDOMString;
+ use script_bindings::error::ErrorResult;
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use servo_base::generic_channel::{GenericSend, GenericSender};
+ use storage_traits::indexeddb::{
+     self, AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+     IndexedDBIndex, IndexedDBIndexId, IndexedDBKeyType, IndexedDBObjectStore,
+-    IndexedDBObjectStoreId, IndexedDBThreadMsg,
++    IndexedDBObjectStoreId, IndexedDBThreadMsg, Utf16String,
+ };
+ 
+ use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
+-use crate::dom::bindings::codegen::Bindings::IDBIndexBinding::IDBIndexMethods;
+ use crate::dom::bindings::codegen::Bindings::IDBObjectStoreBinding::IDBObjectStoreMethods;
+ use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::{
+     IDBTransactionMethods, IDBTransactionMode,
+@@ -34,6 +32,7 @@ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot};
+ use crate::dom::bindings::str::DOMString;
+ use crate::dom::bindings::structuredclone;
++use crate::dom::bindings::trace::NoTrace;
+ use crate::dom::domstringlist::DOMStringList;
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
+@@ -43,8 +42,9 @@ use crate::dom::indexeddb::idbrequest::IDBRequest;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::key::{
+     EvaluationResult, ExtractionResult, can_inject_key_into_value, convert_value_to_key,
+-    convert_value_to_key_range, evaluate_key_path_on_value, extract_key, inject_key_into_value,
+-    injected_key_is_stored, is_valid_key_path,
++    convert_value_to_key_range, dom_string_from_name, evaluate_key_path_on_value, extract_key,
++    inject_key_into_value, injected_key_is_stored, is_valid_key_path, name_from_dom_string,
++    sorted_name_list,
+ };
+ 
+ #[derive(Clone, JSTraceable, MallocSizeOf)]
+@@ -89,9 +89,10 @@ pub struct IDBObjectStore {
+     reflector_: Reflector,
+     /// The id of the handle's object store.
+     id: IndexedDBObjectStoreId,
+-    name: DomRefCell<TracedDOMString>,
++    #[no_trace]
++    name: DomRefCell<Utf16String>,
+     key_path: Option<KeyPath>,
+-    index_set: DomRefCell<HashMap<TracedDOMString, Dom<IDBIndex>>>,
++    index_set: DomRefCell<HashMap<NoTrace<Utf16String>, Dom<IDBIndex>>>,
+     /// Every index handle of this handle, also those of indexes deleted since, whose names an
+     /// aborted upgrade transaction reverts.
+     index_handles: DomRefCell<Vec<Dom<IDBIndex>>>,
+@@ -100,44 +101,40 @@ pub struct IDBObjectStore {
+ 
+     // We store the db name in the object store to address backend operations
+     // that are keyed by (origin, database name, object store id).
+-    db_name: TracedDOMString,
++    #[no_trace]
++    db_name: Utf16String,
+ }
+ 
+ impl IDBObjectStore {
+-    fn new_inherited(
+-        name: DOMString,
+-        store: &IndexedDBObjectStore,
+-        transaction: &IDBTransaction,
+-    ) -> IDBObjectStore {
++    fn new_inherited(store: &IndexedDBObjectStore, transaction: &IDBTransaction) -> IDBObjectStore {
+         IDBObjectStore {
+             reflector_: Reflector::new(),
+             id: store.id,
+-            name: DomRefCell::new(name.traced()),
++            name: DomRefCell::new(store.name.clone()),
+             key_path: store.key_path.clone().map(Into::into),
+             index_set: DomRefCell::new(HashMap::new()),
+             index_handles: Default::default(),
+             transaction: Dom::from_ref(transaction),
+             has_key_generator: store.has_key_generator,
+-            db_name: transaction.get_db_name().traced(),
++            db_name: transaction.get_db_name(),
+         }
+     }
+ 
+-    /// <https://w3c.github.io/IndexedDB/#object-store-handle>: a new handle, named `name`, of the
+-    /// object store `store` in `transaction`, with a handle of each of its indexes.
++    /// <https://w3c.github.io/IndexedDB/#object-store-handle>: a new handle of the object store
++    /// `store` in `transaction`, with a handle of each of its indexes.
+     pub fn new(
+         cx: &mut JSContext,
+         global: &GlobalScope,
+-        name: DOMString,
+         store: &IndexedDBObjectStore,
+         transaction: &IDBTransaction,
+     ) -> DomRoot<IDBObjectStore> {
+         let handle = reflect_dom_object(
+             cx,
+-            Box::new(IDBObjectStore::new_inherited(name, store, transaction)),
++            Box::new(IDBObjectStore::new_inherited(store, transaction)),
+             global,
+         );
+         for index in &store.indexes {
+-            handle.add_index(cx, index.name.clone().into(), index);
++            handle.add_index(cx, index);
+         }
+         handle
+     }
+@@ -155,7 +152,7 @@ impl IDBObjectStore {
+         // Step 5.1. If handle’s object store was not newly created during transaction,
+         // set handle’s name to its object store’s name.
+         if let Some(store) = &store {
+-            *self.name.safe_borrow_mut(cx.no_gc()) = DOMString::from(store.name.clone()).traced();
++            *self.name.safe_borrow_mut(cx.no_gc()) = store.name.clone();
+         }
+ 
+         // Step 6. For each index handle handle associated with transaction, including those for
+@@ -170,7 +167,7 @@ impl IDBObjectStore {
+             .collect();
+         for handle in &handles {
+             if let Some(index) = indexes.iter().find(|index| index.id == handle.id()) {
+-                handle.set_name(index.name.clone().into());
++                handle.set_name(index.name.clone());
+             }
+         }
+ 
+@@ -182,10 +179,10 @@ impl IDBObjectStore {
+                 Some(handle) => {
+                     self.index_set
+                         .safe_borrow_mut(cx.no_gc())
+-                        .insert(handle.Name().traced(), Dom::from_ref(&**handle));
++                        .insert(NoTrace(handle.name()), Dom::from_ref(&**handle));
+                 },
+                 None => {
+-                    self.add_index(cx, index.name.clone().into(), index);
++                    self.add_index(cx, index);
+                 },
+             }
+         }
+@@ -503,34 +500,29 @@ impl IDBObjectStore {
+         .inspect(|request| cursor.set_request(request))
+     }
+ 
+-    /// Adds a handle named `name` of the index `index` to this handle's index set.
+-    fn add_index(
+-        &self,
+-        cx: &mut JSContext,
+-        name: DOMString,
+-        index: &IndexedDBIndex,
+-    ) -> DomRoot<IDBIndex> {
++    /// Adds a handle of the index `index` to this handle's index set.
++    fn add_index(&self, cx: &mut JSContext, index: &IndexedDBIndex) -> DomRoot<IDBIndex> {
+         let handle = IDBIndex::new(
+             cx,
+             &self.global(),
+             self,
+             index.id,
+-            name.clone(),
++            index.name.clone(),
+             index.multi_entry,
+             index.unique,
+             index.key_path.clone().into(),
+         );
+         self.index_set
+             .safe_borrow_mut(cx.no_gc())
+-            .insert(name.traced(), Dom::from_ref(&handle));
++            .insert(NoTrace(index.name.clone()), Dom::from_ref(&handle));
+         self.index_handles
+             .safe_borrow_mut(cx.no_gc())
+             .push(Dom::from_ref(&handle));
+         handle
+     }
+ 
+-    pub(crate) fn has_index(&self, name: &TracedDOMString) -> bool {
+-        self.index_set.borrow().contains_key(name)
++    pub(crate) fn has_index(&self, name: &Utf16String) -> bool {
++        self.index_set.borrow().contains_key(&NoTrace(name.clone()))
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#dom-idbdatabase-deleteobjectstore> step 6.
+@@ -544,7 +536,7 @@ impl IDBObjectStore {
+         self.get_idb_thread()
+             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
+                 origin: self.global().origin().immutable().clone(),
+-                database_name: self.db_name.to_string(),
++                database_name: self.db_name.clone(),
+                 store_id: self.id,
+                 operation,
+                 transaction: self.transaction.id(),
+@@ -561,15 +553,15 @@ impl IDBObjectStore {
+     pub(crate) fn rename_index(
+         &self,
+         index: IndexedDBIndexId,
+-        name: &TracedDOMString,
+-        new_name: &DOMString,
++        name: &Utf16String,
++        new_name: &Utf16String,
+     ) {
+         self.transaction
+             .get_db()
+-            .rename_index(self.id, index, new_name.to_string());
++            .rename_index(self.id, index, new_name.clone());
+         let operation = AsyncSchemaOperation::RenameIndex {
+             index_id: index,
+-            new_name: new_name.to_string(),
++            new_name: new_name.clone(),
+         };
+         if self.send_schema_operation(operation).is_err() {
+             warn!("Could not send AsyncSchemaOperation");
+@@ -579,12 +571,12 @@ impl IDBObjectStore {
+         let index = self
+             .index_set
+             .borrow_mut()
+-            .remove(name)
++            .remove(&NoTrace(name.clone()))
+             .expect("Earlier steps of the algorithm checked that the index exists")
+             .as_rooted();
+         self.index_set
+             .borrow_mut()
+-            .insert(new_name.clone().traced(), Dom::from_ref(&index));
++            .insert(NoTrace(new_name.clone()), Dom::from_ref(&index));
+     }
+ }
+ 
+@@ -832,13 +824,13 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-name>
+     fn Name(&self) -> DOMString {
+-        self.name.borrow().clone().root()
++        dom_string_from_name(&self.name.borrow())
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-name>
+     fn SetName(&self, value: DOMString) -> ErrorResult {
+         // Step 1. Let name be the given value.
+-        let name = value;
++        let name = name_from_dom_string(&value);
+ 
+         // Step 2. Let transaction be this’s transaction.
+         let transaction = &self.transaction;
+@@ -855,13 +847,13 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         self.check_transaction_active()?;
+ 
+         // Step 7. If store’s name is equal to name, terminate these steps.
+-        if *self.name.borrow() == *name {
++        if *self.name.borrow() == name {
+             return Ok(());
+         }
+ 
+         // Step 8. If an object store named name already exists in store’s database,
+         // throw a "ConstraintError" DOMException.
+-        if transaction.get_db().object_store_exists(&name.str()) {
++        if transaction.get_db().object_store_exists(&name) {
+             return Err(Error::Constraint(None));
+         }
+ 
+@@ -869,13 +861,13 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         // The records and indexes of the store stay with it: the backend renames the store's row.
+         transaction
+             .get_db()
+-            .rename_object_store(self.id, name.to_string());
++            .rename_object_store(self.id, name.clone());
+         self.send_schema_operation(AsyncSchemaOperation::RenameObjectStore {
+-            new_name: name.to_string(),
++            new_name: name.clone(),
+         })?;
+ 
+         // Step 10. Set this’s name to name.
+-        *self.name.borrow_mut() = name.traced();
++        *self.name.borrow_mut() = name;
+         Ok(())
+     }
+ 
+@@ -890,7 +882,13 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-indexnames>
+     fn IndexNames(&self, cx: &mut JSContext) -> DomRoot<DOMStringList> {
+-        DOMStringList::new_sorted(cx, &self.global(), self.index_set.borrow().keys())
++        let names: Vec<Utf16String> = self
++            .index_set
++            .borrow()
++            .keys()
++            .map(|name| name.0.clone())
++            .collect();
++        sorted_name_list(cx, &self.global(), names)
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-transaction>
+@@ -923,6 +921,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         self.check_transaction_active()?;
+ 
+         // Step 6. If an index named name already exists in store, throw a "ConstraintError" DOMException.
++        let name = name_from_dom_string(&name);
+         if self.has_index(&name) {
+             return Err(Error::Constraint(None));
+         }
+@@ -949,7 +948,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         let db = self.transaction.get_db();
+         let index = IndexedDBIndex {
+             id: db.allocate_index_id(),
+-            name: name.to_string(),
++            name,
+             key_path: key_path.into(),
+             unique: options.unique,
+             multi_entry: options.multiEntry,
+@@ -964,7 +963,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         db.add_index(self.id, index.clone());
+ 
+         // Step 12. Add index to this object store handle's index set.
+-        let index = self.add_index(cx, name, &index);
++        let index = self.add_index(cx, &index);
+ 
+         // Step 13. Return a new index handle associated with index and this object store handle.
+         Ok(index)
+@@ -982,6 +981,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         self.check_transaction_active()?;
+         // Step 6. Let index be the index named name in store if one exists,
+         // or throw a "NotFoundError" DOMException otherwise.
++        let name = NoTrace(name_from_dom_string(&name));
+         let Some(index) = self
+             .index_set
+             .borrow()
+@@ -991,7 +991,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+             return Err(Error::NotFound(None));
+         };
+         // Step 7. Remove index from this object store handle's index set.
+-        self.index_set.borrow_mut().retain(|n, _| n != &*name);
++        self.index_set.borrow_mut().remove(&name);
+         // Step 8. Destroy index.
+         self.transaction.get_db().remove_index(self.id, index.id());
+         self.send_schema_operation(AsyncSchemaOperation::DeleteIndex {
+@@ -1011,7 +1011,9 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+ 
+         // Step 5. Let index be the index named name in this’s index set if one exists, or throw a "NotFoundError" DOMException otherwise.
+         let index_set = self.index_set.borrow();
+-        let index = index_set.get(&name).ok_or(Error::NotFound(None))?;
++        let index = index_set
++            .get(&NoTrace(name_from_dom_string(&name)))
++            .ok_or(Error::NotFound(None))?;
+ 
+         // Step 6. Return an index handle associated with index and this.
+         Ok(index.as_rooted())
+diff --git a/components/script/dom/indexeddb/idbopendbrequest.rs b/components/script/dom/indexeddb/idbopendbrequest.rs
+index 71e8ba420a5..fd35da89df6 100644
+--- a/components/script/dom/indexeddb/idbopendbrequest.rs
++++ b/components/script/dom/indexeddb/idbopendbrequest.rs
+@@ -13,7 +13,7 @@ use servo_base::generic_channel::GenericSend;
+ use servo_url::origin::ImmutableOrigin;
+ use storage_traits::indexeddb::{
+     BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBObjectStore, IndexedDBThreadMsg,
+-    IndexedDBTxnId, SyncOperation,
++    IndexedDBTxnId, SyncOperation, Utf16String,
+ };
+ use stylo_atoms::Atom;
+ use uuid::Uuid;
+@@ -134,21 +134,14 @@ impl IDBOpenDBRequest {
+         &self,
+         cx: &mut JSContext,
+         global: &GlobalScope,
+-        name: String,
++        name: Utf16String,
+         version: u64,
+         object_stores: Vec<IndexedDBObjectStore>,
+         upgraded: bool,
+     ) -> DomRoot<IDBDatabase> {
+         self.pending_connection.or_init(|| {
+             debug_assert!(!upgraded, "A connection should exist for the upgraded db.");
+-            IDBDatabase::new(
+-                cx,
+-                global,
+-                name.into(),
+-                self.get_id(),
+-                version,
+-                object_stores,
+-            )
++            IDBDatabase::new(cx, global, name, self.get_id(), version, object_stores)
+         })
+     }
+ 
+@@ -174,6 +167,7 @@ impl IDBOpenDBRequest {
+             IDBTransactionMode::Versionchange,
+             IDBTransactionDurability::Default,
+             &scope,
++            Vec::new(),
+             transaction,
+         );
+         transaction.set_versionchange_old_version(old_version);
+@@ -357,7 +351,7 @@ impl IDBOpenDBRequest {
+     pub(crate) fn delete_database(
+         &self,
+         storage_key: ImmutableOrigin,
+-        name: String,
++        name: Utf16String,
+     ) -> Result<(), ()> {
+         let global = self.global();
+ 
+diff --git a/components/script/dom/indexeddb/idbrequest.rs b/components/script/dom/indexeddb/idbrequest.rs
+index 6a38125f5c1..16301922eb8 100644
+--- a/components/script/dom/indexeddb/idbrequest.rs
++++ b/components/script/dom/indexeddb/idbrequest.rs
+@@ -260,7 +260,7 @@ impl IDBRequest {
+             .storage_threads()
+             .send(IndexedDBThreadMsg::Async(
+                 global.origin().immutable().clone(),
+-                String::from(transaction.get_db_name()),
++                transaction.get_db_name(),
+                 source.id(),
+                 transaction.id(),
+                 request_id,
+diff --git a/components/script/dom/indexeddb/idbtransaction.rs b/components/script/dom/indexeddb/idbtransaction.rs
+index a1eb3ef712c..47fa0f041e5 100644
+--- a/components/script/dom/indexeddb/idbtransaction.rs
++++ b/components/script/dom/indexeddb/idbtransaction.rs
+@@ -14,11 +14,10 @@ use servo_base::generic_channel::{GenericSend, GenericSender};
+ use servo_base::id::ScriptEventLoopId;
+ use storage_traits::indexeddb::{
+     BackendError, BackendResult, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg,
+-    IndexedDBTxnId, IndexedDBTxnMode, RequestOutput, SyncOperation, TransactionEvent,
++    IndexedDBTxnId, IndexedDBTxnMode, RequestOutput, SyncOperation, TransactionEvent, Utf16String,
+ };
+ use stylo_atoms::Atom;
+ 
+-use crate::dom::bindings::codegen::Bindings::DOMStringListBinding::DOMStringListMethods;
+ use crate::dom::bindings::codegen::Bindings::IDBDatabaseBinding::IDBTransactionDurability;
+ use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::{
+     IDBTransactionMethods, IDBTransactionMode,
+@@ -38,7 +37,7 @@ use crate::dom::indexeddb::idbcursor::IterationParam;
+ use crate::dom::indexeddb::idbdatabase::IDBDatabase;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+ use crate::dom::indexeddb::idbrequest::IDBRequest;
+-use crate::dom::indexeddb::key::map_backend_error_to_dom_error;
++use crate::dom::indexeddb::key::{map_backend_error_to_dom_error, name_from_dom_string};
+ use crate::realms::enter_auto_realm;
+ 
+ /// A request in a transaction's request list, and its result once the backend has reported it.
+@@ -60,6 +59,9 @@ struct PendingRequest {
+ pub struct IDBTransaction {
+     eventtarget: EventTarget,
+     object_store_names: Dom<DOMStringList>,
++    /// <https://w3c.github.io/IndexedDB/#transaction-scope>, by object store id, of a transaction
++    /// that isn't an upgrade transaction.
++    scope: Vec<IndexedDBObjectStoreId>,
+     mode: IDBTransactionMode,
+     durability: IDBTransactionDurability,
+     db: Dom<IDBDatabase>,
+@@ -101,12 +103,14 @@ impl IDBTransaction {
+         connection: &IDBDatabase,
+         mode: IDBTransactionMode,
+         durability: IDBTransactionDurability,
+-        scope: &DOMStringList,
++        scope_names: &DOMStringList,
++        scope: Vec<IndexedDBObjectStoreId>,
+         id: IndexedDBTxnId,
+     ) -> IDBTransaction {
+         IDBTransaction {
+             eventtarget: EventTarget::new_inherited(),
+-            object_store_names: Dom::from_ref(scope),
++            object_store_names: Dom::from_ref(scope_names),
++            scope,
+             mode,
+             durability,
+             db: Dom::from_ref(connection),
+@@ -131,16 +135,17 @@ impl IDBTransaction {
+         }
+     }
+ 
+-    /// Creates a readonly or readwrite transaction of `connection` with the object stores `scope`,
+-    /// whose ids are `scope_ids`, and tells the backend about it without waiting for a reply.
++    /// Creates a readonly or readwrite transaction of `connection` with the object stores named
++    /// `scope_names`, whose ids are `scope`, and tells the backend about it without waiting for a
++    /// reply.
+     pub fn new(
+         cx: &mut JSContext,
+         global: &GlobalScope,
+         connection: &IDBDatabase,
+         mode: IDBTransactionMode,
+         durability: IDBTransactionDurability,
+-        scope: &DOMStringList,
+-        scope_ids: Vec<IndexedDBObjectStoreId>,
++        scope_names: &DOMStringList,
++        scope: Vec<IndexedDBObjectStoreId>,
+     ) -> DomRoot<IDBTransaction> {
+         let id = connection.allocate_transaction_id();
+         let backend_mode = match mode {
+@@ -155,31 +160,47 @@ impl IDBTransaction {
+             .storage_threads()
+             .send(IndexedDBThreadMsg::Sync(SyncOperation::CreateTransaction {
+                 origin: global.origin().immutable().clone(),
+-                db_name: String::from(connection.get_name()),
++                db_name: connection.name().clone(),
+                 txn: id,
+                 mode: backend_mode,
+-                scope: scope_ids,
++                scope: scope.clone(),
+             }))
+             .is_err()
+         {
+             error!("Failed to send SyncOperation::CreateTransaction");
+         }
+-        IDBTransaction::new_with_id(cx, global, connection, mode, durability, scope, id)
++        IDBTransaction::new_with_id(
++            cx,
++            global,
++            connection,
++            mode,
++            durability,
++            scope_names,
++            scope,
++            id,
++        )
+     }
+ 
++    #[expect(clippy::too_many_arguments)]
+     pub(crate) fn new_with_id(
+         cx: &mut JSContext,
+         global: &GlobalScope,
+         connection: &IDBDatabase,
+         mode: IDBTransactionMode,
+         durability: IDBTransactionDurability,
+-        scope: &DOMStringList,
++        scope_names: &DOMStringList,
++        scope: Vec<IndexedDBObjectStoreId>,
+         id: IndexedDBTxnId,
+     ) -> DomRoot<IDBTransaction> {
+         let transaction = reflect_dom_object(
+             cx,
+             Box::new(IDBTransaction::new_inherited(
+-                connection, mode, durability, scope, id,
++                connection,
++                mode,
++                durability,
++                scope_names,
++                scope,
++                id,
+             )),
+             global,
+         );
+@@ -293,7 +314,7 @@ impl IDBTransaction {
+         let global = self.global();
+         let commit_operation = SyncOperation::Commit {
+             origin: global.origin().immutable().clone(),
+-            db_name: String::from(self.db.get_name()),
++            db_name: self.db.name().clone(),
+             txn: self.id,
+         };
+ 
+@@ -348,8 +369,8 @@ impl IDBTransaction {
+         self.mode
+     }
+ 
+-    pub fn get_db_name(&self) -> DOMString {
+-        self.db.get_name()
++    pub fn get_db_name(&self) -> Utf16String {
++        self.db.name().clone()
+     }
+ 
+     pub(crate) fn get_db(&self) -> &IDBDatabase {
+@@ -616,7 +637,7 @@ impl IDBTransaction {
+             let _ = self.get_idb_thread().send(IndexedDBThreadMsg::Sync(
+                 SyncOperation::UpgradeTransactionFinished {
+                     origin: global.origin().immutable().clone(),
+-                    db_name: String::from(self.db.get_name()),
++                    db_name: self.db.name().clone(),
+                     txn: self.id,
+                     committed: false,
+                 },
+@@ -644,7 +665,7 @@ impl IDBTransaction {
+             .get_idb_thread()
+             .send(IndexedDBThreadMsg::Sync(SyncOperation::Abort {
+                 origin: global.origin().immutable().clone(),
+-                db_name: String::from(self.db.get_name()),
++                db_name: self.db.name().clone(),
+                 txn: self.id,
+             }));
+     }
+@@ -668,7 +689,7 @@ impl IDBTransaction {
+         let _ = self.get_idb_thread().send(IndexedDBThreadMsg::Sync(
+             SyncOperation::TransactionFinished {
+                 origin: global.origin().immutable().clone(),
+-                db_name: String::from(self.db.get_name()),
++                db_name: self.db.name().clone(),
+                 txn: self.id,
+             },
+         ));
+@@ -709,7 +730,7 @@ impl IDBTransaction {
+             let _ = self.get_idb_thread().send(IndexedDBThreadMsg::Sync(
+                 SyncOperation::UpgradeTransactionFinished {
+                     origin: global.origin().immutable().clone(),
+-                    db_name: String::from(self.db.get_name()),
++                    db_name: self.db.name().clone(),
+                     txn: self.id,
+                     committed: true,
+                 },
+@@ -750,11 +771,12 @@ impl IDBTransactionMethods<crate::DomTypeHolder> for IDBTransaction {
+         // "NotFoundError" DOMException if none.
+         // For versionchange transactions, the scope is the connection's object store set,
+         // which follows the changes of the upgrade.
+-        let in_scope = self.mode == IDBTransactionMode::Versionchange ||
+-            self.object_store_names.Contains(name.clone());
+-        let Some(store) = in_scope
+-            .then(|| self.db.object_store_named(&name.str()))
+-            .flatten()
++        let Some(store) = self
++            .db
++            .object_store_named(&name_from_dom_string(&name))
++            .filter(|store| {
++                self.mode == IDBTransactionMode::Versionchange || self.scope.contains(&store.id)
++            })
+         else {
+             return Err(Error::NotFound(None));
+         };
+@@ -767,7 +789,7 @@ impl IDBTransactionMethods<crate::DomTypeHolder> for IDBTransaction {
+         }
+ 
+         // Step 4: Return an object store handle associated with store and this.
+-        let handle = IDBObjectStore::new(cx, &self.global(), name, &store, self);
++        let handle = IDBObjectStore::new(cx, &self.global(), &store, self);
+         self.register_object_store_handle(&handle);
+         Ok(handle)
+     }
+diff --git a/components/script/dom/indexeddb/key.rs b/components/script/dom/indexeddb/key.rs
+index 387bb90ee23..2768ae50289 100644
+--- a/components/script/dom/indexeddb/key.rs
++++ b/components/script/dom/indexeddb/key.rs
+@@ -3,25 +3,26 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use std::ffi::CString;
+-use std::ptr;
++use std::{ptr, slice};
+ 
+ use itertools::Itertools;
+ use js::context::JSContext;
+-use js::conversions::{ToJSValConvertible, jsstr_to_string};
++use js::conversions::ToJSValConvertible;
+ use js::jsapi::{
+     ClippedTime, ESClass, IsArrayBufferObject, IsDetachedArrayBufferObject,
+-    JS_GetArrayBufferViewBuffer, JS_GetStringLength, JS_IsArrayBufferViewObject, NewArrayObject1,
+-    PropertyKey,
++    JS_DeprecatedStringHasLatin1Chars, JS_GetArrayBufferViewBuffer, JS_GetStringLength,
++    JS_IsArrayBufferViewObject, JSString, NewArrayObject1, PropertyKey,
+ };
+-use js::jsval::{DoubleValue, ObjectValue, UndefinedValue};
++use js::jsval::{DoubleValue, ObjectValue, StringValue, UndefinedValue};
+ use js::rust::wrappers2::{
+-    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_HasOwnPropertyById, JS_IndexToId,
+-    JS_IsIdentifier, NewDateObject, ObjectIsDate, SameValue,
++    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_GetLatin1StringCharsAndLength,
++    JS_GetTwoByteStringCharsAndLength, JS_HasOwnPropertyById, JS_IndexToId, JS_IsIdentifier,
++    JS_NewUCStringCopyN, NewDateObject, ObjectIsDate, SameValue,
+ };
+ use js::rust::{HandleValue, MutableHandleValue};
+ use js::typedarray::{ArrayBuffer, ArrayBufferU8, ArrayBufferView};
+ use script_bindings::js::{JS_GetPropertyById, JS_NewObject};
+-use storage_traits::indexeddb::{BackendError, IndexedDBKeyRange, IndexedDBKeyType};
++use storage_traits::indexeddb::{BackendError, IndexedDBKeyRange, IndexedDBKeyType, Utf16String};
+ 
+ use crate::dom::bindings::buffer_source::create_buffer_source;
+ use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
+@@ -29,13 +30,76 @@ use crate::dom::bindings::codegen::Bindings::FileBinding::FileMethods;
+ use crate::dom::bindings::codegen::UnionTypes::StringOrStringSequence as StrOrStringSequence;
+ use crate::dom::bindings::conversions::{get_property_jsval, root_from_handlevalue};
+ use crate::dom::bindings::error::Error;
++use crate::dom::bindings::root::DomRoot;
+ use crate::dom::bindings::str::DOMString;
+ use crate::dom::bindings::utils::{define_dictionary_property, has_own_property};
+ use crate::dom::blob::Blob;
++use crate::dom::domstringlist::DOMStringList;
+ use crate::dom::file::File;
++use crate::dom::globalscope::GlobalScope;
+ use crate::dom::idbkeyrange::IDBKeyRange;
+ use crate::dom::idbobjectstore::KeyPath;
+ 
++/// The code units of the JavaScript string `string`, which must not be null.
++#[expect(unsafe_code)]
++fn js_string_code_units(cx: &JSContext, string: *mut JSString) -> Vec<u16> {
++    let mut length = 0;
++    // SAFETY: `string` is a live string, and its characters are copied before anything can
++    // garbage collect.
++    unsafe {
++        if JS_DeprecatedStringHasLatin1Chars(string) {
++            let chars = JS_GetLatin1StringCharsAndLength(cx, string, &mut length);
++            assert!(!chars.is_null());
++            slice::from_raw_parts(chars, length)
++                .iter()
++                .map(|&char| char.into())
++                .collect()
++        } else {
++            let chars = JS_GetTwoByteStringCharsAndLength(cx, string, &mut length);
++            assert!(!chars.is_null());
++            slice::from_raw_parts(chars, length).to_vec()
++        }
++    }
++}
++
++/// Sets `result` to a JavaScript string of the code units of `string`.
++#[expect(unsafe_code)]
++fn utf16_string_to_jsval(cx: &mut JSContext, string: &Utf16String, mut result: MutableHandleValue) {
++    let units = string.units();
++    // SAFETY: `units` is valid for `units.len()` code units, which the call copies.
++    let js_string = unsafe { JS_NewUCStringCopyN(cx, units.as_ptr(), units.len()) };
++    assert!(
++        !js_string.is_null(),
++        "Failed to convert an IndexedDB string into a JS string"
++    );
++    // SAFETY: `js_string` is a new, non-null string.
++    result.set(StringValue(unsafe { &*js_string }));
++}
++
++/// The name (<https://w3c.github.io/IndexedDB/#name>) that the DOMString `name` gives.
++pub(crate) fn name_from_dom_string(name: &DOMString) -> Utf16String {
++    Utf16String::from(&*name.str())
++}
++
++/// The DOMString of the name `name`.
++pub(crate) fn dom_string_from_name(name: &Utf16String) -> DOMString {
++    DOMString::from(name.to_string_lossy())
++}
++
++/// <https://w3c.github.io/IndexedDB/#sorted-name-list> of `names`, sorted by code unit.
++pub(crate) fn sorted_name_list(
++    cx: &mut JSContext,
++    global: &GlobalScope,
++    names: impl IntoIterator<Item = Utf16String>,
++) -> DomRoot<DOMStringList> {
++    let names = names
++        .into_iter()
++        .sorted_unstable()
++        .map(|name| dom_string_from_name(&name))
++        .collect();
++    DOMStringList::new(cx, global, names)
++}
++
+ // https://www.w3.org/TR/IndexedDB-3/#convert-key-to-value
+ #[expect(unsafe_code)]
+ pub fn key_type_to_jsval(
+@@ -51,7 +115,7 @@ pub fn key_type_to_jsval(
+         IndexedDBKeyType::Number(n) => result.set(DoubleValue(*n)),
+ 
+         // Step 3. If type is string, return an ECMAScript String value equal to value.
+-        IndexedDBKeyType::String(s) => s.to_jsval(cx, result),
++        IndexedDBKeyType::String(s) => utf16_string_to_jsval(cx, s, result),
+ 
+         IndexedDBKeyType::Date(d) => unsafe {
+             // Step 3.1. Let date be the result of executing the ECMAScript Date
+@@ -254,9 +318,10 @@ pub fn convert_value_to_key(
+     // If Type(input) is String:
+     if input.is_string() {
+         // 3.1. Return a new key with type string and value input.
+-        let string_ptr = std::ptr::NonNull::new(input.to_string()).unwrap();
+-        let key = unsafe { jsstr_to_string(cx, string_ptr) };
+-        return Ok(ConversionResult::Valid(IndexedDBKeyType::String(key)));
++        let units = js_string_code_units(cx, input.to_string());
++        return Ok(ConversionResult::Valid(IndexedDBKeyType::String(
++            Utf16String::from_units(units),
++        )));
+     }
+ 
+     if input.is_object() {
+diff --git a/components/shared/storage/client_storage.rs b/components/shared/storage/client_storage.rs
+index dec44d4c8e9..bdd26748a80 100644
+--- a/components/shared/storage/client_storage.rs
++++ b/components/shared/storage/client_storage.rs
+@@ -13,6 +13,8 @@ use servo_base::generic_channel::{
+ use servo_base::id::WebViewId;
+ use servo_url::ImmutableOrigin;
+ 
++use crate::indexeddb::Utf16String;
++
+ #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+ pub struct ClientStorageThreadHandle {
+     sender: GenericSender<ClientStorageThreadMessage>,
+@@ -45,12 +47,12 @@ impl ClientStorageThreadHandle {
+     pub fn create_database(
+         &self,
+         bottle_id: i64,
+-        name: String,
++        name: impl Into<Utf16String>,
+     ) -> GenericReceiver<Result<(PathBuf, bool), String>> {
+         let (sender, receiver) = generic_channel::channel().unwrap();
+         let message = ClientStorageThreadMessage::CreateDatabase {
+             bottle_id,
+-            name,
++            name: name.into(),
+             sender,
+         };
+         self.sender.send(message).unwrap();
+@@ -60,12 +62,12 @@ impl ClientStorageThreadHandle {
+     pub fn delete_database(
+         &self,
+         bottle_id: i64,
+-        name: String,
++        name: impl Into<Utf16String>,
+     ) -> GenericReceiver<Result<(), String>> {
+         let (sender, receiver) = generic_channel::channel().unwrap();
+         let message = ClientStorageThreadMessage::DeleteDatabase {
+             bottle_id,
+-            name,
++            name: name.into(),
+             sender,
+         };
+         self.sender.send(message).unwrap();
+@@ -247,13 +249,13 @@ pub enum ClientStorageThreadMessage {
+     },
+     CreateDatabase {
+         bottle_id: i64,
+-        name: String,
++        name: Utf16String,
+         /// Boolean stands for "created".
+         sender: GenericSender<Result<(PathBuf, bool), String>>,
+     },
+     DeleteDatabase {
+         bottle_id: i64,
+-        name: String,
++        name: Utf16String,
+         sender: GenericSender<Result<(), String>>,
+     },
+     Persisted {
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 9fcfdbca033..555327c89e2 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -61,6 +61,92 @@ impl Error for BackendError {}
+ 
+ pub type BackendResult<T> = Result<T, BackendError>;
+ 
++/// A DOMString as its UTF-16 code units, which may include unpaired surrogates
++/// (<https://webidl.spec.whatwg.org/#idl-DOMString>). String keys and the names of databases,
++/// object stores and indexes take this form, so that any JavaScript string survives unchanged,
++/// and it orders by code units, as IndexedDB compares keys and sorts names.
++#[derive(
++    Clone, Default, Deserialize, Eq, Hash, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize,
++)]
++pub struct Utf16String(Vec<u16>);
++
++impl Utf16String {
++    pub fn from_units(units: Vec<u16>) -> Self {
++        Self(units)
++    }
++
++    pub fn units(&self) -> &[u16] {
++        &self.0
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.0.is_empty()
++    }
++
++    /// The string, unless it has an unpaired surrogate.
++    pub fn to_utf8(&self) -> Option<String> {
++        String::from_utf16(&self.0).ok()
++    }
++
++    /// The string with each unpaired surrogate replaced by U+FFFD.
++    pub fn to_string_lossy(&self) -> String {
++        String::from_utf16_lossy(&self.0)
++    }
++
++    /// The code units in big-endian byte order, which sorts like the code units.
++    pub fn to_be_bytes(&self) -> Vec<u8> {
++        self.0.iter().flat_map(|unit| unit.to_be_bytes()).collect()
++    }
++
++    /// The string of [`Utf16String::to_be_bytes`], or `None` for an odd number of bytes.
++    pub fn from_be_bytes(bytes: &[u8]) -> Option<Self> {
++        let (pairs, remainder) = bytes.as_chunks::<2>();
++        if !remainder.is_empty() {
++            return None;
++        }
++        Some(Self(
++            pairs.iter().map(|pair| u16::from_be_bytes(*pair)).collect(),
++        ))
++    }
++}
++
++impl From<&str> for Utf16String {
++    fn from(string: &str) -> Self {
++        Self(string.encode_utf16().collect())
++    }
++}
++
++impl From<String> for Utf16String {
++    fn from(string: String) -> Self {
++        Self::from(string.as_str())
++    }
++}
++
++impl PartialEq<&str> for Utf16String {
++    fn eq(&self, other: &&str) -> bool {
++        self.0.iter().copied().eq(other.encode_utf16())
++    }
++}
++
++impl Debug for Utf16String {
++    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
++        f.write_str("\"")?;
++        for unit in char::decode_utf16(self.0.iter().copied()) {
++            match unit {
++                Ok(character) => write!(f, "{}", character.escape_debug())?,
++                Err(error) => write!(f, "\\u{{{:x}}}", error.unpaired_surrogate())?,
++            }
++        }
++        f.write_str("\"")
++    }
++}
++
++impl Display for Utf16String {
++    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
++        f.write_str(&self.to_string_lossy())
++    }
++}
++
+ #[derive(Clone, Debug, Deserialize, Eq, PartialEq, MallocSizeOf, Serialize)]
+ pub enum KeyPath {
+     String(String),
+@@ -105,7 +191,7 @@ pub enum IndexedDBTxnMode {
+ #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+ pub enum IndexedDBKeyType {
+     Number(f64),
+-    String(String),
++    String(Utf16String),
+     Binary(Vec<u8>),
+     Date(f64),
+     Array(Vec<IndexedDBKeyType>),
+@@ -166,7 +252,8 @@ impl PartialOrd for IndexedDBKeyType {
+             // Step 11 skipped
+             // TODO: Likely a tiny bit wrong (use js number comparison)
+             (IndexedDBKeyType::Number(a), IndexedDBKeyType::Number(b)) => a.partial_cmp(b),
+-            // TODO: Likely a tiny bit wrong (use js string comparison)
++            // Step 11. string: If va is code unit less than vb, then return -1. If vb is code
++            // unit less than va, then return 1. Return 0.
+             (IndexedDBKeyType::String(a), IndexedDBKeyType::String(b)) => a.partial_cmp(b),
+             // TODO: Likely a little wrong (use js binary comparison)
+             (IndexedDBKeyType::Binary(a), IndexedDBKeyType::Binary(b)) => a.partial_cmp(b),
+@@ -334,7 +421,7 @@ pub type IndexedDBIndexId = i64;
+ #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+ pub struct IndexedDBIndex {
+     pub id: IndexedDBIndexId,
+-    pub name: String,
++    pub name: Utf16String,
+     pub key_path: KeyPath,
+     pub multi_entry: bool,
+     pub unique: bool,
+@@ -345,7 +432,7 @@ pub struct IndexedDBIndex {
+ #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+ pub struct IndexedDBObjectStore {
+     pub id: IndexedDBObjectStoreId,
+-    pub name: String,
++    pub name: Utf16String,
+     pub key_path: Option<KeyPath>,
+     pub has_key_generator: bool,
+     pub indexes: Vec<IndexedDBIndex>,
+@@ -413,18 +500,18 @@ pub enum AsyncReadWriteOperation {
+ pub enum AsyncSchemaOperation {
+     /// Creates the object store, with its id from script.
+     CreateObjectStore {
+-        name: String,
++        name: Utf16String,
+         key_path: Option<KeyPath>,
+         auto_increment: bool,
+     },
+     /// Deletes the object store and its records and indexes.
+     DeleteObjectStore,
+     /// Renames the object store, which keeps its records and indexes.
+-    RenameObjectStore { new_name: String },
++    RenameObjectStore { new_name: Utf16String },
+     /// Creates an index of the object store, with its id from script.
+     CreateIndex {
+         index_id: IndexedDBIndexId,
+-        name: String,
++        name: Utf16String,
+         key_path: KeyPath,
+         unique: bool,
+         multi_entry: bool,
+@@ -432,7 +519,7 @@ pub enum AsyncSchemaOperation {
+     /// Renames an index of the object store.
+     RenameIndex {
+         index_id: IndexedDBIndexId,
+-        new_name: String,
++        new_name: Utf16String,
+     },
+     /// Deletes an index of the object store.
+     DeleteIndex { index_id: IndexedDBIndexId },
+@@ -506,13 +593,13 @@ pub enum ConnectionEvent {
+ /// Messaging used in the context of connection lifecycle management.
+ pub enum ConnectionMsg {
+     /// Error if a DB is opened for a version lower than the current db version.
+-    VersionError { name: String, id: Uuid },
++    VersionError { name: Utf16String, id: Uuid },
+     /// Opening a connection was aborted.
+-    AbortError { name: String, id: Uuid },
++    AbortError { name: Utf16String, id: Uuid },
+     /// A newly created connection with a version,
+     /// updgraded or not.
+     Connection {
+-        name: String,
++        name: Utf16String,
+         id: Uuid,
+         version: u64,
+         upgraded: bool,
+@@ -521,7 +608,7 @@ pub enum ConnectionMsg {
+     },
+     /// An upgrade transaction for a version started.
+     Upgrade {
+-        name: String,
++        name: Utf16String,
+         id: Uuid,
+         version: u64,
+         old_version: u64,
+@@ -532,14 +619,14 @@ pub enum ConnectionMsg {
+     },
+     /// A `blocked` event should be fired for a connection.
+     Blocked {
+-        name: String,
++        name: Utf16String,
+         id: Uuid,
+         version: u64,
+         old_version: u64,
+     },
+     /// A backend error related to the database occurred.
+     DatabaseError {
+-        name: String,
++        name: Utf16String,
+         id: Uuid,
+         error: BackendError,
+     },
+@@ -556,7 +643,7 @@ pub struct StorageBottleSource {
+ 
+ #[derive(Debug, Deserialize, Serialize)]
+ pub struct DatabaseInfo {
+-    pub name: String,
++    pub name: Utf16String,
+     pub version: u64,
+ }
+ 
+@@ -572,7 +659,7 @@ pub enum SyncOperation {
+     /// results of all the transaction's requests have been delivered.
+     Commit {
+         origin: ImmutableOrigin,
+-        db_name: String,
++        db_name: Utf16String,
+         txn: IndexedDBTxnId,
+     },
+     /// <https://w3c.github.io/IndexedDB/#abort-a-transaction>: rolls the transaction back, after
+@@ -580,13 +667,13 @@ pub enum SyncOperation {
+     /// already, and results that arrive after this are discarded.
+     Abort {
+         origin: ImmutableOrigin,
+-        db_name: String,
++        db_name: Utf16String,
+         txn: IndexedDBTxnId,
+     },
+     /// Upgrade transaction finished after its event was fired in script.
+     UpgradeTransactionFinished {
+         origin: ImmutableOrigin,
+-        db_name: String,
++        db_name: Utf16String,
+         txn: IndexedDBTxnId,
+         committed: bool,
+     },
+@@ -596,28 +683,28 @@ pub enum SyncOperation {
+     /// <https://w3c.github.io/IndexedDB/#transaction-scheduling>.
+     CreateTransaction {
+         origin: ImmutableOrigin,
+-        db_name: String,
++        db_name: Utf16String,
+         txn: IndexedDBTxnId,
+         mode: IndexedDBTxnMode,
+         scope: Vec<IndexedDBObjectStoreId>,
+     },
+     TransactionFinished {
+         origin: ImmutableOrigin,
+-        db_name: String,
++        db_name: Utf16String,
+         txn: IndexedDBTxnId,
+     },
+ 
+     CloseDatabase(
+         ImmutableOrigin,
+         Uuid,
+-        String, // Database
++        Utf16String, // Database
+     ),
+ 
+     OpenDatabase(
+         // Origin of the request.
+         ImmutableOrigin,
+         // Name of the database.
+-        String,
++        Utf16String,
+         // Requested db version(optional).
+         Option<u64>,
+         // The id of the request.
+@@ -633,7 +720,7 @@ pub enum SyncOperation {
+         GenericCallback<BackendResult<u64>>,
+         ImmutableOrigin,
+         // Database name.
+-        String,
++        Utf16String,
+         // Where to obtain the storage proxy map.
+         StorageBottleSource,
+         Uuid,
+@@ -641,13 +728,13 @@ pub enum SyncOperation {
+ 
+     /// Abort pending database upgrades
+     AbortPendingUpgrades {
+-        pending_upgrades: HashMap<String, HashSet<Uuid>>,
++        pending_upgrades: HashMap<Utf16String, HashSet<Uuid>>,
+         origin: ImmutableOrigin,
+     },
+ 
+     NotifyEndOfVersionChange {
+         id: Uuid,
+-        name: String,
++        name: Utf16String,
+         old_version: u64,
+         origin: ImmutableOrigin,
+     },
+@@ -661,7 +748,7 @@ pub enum IndexedDBThreadMsg {
+     Sync(SyncOperation),
+     Async(
+         ImmutableOrigin,
+-        String, // Database
++        Utf16String, // Database
+         IndexedDBObjectStoreId,
+         IndexedDBTxnId,
+         u64, // Monotonic request id in the transaction
+@@ -670,14 +757,14 @@ pub enum IndexedDBThreadMsg {
+     ),
+     AsyncSchemaOperation {
+         origin: ImmutableOrigin,
+-        database_name: String,
++        database_name: Utf16String,
+         store_id: IndexedDBObjectStoreId,
+         operation: AsyncSchemaOperation,
+         transaction: IndexedDBTxnId,
+     },
+     EngineTxnBatchComplete {
+         origin: ImmutableOrigin,
+-        db_name: String,
++        db_name: Utf16String,
+         txn: IndexedDBTxnId,
+     },
+ 
+diff --git a/components/storage/client_storage.rs b/components/storage/client_storage.rs
+index 9221049702f..a194248b7ef 100644
+--- a/components/storage/client_storage.rs
++++ b/components/storage/client_storage.rs
+@@ -26,6 +26,7 @@ use storage_traits::client_storage::{
+     ClientStorageErrorr, ClientStorageThreadHandle, ClientStorageThreadMessage, Mode,
+     StorageIdentifier, StorageProxyMap, StorageType,
+ };
++use storage_traits::indexeddb::Utf16String;
+ #[cfg(feature = "sqlite-backend")]
+ use uuid::Uuid;
+ 
+@@ -36,17 +37,45 @@ use uuid::Uuid;
+ #[cfg(feature = "sqlite-backend")]
+ const STORAGE_SHELF_QUOTA_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+ 
++/// How the `databases` registry table holds a database name: as text, or, for a name with an
++/// unpaired surrogate, which text can't hold, as a BLOB of its code units
++/// ([`Utf16String::to_be_bytes`]). SQLite never finds a BLOB equal to a text value, so such a name
++/// can't take another's entry, and every other name keeps the entry it had.
++enum RegistryDatabaseName {
++    Text(String),
++    Blob(Vec<u8>),
++}
++
++impl From<&Utf16String> for RegistryDatabaseName {
++    fn from(name: &Utf16String) -> Self {
++        match name.to_utf8() {
++            Some(text) => Self::Text(text),
++            None => Self::Blob(name.to_be_bytes()),
++        }
++    }
++}
++
++#[cfg(feature = "sqlite-backend")]
++impl From<RegistryDatabaseName> for rusqlite::types::Value {
++    fn from(name: RegistryDatabaseName) -> Self {
++        match name {
++            RegistryDatabaseName::Text(text) => Self::Text(text),
++            RegistryDatabaseName::Blob(blob) => Self::Blob(blob),
++        }
++    }
++}
++
+ trait RegistryEngine {
+     type Error: Debug;
+     fn create_database(
+         &mut self,
+         bottle_id: i64,
+-        name: String,
++        name: Utf16String,
+     ) -> Result<(PathBuf, bool), ClientStorageErrorr<Self::Error>>;
+     fn delete_database(
+         &mut self,
+         bottle_id: i64,
+-        name: String,
++        name: Utf16String,
+     ) -> Result<(), ClientStorageErrorr<Self::Error>>;
+     fn obtain_a_storage_bottle_map(
+         &mut self,
+@@ -454,17 +483,21 @@ impl RegistryEngine for SqliteEngine {
+     fn create_database(
+         &mut self,
+         bottle_id: i64,
+-        name: String,
++        name: Utf16String,
+     ) -> Result<(PathBuf, bool), ClientStorageErrorr<Self::Error>> {
+         let tx = self.connection.transaction()?;
+ 
++        let args = [
++            rusqlite::types::Value::Integer(bottle_id),
++            RegistryDatabaseName::from(&name).into(),
++        ];
+         // TODO: combine this into a single query (utilizing WITH and a join).
+         let database_id: i64 = tx
+             .query_row(
+                 "INSERT INTO databases (bottle_id, name) VALUES (?1, ?2)
+              ON CONFLICT(bottle_id, name) DO UPDATE SET name = excluded.name
+             RETURNING id;",
+-                (bottle_id, name),
++                rusqlite::params_from_iter(&args),
+                 |row| row.get(0),
+             )
+             .map_err(ClientStorageErrorr::Internal)?;
+@@ -514,13 +547,17 @@ impl RegistryEngine for SqliteEngine {
+     fn delete_database(
+         &mut self,
+         bottle_id: i64,
+-        name: String,
++        name: Utf16String,
+     ) -> Result<(), ClientStorageErrorr<Self::Error>> {
+         let tx = self.connection.transaction()?;
+ 
++        let args = [
++            rusqlite::types::Value::Integer(bottle_id),
++            RegistryDatabaseName::from(&name).into(),
++        ];
+         let database_id: i64 = tx.query_row(
+             "SELECT id FROM databases WHERE bottle_id = ?1 AND name = ?2;",
+-            (bottle_id, name.clone()),
++            rusqlite::params_from_iter(&args),
+             |row| row.get(0),
+         )?;
+ 
+@@ -532,7 +569,7 @@ impl RegistryEngine for SqliteEngine {
+ 
+         tx.execute(
+             "DELETE FROM databases WHERE bottle_id = ?1 AND name = ?2;",
+-            (bottle_id, name),
++            rusqlite::params_from_iter(&args),
+         )?;
+ 
+         if tx.changes() == 0 {
+diff --git a/components/storage/client_storage_ohos_rdb.rs b/components/storage/client_storage_ohos_rdb.rs
+index a17ce191f1a..122e0bbe2ae 100644
+--- a/components/storage/client_storage_ohos_rdb.rs
++++ b/components/storage/client_storage_ohos_rdb.rs
+@@ -14,9 +14,10 @@ use storage_traits::client_storage::{
+     ClientStorageErrorr, ClientStorageThreadHandle, ClientStorageThreadMessage, Mode,
+     StorageIdentifier, StorageProxyMap, StorageType,
+ };
++use storage_traits::indexeddb::Utf16String;
+ use uuid::Uuid;
+ 
+-use super::RegistryEngine;
++use super::{RegistryDatabaseName, RegistryEngine};
+ use crate::client_storage_shared::{self, StorageShelf};
+ use crate::ohos_rdb::{
+     OhosRdbError, OhosRdbStore, OhosRdbTransaction, OhosRdbValues, Result as OhosRdbResult,
+@@ -50,6 +51,13 @@ impl OhosRdbEngine {
+     }
+ }
+ 
++fn push_database_name(args: &mut OhosRdbValues, name: &Utf16String) -> OhosRdbResult<()> {
++    match RegistryDatabaseName::from(name) {
++        RegistryDatabaseName::Text(text) => args.push_text(&text),
++        RegistryDatabaseName::Blob(blob) => args.push_blob(&blob),
++    }
++}
++
+ fn missing_row(context: &'static str) -> OhosRdbError {
+     OhosRdbError::Api { context, code: -1 }
+ }
+@@ -150,7 +158,7 @@ impl RegistryEngine for OhosRdbEngine {
+     fn create_database(
+         &mut self,
+         bottle_id: i64,
+-        name: String,
++        name: Utf16String,
+     ) -> Result<(PathBuf, bool), ClientStorageErrorr<Self::Error>> {
+         let tx = self
+             .store
+@@ -160,8 +168,7 @@ impl RegistryEngine for OhosRdbEngine {
+         let mut args = OhosRdbValues::new().map_err(ClientStorageErrorr::Internal)?;
+         args.push_int(bottle_id)
+             .map_err(ClientStorageErrorr::Internal)?;
+-        args.push_text(name.as_str())
+-            .map_err(ClientStorageErrorr::Internal)?;
++        push_database_name(&mut args, &name).map_err(ClientStorageErrorr::Internal)?;
+         tx.execute(
+             "INSERT INTO databases (bottle_id, name) VALUES (?1, ?2) ON CONFLICT(bottle_id, name) DO UPDATE SET name = excluded.name;",
+             &args,
+@@ -233,7 +240,7 @@ impl RegistryEngine for OhosRdbEngine {
+     fn delete_database(
+         &mut self,
+         bottle_id: i64,
+-        name: String,
++        name: Utf16String,
+     ) -> Result<(), ClientStorageErrorr<Self::Error>> {
+         let tx = self
+             .store
+@@ -244,9 +251,7 @@ impl RegistryEngine for OhosRdbEngine {
+         lookup_args
+             .push_int(bottle_id)
+             .map_err(ClientStorageErrorr::Internal)?;
+-        lookup_args
+-            .push_text(name.as_str())
+-            .map_err(ClientStorageErrorr::Internal)?;
++        push_database_name(&mut lookup_args, &name).map_err(ClientStorageErrorr::Internal)?;
+ 
+         let database_id = crate::client_storage_shared::query_required_i64(
+             &tx,
+@@ -534,6 +539,55 @@ mod tests {
+         assert!(registry_path.exists());
+     }
+ 
++    /// A database name with an unpaired surrogate names its own database.
++    #[cfg(ohos_rdb)]
++    #[test]
++    fn test_ohos_registry_database_names_with_unpaired_surrogates() {
++        install_test_namespace();
++        let tmp_dir = tempfile::tempdir().unwrap();
++        let handle: ClientStorageThreadHandle =
++            ClientStorageThreadFactory::new(Some(tmp_dir.path().to_path_buf()), false);
++        let bottle_id = obtain_bottle_map(
++            &handle,
++            StorageType::Local,
++            Some(WebViewId::new(servo_base::id::TEST_PAINTER_ID)),
++            StorageIdentifier::IndexedDB,
++            ServoUrl::parse("https://example.com").unwrap().origin(),
++        )
++        .bottle_id;
++
++        let names = [
++            Utf16String::from_units(vec![0xD800]),
++            Utf16String::from_units(vec![0xDC00]),
++            Utf16String::from("\u{FFFD}"),
++        ];
++        let create = |name: &Utf16String| {
++            handle
++                .create_database(bottle_id, name.clone())
++                .recv()
++                .unwrap()
++                .unwrap()
++        };
++        let paths: Vec<PathBuf> = names
++            .iter()
++            .map(|name| {
++                let (path, created) = create(name);
++                assert!(created);
++                path
++            })
++            .collect();
++        assert!(paths[0] != paths[1] && paths[1] != paths[2] && paths[0] != paths[2]);
++        assert_eq!(create(&names[0]), (paths[0].clone(), false));
++
++        handle
++            .delete_database(bottle_id, names[0].clone())
++            .recv()
++            .unwrap()
++            .unwrap();
++        assert!(!paths[0].exists());
++        assert!(paths[1].exists() && paths[2].exists());
++    }
++
+     #[cfg(ohos_rdb)]
+     #[test]
+     fn test_ohos_client_storage_roundtrip_uses_rdb_file() {
+diff --git a/components/storage/indexeddb/backend/executor.rs b/components/storage/indexeddb/backend/executor.rs
+index 728535d32d1..c349299c4bc 100644
+--- a/components/storage/indexeddb/backend/executor.rs
++++ b/components/storage/indexeddb/backend/executor.rs
+@@ -34,6 +34,7 @@ pub(crate) enum SqlParam<'a> {
+ /// A result row of [`SqlExecutor::query`]. Columns are numbered from 0; `None` is SQL NULL.
+ pub(crate) trait SqlRow {
+     fn optional_integer(&self, column: usize) -> Result<Option<i64>, SqlError>;
++    #[cfg(test)]
+     fn optional_text(&self, column: usize) -> Result<Option<String>, SqlError>;
+     fn optional_blob(&self, column: usize) -> Result<Option<Vec<u8>>, SqlError>;
+ 
+@@ -42,6 +43,7 @@ pub(crate) trait SqlRow {
+             .ok_or(SqlError::UnexpectedNull(column))
+     }
+ 
++    #[cfg(test)]
+     fn text(&self, column: usize) -> Result<String, SqlError> {
+         self.optional_text(column)?
+             .ok_or(SqlError::UnexpectedNull(column))
+@@ -184,6 +186,8 @@ pub(crate) enum SqlError {
+     KeyPath(postcard::Error),
+     /// A stored key that can't be decoded.
+     InvalidKey,
++    /// A stored name that can't be decoded.
++    InvalidName,
+     /// A misuse of the executor: [`SqlExecutor::begin`] while a transaction is open, a commit
+     /// without one, or a delete while other executors on the database exist.
+     TransactionState(&'static str),
+@@ -211,6 +215,7 @@ impl fmt::Display for SqlError {
+             Self::MissingRow(context) => write!(formatter, "missing row: {context}"),
+             Self::KeyPath(error) => write!(formatter, "invalid stored key path: {error}"),
+             Self::InvalidKey => write!(formatter, "invalid stored key"),
++            Self::InvalidName => write!(formatter, "invalid stored name"),
+             Self::TransactionState(context) => write!(formatter, "transaction state: {context}"),
+             Self::ResetFailed => write!(formatter, "failed to delete a database to reset it"),
+             Self::InvalidMetadata(context) => write!(formatter, "invalid metadata: {context}"),
+diff --git a/components/storage/indexeddb/backend/queries.rs b/components/storage/indexeddb/backend/queries.rs
+index dce527b7b33..6122ad8ee08 100644
+--- a/components/storage/indexeddb/backend/queries.rs
++++ b/components/storage/indexeddb/backend/queries.rs
+@@ -6,7 +6,7 @@
+ 
+ use storage_traits::indexeddb::{
+     IndexedDBIndex, IndexedDBIndexId, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore,
+-    IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBValue, KeyPath, PutItemResult,
++    IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBValue, KeyPath, PutItemResult, Utf16String,
+ };
+ 
+ use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
+@@ -32,6 +32,10 @@ fn decode_key(data: &[u8]) -> Result<IndexedDBKeyType, SqlError> {
+     encoding::deserialize(data).ok_or(SqlError::InvalidKey)
+ }
+ 
++fn decode_name(data: &[u8]) -> Result<Utf16String, SqlError> {
++    Utf16String::from_be_bytes(data).ok_or(SqlError::InvalidName)
++}
++
+ fn expect_one_changed_row(changed: u64, context: &'static str) -> Result<(), SqlError> {
+     if changed == 1 {
+         Ok(())
+@@ -75,7 +79,7 @@ pub(crate) fn object_stores<X: SqlExecutor>(
+         |row| {
+             Ok(IndexedDBObjectStore {
+                 id: row.integer(0)?,
+-                name: row.text(1)?,
++                name: decode_name(&row.blob(1)?)?,
+                 key_path: row
+                     .optional_blob(2)?
+                     .map(|key_path| decode_key_path(&key_path))
+@@ -95,7 +99,7 @@ pub(crate) fn object_stores<X: SqlExecutor>(
+                 row.integer(0)?,
+                 IndexedDBIndex {
+                     id: row.integer(1)?,
+-                    name: row.text(2)?,
++                    name: decode_name(&row.blob(2)?)?,
+                     key_path: decode_key_path(&row.blob(3)?)?,
+                     unique: row.integer(4)? != 0,
+                     multi_entry: row.integer(5)? != 0,
+@@ -130,7 +134,7 @@ fn is_new_id<X: SqlExecutor>(executor: &mut X, table: &str, id: i64) -> Result<b
+ pub(crate) fn create_object_store<X: SqlExecutor>(
+     executor: &mut X,
+     store_id: IndexedDBObjectStoreId,
+-    name: &str,
++    name: &Utf16String,
+     key_path: Option<&KeyPath>,
+     auto_increment: bool,
+ ) -> Result<(), SqlError> {
+@@ -145,7 +149,7 @@ pub(crate) fn create_object_store<X: SqlExecutor>(
+         "INSERT INTO object_store (id, name, key_path, auto_increment) VALUES (?, ?, ?, ?)",
+         &[
+             SqlParam::Integer(store_id),
+-            SqlParam::Text(name),
++            SqlParam::Blob(&name.to_be_bytes()),
+             key_path.as_deref().map_or(SqlParam::Null, SqlParam::Blob),
+             SqlParam::Integer(auto_increment as i64),
+         ],
+@@ -156,12 +160,12 @@ pub(crate) fn create_object_store<X: SqlExecutor>(
+ /// The id of the object store named `name`, if there is one.
+ fn object_store_named<X: SqlExecutor>(
+     executor: &mut X,
+-    name: &str,
++    name: &Utf16String,
+ ) -> Result<Option<IndexedDBObjectStoreId>, SqlError> {
+     query_row(
+         executor,
+         "SELECT id FROM object_store WHERE name = ?",
+-        &[SqlParam::Text(name)],
++        &[SqlParam::Blob(&name.to_be_bytes())],
+         |row| row.integer(0),
+     )
+ }
+@@ -193,14 +197,17 @@ pub(crate) fn delete_object_store<X: SqlExecutor>(
+ pub(crate) fn rename_object_store<X: SqlExecutor>(
+     executor: &mut X,
+     store_id: IndexedDBObjectStoreId,
+-    new_name: &str,
++    new_name: &Utf16String,
+ ) -> Result<(), SqlError> {
+     if object_store_named(executor, new_name)?.is_some_and(|other| other != store_id) {
+         return Err(SqlError::InvalidMetadata("object store name exists"));
+     }
+     let changed = executor.execute(
+         "UPDATE object_store SET name = ? WHERE id = ?",
+-        &[SqlParam::Text(new_name), SqlParam::Integer(store_id)],
++        &[
++            SqlParam::Blob(&new_name.to_be_bytes()),
++            SqlParam::Integer(store_id),
++        ],
+     )?;
+     expect_one_changed_row(changed, "object store rename")
+ }
+@@ -220,12 +227,15 @@ pub(crate) fn key_generator_current_number<X: SqlExecutor>(
+ fn index_named<X: SqlExecutor>(
+     executor: &mut X,
+     store_id: IndexedDBObjectStoreId,
+-    name: &str,
++    name: &Utf16String,
+ ) -> Result<Option<IndexedDBIndexId>, SqlError> {
+     query_row(
+         executor,
+         "SELECT id FROM object_store_index WHERE object_store_id = ? AND name = ?",
+-        &[SqlParam::Integer(store_id), SqlParam::Text(name)],
++        &[
++            SqlParam::Integer(store_id),
++            SqlParam::Blob(&name.to_be_bytes()),
++        ],
+         |row| row.integer(0),
+     )
+ }
+@@ -236,7 +246,7 @@ pub(crate) fn create_index<X: SqlExecutor>(
+     executor: &mut X,
+     store_id: IndexedDBObjectStoreId,
+     index_id: IndexedDBIndexId,
+-    name: &str,
++    name: &Utf16String,
+     key_path: &KeyPath,
+     unique: bool,
+     multi_entry: bool,
+@@ -255,7 +265,7 @@ pub(crate) fn create_index<X: SqlExecutor>(
+         &[
+             SqlParam::Integer(index_id),
+             SqlParam::Integer(store.id),
+-            SqlParam::Text(name),
++            SqlParam::Blob(&name.to_be_bytes()),
+             SqlParam::Blob(&encode_key_path(key_path)?),
+             SqlParam::Integer(unique as i64),
+             SqlParam::Integer(multi_entry as i64),
+@@ -269,7 +279,7 @@ pub(crate) fn rename_index<X: SqlExecutor>(
+     executor: &mut X,
+     store_id: IndexedDBObjectStoreId,
+     index_id: IndexedDBIndexId,
+-    new_name: &str,
++    new_name: &Utf16String,
+ ) -> Result<(), SqlError> {
+     if index_named(executor, store_id, new_name)?.is_some_and(|other| other != index_id) {
+         return Err(SqlError::InvalidMetadata("index name exists"));
+@@ -277,7 +287,7 @@ pub(crate) fn rename_index<X: SqlExecutor>(
+     let changed = executor.execute(
+         "UPDATE object_store_index SET name = ? WHERE id = ? AND object_store_id = ?",
+         &[
+-            SqlParam::Text(new_name),
++            SqlParam::Blob(&new_name.to_be_bytes()),
+             SqlParam::Integer(index_id),
+             SqlParam::Integer(store_id),
+         ],
+diff --git a/components/storage/indexeddb/backend/rdb.rs b/components/storage/indexeddb/backend/rdb.rs
+index 817205e7bb4..8d09ff8c944 100644
+--- a/components/storage/indexeddb/backend/rdb.rs
++++ b/components/storage/indexeddb/backend/rdb.rs
+@@ -131,6 +131,7 @@ impl SqlRow for RdbRow<'_, '_> {
+         Ok(self.0.int64(column)?)
+     }
+ 
++    #[cfg(test)]
+     fn optional_text(&self, column: usize) -> Result<Option<String>, SqlError> {
+         Ok(self.0.text(column)?)
+     }
+diff --git a/components/storage/indexeddb/backend/schema.rs b/components/storage/indexeddb/backend/schema.rs
+index 1f5e0c59d20..fc85cb8a0eb 100644
+--- a/components/storage/indexeddb/backend/schema.rs
++++ b/components/storage/indexeddb/backend/schema.rs
+@@ -15,14 +15,16 @@ use crate::shared::DB_INIT_PRAGMAS;
+ /// The version of the tables below and of how records are stored in them, kept in the database
+ /// file's `user_version`. Bump it with every change to either: a database stored with another
+ /// version is deleted and created anew when it is opened, as there are no migrations.
+-pub(crate) const SCHEMA_VERSION: i64 = 1;
++pub(crate) const SCHEMA_VERSION: i64 = 2;
+ 
+ // Adapted from:
+ // https://github.com/mozilla-firefox/firefox/blob/ee102e926521b3e460293b0aea6b54b1a03f6f74/dom/indexedDB/DBSchema.cpp#L78
++// Names are BLOBs of UTF-16 code units (`Utf16String::to_be_bytes`), which, unlike text, hold
++// any DOMString.
+ const CREATE_TABLES: [&str; 6] = [
+     r#"
+ CREATE TABLE IF NOT EXISTS database (
+-    name    varchar          not null
++    name    blob             not null
+         primary key,
+     origin  varchar          not null,
+     version bigint default 0 not null
+@@ -31,7 +33,7 @@ CREATE TABLE IF NOT EXISTS database (
+ CREATE TABLE IF NOT EXISTS object_store (
+     id             integer               not null
+         primary key autoincrement,
+-    name           varchar               not null
++    name           blob                  not null
+         unique,
+     key_path       varbinary_blob,
+     auto_increment integer default FALSE not null
+@@ -51,7 +53,7 @@ CREATE TABLE IF NOT EXISTS object_store_index (
+     primary key autoincrement,
+     object_store_id   integer        not null
+     references object_store,
+-    name              varchar        not null,
++    name              blob           not null,
+     key_path          varbinary_blob not null,
+     unique_index      boolean        not null,
+     multi_entry_index boolean        not null,
+@@ -148,7 +150,10 @@ fn init_database<X: SqlExecutor>(
+         // "When a database is first created, its version is 0 (zero)."
+         executor.execute(
+             "INSERT INTO database (name, origin, version) VALUES (?, ?, 0)",
+-            &[SqlParam::Text(&description.name), SqlParam::Text(&origin)],
++            &[
++                SqlParam::Blob(&description.name.to_be_bytes()),
++                SqlParam::Text(&origin),
++            ],
+         )?;
+         executor.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), &[])?;
+         Ok(true)
+diff --git a/components/storage/indexeddb/backend/sqlite.rs b/components/storage/indexeddb/backend/sqlite.rs
+index 5026406674e..5c77eeccd7e 100644
+--- a/components/storage/indexeddb/backend/sqlite.rs
++++ b/components/storage/indexeddb/backend/sqlite.rs
+@@ -124,6 +124,7 @@ impl SqlRow for SqliteRow<'_, '_> {
+         Ok(self.0.get(column)?)
+     }
+ 
++    #[cfg(test)]
+     fn optional_text(&self, column: usize) -> Result<Option<String>, SqlError> {
+         Ok(self.0.get(column)?)
+     }
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index 9377dfdeb30..85c827726b1 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -18,7 +18,7 @@ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+     BackendError, BackendResult, ConnectionEvent, IndexedDBIndex, IndexedDBKeyRange,
+     IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBTxnId, IndexedDBTxnMode,
+-    IndexedDBValue, KeyPath, PutItemResult, RequestOutput, TransactionEvent,
++    IndexedDBValue, KeyPath, PutItemResult, RequestOutput, TransactionEvent, Utf16String,
+ };
+ use tempfile::TempDir;
+ use url::Host;
+@@ -86,6 +86,7 @@ executor_tests!(
+     test_create_store,
+     test_create_store_empty_name,
+     test_injection,
++    test_unpaired_surrogates_in_names_and_keys,
+     test_key_path,
+     test_delete_store,
+     test_delete_store_removes_store_records,
+@@ -138,7 +139,7 @@ fn test_origin() -> ImmutableOrigin {
+ 
+ fn test_description() -> IndexedDBDescription {
+     IndexedDBDescription {
+-        name: "test_db".to_string(),
++        name: "test_db".into(),
+         origin: test_origin(),
+     }
+ }
+@@ -200,7 +201,13 @@ fn create_store<X: SqlExecutor>(
+ ) -> Result<i64, SqlError> {
+     in_own_transaction(db, |executor| {
+         let id = next_id(executor, "object_store")?;
+-        queries::create_object_store(executor, id, store_name, key_path.as_ref(), auto_increment)?;
++        queries::create_object_store(
++            executor,
++            id,
++            &store_name.into(),
++            key_path.as_ref(),
++            auto_increment,
++        )?;
+         Ok(id)
+     })
+ }
+@@ -224,7 +231,7 @@ fn create_index<X: SqlExecutor>(
+             executor,
+             store,
+             id,
+-            &index_name,
++            &index_name.into(),
+             &key_path,
+             unique,
+             multi_entry,
+@@ -237,7 +244,7 @@ fn create_index<X: SqlExecutor>(
+ fn store_names<X: SqlExecutor>(db: &SqlEngine<X>) -> Vec<String> {
+     db.object_stores()
+         .into_iter()
+-        .map(|store| store.name)
++        .map(|store| store.name.to_string())
+         .collect()
+ }
+ 
+@@ -732,7 +739,7 @@ fn test_create_store<X: SqlExecutor>() {
+         Err(SqlError::InvalidMetadata(_))
+     ));
+     let reused_id = in_own_transaction(&db, |executor| {
+-        queries::create_object_store(executor, store, "other", None, false)
++        queries::create_object_store(executor, store, &"other".into(), None, false)
+     });
+     assert!(matches!(reused_id, Err(SqlError::InvalidMetadata(_))));
+     // Ensure store was not overwritten
+@@ -762,6 +769,124 @@ fn test_injection<X: SqlExecutor>() {
+     );
+ }
+ 
++fn units(units: &[u16]) -> Utf16String {
++    Utf16String::from_units(units.to_vec())
++}
++
++/// Database, store and index names keep their unpaired surrogates, also after reopening, and so
++/// do string keys, which sort by code unit.
++fn test_unpaired_surrogates_in_names_and_keys<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let description = IndexedDBDescription {
++        name: units(&[0xDC00, 0xD800]),
++        origin: test_origin(),
++    };
++    let open = |created| {
++        SqlEngine::<X>::new(
++            dir.path().to_path_buf(),
++            created,
++            &description,
++            ThreadPool::global(),
++        )
++        .unwrap()
++    };
++    let db = open(true);
++    let lead = units(&[0xD800]);
++    let trail = units(&[0xDC00]);
++    let replacement = Utf16String::from("\u{FFFD}");
++    in_own_transaction(&db, |executor| {
++        // Names that are equal once each unpaired surrogate is replaced are different names.
++        for (name, id) in [&lead, &trail, &replacement].into_iter().zip(1..) {
++            queries::create_object_store(executor, id, name, None, false)?;
++        }
++        queries::rename_object_store(executor, 3, &units(&[0x61, 0xDFFF]))?;
++        let key_path = KeyPath::String("a".to_owned());
++        queries::create_index(executor, 1, 1, &trail, &key_path, false, false)?;
++        queries::create_index(executor, 1, 2, &replacement, &key_path, false, false)?;
++        queries::rename_index(executor, 1, 2, &lead)
++    })
++    .unwrap();
++    assert!(
++        in_own_transaction(&db, |executor| {
++            queries::create_object_store(executor, 4, &trail, None, false)
++        })
++        .is_err()
++    );
++    let names = |db: &SqlEngine<X>| {
++        let stores = db.object_stores();
++        let index_names: Vec<_> = stores[0]
++            .indexes
++            .iter()
++            .map(|index| index.name.clone())
++            .collect();
++        (
++            stores
++                .into_iter()
++                .map(|store| store.name)
++                .collect::<Vec<_>>(),
++            index_names,
++        )
++    };
++    let expected = (
++        vec![lead.clone(), trail.clone(), units(&[0x61, 0xDFFF])],
++        vec![trail.clone(), lead.clone()],
++    );
++    assert_eq!(names(&db), expected);
++
++    let puts = [
++        units(&[0xDC00]),
++        units(&[0xD834, 0xDD1E]),
++        replacement,
++        units(&[0xD800]),
++        units(&[0x61, 0xDFFF]),
++        units(&[0xDC00, 0xD800]),
++    ]
++    .into_iter()
++    .map(|key| (Some(IndexedDBKeyType::String(key)), vec![]))
++    .collect();
++    assert!(run_puts(&db, 1, 1, puts, false).iter().all(Result::is_ok));
++    assert!(commit(&db, 1).is_ok());
++    let sorted: Vec<_> = [
++        &[0x61, 0xDFFF][..],
++        &[0xD800],
++        &[0xD834, 0xDD1E],
++        &[0xDC00],
++        &[0xDC00, 0xD800],
++        &[0xFFFD],
++    ]
++    .into_iter()
++    .map(|key| IndexedDBKeyType::String(units(key)))
++    .collect();
++    assert!(sorted.is_sorted_by(|a, b| a < b));
++    assert_eq!(stored_keys(&db, 1), sorted);
++    let range = IndexedDBKeyRange::new(
++        Some(IndexedDBKeyType::String(lead.clone())),
++        Some(IndexedDBKeyType::String(trail.clone())),
++        true,
++        false,
++    );
++    let mut connection = db.connection();
++    let store = queries::object_store(&mut *connection, 1).unwrap().unwrap();
++    assert_eq!(
++        queries::get_all_keys(&mut *connection, &store, &range, None).unwrap(),
++        vec![
++            IndexedDBKeyType::String(units(&[0xD834, 0xDD1E])),
++            IndexedDBKeyType::String(trail),
++        ]
++    );
++    let stored_name = query_row(&mut *connection, "SELECT name FROM database", &[], |row| {
++        row.blob(0)
++    })
++    .unwrap();
++    assert_eq!(stored_name, Some(description.name.to_be_bytes()));
++    drop(connection);
++    drop(db);
++
++    let db = open(false);
++    assert_eq!(names(&db), expected);
++    assert_eq!(stored_keys(&db, 1), sorted);
++}
++
+ fn test_key_path<X: SqlExecutor>() {
+     let dir = tempfile::tempdir().unwrap();
+     let db = open_engine::<X>(&dir);
+@@ -823,7 +948,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
+     assert_eq!((by_title, by_name, by_author), (1, 2, 3));
+     let index = |id, name: &str, key_path: KeyPath, unique, multi_entry| IndexedDBIndex {
+         id,
+-        name: name.to_owned(),
++        name: name.into(),
+         key_path,
+         unique,
+         multi_entry,
+@@ -833,7 +958,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
+         vec![
+             IndexedDBObjectStore {
+                 id: books,
+-                name: "books".to_owned(),
++                name: "books".into(),
+                 key_path: Some(KeyPath::String("isbn".to_owned())),
+                 has_key_generator: true,
+                 indexes: vec![
+@@ -855,7 +980,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
+             },
+             IndexedDBObjectStore {
+                 id: authors,
+-                name: "authors".to_owned(),
++                name: "authors".into(),
+                 key_path: None,
+                 has_key_generator: false,
+                 indexes: vec![index(
+@@ -888,30 +1013,33 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
+ 
+     // Swap the names of the two stores and of two indexes, as script does it.
+     in_own_transaction(&db, |executor| {
+-        queries::rename_object_store(executor, books, "tmp")?;
+-        queries::rename_object_store(executor, authors, "books")?;
+-        queries::rename_object_store(executor, books, "authors")?;
+-        queries::rename_index(executor, books, by_title, "tmp")?;
+-        queries::rename_index(executor, books, by_author, "by_title")?;
+-        queries::rename_index(executor, books, by_title, "by_author")
++        queries::rename_object_store(executor, books, &"tmp".into())?;
++        queries::rename_object_store(executor, authors, &"books".into())?;
++        queries::rename_object_store(executor, books, &"authors".into())?;
++        queries::rename_index(executor, books, by_title, &"tmp".into())?;
++        queries::rename_index(executor, books, by_author, &"by_title".into())?;
++        queries::rename_index(executor, books, by_title, &"by_author".into())
+     })
+     .unwrap();
+     let stores = db.object_stores();
+     assert_eq!(
+         (
+             stores[0].id,
+-            stores[0].name.as_str(),
+-            stores[1].name.as_str()
++            stores[0].name.to_string(),
++            stores[1].name.to_string()
+         ),
+-        (books, "authors", "books")
++        (books, "authors".to_owned(), "books".to_owned())
+     );
+     assert_eq!(
+         stores[0]
+             .indexes
+             .iter()
+-            .map(|index| (index.id, index.name.as_str()))
++            .map(|index| (index.id, index.name.to_string()))
+             .collect::<Vec<_>>(),
+-        vec![(by_title, "by_author"), (by_author, "by_title")]
++        vec![
++            (by_title, "by_author".to_owned()),
++            (by_author, "by_title".to_owned())
++        ]
+     );
+     assert_eq!(stored_keys(&db, books), number_keys([1]));
+     assert_eq!(db.key_generator_current_number(books), Some(2));
+@@ -919,16 +1047,16 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
+     // A name in use, a missing store or index, and an index of another store are refused.
+     for result in [
+         in_own_transaction(&db, |executor| {
+-            queries::rename_object_store(executor, books, "books")
++            queries::rename_object_store(executor, books, &"books".into())
+         }),
+         in_own_transaction(&db, |executor| {
+-            queries::rename_object_store(executor, 9, "other")
++            queries::rename_object_store(executor, 9, &"other".into())
+         }),
+         in_own_transaction(&db, |executor| {
+-            queries::rename_index(executor, books, by_title, "by_title")
++            queries::rename_index(executor, books, by_title, &"by_title".into())
+         }),
+         in_own_transaction(&db, |executor| {
+-            queries::rename_index(executor, authors, by_title, "other")
++            queries::rename_index(executor, authors, by_title, &"other".into())
+         }),
+         in_own_transaction(&db, |executor| {
+             queries::delete_index(executor, authors, by_title)
+@@ -938,7 +1066,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
+                 executor,
+                 books,
+                 by_author,
+-                "new",
++                &"new".into(),
+                 &KeyPath::String("new".to_owned()),
+                 false,
+                 false,
+@@ -949,7 +1077,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
+                 executor,
+                 9,
+                 9,
+-                "new",
++                &"new".into(),
+                 &KeyPath::String("new".to_owned()),
+                 false,
+                 false,
+@@ -1308,7 +1436,7 @@ fn test_async_operations<X: SqlExecutor>() {
+             put_request(
+                 store_id,
+                 put2.0,
+-                IndexedDBKeyType::String("2.0".to_string()),
++                IndexedDBKeyType::String("2.0".into()),
+                 vec![4, 5, 6],
+                 false,
+             ),
+@@ -1316,7 +1444,7 @@ fn test_async_operations<X: SqlExecutor>() {
+                 store_id,
+                 put3.0,
+                 IndexedDBKeyType::Array(vec![
+-                    IndexedDBKeyType::String("3".to_string()),
++                    IndexedDBKeyType::String("3".into()),
+                     IndexedDBKeyType::Number(0.0),
+                 ]),
+                 vec![7, 8, 9],
+@@ -1399,12 +1527,12 @@ fn test_async_operations<X: SqlExecutor>() {
+     // Check that all three items are present
+     assert!(all_items.contains(&stored_value(1.0, vec![13, 14, 15])));
+     assert!(all_items.contains(&IndexedDBValue {
+-        primary_key: IndexedDBKeyType::String("2.0".to_string()),
++        primary_key: IndexedDBKeyType::String("2.0".into()),
+         value: vec![4, 5, 6],
+     }));
+     assert!(all_items.contains(&IndexedDBValue {
+         primary_key: IndexedDBKeyType::Array(vec![
+-            IndexedDBKeyType::String("3".to_string()),
++            IndexedDBKeyType::String("3".into()),
+             IndexedDBKeyType::Number(0.0),
+         ]),
+         value: vec![7, 8, 9],
+@@ -1503,7 +1631,7 @@ pub(crate) fn stored_version_and_store_names<X: SqlExecutor>(
+         queries::object_stores(&mut *connection)
+             .unwrap()
+             .into_iter()
+-            .map(|store| store.name)
++            .map(|store| store.name.to_string())
+             .collect(),
+     )
+ }
+@@ -1548,7 +1676,7 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
+                 store_id,
+                 AsyncSchemaOperation::RenameIndex {
+                     index_id: index_ids[0],
+-                    new_name: "b".to_owned(),
++                    new_name: "b".into(),
+                 },
+             ),
+             put_request(
+@@ -1587,7 +1715,7 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
+     let index_names: Vec<String> = db.object_stores()[0]
+         .indexes
+         .iter()
+-        .map(|index| index.name.clone())
++        .map(|index| index.name.to_string())
+         .collect();
+     assert_eq!(index_names, vec!["a".to_owned(), "b".to_owned()]);
+ }
+@@ -1649,7 +1777,7 @@ fn test_key_generator_follows_generated_and_explicit_keys<X: SqlExecutor>() {
+             (None, vec![2]),
+             (number(1000.0), vec![3]),
+             (None, vec![4]),
+-            (Some(IndexedDBKeyType::String("9999".to_owned())), vec![5]),
++            (Some(IndexedDBKeyType::String("9999".into())), vec![5]),
+             (Some(IndexedDBKeyType::Date(9999.0)), vec![6]),
+             (
+                 Some(IndexedDBKeyType::Array(vec![IndexedDBKeyType::Number(
+@@ -1865,7 +1993,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+             schema(
+                 created,
+                 AsyncSchemaOperation::CreateObjectStore {
+-                    name: "created".to_owned(),
++                    name: "created".into(),
+                     key_path: None,
+                     auto_increment: true,
+                 },
+@@ -1874,7 +2002,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+                 kept,
+                 AsyncSchemaOperation::CreateIndex {
+                     index_id: 2,
+-                    name: "by_b".to_owned(),
++                    name: "by_b".into(),
+                     key_path: KeyPath::String("b".to_owned()),
+                     unique: false,
+                     multi_entry: false,
+@@ -1884,14 +2012,14 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+                 kept,
+                 AsyncSchemaOperation::RenameIndex {
+                     index_id: by_a,
+-                    new_name: "by_c".to_owned(),
++                    new_name: "by_c".into(),
+                 },
+             ),
+             schema(deleted, AsyncSchemaOperation::DeleteObjectStore),
+             schema(
+                 kept,
+                 AsyncSchemaOperation::RenameObjectStore {
+-                    new_name: "renamed".to_owned(),
++                    new_name: "renamed".into(),
+                 },
+             ),
+         ],
+@@ -1925,7 +2053,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+             .unwrap()
+             .indexes
+             .into_iter()
+-            .map(|index| index.name)
++            .map(|index| index.name.to_string())
+             .collect()
+     };
+     let before = (1, vec!["kept".to_owned(), "deleted".to_owned()]);
+@@ -1946,7 +2074,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+         db.object_stores()[0]
+             .indexes
+             .iter()
+-            .map(|index| index.name.as_str())
++            .map(|index| index.name.to_string())
+             .collect::<Vec<_>>(),
+         vec!["by_a"]
+     );
+@@ -1965,7 +2093,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
+             (
+                 store,
+                 AsyncSchemaOperation::CreateObjectStore {
+-                    name: "other".to_owned(),
++                    name: "other".into(),
+                     key_path: None,
+                     auto_increment: false,
+                 },
+@@ -1974,7 +2102,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
+                 store + 1,
+                 AsyncSchemaOperation::CreateIndex {
+                     index_id: 0,
+-                    name: "index".to_owned(),
++                    name: "index".into(),
+                     key_path: KeyPath::String("a".to_owned()),
+                     unique: false,
+                     multi_entry: false,
+@@ -1984,7 +2112,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
+                 store + 5,
+                 AsyncSchemaOperation::CreateIndex {
+                     index_id: 1,
+-                    name: "index".to_owned(),
++                    name: "index".into(),
+                     key_path: KeyPath::String("a".to_owned()),
+                     unique: false,
+                     multi_entry: false,
+@@ -1995,19 +2123,19 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
+                 store,
+                 AsyncSchemaOperation::RenameIndex {
+                     index_id: 1,
+-                    new_name: "index".to_owned(),
++                    new_name: "index".into(),
+                 },
+             ),
+             (
+                 store,
+                 AsyncSchemaOperation::RenameObjectStore {
+-                    new_name: "created".to_owned(),
++                    new_name: "created".into(),
+                 },
+             ),
+             (
+                 store + 5,
+                 AsyncSchemaOperation::RenameObjectStore {
+-                    new_name: "other".to_owned(),
++                    new_name: "other".into(),
+                 },
+             ),
+             (store + 5, AsyncSchemaOperation::DeleteObjectStore),
+@@ -2024,7 +2152,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
+                 schema(
+                     store + 1,
+                     AsyncSchemaOperation::CreateObjectStore {
+-                        name: "created".to_owned(),
++                        name: "created".into(),
+                         key_path: None,
+                         auto_increment: false,
+                     },
+diff --git a/components/storage/indexeddb/engines/sqlite/encoding.rs b/components/storage/indexeddb/engines/sqlite/encoding.rs
+index e71ae4df50a..7765e4c63c2 100644
+--- a/components/storage/indexeddb/engines/sqlite/encoding.rs
++++ b/components/storage/indexeddb/engines/sqlite/encoding.rs
+@@ -2,7 +2,7 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use storage_traits::indexeddb::IndexedDBKeyType;
++use storage_traits::indexeddb::{IndexedDBKeyType, Utf16String};
+ 
+ // Implementation is a port of:
+ // https://searchfox.org/firefox-main/rev/55ec080e4a37b7ae1f89267063eccd361cdd232d/dom/indexedDB/Key.cpp#109-187
+@@ -106,7 +106,7 @@ fn internal_serialize(key: &IndexedDBKeyType, type_offset: u8, buffer: &mut Vec<
+         },
+         IndexedDBKeyType::String(s) => {
+             encode_stringy(
+-                s.encode_utf16(),
++                s.units().iter().copied(),
+                 KeyType::String as u8 + type_offset,
+                 buffer,
+             );
+@@ -205,7 +205,7 @@ fn internal_deserialize(
+     } else if key_type == KeyType::String as u8 + type_offset {
+         *pos += 1;
+         let u16s = decode_stringy(buffer, pos)?;
+-        Some(IndexedDBKeyType::String(String::from_utf16(&u16s).ok()?))
++        Some(IndexedDBKeyType::String(Utf16String::from_units(u16s)))
+     } else if key_type == KeyType::Binary as u8 + type_offset {
+         *pos += 1;
+         let u16s = decode_stringy(buffer, pos)?;
+@@ -235,10 +235,14 @@ pub fn deserialize(data: &[u8]) -> Option<IndexedDBKeyType> {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use storage_traits::indexeddb::IndexedDBKeyType;
++    use storage_traits::indexeddb::{IndexedDBKeyType, Utf16String};
+ 
+     use super::{deserialize, deserialize_number, serialize, serialize_number};
+ 
++    fn units(units: &[u16]) -> IndexedDBKeyType {
++        IndexedDBKeyType::String(Utf16String::from_units(units.to_vec()))
++    }
++
+     #[test]
+     fn test_number_roundtrip() {
+         let numbers = [
+@@ -271,12 +275,15 @@ mod tests {
+         let keys = vec![
+             IndexedDBKeyType::Number(42.0),
+             IndexedDBKeyType::Date(1625077765.0),
+-            IndexedDBKeyType::String("hello".to_string()),
++            IndexedDBKeyType::String("hello".into()),
+             IndexedDBKeyType::Binary(vec![1, 2, 3, 4]),
+             IndexedDBKeyType::Array(vec![
+                 IndexedDBKeyType::Number(1.0),
+-                IndexedDBKeyType::String("nested".to_string()),
++                IndexedDBKeyType::String("nested".into()),
+             ]),
++            units(&[0xDC00, 0xD800]),
++            units(&[0x61, 0xD800]),
++            IndexedDBKeyType::Array(vec![units(&[0xDFFF]), units(&[0xD834, 0xDD1E])]),
+         ];
+         for key in &keys {
+             let serialized = serialize(key);
+@@ -302,14 +309,20 @@ mod tests {
+             IndexedDBKeyType::Date(0.0),
+             IndexedDBKeyType::Date(100.0),
+             // String sorting
+-            IndexedDBKeyType::String(String::new()),
+-            IndexedDBKeyType::String("\0".to_string()),
+-            IndexedDBKeyType::String("a".to_string()),
+-            IndexedDBKeyType::String("aa".to_string()),
+-            IndexedDBKeyType::String("b".to_string()),
+-            IndexedDBKeyType::String("ba".to_string()),
+-            IndexedDBKeyType::String("c".to_string()),
+-            IndexedDBKeyType::String("~".to_string()),
++            IndexedDBKeyType::String("".into()),
++            IndexedDBKeyType::String("\0".into()),
++            IndexedDBKeyType::String("a".into()),
++            IndexedDBKeyType::String("aa".into()),
++            IndexedDBKeyType::String("b".into()),
++            IndexedDBKeyType::String("ba".into()),
++            IndexedDBKeyType::String("c".into()),
++            IndexedDBKeyType::String("~".into()),
++            // By code unit: unpaired surrogates and pairs sort among the units around them.
++            units(&[0xD800]),
++            units(&[0xD834, 0xDD1E]),
++            units(&[0xDC00]),
++            units(&[0xDC00, 0xD800]),
++            IndexedDBKeyType::String("\u{FFFD}".into()),
+             // Binary sorting
+             IndexedDBKeyType::Binary(vec![]),
+             IndexedDBKeyType::Binary(vec![0]),
+@@ -326,7 +339,7 @@ mod tests {
+                 IndexedDBKeyType::Number(1.0),
+                 IndexedDBKeyType::Number(2.0),
+             ]),
+-            IndexedDBKeyType::Array(vec![IndexedDBKeyType::String("a".to_string())]),
++            IndexedDBKeyType::Array(vec![IndexedDBKeyType::String("a".into())]),
+         ];
+ 
+         let serialized: Vec<Vec<u8>> = keys.iter().map(serialize).collect();
+@@ -335,5 +348,6 @@ mod tests {
+ 
+         // The bytes should be byte-wise sortable mirroring the original sort order
+         assert_eq!(serialized, sorted_serialized);
++        assert!(keys.is_sorted_by(|a, b| a <= b));
+     }
+ }
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 70173582fbd..9e0be7f718e 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -29,7 +29,7 @@ use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, Storage
+ use storage_traits::indexeddb::{
+     AsyncOperation, BackendError, BackendResult, ConnectionEvent, ConnectionMsg, DatabaseInfo,
+     IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId,
+-    IndexedDBTxnMode, StorageBottleSource, SyncOperation, TransactionEvent,
++    IndexedDBTxnMode, StorageBottleSource, SyncOperation, TransactionEvent, Utf16String,
+ };
+ use uuid::Uuid;
+ 
+@@ -73,7 +73,7 @@ impl IndexedDBThreadFactory for GenericSender<IndexedDBThreadMsg> {
+ #[derive(Clone, Debug, Eq, Hash, MallocSizeOf, PartialEq)]
+ pub struct IndexedDBDescription {
+     pub origin: ImmutableOrigin,
+-    pub name: String,
++    pub name: Utf16String,
+ }
+ 
+ #[derive(MallocSizeOf)]
+@@ -320,7 +320,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#transaction-scheduling>
+-    fn schedule_transactions(&mut self, origin: ImmutableOrigin, db_name: &str) {
++    fn schedule_transactions(&mut self, origin: ImmutableOrigin, db_name: &Utf16String) {
+         let readonly_len = self.queued_readonly.len();
+         for _ in 0..readonly_len {
+             let Some(txn) = self.queued_readonly.pop_front() else {
+@@ -351,7 +351,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+             // Mark running and start async.
+             // DO NOT clear here; clear on EngineTxnBatchComplete.
+             self.running_readonly.insert(txn);
+-            self.start_transaction(origin.clone(), db_name.to_string(), txn, None);
++            self.start_transaction(origin.clone(), db_name.clone(), txn, None);
+         }
+ 
+         // Start at most one readwrite txn.
+@@ -390,7 +390,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+             // Mark running and start async.
+             // DO NOT clear here; clear on EngineTxnBatchComplete.
+             self.running_readwrite = Some(txn);
+-            self.start_transaction(origin, db_name.to_string(), txn, None);
++            self.start_transaction(origin, db_name.clone(), txn, None);
+             return;
+         }
+     }
+@@ -399,7 +399,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+     fn start_transaction(
+         &mut self,
+         origin: ImmutableOrigin,
+-        db_name: String,
++        db_name: Utf16String,
+         txn: IndexedDBTxnId,
+         sender: Option<GenericSender<BackendResult<()>>>,
+     ) {
+@@ -575,7 +575,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+     fn abort(
+         &mut self,
+         origin: &ImmutableOrigin,
+-        database_name: &str,
++        database_name: &Utf16String,
+         transaction: IndexedDBTxnId,
+     ) {
+         self.engine.rollback(transaction, Box::new(|| {}));
+@@ -628,7 +628,7 @@ fn obtain_a_local_storage_bottle_map(
+ enum OpenRequest {
+     Open {
+         /// The name of the database.
+-        db_name: String,
++        db_name: Utf16String,
+ 
+         /// Optionnaly, a requested db version.
+         /// Note: when the open algorithm starts, this will be mutated and set to something as per the algo.
+@@ -666,7 +666,7 @@ enum OpenRequest {
+ 
+         /// The name of the database.
+         /// Note: will be used when the full spec is implemented.
+-        db_name: String,
++        db_name: Utf16String,
+ 
+         /// <https://w3c.github.io/IndexedDB/#request-processed-flag>
+         processed: bool,
+@@ -958,7 +958,7 @@ impl IndexedDBManager {
+     fn queue_operation(
+         &mut self,
+         origin: ImmutableOrigin,
+-        db_name: String,
++        db_name: Utf16String,
+         txn: IndexedDBTxnId,
+         mode: IndexedDBTxnMode,
+         operation: KvsOperation,
+@@ -1017,7 +1017,7 @@ impl IndexedDBManager {
+     /// Handle when an upgrade transaction finishes in script.
+     fn handle_upgrade_transaction_finished(
+         &mut self,
+-        name: String,
++        name: Utf16String,
+         origin: ImmutableOrigin,
+         txn: IndexedDBTxnId,
+         committed: bool,
+@@ -1228,7 +1228,7 @@ impl IndexedDBManager {
+     /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
+     fn abort_pending_upgrade(
+         &mut self,
+-        name: String,
++        name: Utf16String,
+         id: Uuid,
+         origin: ImmutableOrigin,
+         proxy_map: &StorageProxyMap,
+@@ -1266,7 +1266,7 @@ impl IndexedDBManager {
+     /// Note: this only reverts the version at this point.
+     fn abort_pending_upgrades(
+         &mut self,
+-        pending_upgrades: HashMap<String, HashSet<Uuid>>,
++        pending_upgrades: HashMap<Utf16String, HashSet<Uuid>>,
+         origin: ImmutableOrigin,
+     ) {
+         for (name, ids) in pending_upgrades.into_iter() {
+@@ -1313,7 +1313,7 @@ impl IndexedDBManager {
+     fn open_a_database_connection(
+         &mut self,
+         origin: ImmutableOrigin,
+-        db_name: String,
++        db_name: Utf16String,
+         version: Option<u64>,
+         id: Uuid,
+         bottle_source: StorageBottleSource,
+@@ -1369,7 +1369,7 @@ impl IndexedDBManager {
+     fn get_database_mut(
+         &mut self,
+         origin: ImmutableOrigin,
+-        db_name: String,
++        db_name: Utf16String,
+     ) -> Option<&mut IndexedDBEnvironment<ActiveKvsEngine>> {
+         let idb_description = IndexedDBDescription {
+             origin,
+@@ -1468,7 +1468,7 @@ impl IndexedDBManager {
+     /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
+     fn handle_version_change_done(
+         &mut self,
+-        name: String,
++        name: Utf16String,
+         from_id: Uuid,
+         old_version: u64,
+         origin: ImmutableOrigin,
+@@ -1914,7 +1914,7 @@ impl IndexedDBManager {
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#closing-connection>
+-    fn close_database(&mut self, origin: ImmutableOrigin, id: Uuid, name: String) {
++    fn close_database(&mut self, origin: ImmutableOrigin, id: Uuid, name: Utf16String) {
+         // Step 1: Set connection’s close pending flag to true.
+         // TODO: seems like a script only flag.
+ 
+@@ -2285,7 +2285,7 @@ mod tests {
+         GenericReceiver<IndexedDBThreadMsg>,
+     ) {
+         let description = IndexedDBDescription {
+-            name: "test_db".to_string(),
++            name: "test_db".into(),
+             origin: test_origin(),
+         };
+         let engine = SqlEngine::<X>::new(
+@@ -2374,7 +2374,7 @@ mod tests {
+             operation,
+         };
+         env.queue_operation(txn(serial), mode, operation);
+-        env.schedule_transactions(test_origin(), "test_db");
++        env.schedule_transactions(test_origin(), &"test_db".into());
+         match batches.recv().unwrap() {
+             IndexedDBThreadMsg::EngineTxnBatchComplete { txn: done, .. } => {
+                 assert_eq!(done, txn(serial));
+@@ -2387,7 +2387,7 @@ mod tests {
+ 
+     /// Aborts `serial` and waits until the engine has rolled it back.
+     fn abort<X: SqlExecutor>(env: &mut IndexedDBEnvironment<SqlEngine<X>>, serial: u64) {
+-        env.abort(&test_origin(), "test_db", txn(serial));
++        env.abort(&test_origin(), &"test_db".into(), txn(serial));
+         let (sender, rolled_back) = mpsc::channel();
+         // A second rollback is a no-op, which the engine runs after the first.
+         env.engine.rollback(
+@@ -2408,7 +2408,7 @@ mod tests {
+ 
+     fn create_store_operation(name: &str, auto_increment: bool) -> AsyncOperation {
+         AsyncOperation::Schema(AsyncSchemaOperation::CreateObjectStore {
+-            name: name.to_owned(),
++            name: name.into(),
+             key_path: None,
+             auto_increment,
+         })
+@@ -2417,7 +2417,7 @@ mod tests {
+     fn store_names<X: SqlExecutor>(env: &IndexedDBEnvironment<SqlEngine<X>>) -> Vec<String> {
+         env.object_stores()
+             .into_iter()
+-            .map(|store| store.name)
++            .map(|store| store.name.to_string())
+             .collect()
+     }
+ 
+@@ -2445,7 +2445,7 @@ mod tests {
+             1,
+             AsyncOperation::Schema(AsyncSchemaOperation::CreateIndex {
+                 index_id: 1,
+-                name: "not_by_author".to_string(),
++                name: "not_by_author".into(),
+                 key_path: KeyPath::String("author".to_string()),
+                 unique: false,
+                 multi_entry: false,
+diff --git a/components/storage/tests/client_storage.rs b/components/storage/tests/client_storage.rs
+index 7d859951b67..32481aba30e 100644
+--- a/components/storage/tests/client_storage.rs
++++ b/components/storage/tests/client_storage.rs
+@@ -21,6 +21,7 @@ use storage_traits::client_storage::{
+     ClientStorageThreadHandle, ClientStorageThreadMessage, StorageIdentifier, StorageProxyMap,
+     StorageType,
+ };
++use storage_traits::indexeddb::Utf16String;
+ 
+ fn install_test_namespace() {
+     if PIPELINE_NAMESPACE.get().is_none() {
+@@ -136,6 +137,76 @@ fn test_workflow() {
+     std::thread::sleep(std::time::Duration::from_millis(1000));
+ }
+ 
++/// A database name with an unpaired surrogate names its own database, and a well-formed name
++/// keeps its registry entry as text.
++#[test]
++fn test_database_names_with_unpaired_surrogates() {
++    install_test_namespace();
++    let tmp_dir = tempfile::tempdir().unwrap();
++    let handle: ClientStorageThreadHandle =
++        ClientStorageThreadFactory::new(Some(tmp_dir.path().to_path_buf()), false);
++    let bottle_id = obtain_bottle_map(
++        &handle,
++        StorageType::Local,
++        Some(WebViewId::new(servo_base::id::TEST_PAINTER_ID)),
++        StorageIdentifier::IndexedDB,
++        ServoUrl::parse("https://example.com").unwrap().origin(),
++    )
++    .bottle_id;
++
++    let names = [
++        Utf16String::from_units(vec![0xD800]),
++        Utf16String::from_units(vec![0xDC00]),
++        Utf16String::from("\u{FFFD}"),
++        Utf16String::from("plain"),
++    ];
++    let create = |name: &Utf16String| {
++        handle
++            .create_database(bottle_id, name.clone())
++            .recv()
++            .unwrap()
++            .unwrap()
++    };
++    let paths: Vec<PathBuf> = names
++        .iter()
++        .map(|name| {
++            let (path, created) = create(name);
++            assert!(created);
++            path
++        })
++        .collect();
++    for (index, path) in paths.iter().enumerate() {
++        assert!(!paths[..index].contains(path));
++    }
++    assert_eq!(create(&names[0]), (paths[0].clone(), false));
++
++    let registry = open_registry(&tmp_dir);
++    let stored: Vec<(String, Vec<u8>)> = registry
++        .prepare("SELECT typeof(name), CAST(name AS BLOB) FROM databases ORDER BY id")
++        .unwrap()
++        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
++        .unwrap()
++        .collect::<Result<_, _>>()
++        .unwrap();
++    assert_eq!(
++        stored,
++        vec![
++            ("blob".to_owned(), vec![0xD8, 0x00]),
++            ("blob".to_owned(), vec![0xDC, 0x00]),
++            ("text".to_owned(), "\u{FFFD}".as_bytes().to_vec()),
++            ("text".to_owned(), b"plain".to_vec()),
++        ]
++    );
++
++    handle
++        .delete_database(bottle_id, names[0].clone())
++        .recv()
++        .unwrap()
++        .unwrap();
++    assert!(!paths[0].exists());
++    assert!(paths[1..].iter().all(|path| path.exists()));
++}
++
+ #[test]
+ fn test_repeated_local_obtain_reuses_same_logical_rows() {
+     install_test_namespace();
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index 22383801978..8d90d349918 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -309,7 +309,7 @@ fn send_request<T: TestReply>(
+         &ctx.private_threads,
+         IndexedDBThreadMsg::Async(
+             ctx.origin.clone(),
+-            db_name.to_string(),
++            db_name.into(),
+             store,
+             txn,
+             request_id,
+@@ -364,7 +364,7 @@ fn open_database_with(
+         &ctx.private_threads,
+         IndexedDBThreadMsg::Sync(SyncOperation::OpenDatabase(
+             ctx.origin.clone(),
+-            db_name.to_string(),
++            db_name.into(),
+             version,
+             id,
+             ctx.bottle_source.clone(),
+@@ -402,7 +402,7 @@ fn send_schema_operation(
+         &ctx.private_threads,
+         IndexedDBThreadMsg::AsyncSchemaOperation {
+             origin: ctx.origin.clone(),
+-            database_name: db_name.to_string(),
++            database_name: db_name.into(),
+             store_id: store,
+             operation,
+             transaction,
+@@ -428,7 +428,7 @@ fn create_object_store(
+         store,
+         transaction,
+         AsyncSchemaOperation::CreateObjectStore {
+-            name: store_name.to_owned(),
++            name: store_name.into(),
+             key_path,
+             auto_increment,
+         },
+@@ -453,7 +453,7 @@ fn create_index(
+         transaction,
+         AsyncSchemaOperation::CreateIndex {
+             index_id,
+-            name: index_name.to_string(),
++            name: index_name.into(),
+             key_path,
+             unique,
+             multi_entry,
+@@ -462,8 +462,8 @@ fn create_index(
+ }
+ 
+ /// The names of `stores`.
+-fn names(stores: &[IndexedDBObjectStore]) -> Vec<&str> {
+-    stores.iter().map(|store| store.name.as_str()).collect()
++fn names(stores: &[IndexedDBObjectStore]) -> Vec<String> {
++    stores.iter().map(|store| store.name.to_string()).collect()
+ }
+ 
+ /// The committed version and object stores of `db_name`, from the metadata snapshot that a new
+@@ -503,7 +503,7 @@ fn create_transaction(
+         &ctx.private_threads,
+         IndexedDBThreadMsg::Sync(SyncOperation::CreateTransaction {
+             origin: ctx.origin.clone(),
+-            db_name: db_name.to_string(),
++            db_name: db_name.into(),
+             txn,
+             mode,
+             scope,
+@@ -531,7 +531,7 @@ fn commit_transaction(
+         &ctx.private_threads,
+         IndexedDBThreadMsg::Sync(SyncOperation::Commit {
+             origin: ctx.origin.clone(),
+-            db_name: db_name.to_string(),
++            db_name: db_name.into(),
+             txn,
+         }),
+     )
+@@ -573,7 +573,7 @@ fn close_database(ctx: &IndexedDbTestContext, id: Uuid, db_name: &str) {
+         IndexedDBThreadMsg::Sync(SyncOperation::CloseDatabase(
+             ctx.origin.clone(),
+             id,
+-            db_name.to_string(),
++            db_name.into(),
+         )),
+     )
+     .unwrap();
+@@ -589,7 +589,7 @@ fn finish_upgrade_transaction(
+         &ctx.private_threads,
+         IndexedDBThreadMsg::Sync(SyncOperation::UpgradeTransactionFinished {
+             txn,
+-            db_name: db_name.to_string(),
++            db_name: db_name.into(),
+             origin: ctx.origin.clone(),
+             committed,
+         }),
+@@ -602,7 +602,7 @@ fn finish_transaction(ctx: &IndexedDbTestContext, db_name: &str, txn: IndexedDBT
+         &ctx.private_threads,
+         IndexedDBThreadMsg::Sync(SyncOperation::TransactionFinished {
+             origin: ctx.origin.clone(),
+-            db_name: db_name.to_string(),
++            db_name: db_name.into(),
+             txn,
+         }),
+     )
+@@ -869,7 +869,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
+         db_name,
+         STORE,
+         txn,
+-        IndexedDBKeyType::String("book-1".to_string()),
++        IndexedDBKeyType::String("book-1".into()),
+         b"Moby Dick".to_vec(),
+     );
+     let commit_result = commit_transaction(&ctx, db_name, txn);
+@@ -877,7 +877,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
+     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
+     assert_eq!(
+         put_msg,
+-        PutItemResult::Key(IndexedDBKeyType::String("book-1".to_string()))
++        PutItemResult::Key(IndexedDBKeyType::String("book-1".into()))
+     );
+     assert!(commit_msg.is_ok());
+     finish_transaction(&ctx, db_name, txn);
+@@ -894,7 +894,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
+         db_name,
+         STORE,
+         txn,
+-        IndexedDBKeyType::String("book-1".to_string()),
++        IndexedDBKeyType::String("book-1".into()),
+     );
+     let commit_result = commit_transaction(&ctx, db_name, txn);
+     let roundtrip_msg = recv_callback_timeout(&roundtrip, "get item reply").unwrap();
+@@ -902,7 +902,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
+     assert_eq!(
+         roundtrip_msg,
+         Some(IndexedDBValue {
+-            primary_key: IndexedDBKeyType::String("book-1".to_string()),
++            primary_key: IndexedDBKeyType::String("book-1".into()),
+             value: b"Moby Dick".to_vec(),
+         })
+     );
+@@ -921,7 +921,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
+         db_name,
+         STORE,
+         txn,
+-        IndexedDBKeyType::String("book-1".to_string()),
++        IndexedDBKeyType::String("book-1".into()),
+     );
+     let commit_result = commit_transaction(&ctx, db_name, txn);
+     let remove_msg = recv_callback_timeout(&remove_result, "remove item reply");
+@@ -942,7 +942,7 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
+         db_name,
+         STORE,
+         txn,
+-        IndexedDBKeyType::String("book-1".to_string()),
++        IndexedDBKeyType::String("book-1".into()),
+     );
+     let commit_result = commit_transaction(&ctx, db_name, txn);
+     let deleted_msg = recv_callback_timeout(&deleted, "get deleted item reply").unwrap();
+@@ -1087,7 +1087,7 @@ fn test_indexeddb_duplicate_store_fails_the_upgrade() {
+     ));
+ 
+     let (version, stores) = committed_metadata(&ctx, db_name);
+-    assert_eq!((version, names(&stores)), (1, vec![store_name]));
++    assert_eq!((version, names(&stores)), (1, vec![store_name.to_owned()]));
+     ctx.shutdown();
+ }
+ 
+@@ -1097,7 +1097,7 @@ fn abort_transaction(ctx: &IndexedDbTestContext, db_name: &str, txn: IndexedDBTx
+         &ctx.private_threads,
+         IndexedDBThreadMsg::Sync(SyncOperation::Abort {
+             origin: ctx.origin.clone(),
+-            db_name: db_name.to_string(),
++            db_name: db_name.into(),
+             txn,
+         }),
+     )
+@@ -1140,7 +1140,7 @@ fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
+         db_name,
+         STORE,
+         txn,
+-        IndexedDBKeyType::String("book-aborted".to_string()),
++        IndexedDBKeyType::String("book-aborted".into()),
+         b"Never Committed".to_vec(),
+     );
+     abort_transaction(&ctx, db_name, txn);
+@@ -1163,7 +1163,7 @@ fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
+         db_name,
+         STORE,
+         txn,
+-        IndexedDBKeyType::String("book-aborted".to_string()),
++        IndexedDBKeyType::String("book-aborted".into()),
+     );
+     let commit_result = commit_transaction(&ctx, db_name, txn);
+     let lookup_msg = recv_callback_timeout(&lookup, "get aborted item reply").unwrap();
+@@ -1201,7 +1201,7 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
+         db_name,
+         STORE,
+         txn,
+-        IndexedDBKeyType::String("book-1".to_string()),
++        IndexedDBKeyType::String("book-1".into()),
+         b"Moby Dick".to_vec(),
+     );
+     let commit_result = commit_transaction(&ctx, db_name, txn);
+@@ -1276,7 +1276,7 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
+         db_name,
+         STORE,
+         txn,
+-        IndexedDBKeyType::String("book-1".to_string()),
++        IndexedDBKeyType::String("book-1".into()),
+     );
+     let commit_result = commit_transaction(&ctx, db_name, txn);
+     let lookup_msg = recv_callback_timeout(&lookup, "get preserved item reply").unwrap();
+@@ -1310,11 +1310,7 @@ fn test_indexeddb_cross_type_key_sort_order() {
+     for (request_id, key, value) in [
+         (1, IndexedDBKeyType::Number(1.0), b"number".to_vec()),
+         (2, IndexedDBKeyType::Date(1.0), b"date".to_vec()),
+-        (
+-            3,
+-            IndexedDBKeyType::String("1".to_string()),
+-            b"string".to_vec(),
+-        ),
++        (3, IndexedDBKeyType::String("1".into()), b"string".to_vec()),
+         (4, IndexedDBKeyType::Binary(vec![1]), b"binary".to_vec()),
+         (
+             5,
+@@ -1364,7 +1360,7 @@ fn test_indexeddb_cross_type_key_sort_order() {
+         vec![
+             IndexedDBKeyType::Number(1.0),
+             IndexedDBKeyType::Date(1.0),
+-            IndexedDBKeyType::String("1".to_string()),
++            IndexedDBKeyType::String("1".into()),
+             IndexedDBKeyType::Binary(vec![1]),
+             IndexedDBKeyType::Array(vec![IndexedDBKeyType::Number(1.0)]),
+         ]
+@@ -1766,12 +1762,12 @@ fn test_indexeddb_aborted_put_that_succeeded_leaves_no_record() {
+         db_name,
+         STORE,
+         txn,
+-        IndexedDBKeyType::String("book-aborted".to_string()),
++        IndexedDBKeyType::String("book-aborted".into()),
+         b"Never Committed".to_vec(),
+     );
+     assert_eq!(
+         recv_callback_timeout(&put_result, "put item reply").unwrap(),
+-        PutItemResult::Key(IndexedDBKeyType::String("book-aborted".to_string()))
++        PutItemResult::Key(IndexedDBKeyType::String("book-aborted".into()))
+     );
+ 
+     abort_transaction(&ctx, db_name, txn);
+@@ -1783,7 +1779,7 @@ fn test_indexeddb_aborted_put_that_succeeded_leaves_no_record() {
+             db_name,
+             connection_id,
+             STORE,
+-            IndexedDBKeyType::String("book-aborted".to_string()),
++            IndexedDBKeyType::String("book-aborted".into()),
+         ),
+         None
+     );
+@@ -2008,7 +2004,7 @@ fn test_indexeddb_upgrade_waits_for_no_versionchange_of_a_closed_connection() {
+     GenericSend::send(
+         &ctx.private_threads,
+         IndexedDBThreadMsg::Sync(SyncOperation::NotifyEndOfVersionChange {
+-            name: db_name.to_string(),
++            name: db_name.into(),
+             id: stays,
+             old_version: 1,
+             origin: ctx.origin.clone(),
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 311ce1569d2..958b8ed1f60 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11832,6 +11832,69 @@
+       }
+      ]
+     ],
++    "string-keys-code-units.any.js": [
++     "4959920d8f31f40d5d0a879a598d0888c74a09f5",
++     [
++      "IndexedDB/string-keys-code-units.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: string keys are their code units, unpaired surrogates included"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/string-keys-code-units.any.serviceworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: string keys are their code units, unpaired surrogates included"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/string-keys-code-units.any.sharedworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: string keys are their code units, unpaired surrogates included"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/string-keys-code-units.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: string keys are their code units, unpaired surrogates included"
++        ]
++       ]
++      }
++     ]
++    ],
+     "upgrade-metadata-by-id.any.js": [
+      "8da07ef7c26414dfc154868aa33032afd3af6d52",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/string-keys-code-units.any.js b/tests/wpt/mozilla/tests/IndexedDB/string-keys-code-units.any.js
+new file mode 100644
+index 00000000000..4959920d8f3
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/string-keys-code-units.any.js
+@@ -0,0 +1,91 @@
++// META: global=window,worker
++// META: title=IndexedDB: string keys are their code units, unpaired surrogates included
++
++// https://w3c.github.io/IndexedDB/#convert-a-value-to-a-key makes a string key of the string's
++// code units, and https://w3c.github.io/IndexedDB/#compare-two-keys compares string keys by code
++// unit. So unpaired surrogates survive a round trip, and keys that only differ in them are
++// different keys.
++
++'use strict';
++
++function openDatabase(t, upgrade) {
++  const name = 'string-keys-code-units-' + Math.random();
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open(name, 1);
++    request.onupgradeneeded = () => upgrade(request.result);
++    request.onsuccess = () => {
++      t.add_cleanup(() => {
++        request.result.close();
++        indexedDB.deleteDatabase(name);
++      });
++      resolve(request.result);
++    };
++    request.onerror = () => reject(request.error);
++  });
++}
++
++function result(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++const keys = ['\uDC00', '𝄞', '�', '\uD800', 'a\uDFFF', '\uDC00\uD800'];
++const sortedKeys = ['a\uDFFF', '\uD800', '𝄞', '\uDC00', '\uDC00\uD800', '�'];
++
++async function storeWithKeys(t) {
++  const db = await openDatabase(t, db => db.createObjectStore('store'));
++  const store = db.transaction('store', 'readwrite').objectStore('store');
++  for (const [index, key] of keys.entries()) {
++    assert_equals(await result(store.add(index, key)), key, 'add() returns the key');
++  }
++  return db;
++}
++
++promise_test(async t => {
++  const db = await storeWithKeys(t);
++  const store = db.transaction('store', 'readonly').objectStore('store');
++  assert_array_equals(await result(store.getAllKeys()), sortedKeys);
++  for (const [index, key] of keys.entries()) {
++    assert_equals(await result(store.get(key)), index, `get() of key ${index}`);
++  }
++  assert_equals(await result(store.count('\uD800')), 1);
++}, 'Keys with unpaired surrogates are distinct, read back unchanged and sorted by code unit');
++
++promise_test(async t => {
++  const db = await storeWithKeys(t);
++  const store = db.transaction('store', 'readonly').objectStore('store');
++  const range = IDBKeyRange.bound('\uD800', '\uDC00', true, false);
++  assert_array_equals(await result(store.getAllKeys(range)), ['𝄞', '\uDC00']);
++  const seen = [];
++  const request = store.openCursor(null, 'prev');
++  await new Promise((resolve, reject) => {
++    request.onsuccess = () => {
++      const cursor = request.result;
++      if (!cursor) {
++        return resolve();
++      }
++      seen.push(cursor.key);
++      cursor.continue();
++    };
++    request.onerror = () => reject(request.error);
++  });
++  assert_array_equals(seen, sortedKeys.slice().reverse());
++}, 'Key ranges and cursors order keys with unpaired surrogates by code unit');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => db.createObjectStore('store', {keyPath: 'id'}));
++  const store = db.transaction('store', 'readwrite').objectStore('store');
++  assert_equals(await result(store.put({id: '\uDC00\uD800'})), '\uDC00\uD800');
++  assert_equals((await result(store.get('\uDC00\uD800'))).id, '\uDC00\uD800');
++  assert_equals(await result(store.get('��')), undefined);
++}, 'In-line keys with unpaired surrogates');
++
++test(() => {
++  assert_equals(indexedDB.cmp('\uD800', '�'), -1);
++  assert_equals(indexedDB.cmp('𝄞', '�'), -1);
++  assert_equals(indexedDB.cmp('\uD800', '\uDC00'), -1);
++  assert_equals(indexedDB.cmp('\uDC00', '\uDC00'), 0);
++  assert_equals(indexedDB.cmp(['\uDC00'], ['\uD800']), 1);
++}, 'cmp() compares strings by code unit');

@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 16:04:47 +0000
+Subject: [PATCH] script: Keep the target of events that IndexedDB objects pass
+ on
+
+The events of an IndexedDB request go to its transaction and the
+transaction's connection ("get the parent" of IDBRequest and
+IDBTransaction). DOM's dispatch, taken literally, handles a parent
+that is neither a Window nor a node by setting the target to it (step
+"Otherwise: set target to parent"), so the transaction and the
+connection each became the event's target in their own struct of the
+path: listeners there saw event.target as the transaction or the
+connection and its error, and their bubbling listeners ran as
+AT_TARGET even for success events, which don't bubble. Gecko, Chromium
+and WebKit keep the request as the target, and the IndexedDB WPT tests
+expect it.
+
+A parent that is neither a Window nor a node is now appended to the
+event path like a Window, without a shadow-adjusted target, so the
+target stays the request and the parents get the capturing and
+bubbling phases. Only the IndexedDB objects have such parents.
+
+This makes the error events that "abort a transaction" fires at the
+pending requests look as the spec describes to listeners on the
+transaction and the connection, which transaction-abort-request-error
+checks, and fixes request_bubble-and-capture and
+transaction_bubble-and-capture.
+
+Validation: WPT IndexedDB/ (4,511 subtests), 8 processes, on top of the previous commits: host SpiderMonkey 3,287 pass (P2.1: 3,278), QuickJS 3,289 (3,281; idbfactory-origin-isolation flaked, see the previous commit); DAYU200 2 processes 3,285 (3,272). The 9 newly passing subtests, the three tests in their three globals, pass 10 of 10 on both engines. /dom/events/: 217 of 217 tests as expected. /_mozilla/IndexedDB/: 82 of 82 on the host and the board. `./mach clippy --locked -- -- --deny warnings` and `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`: no warning. After the P2 review the condition is `!parent.is::<Node>()`, which includes a Window: /dom/events/ and /shadow-dom/ 600 of 600 tests as expected on host SpiderMonkey.
+AI-assisted: Yes (agent session; the agent found the dispatch difference, wrote the change, simplified it after the P2 review and ran the WPT runs)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/event/event.rs                      | 4 +++-
+ .../meta/IndexedDB/request_bubble-and-capture.any.js.ini  | 8 --------
+ .../IndexedDB/transaction-abort-request-error.any.js.ini  | 8 --------
+ .../IndexedDB/transaction_bubble-and-capture.any.js.ini   | 8 --------
+ 4 files changed, 3 insertions(+), 25 deletions(-)
+
+diff --git a/components/script/dom/event/event.rs b/components/script/dom/event/event.rs
+index 9c1371f580c..0878df82090 100644
+--- a/components/script/dom/event/event.rs
++++ b/components/script/dom/event/event.rs
+@@ -498,7 +498,9 @@ impl Event {
+                         },
+                         _ => false,
+                     };
+-                if parent.is::<Window>() || root_is_shadow_inclusive_ancestor {
++                // Deviation, as in browsers: any parent that isn't a node, also an IndexedDB request's
++                // transaction or connection, is handled like a Window and doesn't become the target.
++                if !parent.is::<Node>() || root_is_shadow_inclusive_ancestor {
+                     // Step 6.9.6.1. If isActivationEvent is true, event’s bubbles attribute is true, activationTarget
+                     // is null, and parent has activation behavior, then set activationTarget to parent.
+                     if is_activation_event &&
+diff --git a/tests/wpt/meta/IndexedDB/request_bubble-and-capture.any.js.ini b/tests/wpt/meta/IndexedDB/request_bubble-and-capture.any.js.ini
+index 095b5d65f28..a964a912eb8 100644
+--- a/tests/wpt/meta/IndexedDB/request_bubble-and-capture.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/request_bubble-and-capture.any.js.ini
+@@ -1,16 +1,8 @@
+ [request_bubble-and-capture.any.worker.html]
+-  [IndexedDB Request Event Propagation: Bubbling and Capturing]
+-    expected: FAIL
+-
+ 
+ [request_bubble-and-capture.any.serviceworker.html]
+   expected: ERROR
+ 
+ [request_bubble-and-capture.any.sharedworker.html]
+-  [IndexedDB Request Event Propagation: Bubbling and Capturing]
+-    expected: FAIL
+-
+ 
+ [request_bubble-and-capture.any.html]
+-  [IndexedDB Request Event Propagation: Bubbling and Capturing]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/transaction-abort-request-error.any.js.ini b/tests/wpt/meta/IndexedDB/transaction-abort-request-error.any.js.ini
+index 0b6103d26cc..2a669ee8d30 100644
+--- a/tests/wpt/meta/IndexedDB/transaction-abort-request-error.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/transaction-abort-request-error.any.js.ini
+@@ -1,16 +1,8 @@
+ [transaction-abort-request-error.any.worker.html]
+-  [Properties of error events fired at requests when aborting a transaction]
+-    expected: FAIL
+-
+ 
+ [transaction-abort-request-error.any.serviceworker.html]
+   expected: ERROR
+ 
+ [transaction-abort-request-error.any.html]
+-  [Properties of error events fired at requests when aborting a transaction]
+-    expected: FAIL
+-
+ 
+ [transaction-abort-request-error.any.sharedworker.html]
+-  [Properties of error events fired at requests when aborting a transaction]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/transaction_bubble-and-capture.any.js.ini b/tests/wpt/meta/IndexedDB/transaction_bubble-and-capture.any.js.ini
+index 8465df69639..46d833fcbec 100644
+--- a/tests/wpt/meta/IndexedDB/transaction_bubble-and-capture.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/transaction_bubble-and-capture.any.js.ini
+@@ -1,16 +1,8 @@
+ [transaction_bubble-and-capture.any.worker.html]
+-  [Capture and bubble]
+-    expected: FAIL
+-
+ 
+ [transaction_bubble-and-capture.any.serviceworker.html]
+   expected: ERROR
+ 
+ [transaction_bubble-and-capture.any.html]
+-  [Capture and bubble]
+-    expected: FAIL
+-
+ 
+ [transaction_bubble-and-capture.any.sharedworker.html]
+-  [Capture and bubble]
+-    expected: FAIL

@@ -1,0 +1,494 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 12:52:40 +0000
+Subject: [PATCH] indexeddb: Obtain the storage bottle map in the backend
+
+indexedDB.open() and deleteDatabase() asked the client storage thread
+for the global's local storage bottle map and blocked the script
+thread until it replied, and so did the teardown of a window or
+worker. The bottle map is only needed by the backend, to create and
+delete the database's files.
+
+Script now sends what is needed to obtain it, the client storage
+handle and the webview, as a StorageBottleSource with OpenDatabase and
+DeleteDatabase, and the manager obtains the map when it handles the
+request. A failure reaches script as the request's error event (an
+OperationError, as the exception before) instead of an exception. On
+teardown, AbortPendingUpgrades no longer carries a map: reverting an
+aborted upgrade of a new database uses the map of its open request.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 105 passed, 1 skipped, as before. Host SpiderMonkey WPT IndexedDB/ plus /_mozilla/IndexedDB/ (8 processes): 3,250 of 4,511 IndexedDB subtests pass (P1's tip: 3,251) and all /_mozilla/ ones; the difference is the one unexpected result, idbfactory-origin-isolation.html TIMEOUT, which also timed out in P0.1's and P0.2's baseline runs and passed 5 of 5 alone. `./mach test-tidy`: only the known libsqlite3-sys advisory.
+AI-assisted: Yes (agent session; the agent wrote the change and ran the host tests and WPT)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbfactory.rs | 53 ++++--------
+ .../script/dom/indexeddb/idbopendbrequest.rs  | 12 ++-
+ components/shared/storage/indexeddb.rs        | 21 +++--
+ components/storage/indexeddb/mod.rs           | 81 ++++++++++++++++---
+ components/storage/tests/indexeddb.rs         | 23 ++----
+ python/tidy/error_message_exceptions.txt      |  2 +-
+ 6 files changed, 116 insertions(+), 76 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbfactory.rs b/components/script/dom/indexeddb/idbfactory.rs
+index 8594bea04a2..63a0de4e88d 100644
+--- a/components/script/dom/indexeddb/idbfactory.rs
++++ b/components/script/dom/indexeddb/idbfactory.rs
+@@ -13,9 +13,9 @@ use script_bindings::inheritance::Castable;
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use servo_base::generic_channel::GenericSend;
+ use servo_url::origin::ImmutableOrigin;
+-use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
+ use storage_traits::indexeddb::{
+-    BackendResult, ConnectionMsg, DatabaseInfo, IndexedDBThreadMsg, SyncOperation,
++    BackendResult, ConnectionMsg, DatabaseInfo, IndexedDBThreadMsg, StorageBottleSource,
++    SyncOperation,
+ };
+ use stylo_atoms::Atom;
+ use uuid::Uuid;
+@@ -455,7 +455,6 @@ impl IDBFactory {
+         name: DOMString,
+         version: Option<u64>,
+         request: &IDBOpenDBRequest,
+-        proxy_map: StorageProxyMap,
+     ) -> Result<(), ()> {
+         let global = self.global();
+         let request_id = request.get_id();
+@@ -477,7 +476,7 @@ impl IDBFactory {
+             String::from(name),
+             version,
+             request.get_id(),
+-            proxy_map,
++            Self::storage_bottle_source(&global),
+         );
+ 
+         // Note: algo continues in parallel.
+@@ -516,17 +515,12 @@ impl IDBFactory {
+             })
+             .collect();
+         let origin = global.origin().immutable().clone();
+-        let Ok(proxy_map) = self.obtain_a_local_storage_bottle_map(&global, origin.clone()) else {
+-            debug_assert!(false, "Failed to obtain a proxy map.");
+-            return;
+-        };
+         if global
+             .storage_threads()
+             .send(IndexedDBThreadMsg::Sync(
+                 SyncOperation::AbortPendingUpgrades {
+                     pending_upgrades,
+                     origin,
+-                    proxy_map,
+                 },
+             ))
+             .is_err()
+@@ -543,29 +537,14 @@ impl IDBFactory {
+         }
+     }
+ 
+-    /// The indexeddb call into
+-    /// <https://storage.spec.whatwg.org/#obtain-a-local-storage-bottle-map>
+-    fn obtain_a_local_storage_bottle_map(
+-        &self,
+-        global: &GlobalScope,
+-        origin: ImmutableOrigin,
+-    ) -> Result<StorageProxyMap, Error> {
+-        let handle = global.storage_threads().client_storage_handle();
+-        let message = handle
+-            .obtain_a_storage_bottle_map(
+-                StorageType::Local,
+-                global.webview_id(),
+-                StorageIdentifier::IndexedDB,
+-                origin,
+-            )
+-            .recv();
+-        let Ok(response) = message else {
+-            return Err(Error::Operation(None));
+-        };
+-        let Ok(proxy_map) = response else {
+-            return Err(Error::Operation(None));
+-        };
+-        Ok(proxy_map)
++    /// What the backend needs to run
++    /// <https://storage.spec.whatwg.org/#obtain-a-local-storage-bottle-map> for `global`, which it
++    /// does in parallel.
++    pub(crate) fn storage_bottle_source(global: &GlobalScope) -> StorageBottleSource {
++        StorageBottleSource {
++            client_storage: global.storage_threads().client_storage_handle(),
++            webview: global.webview_id(),
++        }
+     }
+ }
+ 
+@@ -595,15 +574,14 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
+ 
+         // Note: switching to obtaining a storage bottle map,
+         // as per https://github.com/w3c/IndexedDB/pull/334/
+-        let proxy_map =
+-            self.obtain_a_local_storage_bottle_map(&global, global.origin().immutable().clone())?;
++        // The backend obtains it in parallel, see `open_database`.
+ 
+         // Step 4: Let request be a new open request.
+         let request = IDBOpenDBRequest::new(cx, &self.global());
+ 
+         // Step 5: Runs in parallel
+         if self
+-            .open_database(storage_key, name, version, &request, proxy_map)
++            .open_database(storage_key, name, version, &request)
+             .is_err()
+         {
+             return Err(Error::Operation(None));
+@@ -630,15 +608,14 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
+ 
+         // Note: switching to obtaining a storage bottle map,
+         // as per https://github.com/w3c/IndexedDB/pull/334/
+-        let proxy_map =
+-            self.obtain_a_local_storage_bottle_map(&global, global.origin().immutable().clone())?;
++        // The backend obtains it in parallel.
+ 
+         // Step 3: Let request be a new open request
+         let request = IDBOpenDBRequest::new(cx, &self.global());
+ 
+         // Step 4: Runs in parallel
+         if request
+-            .delete_database(storage_key, String::from(name), proxy_map)
++            .delete_database(storage_key, String::from(name))
+             .is_err()
+         {
+             return Err(Error::Operation(None));
+diff --git a/components/script/dom/indexeddb/idbopendbrequest.rs b/components/script/dom/indexeddb/idbopendbrequest.rs
+index 7726e918bb0..038e3609309 100644
+--- a/components/script/dom/indexeddb/idbopendbrequest.rs
++++ b/components/script/dom/indexeddb/idbopendbrequest.rs
+@@ -11,7 +11,6 @@ use profile_traits::generic_callback::GenericCallback;
+ use script_bindings::reflector::reflect_dom_object;
+ use servo_base::generic_channel::GenericSend;
+ use servo_url::origin::ImmutableOrigin;
+-use storage_traits::client_storage::StorageProxyMap;
+ use storage_traits::indexeddb::{BackendResult, IndexedDBThreadMsg, SyncOperation};
+ use stylo_atoms::Atom;
+ use uuid::Uuid;
+@@ -27,6 +26,7 @@ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+ use crate::dom::event::{Event, EventBubbles, EventCancelable};
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::indexeddb::idbdatabase::IDBDatabase;
++use crate::dom::indexeddb::idbfactory::IDBFactory;
+ use crate::dom::indexeddb::idbrequest::IDBRequest;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::idbversionchangeevent::IDBVersionChangeEvent;
+@@ -235,7 +235,6 @@ impl IDBOpenDBRequest {
+         &self,
+         storage_key: ImmutableOrigin,
+         name: String,
+-        proxy_map: StorageProxyMap,
+     ) -> Result<(), ()> {
+         let global = self.global();
+ 
+@@ -254,8 +253,13 @@ impl IDBOpenDBRequest {
+         })
+         .expect("Could not create delete database callback");
+ 
+-        let delete_operation =
+-            SyncOperation::DeleteDatabase(callback, storage_key, name, proxy_map, self.get_id());
++        let delete_operation = SyncOperation::DeleteDatabase(
++            callback,
++            storage_key,
++            name,
++            IDBFactory::storage_bottle_source(&global),
++            self.get_id(),
++        );
+ 
+         if global
+             .storage_threads()
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 04639547d1e..db7879cc8fc 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -12,10 +12,11 @@ use profile_traits::generic_callback::GenericCallback;
+ use profile_traits::mem::ReportsChan;
+ use serde::{Deserialize, Serialize};
+ use servo_base::generic_channel::GenericSender;
++use servo_base::id::WebViewId;
+ use servo_url::origin::ImmutableOrigin;
+ use uuid::Uuid;
+ 
+-use crate::client_storage::StorageProxyMap;
++use crate::client_storage::ClientStorageThreadHandle;
+ 
+ // TODO Box<dyn Error> is not serializable, fix needs to be found
+ pub type DbError = String;
+@@ -533,6 +534,15 @@ pub struct TxnCompleteMsg {
+     pub result: BackendResult<()>,
+ }
+ 
++/// What the IndexedDB manager needs to obtain a global's local storage bottle map
++/// (<https://storage.spec.whatwg.org/#obtain-a-local-storage-bottle-map>), so that script doesn't
++/// wait for it.
++#[derive(Clone, Debug, Deserialize, Serialize)]
++pub struct StorageBottleSource {
++    pub client_storage: ClientStorageThreadHandle,
++    pub webview: Option<WebViewId>,
++}
++
+ #[derive(Debug, Deserialize, Serialize)]
+ pub struct DatabaseInfo {
+     pub name: String,
+@@ -632,8 +642,8 @@ pub enum SyncOperation {
+         Option<u64>,
+         // The id of the request.
+         Uuid,
+-        // The Storage proxy map.
+-        StorageProxyMap,
++        // Where to obtain the storage proxy map.
++        StorageBottleSource,
+     ),
+ 
+     /// Deletes the database
+@@ -642,8 +652,8 @@ pub enum SyncOperation {
+         ImmutableOrigin,
+         // Database name.
+         String,
+-        // The Storage proxy map.
+-        StorageProxyMap,
++        // Where to obtain the storage proxy map.
++        StorageBottleSource,
+         Uuid,
+     ),
+ 
+@@ -658,7 +668,6 @@ pub enum SyncOperation {
+     AbortPendingUpgrades {
+         pending_upgrades: HashMap<String, HashSet<Uuid>>,
+         origin: ImmutableOrigin,
+-        proxy_map: StorageProxyMap,
+     },
+ 
+     NotifyEndOfVersionChange {
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 4a9d73119a7..fc01a072abe 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -25,11 +25,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
+ use servo_base::generic_channel::{self, GenericReceiver, GenericSender, ReceiveError};
+ use servo_base::threadpool::ThreadPool;
+ use servo_url::origin::ImmutableOrigin;
+-use storage_traits::client_storage::StorageProxyMap;
++use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
+ use storage_traits::indexeddb::{
+     AsyncOperation, BackendError, BackendResult, ConnectionMsg, DatabaseInfo, DbResult,
+     IndexedDBIndex, IndexedDBObjectStore, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath,
+-    SyncOperation, TxnCompleteMsg,
++    StorageBottleSource, SyncOperation, TxnCompleteMsg,
+ };
+ use uuid::Uuid;
+ 
+@@ -653,6 +653,24 @@ fn backend_error_from_storage_error<E: BackendErrorMapper>(err: E) -> BackendErr
+     err.into_backend_error()
+ }
+ 
++/// <https://storage.spec.whatwg.org/#obtain-a-local-storage-bottle-map>
++fn obtain_a_local_storage_bottle_map(
++    source: &StorageBottleSource,
++    origin: &ImmutableOrigin,
++) -> BackendResult<StorageProxyMap> {
++    source
++        .client_storage
++        .obtain_a_storage_bottle_map(
++            StorageType::Local,
++            source.webview,
++            StorageIdentifier::IndexedDB,
++            origin.clone(),
++        )
++        .recv()
++        .map_err(|_| BackendError::DbErr("Failed to communicate with client storage.".to_owned()))?
++        .map_err(|error| BackendError::DbErr(format!("Client storage error: {error}")))
++}
++
+ /// <https://w3c.github.io/IndexedDB/#request-open-request>
+ /// Used here to implement the
+ /// <https://w3c.github.io/IndexedDB/#connection-queue>
+@@ -735,6 +753,14 @@ impl OpenRequest {
+         *id
+     }
+ 
++    fn proxy_map(&self) -> &StorageProxyMap {
++        match self {
++            OpenRequest::Open { proxy_map, .. } | OpenRequest::Delete { proxy_map, .. } => {
++                proxy_map
++            },
++        }
++    }
++
+     fn is_open(&self) -> bool {
+         match self {
+             OpenRequest::Open {
+@@ -1287,10 +1313,9 @@ impl IndexedDBManager {
+         &mut self,
+         pending_upgrades: HashMap<String, HashSet<Uuid>>,
+         origin: ImmutableOrigin,
+-        proxy_map: StorageProxyMap,
+     ) {
+         for (name, ids) in pending_upgrades.into_iter() {
+-            let mut upgrade_to_revert: Option<VersionUpgrade> = None;
++            let mut upgrade_to_revert: Option<(VersionUpgrade, StorageProxyMap)> = None;
+             let key = IndexedDBDescription {
+                 name: name.clone(),
+                 origin: origin.clone(),
+@@ -1309,7 +1334,8 @@ impl IndexedDBManager {
+                             if upgrade_to_revert.is_none() &&
+                                 let Some(upgrade) = upgrade
+                             {
+-                                upgrade_to_revert = Some(upgrade);
++                                upgrade_to_revert =
++                                    Some((upgrade, open_request.proxy_map().clone()));
+                             }
+                             false
+                         } else {
+@@ -1322,7 +1348,7 @@ impl IndexedDBManager {
+                     self.connection_queues.remove(&key);
+                 }
+             }
+-            if let Some(upgrade) = upgrade_to_revert {
++            if let Some((upgrade, proxy_map)) = upgrade_to_revert {
+                 self.revert_aborted_upgrade(&key, &upgrade, &proxy_map);
+             }
+         }
+@@ -1336,8 +1362,24 @@ impl IndexedDBManager {
+         db_name: String,
+         version: Option<u64>,
+         id: Uuid,
+-        proxy_map: StorageProxyMap,
++        bottle_source: StorageBottleSource,
+     ) {
++        let proxy_map = match obtain_a_local_storage_bottle_map(&bottle_source, &origin) {
++            Ok(proxy_map) => proxy_map,
++            Err(error) => {
++                if sender
++                    .send(ConnectionMsg::DatabaseError {
++                        name: db_name,
++                        id,
++                        error,
++                    })
++                    .is_err()
++                {
++                    debug!("Script exit during indexeddb database open");
++                }
++                return;
++            },
++        };
+         let key = IndexedDBDescription {
+             name: db_name.clone(),
+             origin,
+@@ -2072,17 +2114,32 @@ impl IndexedDBManager {
+             SyncOperation::CloseDatabase(origin, id, db_name) => {
+                 self.close_database(origin, id, db_name);
+             },
+-            SyncOperation::OpenDatabase(sender, origin, db_name, version, id, proxy_map) => {
+-                self.open_a_database_connection(sender, origin, db_name, version, id, proxy_map);
++            SyncOperation::OpenDatabase(sender, origin, db_name, version, id, bottle_source) => {
++                self.open_a_database_connection(
++                    sender,
++                    origin,
++                    db_name,
++                    version,
++                    id,
++                    bottle_source,
++                );
+             },
+             SyncOperation::AbortPendingUpgrades {
+                 pending_upgrades,
+                 origin,
+-                proxy_map,
+             } => {
+-                self.abort_pending_upgrades(pending_upgrades, origin, proxy_map);
++                self.abort_pending_upgrades(pending_upgrades, origin);
+             },
+-            SyncOperation::DeleteDatabase(callback, origin, db_name, proxy_map, id) => {
++            SyncOperation::DeleteDatabase(callback, origin, db_name, bottle_source, id) => {
++                let proxy_map = match obtain_a_local_storage_bottle_map(&bottle_source, &origin) {
++                    Ok(proxy_map) => proxy_map,
++                    Err(error) => {
++                        if callback.send(Err(error)).is_err() {
++                            debug!("Script went away during pending database delete.");
++                        }
++                        return;
++                    },
++                };
+                 let idb_description = IndexedDBDescription {
+                     origin,
+                     name: db_name,
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index 6cd7ca27527..d7229e0665a 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -16,12 +16,11 @@ use servo_config::prefs;
+ use servo_url::{ImmutableOrigin, ServoUrl};
+ use storage::ClientStorageThreadFactory;
+ use storage_traits::StorageThreads;
+-use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+     BackendError, BackendResult, ConnectionMsg, IndexedDBKeyRange, IndexedDBKeyType,
+     IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, IndexedDBValue,
+-    KeyPath, PutItemResult, SyncOperation, TxnCompleteMsg,
++    KeyPath, PutItemResult, StorageBottleSource, SyncOperation, TxnCompleteMsg,
+ };
+ use tempfile::TempDir;
+ use uuid::Uuid;
+@@ -135,7 +134,7 @@ struct IndexedDbTestContext {
+     _temp_dir: TempDir,
+     private_threads: StorageThreads,
+     public_threads: StorageThreads,
+-    proxy_map: StorageProxyMap,
++    bottle_source: StorageBottleSource,
+     origin: ImmutableOrigin,
+     shutdown: Cell<bool>,
+ }
+@@ -151,23 +150,17 @@ impl IndexedDbTestContext {
+         let (private_threads, public_threads) =
+             storage::new_storage_threads(mem_profiler_chan, Some(config_dir), false);
+         let origin = ServoUrl::parse("https://example.com").unwrap().origin();
+-        let proxy_map = client_handle
+-            .obtain_a_storage_bottle_map(
+-                StorageType::Local,
+-                Some(WebViewId::new(TEST_PAINTER_ID)),
+-                StorageIdentifier::IndexedDB,
+-                origin.clone(),
+-            )
+-            .recv()
+-            .unwrap()
+-            .unwrap();
++        let bottle_source = StorageBottleSource {
++            client_storage: client_handle.clone(),
++            webview: Some(WebViewId::new(TEST_PAINTER_ID)),
++        };
+ 
+         Self {
+             _client_handle: client_handle,
+             _temp_dir: temp_dir,
+             private_threads,
+             public_threads,
+-            proxy_map,
++            bottle_source,
+             origin,
+             shutdown: Cell::new(false),
+         }
+@@ -231,7 +224,7 @@ fn open_database(
+             db_name.to_string(),
+             version,
+             Uuid::new_v4(),
+-            ctx.proxy_map.clone(),
++            ctx.bottle_source.clone(),
+         )),
+     )
+     .unwrap();
+diff --git a/python/tidy/error_message_exceptions.txt b/python/tidy/error_message_exceptions.txt
+index de9136044a6..d4d302e41e8 100644
+--- a/python/tidy/error_message_exceptions.txt
++++ b/python/tidy/error_message_exceptions.txt
+@@ -29,7 +29,7 @@
+ ./components/script/dom/geometry/dommatrixreadonly.rs 3
+ ./components/script/dom/globalscope/messageport.rs 2
+ ./components/script/dom/indexeddb/idbdatabase.rs 13
+-./components/script/dom/indexeddb/idbfactory.rs 9
++./components/script/dom/indexeddb/idbfactory.rs 7
+ ./components/script/dom/indexeddb/idbkeyrange.rs 1
+ ./components/script/dom/indexeddb/idbobjectstore.rs 22
+ ./components/script/dom/indexeddb/idbopendbrequest.rs 1

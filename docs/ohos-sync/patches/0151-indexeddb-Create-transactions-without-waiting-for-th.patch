@@ -1,0 +1,1684 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 13:00:48 +0000
+Subject: [PATCH] indexeddb: Create transactions without waiting for the
+ backend
+
+IDBDatabase.transaction() sent CreateTransaction and blocked the script
+thread until the backend replied with the transaction's id, a number
+from one counter in the manager. Gecko, Chromium and WebKit create
+transactions without a synchronous message.
+
+Transactions are now named by IndexedDBTxnId: the id of their
+connection and a serial number that is unique among the connection's
+transactions. Script numbers the transactions of a connection from 1
+and sends CreateTransaction with the id, without a reply; the backend
+gives the upgrade transaction of an open request serial 0, with the
+request's id, which is also the connection's. Every message about a
+transaction carries the id (commit, abort, requests, schema operations,
+RequestHandled, TransactionFinished, and the replies), so P2.2's
+results per connection can be tagged with it. The manager's global
+counter and the unused UpgradeVersion message are gone.
+
+Transaction scheduling ("created before") follows the order in which
+CreateTransaction messages reach the manager, as Chromium orders them.
+Script sends the message before transaction() returns, ahead of any
+other message about the transaction, and every global's messages reach
+the manager through its one channel. So two transactions whose
+creation is ordered in one global, also on two connections, or across
+globals through anything that orders them (a postMessage, a lock),
+are created in that order in the backend, as with the synchronous
+message before.
+
+A CreateTransaction for a database that is gone is ignored, and
+requests for a database that is gone now fail with DbNotFound instead
+of being dropped; before, script panicked when CreateTransaction
+failed.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 105 passed, 1 skipped, as before (the tests use the new ids; the integration tests create transactions without waiting, like script). Host SpiderMonkey WPT IndexedDB/ plus /_mozilla/IndexedDB/ (8 processes): 3,251 of 4,511 IndexedDB subtests pass, as at P1's tip, and all /_mozilla/ ones; no unexpected result. The transaction-scheduling-*.any.js tests and idbtransaction-oncomplete.any.js, all globals, `--repeat 10 --processes 4`: 170 of 170 OK (plus the expected serviceworker ERRORs).
+AI-assisted: Yes (agent session; the agent wrote the change, adapted the tests, and ran the host tests and WPT)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../script/dom/indexeddb/idbdatabase.rs       |  22 +-
+ components/script/dom/indexeddb/idbfactory.rs |  12 +-
+ .../script/dom/indexeddb/idbobjectstore.rs    |   6 +-
+ .../script/dom/indexeddb/idbopendbrequest.rs  |   6 +-
+ components/script/dom/indexeddb/idbrequest.rs |   4 +-
+ .../script/dom/indexeddb/idbtransaction.rs    | 112 ++++-----
+ components/shared/storage/indexeddb.rs        |  70 ++++--
+ .../storage/indexeddb/backend/engine.rs       |  34 +--
+ components/storage/indexeddb/backend/tests.rs |  29 ++-
+ components/storage/indexeddb/engines/mod.rs   |  14 +-
+ components/storage/indexeddb/mod.rs           | 213 ++++++++++--------
+ components/storage/tests/indexeddb.rs         |  67 ++++--
+ 12 files changed, 332 insertions(+), 257 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbdatabase.rs b/components/script/dom/indexeddb/idbdatabase.rs
+index 9f0ce269f03..c321a79124c 100644
+--- a/components/script/dom/indexeddb/idbdatabase.rs
++++ b/components/script/dom/indexeddb/idbdatabase.rs
+@@ -10,7 +10,9 @@ use script_bindings::cell::DomRefCell;
+ use script_bindings::domstring::TracedDOMString;
+ use script_bindings::reflector::reflect_dom_object;
+ use servo_base::generic_channel::{GenericSend, GenericSender};
+-use storage_traits::indexeddb::{AsyncSchemaOperation, IndexedDBThreadMsg, KeyPath, SyncOperation};
++use storage_traits::indexeddb::{
++    AsyncSchemaOperation, IndexedDBThreadMsg, IndexedDBTxnId, KeyPath, SyncOperation,
++};
+ use stylo_atoms::Atom;
+ use uuid::Uuid;
+ 
+@@ -46,6 +48,9 @@ pub struct IDBDatabase {
+ 
+     #[no_trace]
+     id: Uuid,
++    /// The serial number of the next transaction this connection creates; 0 is its upgrade
++    /// transaction's.
++    next_transaction_serial: Cell<u64>,
+ 
+     // Flags
+     /// <https://w3c.github.io/IndexedDB/#connection-close-pending-flag>
+@@ -68,6 +73,7 @@ impl IDBDatabase {
+                 object_store_names.into_iter().map(Into::into).collect(),
+             ),
+             upgrade_transaction: Default::default(),
++            next_transaction_serial: Cell::new(1),
+             close_pending: Cell::new(false),
+         }
+     }
+@@ -100,6 +106,16 @@ impl IDBDatabase {
+         self.name.clone().root()
+     }
+ 
++    /// The id of a new transaction of this connection, unique among them.
++    pub(crate) fn allocate_transaction_id(&self) -> IndexedDBTxnId {
++        let serial = self.next_transaction_serial.get();
++        self.next_transaction_serial.set(serial + 1);
++        IndexedDBTxnId {
++            connection: self.id,
++            serial,
++        }
++    }
++
+     pub fn object_stores(&self, cx: &mut JSContext) -> DomRoot<DOMStringList> {
+         DOMStringList::new(
+             cx,
+@@ -376,7 +392,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+                 database_name: self.name.to_string(),
+                 store_name: name.to_string(),
+                 operation,
+-                transaction_serial_number: transaction.get_serial_number(),
++                transaction: transaction.id(),
+             })
+             .unwrap();
+ 
+@@ -426,7 +442,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+                 database_name: self.name.to_string(),
+                 store_name: name.to_string(),
+                 operation,
+-                transaction_serial_number: transaction.get_serial_number(),
++                transaction: transaction.id(),
+             })
+             .unwrap();
+ 
+diff --git a/components/script/dom/indexeddb/idbfactory.rs b/components/script/dom/indexeddb/idbfactory.rs
+index 63a0de4e88d..b59eedf99bf 100644
+--- a/components/script/dom/indexeddb/idbfactory.rs
++++ b/components/script/dom/indexeddb/idbfactory.rs
+@@ -14,8 +14,8 @@ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use servo_base::generic_channel::GenericSend;
+ use servo_url::origin::ImmutableOrigin;
+ use storage_traits::indexeddb::{
+-    BackendResult, ConnectionMsg, DatabaseInfo, IndexedDBThreadMsg, StorageBottleSource,
+-    SyncOperation,
++    BackendResult, ConnectionMsg, DatabaseInfo, IndexedDBThreadMsg, IndexedDBTxnId,
++    StorageBottleSource, SyncOperation,
+ };
+ use stylo_atoms::Atom;
+ use uuid::Uuid;
+@@ -157,7 +157,7 @@ impl IDBFactory {
+         true
+     }
+ 
+-    pub(crate) fn maybe_commit_txn(&self, cx: &mut JSContext, db_name: &str, txn_serial: u64) {
++    pub(crate) fn maybe_commit_txn(&self, cx: &mut JSContext, db_name: &str, txn: IndexedDBTxnId) {
+         let key = DBName(db_name.to_string());
+         let snapshot: Vec<DomRoot<IDBTransaction>> = {
+             let map = self.indexeddb_transactions.borrow();
+@@ -167,9 +167,9 @@ impl IDBFactory {
+             bucket.iter().map(|t| DomRoot::from_ref(&**t)).collect()
+         };
+ 
+-        for txn in snapshot {
+-            if txn.get_serial_number() == txn_serial {
+-                txn.maybe_commit(cx);
++        for transaction in snapshot {
++            if transaction.id() == txn {
++                transaction.maybe_commit(cx);
+                 break;
+             }
+         }
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index 60303b75097..c780e48b21b 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -565,7 +565,7 @@ impl IDBObjectStore {
+                 database_name: self.db_name.to_string(),
+                 store_name: self.name.borrow().clone().into(),
+                 operation,
+-                transaction_serial_number: self.transaction.get_serial_number(),
++                transaction: self.transaction.id(),
+             })
+             .is_err()
+         {
+@@ -987,7 +987,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+                 database_name: self.db_name.to_string(),
+                 store_name: self.name.borrow().clone().into(),
+                 operation,
+-                transaction_serial_number: self.transaction.get_serial_number(),
++                transaction: self.transaction.id(),
+             })
+             .is_err()
+         {
+@@ -1030,7 +1030,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+                 database_name: self.db_name.to_string(),
+                 store_name: self.name.borrow().clone().into(),
+                 operation,
+-                transaction_serial_number: self.transaction.get_serial_number(),
++                transaction: self.transaction.id(),
+             })
+             .is_err()
+         {
+diff --git a/components/script/dom/indexeddb/idbopendbrequest.rs b/components/script/dom/indexeddb/idbopendbrequest.rs
+index 038e3609309..1b56619ae18 100644
+--- a/components/script/dom/indexeddb/idbopendbrequest.rs
++++ b/components/script/dom/indexeddb/idbopendbrequest.rs
+@@ -11,7 +11,7 @@ use profile_traits::generic_callback::GenericCallback;
+ use script_bindings::reflector::reflect_dom_object;
+ use servo_base::generic_channel::GenericSend;
+ use servo_url::origin::ImmutableOrigin;
+-use storage_traits::indexeddb::{BackendResult, IndexedDBThreadMsg, SyncOperation};
++use storage_traits::indexeddb::{BackendResult, IndexedDBThreadMsg, IndexedDBTxnId, SyncOperation};
+ use stylo_atoms::Atom;
+ use uuid::Uuid;
+ 
+@@ -164,13 +164,13 @@ impl IDBOpenDBRequest {
+         connection: &IDBDatabase,
+         old_version: u64,
+         version: u64,
+-        transaction: u64,
++        transaction: IndexedDBTxnId,
+     ) {
+         let global = self.global();
+ 
+         let scope = connection.object_stores(cx);
+ 
+-        let transaction = IDBTransaction::new_with_serial(
++        let transaction = IDBTransaction::new_with_id(
+             cx,
+             &global,
+             connection,
+diff --git a/components/script/dom/indexeddb/idbrequest.rs b/components/script/dom/indexeddb/idbrequest.rs
+index 839b6f932bb..1ac6a14787b 100644
+--- a/components/script/dom/indexeddb/idbrequest.rs
++++ b/components/script/dom/indexeddb/idbrequest.rs
+@@ -137,7 +137,7 @@ impl RequestListener {
+             SyncOperation::RequestHandled {
+                 origin: global.origin().immutable().clone(),
+                 db_name: String::from(transaction.get_db_name()),
+-                txn: transaction.get_serial_number(),
++                txn: transaction.id(),
+                 request_id,
+             },
+         ));
+@@ -562,7 +562,7 @@ impl IDBRequest {
+                 global.origin().immutable().clone(),
+                 String::from(transaction.get_db_name()),
+                 String::from(source.get_name()),
+-                transaction.get_serial_number(),
++                transaction.id(),
+                 request_id,
+                 transaction_mode,
+                 operation,
+diff --git a/components/script/dom/indexeddb/idbtransaction.rs b/components/script/dom/indexeddb/idbtransaction.rs
+index 029493b64d8..b459e7f2306 100644
+--- a/components/script/dom/indexeddb/idbtransaction.rs
++++ b/components/script/dom/indexeddb/idbtransaction.rs
+@@ -16,8 +16,8 @@ use script_bindings::reflector::reflect_dom_object;
+ use servo_base::generic_channel::{GenericSend, GenericSender, SendError};
+ use servo_base::id::ScriptEventLoopId;
+ use storage_traits::indexeddb::{
+-    BackendError, IndexedDBIndex, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath, SyncOperation,
+-    TxnCompleteMsg,
++    BackendError, IndexedDBIndex, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode, KeyPath,
++    SyncOperation, TxnCompleteMsg,
+ };
+ use stylo_atoms::Atom;
+ 
+@@ -84,9 +84,9 @@ pub struct IDBTransaction {
+     next_unhandled_request_id: Cell<u64>,
+     handled_pending: DomRefCell<HashSet<u64>>,
+ 
+-    // An unique identifier, used to commit and revert this transaction
+-    // FIXME:(rasviitanen) Replace this with a channel
+-    serial_number: u64,
++    /// The id the backend knows this transaction by.
++    #[no_trace]
++    id: IndexedDBTxnId,
+ }
+ 
+ impl IDBTransaction {
+@@ -95,7 +95,7 @@ impl IDBTransaction {
+         mode: IDBTransactionMode,
+         durability: IDBTransactionDurability,
+         scope: &DOMStringList,
+-        serial_number: u64,
++        id: IndexedDBTxnId,
+     ) -> IDBTransaction {
+         IDBTransaction {
+             eventtarget: EventTarget::new_inherited(),
+@@ -129,11 +129,12 @@ impl IDBTransaction {
+             next_request_id: Cell::new(0),
+             next_unhandled_request_id: Cell::new(0),
+             handled_pending: Default::default(),
+-            serial_number,
++            id,
+         }
+     }
+ 
+-    /// Does a blocking call to create a backend transaction and get its id.
++    /// Creates a readonly or readwrite transaction of `connection`, and tells the backend about
++    /// it without waiting for a reply.
+     pub fn new(
+         cx: &mut JSContext,
+         global: &GlobalScope,
+@@ -142,72 +143,53 @@ impl IDBTransaction {
+         durability: IDBTransactionDurability,
+         scope: &DOMStringList,
+     ) -> DomRoot<IDBTransaction> {
+-        let serial_number =
+-            IDBTransaction::create_transaction(global, connection.get_name(), mode, scope);
+-        IDBTransaction::new_with_serial(
+-            cx,
+-            global,
+-            connection,
+-            mode,
+-            durability,
+-            scope,
+-            serial_number,
+-        )
++        let id = connection.allocate_transaction_id();
++        let backend_mode = match mode {
++            IDBTransactionMode::Readonly => IndexedDBTxnMode::Readonly,
++            IDBTransactionMode::Readwrite => IndexedDBTxnMode::Readwrite,
++            IDBTransactionMode::Versionchange => IndexedDBTxnMode::Versionchange,
++        };
++        let backend_scope = (0..scope.Length())
++            .filter_map(|i| scope.Item(i))
++            .map(String::from)
++            .collect();
++        // https://w3c.github.io/IndexedDB/#transaction-scheduling
++        // The backend orders transactions by the arrival of this message, which is sent before
++        // any other message about the transaction.
++        if global
++            .storage_threads()
++            .send(IndexedDBThreadMsg::Sync(SyncOperation::CreateTransaction {
++                origin: global.origin().immutable().clone(),
++                db_name: String::from(connection.get_name()),
++                txn: id,
++                mode: backend_mode,
++                scope: backend_scope,
++            }))
++            .is_err()
++        {
++            error!("Failed to send SyncOperation::CreateTransaction");
++        }
++        IDBTransaction::new_with_id(cx, global, connection, mode, durability, scope, id)
+     }
+ 
+-    pub(crate) fn new_with_serial(
++    pub(crate) fn new_with_id(
+         cx: &mut JSContext,
+         global: &GlobalScope,
+         connection: &IDBDatabase,
+         mode: IDBTransactionMode,
+         durability: IDBTransactionDurability,
+         scope: &DOMStringList,
+-        serial_number: u64,
++        id: IndexedDBTxnId,
+     ) -> DomRoot<IDBTransaction> {
+         reflect_dom_object(
+             cx,
+             Box::new(IDBTransaction::new_inherited(
+-                connection,
+-                mode,
+-                durability,
+-                scope,
+-                serial_number,
++                connection, mode, durability, scope, id,
+             )),
+             global,
+         )
+     }
+ 
+-    fn create_transaction(
+-        global: &GlobalScope,
+-        db_name: DOMString,
+-        mode: IDBTransactionMode,
+-        scope: &DOMStringList,
+-    ) -> u64 {
+-        let backend_mode = match mode {
+-            IDBTransactionMode::Readonly => IndexedDBTxnMode::Readonly,
+-            IDBTransactionMode::Readwrite => IndexedDBTxnMode::Readwrite,
+-            IDBTransactionMode::Versionchange => IndexedDBTxnMode::Versionchange,
+-        };
+-        let scope: Vec<String> = (0..scope.Length())
+-            .filter_map(|i| scope.Item(i))
+-            .map(String::from)
+-            .collect();
+-        let (sender, receiver) = channel(global.time_profiler_chan().clone()).unwrap();
+-
+-        global
+-            .storage_threads()
+-            .send(IndexedDBThreadMsg::Sync(SyncOperation::CreateTransaction {
+-                sender,
+-                origin: global.origin().immutable().clone(),
+-                db_name: String::from(db_name),
+-                mode: backend_mode,
+-                scope,
+-            }))
+-            .expect("Failed to send IndexedDBThreadMsg::Sync");
+-
+-        receiver.recv().unwrap().expect("CreateTransaction failed")
+-    }
+-
+     /// <https://w3c.github.io/IndexedDB/#transaction-lifecycle>
+     pub fn set_active_flag(&self, status: bool) {
+         // inactive
+@@ -357,7 +339,7 @@ impl IDBTransaction {
+             callback,
+             global.origin().immutable().clone(),
+             String::from(self.db.get_name()),
+-            self.serial_number,
++            self.id,
+         );
+ 
+         // https://w3c.github.io/IndexedDB/#transaction-lifecycle
+@@ -435,8 +417,8 @@ impl IDBTransaction {
+         &self.db
+     }
+ 
+-    pub fn get_serial_number(&self) -> u64 {
+-        self.serial_number
++    pub(crate) fn id(&self) -> IndexedDBTxnId {
++        self.id
+     }
+ 
+     pub(crate) fn issued_count(&self) -> u64 {
+@@ -551,7 +533,7 @@ impl IDBTransaction {
+             callback,
+             global.origin().immutable().clone(),
+             String::from(self.db.get_name()),
+-            self.serial_number,
++            self.id,
+         );
+         let _ = self
+             .get_idb_thread()
+@@ -574,7 +556,7 @@ impl IDBTransaction {
+                 callback,
+                 self.global().origin().immutable().clone(),
+                 String::from(self.db.get_name()),
+-                self.serial_number,
++                self.id,
+             )));
+         self.notify_backend_transaction_finished();
+     }
+@@ -585,7 +567,7 @@ impl IDBTransaction {
+             SyncOperation::TransactionFinished {
+                 origin: global.origin().immutable().clone(),
+                 db_name: String::from(self.db.get_name()),
+-                txn: self.serial_number,
++                txn: self.id,
+             },
+         ));
+     }
+@@ -628,7 +610,7 @@ impl IDBTransaction {
+                         .clear_open_request_transaction_for_txn(&this);
+                     let origin = this.global().origin().immutable().clone();
+                     let db_name = String::from(this.db.get_name());
+-                    let txn = this.serial_number;
++                    let txn = this.id;
+                     let _ = this.get_idb_thread().send(IndexedDBThreadMsg::Sync(
+                         SyncOperation::UpgradeTransactionFinished {
+                             origin,
+@@ -698,7 +680,7 @@ impl IDBTransaction {
+                         .clear_open_request_transaction_for_txn(&this);
+                     let origin = this.global().origin().immutable().clone();
+                     let db_name = String::from(this.db.get_name());
+-                    let txn = this.serial_number;
++                    let txn = this.id;
+                     let _ = this.get_idb_thread().send(IndexedDBThreadMsg::Sync(
+                         SyncOperation::UpgradeTransactionFinished {
+                             origin,
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index db7879cc8fc..9d596ff92e9 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -67,6 +67,32 @@ pub enum KeyPath {
+     Sequence(Vec<String>),
+ }
+ 
++/// A transaction: its connection, and a serial number that is unique among the transactions of
++/// the connection. The backend numbers the upgrade transaction of an open request 0
++/// ([`IndexedDBTxnId::upgrade`]); script numbers the transactions it creates from 1.
++#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
++pub struct IndexedDBTxnId {
++    /// The id of the connection, which is also the id of the request that opened it.
++    pub connection: Uuid,
++    pub serial: u64,
++}
++
++impl IndexedDBTxnId {
++    /// The upgrade transaction of the connection `connection`.
++    pub fn upgrade(connection: Uuid) -> Self {
++        Self {
++            connection,
++            serial: 0,
++        }
++    }
++}
++
++impl Display for IndexedDBTxnId {
++    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
++        write!(f, "{}/{}", self.connection, self.serial)
++    }
++}
++
+ // https://www.w3.org/TR/IndexedDB-3/#enumdef-idbtransactionmode
+ #[derive(Clone, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+ pub enum IndexedDBTxnMode {
+@@ -495,7 +521,7 @@ pub enum ConnectionMsg {
+         id: Uuid,
+         version: u64,
+         old_version: u64,
+-        transaction: u64,
++        transaction: IndexedDBTxnId,
+         // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps
+         // Step 3. Set transaction’s scope to connection’s object store set.
+         object_store_names: Vec<String>,
+@@ -523,14 +549,17 @@ pub enum ConnectionMsg {
+         error: BackendError,
+     },
+     /// Ask script to recheck whether a transaction can commit now.
+-    TxnMaybeCommit { db_name: String, txn: u64 },
++    TxnMaybeCommit {
++        db_name: String,
++        txn: IndexedDBTxnId,
++    },
+ }
+ 
+ #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+ pub struct TxnCompleteMsg {
+     pub origin: ImmutableOrigin,
+     pub db_name: String,
+-    pub txn: u64,
++    pub txn: IndexedDBTxnId,
+     pub result: BackendResult<()>,
+ }
+ 
+@@ -556,15 +585,6 @@ pub enum SyncOperation {
+         GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
+         ImmutableOrigin,
+     ),
+-    /// Upgrades the version of the database
+-    UpgradeVersion(
+-        /// Sender to send new version as the result of the operation
+-        GenericSender<BackendResult<u64>>,
+-        ImmutableOrigin,
+-        String, // Database
+-        u64,    // Serial number for the transaction
+-        u64,    // Version to upgrade to
+-    ),
+     /// Get object store info
+     GetObjectStore(
+         GenericSender<BackendResult<IndexedDBObjectStore>>,
+@@ -577,20 +597,20 @@ pub enum SyncOperation {
+         GenericCallback<TxnCompleteMsg>,
+         ImmutableOrigin,
+         String, // Database
+-        u64,    // Transaction serial number
++        IndexedDBTxnId,
+     ),
+     /// Aborts a transaction in the backend
+     Abort(
+         GenericCallback<TxnCompleteMsg>,
+         ImmutableOrigin,
+         String, // Database
+-        u64,    // Transaction serial number
++        IndexedDBTxnId,
+     ),
+     /// Upgrade transaction finished after its event was fired in script.
+     UpgradeTransactionFinished {
+         origin: ImmutableOrigin,
+         db_name: String,
+-        txn: u64,
++        txn: IndexedDBTxnId,
+         committed: bool,
+     },
+     /// <https://w3c.github.io/IndexedDB/#transaction-lifetime
+@@ -603,13 +623,17 @@ pub enum SyncOperation {
+     RequestHandled {
+         origin: ImmutableOrigin,
+         db_name: String,
+-        txn: u64,
++        txn: IndexedDBTxnId,
+         request_id: u64,
+     },
++    /// <https://w3c.github.io/IndexedDB/#dom-idbdatabase-transaction>: a transaction was created
++    /// with the id script gave it. Transactions are created before each other in the order in
++    /// which their messages reach the backend, see
++    /// <https://w3c.github.io/IndexedDB/#transaction-scheduling>.
+     CreateTransaction {
+-        sender: GenericSender<BackendResult<u64>>,
+         origin: ImmutableOrigin,
+         db_name: String,
++        txn: IndexedDBTxnId,
+         mode: IndexedDBTxnMode,
+         scope: Vec<String>,
+     },
+@@ -617,12 +641,12 @@ pub enum SyncOperation {
+     TxnMaybeCommit {
+         origin: ImmutableOrigin,
+         db_name: String,
+-        txn: u64,
++        txn: IndexedDBTxnId,
+     },
+     TransactionFinished {
+         origin: ImmutableOrigin,
+         db_name: String,
+-        txn: u64,
++        txn: IndexedDBTxnId,
+     },
+ 
+     CloseDatabase(
+@@ -688,8 +712,8 @@ pub enum IndexedDBThreadMsg {
+         ImmutableOrigin,
+         String, // Database
+         String, // ObjectStore
+-        u64,    // Serial number of the transaction that requests this operation
+-        u64,    // Monotonic request id in the transaction
++        IndexedDBTxnId,
++        u64, // Monotonic request id in the transaction
+         IndexedDBTxnMode,
+         AsyncOperation,
+     ),
+@@ -698,12 +722,12 @@ pub enum IndexedDBThreadMsg {
+         database_name: String,
+         store_name: String,
+         operation: AsyncSchemaOperation,
+-        transaction_serial_number: u64,
++        transaction: IndexedDBTxnId,
+     },
+     EngineTxnBatchComplete {
+         origin: ImmutableOrigin,
+         db_name: String,
+-        txn: u64,
++        txn: IndexedDBTxnId,
+     },
+ 
+     /// Measure memory used by this thread and send the report over the provided channel.
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index cd58e511ff4..0169884b773 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
+ use servo_base::threadpool::ThreadPool;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+-    BackendError, BackendResult, IndexedDBIndex, IndexedDBTxnMode, KeyPath,
++    BackendError, BackendResult, IndexedDBIndex, IndexedDBTxnId, IndexedDBTxnMode, KeyPath,
+ };
+ 
+ use super::executor::{SqlError, SqlExecutor, TransactionBehavior};
+@@ -275,21 +275,21 @@ impl<X: SqlExecutor> Actor<X> {
+ pub(super) struct Database<X> {
+     executor: X,
+     /// The readwrite or versionchange transaction whose SQL transaction is open.
+-    writer: Option<u64>,
++    writer: Option<IndexedDBTxnId>,
+     /// The upgrade transaction that hasn't begun yet, and the version it sets when it begins.
+-    upgrade: Option<(u64, u64)>,
++    upgrade: Option<(IndexedDBTxnId, u64)>,
+     /// The upgrade transaction, whose commit changes the metadata.
+-    versionchange: Option<u64>,
++    versionchange: Option<IndexedDBTxnId>,
+     /// The metadata as of the last commit, which the [`SqlEngine`] reads.
+     metadata: Arc<Mutex<Metadata>>,
+     /// Transactions whose changes were rolled back by a failure, with the error that their later
+     /// requests and their commit report, until the transaction aborts.
+-    failed: FxHashMap<u64, BackendError>,
++    failed: FxHashMap<IndexedDBTxnId, BackendError>,
+ }
+ 
+ impl<X: SqlExecutor> Database<X> {
+     /// Runs the requests of a batch in order and replies to each as it has run.
+-    fn run_batch(&mut self, transaction: u64, batch: KvsTransaction) {
++    fn run_batch(&mut self, transaction: IndexedDBTxnId, batch: KvsTransaction) {
+         let writes = batch.mode != IndexedDBTxnMode::Readonly;
+         for request in batch.requests {
+             if let Some(error) = self.failed.get(&transaction) {
+@@ -329,7 +329,7 @@ impl<X: SqlExecutor> Database<X> {
+     /// Begins the SQL transaction of the readwrite or versionchange `transaction`, unless it is
+     /// open already. An upgrade transaction sets the database's version when it begins. On
+     /// failure, the transaction has failed.
+-    fn begin(&mut self, transaction: u64) -> Result<(), BackendError> {
++    fn begin(&mut self, transaction: IndexedDBTxnId) -> Result<(), BackendError> {
+         self.notice_ended_transaction(ended_early);
+         if let Some(error) = self.failed.get(&transaction) {
+             return Err(error.clone());
+@@ -363,7 +363,7 @@ impl<X: SqlExecutor> Database<X> {
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>
+-    fn commit(&mut self, transaction: u64) -> BackendResult<()> {
++    fn commit(&mut self, transaction: IndexedDBTxnId) -> BackendResult<()> {
+         let changes_metadata = self
+             .versionchange
+             .take_if(|versionchange| *versionchange == transaction)
+@@ -410,7 +410,7 @@ impl<X: SqlExecutor> Database<X> {
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#abort-a-transaction>
+-    fn abort(&mut self, transaction: u64) {
++    fn abort(&mut self, transaction: IndexedDBTxnId) {
+         self.failed.remove(&transaction);
+         if self
+             .upgrade
+@@ -428,12 +428,12 @@ impl<X: SqlExecutor> Database<X> {
+     }
+ 
+     /// Rolls back `transaction`, and fails its later requests and its commit with `error`.
+-    fn fail(&mut self, transaction: u64, error: BackendError) {
++    fn fail(&mut self, transaction: IndexedDBTxnId, error: BackendError) {
+         self.roll_back(transaction);
+         self.failed.insert(transaction, error);
+     }
+ 
+-    fn roll_back(&mut self, transaction: u64) {
++    fn roll_back(&mut self, transaction: IndexedDBTxnId) {
+         if self.writer != Some(transaction) {
+             return;
+         }
+@@ -460,7 +460,7 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
+ 
+     fn process_transaction(
+         &self,
+-        transaction: u64,
++        transaction: IndexedDBTxnId,
+         batch: KvsTransaction,
+         on_complete: Box<dyn FnOnce() + Send + 'static>,
+     ) {
+@@ -470,19 +470,23 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
+         });
+     }
+ 
+-    fn upgrade_version(&self, transaction: u64, version: u64) {
++    fn upgrade_version(&self, transaction: IndexedDBTxnId, version: u64) {
+         self.actor.spawn(move |database| {
+             database.upgrade = Some((transaction, version));
+             database.versionchange = Some(transaction);
+         });
+     }
+ 
+-    fn commit(&self, transaction: u64, on_done: Box<dyn FnOnce(BackendResult<()>) + Send>) {
++    fn commit(
++        &self,
++        transaction: IndexedDBTxnId,
++        on_done: Box<dyn FnOnce(BackendResult<()>) + Send>,
++    ) {
+         self.actor
+             .spawn(move |database| on_done(database.commit(transaction)));
+     }
+ 
+-    fn rollback(&self, transaction: u64, on_done: Box<dyn FnOnce() + Send>) {
++    fn rollback(&self, transaction: IndexedDBTxnId, on_done: Box<dyn FnOnce() + Send>) {
+         self.actor.spawn(move |database| {
+             database.abort(transaction);
+             on_done();
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index 8902a54f653..6d98d15acb6 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -16,10 +16,11 @@ use servo_url::ImmutableOrigin;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+     BackendError, BackendResult, CreateObjectResult, IndexedDBKeyRange, IndexedDBKeyType,
+-    IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
++    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
+ };
+ use tempfile::TempDir;
+ use url::Host;
++use uuid::Uuid;
+ 
+ use super::engine::SqlEngine;
+ use super::executor::{
+@@ -110,6 +111,14 @@ executor_tests!(
+ 
+ const TIMEOUT: Duration = Duration::from_secs(10);
+ 
++/// The transaction numbered `serial` of a test connection.
++pub(crate) fn txn(serial: u64) -> IndexedDBTxnId {
++    IndexedDBTxnId {
++        connection: Uuid::nil(),
++        serial,
++    }
++}
++
+ fn test_origin() -> ImmutableOrigin {
+     ImmutableOrigin::Tuple(
+         "test_origin".to_string(),
+@@ -876,7 +885,7 @@ fn run_batch<X: SqlExecutor>(
+ ) {
+     let (done_sender, done_receiver) = mpsc::channel();
+     db.process_transaction(
+-        transaction,
++        txn(transaction),
+         KvsTransaction {
+             mode,
+             requests: VecDeque::from(requests),
+@@ -895,7 +904,7 @@ fn commit<X: SqlExecutor>(db: &SqlEngine<X>, transaction: u64) -> BackendResult<
+     let (sender, receiver) = mpsc::channel();
+     KvsEngine::commit(
+         db,
+-        transaction,
++        txn(transaction),
+         Box::new(move |result| {
+             let _ = sender.send(result);
+         }),
+@@ -909,7 +918,7 @@ fn commit<X: SqlExecutor>(db: &SqlEngine<X>, transaction: u64) -> BackendResult<
+ fn abort<X: SqlExecutor>(db: &SqlEngine<X>, transaction: u64) {
+     let (sender, receiver) = mpsc::channel();
+     db.rollback(
+-        transaction,
++        txn(transaction),
+         Box::new(move || {
+             let _ = sender.send(());
+         }),
+@@ -1538,7 +1547,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+     let schema =
+         |store_name: &str, operation| request(store_name, AsyncOperation::Schema(operation));
+     let put = get_callback();
+-    db.upgrade_version(2, 2);
++    db.upgrade_version(txn(2), 2);
+     run_batch(
+         &db,
+         2,
+@@ -1751,7 +1760,7 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
+     for (transaction, mode, requests) in batches {
+         let done_sender = done_sender.clone();
+         db.process_transaction(
+-            transaction,
++            txn(transaction),
+             KvsTransaction {
+                 mode,
+                 requests: VecDeque::from(requests),
+@@ -1824,7 +1833,7 @@ fn test_two_databases_progress_independently<X: SqlExecutor>() {
+     });
+     let get = get_callback();
+     busy.process_transaction(
+-        2,
++        txn(2),
+         KvsTransaction {
+             mode: IndexedDBTxnMode::Readonly,
+             requests: VecDeque::from([get_request(get.0, 1.0)]),
+@@ -2198,7 +2207,7 @@ fn test_batches_reply_in_dispatch_order<X: SqlExecutor>() {
+     for id in 0..8 {
+         let done_sender = done_sender.clone();
+         db.process_transaction(
+-            id.into(),
++            txn(id.into()),
+             KvsTransaction {
+                 mode: IndexedDBTxnMode::Readonly,
+                 requests: VecDeque::from([get_request(tagged(&order_sender, id), 1.0)]),
+@@ -2284,12 +2293,12 @@ fn test_metadata_reads_do_not_wait_for_the_connection<X: SqlExecutor>() {
+ fn test_upgrade_without_requests_sets_the_version_at_commit<X: SqlExecutor>() {
+     let dir = tempfile::tempdir().unwrap();
+     let db = open_engine::<X>(&dir);
+-    db.upgrade_version(1, 2);
++    db.upgrade_version(txn(1), 2);
+     assert_eq!(commit(&db, 1), Ok(()));
+     assert_eq!(queries::version(&mut *db.connection()).unwrap(), 2);
+     assert_eq!(db.version().unwrap(), 2);
+ 
+-    db.upgrade_version(2, 3);
++    db.upgrade_version(txn(2), 3);
+     abort(&db, 2);
+     assert_eq!(db.version().unwrap(), 2);
+     let mut connection = db.connection();
+diff --git a/components/storage/indexeddb/engines/mod.rs b/components/storage/indexeddb/engines/mod.rs
+index 68c7e2eb9c3..db386353489 100644
+--- a/components/storage/indexeddb/engines/mod.rs
++++ b/components/storage/indexeddb/engines/mod.rs
+@@ -7,7 +7,7 @@ use std::collections::VecDeque;
+ use malloc_size_of::MallocSizeOf;
+ use malloc_size_of_derive::MallocSizeOf;
+ use storage_traits::indexeddb::{
+-    AsyncOperation, BackendResult, IndexedDBIndex, IndexedDBTxnMode, KeyPath,
++    AsyncOperation, BackendResult, IndexedDBIndex, IndexedDBTxnId, IndexedDBTxnMode, KeyPath,
+ };
+ 
+ pub(crate) use crate::indexeddb::backend::ActiveKvsEngine;
+@@ -39,22 +39,26 @@ pub trait KvsEngine: MallocSizeOf {
+     /// `on_complete` once they have run.
+     fn process_transaction(
+         &self,
+-        transaction: u64,
++        transaction: IndexedDBTxnId,
+         batch: KvsTransaction,
+         on_complete: Box<dyn FnOnce() + Send + 'static>,
+     );
+ 
+     /// Makes the database's version `version` as part of the upgrade `transaction`, so that
+     /// aborting the transaction reverts it.
+-    fn upgrade_version(&self, transaction: u64, version: u64);
++    fn upgrade_version(&self, transaction: IndexedDBTxnId, version: u64);
+ 
+     /// Commits `transaction` after all work handed over before, and calls `on_done` with the
+     /// result once it is durable or has failed.
+-    fn commit(&self, transaction: u64, on_done: Box<dyn FnOnce(BackendResult<()>) + Send>);
++    fn commit(
++        &self,
++        transaction: IndexedDBTxnId,
++        on_done: Box<dyn FnOnce(BackendResult<()>) + Send>,
++    );
+ 
+     /// Undoes everything `transaction` changed, after all work handed over before, and calls
+     /// `on_done` once it is undone.
+-    fn rollback(&self, transaction: u64, on_done: Box<dyn FnOnce() + Send>);
++    fn rollback(&self, transaction: IndexedDBTxnId, on_done: Box<dyn FnOnce() + Send>);
+ 
+     // The metadata reads answer as of the last commit, without waiting for the work handed over.
+     fn has_key_generator(&self, store_name: &str) -> bool;
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index fc01a072abe..d6a6299a277 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -28,8 +28,8 @@ use servo_url::origin::ImmutableOrigin;
+ use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
+ use storage_traits::indexeddb::{
+     AsyncOperation, BackendError, BackendResult, ConnectionMsg, DatabaseInfo, DbResult,
+-    IndexedDBIndex, IndexedDBObjectStore, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath,
+-    StorageBottleSource, SyncOperation, TxnCompleteMsg,
++    IndexedDBIndex, IndexedDBObjectStore, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode,
++    KeyPath, StorageBottleSource, SyncOperation, TxnCompleteMsg,
+ };
+ use uuid::Uuid;
+ 
+@@ -88,20 +88,20 @@ struct TxnInfo {
+ struct IndexedDBEnvironment<E: KvsEngine> {
+     engine: E,
+     manager_sender: GenericSender<IndexedDBThreadMsg>,
+-    transactions: FxHashMap<u64, KvsTransaction>,
++    transactions: FxHashMap<IndexedDBTxnId, KvsTransaction>,
+     next_created_seq: u64,
+-    txn_info: FxHashMap<u64, TxnInfo>,
+-    queued_readwrite: VecDeque<u64>,
+-    queued_readonly: VecDeque<u64>,
++    txn_info: FxHashMap<IndexedDBTxnId, TxnInfo>,
++    queued_readwrite: VecDeque<IndexedDBTxnId>,
++    queued_readonly: VecDeque<IndexedDBTxnId>,
+     // Fast membership checks + de-dup for queued_*.
+-    queued_readwrite_set: FxHashSet<u64>,
+-    queued_readonly_set: FxHashSet<u64>,
+-    running_readwrite: Option<u64>,
+-    running_readonly: HashSet<u64>,
+-    handled_next_unhandled_request_id: FxHashMap<u64, u64>,
+-    handled_pending: FxHashMap<u64, HashSet<u64>>,
+-    pending_commit_callbacks: FxHashMap<u64, Vec<GenericCallback<TxnCompleteMsg>>>,
+-    pending_abort_callbacks: FxHashMap<u64, Vec<GenericCallback<TxnCompleteMsg>>>,
++    queued_readwrite_set: FxHashSet<IndexedDBTxnId>,
++    queued_readonly_set: FxHashSet<IndexedDBTxnId>,
++    running_readwrite: Option<IndexedDBTxnId>,
++    running_readonly: HashSet<IndexedDBTxnId>,
++    handled_next_unhandled_request_id: FxHashMap<IndexedDBTxnId, u64>,
++    handled_pending: FxHashMap<IndexedDBTxnId, HashSet<u64>>,
++    pending_commit_callbacks: FxHashMap<IndexedDBTxnId, Vec<GenericCallback<TxnCompleteMsg>>>,
++    pending_abort_callbacks: FxHashMap<IndexedDBTxnId, Vec<GenericCallback<TxnCompleteMsg>>>,
+ }
+ 
+ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+@@ -128,7 +128,12 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         }
+     }
+ 
+-    fn register_transaction(&mut self, txn: u64, mode: IndexedDBTxnMode, scope: Vec<String>) {
++    fn register_transaction(
++        &mut self,
++        txn: IndexedDBTxnId,
++        mode: IndexedDBTxnMode,
++        scope: Vec<String>,
++    ) {
+         if self.txn_info.contains_key(&txn) {
+             return;
+         }
+@@ -168,7 +173,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         a.scope.iter().any(|store| b.scope.contains(store))
+     }
+ 
+-    fn earlier_overlapping_live_exists<F>(&self, transaction: u64, predicate: F) -> bool
++    fn earlier_overlapping_live_exists<F>(&self, transaction: IndexedDBTxnId, predicate: F) -> bool
+     where
+         F: Fn(&TxnInfo) -> bool,
+     {
+@@ -188,7 +193,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         })
+     }
+ 
+-    fn can_start_by_spec(&self, txn: u64) -> bool {
++    fn can_start_by_spec(&self, txn: IndexedDBTxnId) -> bool {
+         let Some(info) = self.txn_info.get(&txn) else {
+             return false;
+         };
+@@ -206,7 +211,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+     /// Whether a readwrite or versionchange transaction other than `txn` has started and is
+     /// still live. The engine runs each such transaction as the one SQL transaction of its
+     /// connection, so writers run one after another, also those with disjoint scopes.
+-    fn other_writer_started(&self, txn: u64) -> bool {
++    fn other_writer_started(&self, txn: IndexedDBTxnId) -> bool {
+         self.txn_info.iter().any(|(other_txn, other)| {
+             *other_txn != txn &&
+                 other.live &&
+@@ -215,7 +220,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         })
+     }
+ 
+-    fn enqueue_txn(&mut self, txn: u64, mode: &IndexedDBTxnMode) {
++    fn enqueue_txn(&mut self, txn: IndexedDBTxnId, mode: &IndexedDBTxnMode) {
+         match mode {
+             IndexedDBTxnMode::Readonly => {
+                 if self.queued_readonly_set.insert(txn) {
+@@ -233,7 +238,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+     fn queue_operation(
+         &mut self,
+         store_name: &str,
+-        serial_number: u64,
++        serial_number: IndexedDBTxnId,
+         mode: IndexedDBTxnMode,
+         operation: AsyncOperation,
+     ) {
+@@ -354,7 +359,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         &mut self,
+         origin: ImmutableOrigin,
+         db_name: String,
+-        txn: u64,
++        txn: IndexedDBTxnId,
+         sender: Option<GenericSender<BackendResult<()>>>,
+     ) {
+         // https://w3c.github.io/IndexedDB/#transaction-lifetime
+@@ -418,7 +423,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         );
+     }
+ 
+-    fn mark_request_handled(&mut self, txn: u64, request_id: u64) {
++    fn mark_request_handled(&mut self, txn: IndexedDBTxnId, request_id: u64) {
+         let current = self
+             .handled_next_unhandled_request_id
+             .get(&txn)
+@@ -443,7 +448,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         }
+     }
+ 
+-    fn can_notify_txn_maybe_commit(&self, txn: u64) -> bool {
++    fn can_notify_txn_maybe_commit(&self, txn: IndexedDBTxnId) -> bool {
+         if self.running_readwrite == Some(txn) || self.running_readonly.contains(&txn) {
+             return false;
+         }
+@@ -457,13 +462,13 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         }
+     }
+ 
+-    fn can_commit_now(&self, txn: u64) -> bool {
++    fn can_commit_now(&self, txn: IndexedDBTxnId) -> bool {
+         self.can_start_by_spec(txn) && self.can_notify_txn_maybe_commit(txn)
+     }
+ 
+     fn queue_pending_commit_callback(
+         &mut self,
+-        txn: u64,
++        txn: IndexedDBTxnId,
+         callback: GenericCallback<TxnCompleteMsg>,
+     ) {
+         self.pending_commit_callbacks
+@@ -472,14 +477,17 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+             .push(callback);
+     }
+ 
+-    fn take_pending_commit_callbacks(&mut self, txn: u64) -> Vec<GenericCallback<TxnCompleteMsg>> {
++    fn take_pending_commit_callbacks(
++        &mut self,
++        txn: IndexedDBTxnId,
++    ) -> Vec<GenericCallback<TxnCompleteMsg>> {
+         self.pending_commit_callbacks
+             .remove(&txn)
+             .unwrap_or_default()
+     }
+ 
+-    fn maybe_commit_candidates(&self) -> Vec<u64> {
+-        let mut candidates: Vec<(u64, u64)> = self
++    fn maybe_commit_candidates(&self) -> Vec<IndexedDBTxnId> {
++        let mut candidates: Vec<(IndexedDBTxnId, u64)> = self
+             .txn_info
+             .iter()
+             .filter_map(|(txn, info)| {
+@@ -493,7 +501,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         candidates.into_iter().map(|(txn, _)| txn).collect()
+     }
+ 
+-    fn finish_transaction(&mut self, txn: u64) {
++    fn finish_transaction(&mut self, txn: IndexedDBTxnId) {
+         if let Some(info) = self.txn_info.get_mut(&txn) {
+             info.live = false;
+         }
+@@ -512,7 +520,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         self.pending_commit_callbacks.remove(&txn);
+     }
+ 
+-    fn abort_transaction(&mut self, txn: u64) {
++    fn abort_transaction(&mut self, txn: IndexedDBTxnId) {
+         // Keep scheduling metadata until script reports TransactionFinished.
+         // https://w3c.github.io/IndexedDB/#transaction-lifetime
+         self.transactions.remove(&txn);
+@@ -537,7 +545,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         &self,
+         origin: ImmutableOrigin,
+         db_name: String,
+-        txn: u64,
++        txn: IndexedDBTxnId,
+         callbacks: Vec<GenericCallback<TxnCompleteMsg>>,
+     ) {
+         self.engine.commit(
+@@ -593,7 +601,12 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+     /// callback to [`Self::pending_abort_callbacks`]. The callbacks are told once the engine has
+     /// rolled the transaction back, which also reverts the key generators and, for an upgrade
+     /// transaction, the version and the object stores and indexes.
+-    fn abort(&mut self, origin: &ImmutableOrigin, database_name: &str, transaction: u64) -> bool {
++    fn abort(
++        &mut self,
++        origin: &ImmutableOrigin,
++        database_name: &str,
++        transaction: IndexedDBTxnId,
++    ) -> bool {
+         let Some(abort_callbacks) = self.pending_abort_callbacks.remove(&transaction) else {
+             return false;
+         };
+@@ -863,7 +876,7 @@ impl OpenRequest {
+ struct VersionUpgrade {
+     old: u64,
+     new: u64,
+-    transaction: u64,
++    transaction: IndexedDBTxnId,
+ }
+ 
+ /// <https://w3c.github.io/IndexedDB/#connection>
+@@ -882,12 +895,6 @@ struct IndexedDBManager {
+     databases: HashMap<IndexedDBDescription, IndexedDBEnvironment<ActiveKvsEngine>>,
+     thread_pool: Arc<ThreadPool>,
+ 
+-    /// A global counter to produce unique transaction ids.
+-    /// TODO: remove once db connections lifecyle is managed.
+-    /// A global counter is only necessary because of how deleting a db currently
+-    /// does not wait for connection to close and transactions to finish.
+-    serial_number_counter: u64,
+-
+     /// <https://w3c.github.io/IndexedDB/#connection-queue>
+     connection_queues: HashMap<IndexedDBDescription, VecDeque<OpenRequest>>,
+ 
+@@ -907,7 +914,6 @@ impl IndexedDBManager {
+             manager_sender,
+             databases: HashMap::new(),
+             thread_pool: ThreadPool::global(),
+-            serial_number_counter: 0,
+             connection_queues: Default::default(),
+             connections: Default::default(),
+         }
+@@ -950,6 +956,8 @@ impl IndexedDBManager {
+                         // Queues an operation for a transaction without starting it
+                         db.queue_operation(&store_name, txn, mode, operation);
+                         db.schedule_transactions(origin, &db_name);
++                    } else {
++                        operation.notify_error(BackendError::DbNotFound);
+                     }
+                 },
+                 IndexedDBThreadMsg::EngineTxnBatchComplete {
+@@ -1000,7 +1008,7 @@ impl IndexedDBManager {
+                     database_name,
+                     store_name,
+                     operation,
+-                    transaction_serial_number,
++                    transaction,
+                 } => {
+                     if let Some(database) =
+                         self.get_database_mut(origin.clone(), database_name.clone())
+@@ -1008,7 +1016,7 @@ impl IndexedDBManager {
+                         // Queues an operation for a transaction without starting it
+                         database.queue_operation(
+                             &store_name,
+-                            transaction_serial_number,
++                            transaction,
+                             IndexedDBTxnMode::Versionchange,
+                             AsyncOperation::Schema(operation),
+                         );
+@@ -1021,7 +1029,12 @@ impl IndexedDBManager {
+         }
+     }
+ 
+-    fn dispatch_txn_maybe_commit(&self, origin: ImmutableOrigin, db_name: String, txn: u64) {
++    fn dispatch_txn_maybe_commit(
++        &self,
++        origin: ImmutableOrigin,
++        db_name: String,
++        txn: IndexedDBTxnId,
++    ) {
+         let key = IndexedDBDescription {
+             origin,
+             name: db_name.clone(),
+@@ -1040,7 +1053,12 @@ impl IndexedDBManager {
+         }
+     }
+ 
+-    fn handle_txn_maybe_commit(&mut self, origin: ImmutableOrigin, db_name: String, txn: u64) {
++    fn handle_txn_maybe_commit(
++        &mut self,
++        origin: ImmutableOrigin,
++        db_name: String,
++        txn: IndexedDBTxnId,
++    ) {
+         let key = IndexedDBDescription {
+             origin: origin.clone(),
+             name: db_name.clone(),
+@@ -1064,7 +1082,7 @@ impl IndexedDBManager {
+         &mut self,
+         name: String,
+         origin: ImmutableOrigin,
+-        txn: u64,
++        txn: IndexedDBTxnId,
+         committed: bool,
+     ) {
+         let key = IndexedDBDescription {
+@@ -1469,8 +1487,7 @@ impl IndexedDBManager {
+             .expect("Db should have been opened.");
+ 
+         // Step 2: Let transaction be a new upgrade transaction with connection used as connection.
+-        let transaction = self.serial_number_counter;
+-        self.serial_number_counter += 1;
++        let transaction = IndexedDBTxnId::upgrade(*id);
+ 
+         // Step 3: Set transaction’s scope to connection’s object store set.
+         let scope = db
+@@ -2252,32 +2269,25 @@ impl IndexedDBManager {
+                 }
+             },
+             SyncOperation::CreateTransaction {
+-                sender,
+                 origin,
+                 db_name,
++                txn,
+                 mode,
+                 scope,
+             } => {
+-                let key = IndexedDBDescription {
+-                    origin: origin.clone(),
+-                    name: db_name.clone(),
+-                };
+-                if let Some(db) = self.databases.get_mut(&key) {
+-                    let transaction_id = self.serial_number_counter;
+-                    self.serial_number_counter += 1;
+-                    db.register_transaction(transaction_id, mode, scope);
++                // https://w3c.github.io/IndexedDB/#transaction-scheduling
++                // A transaction counts as created when this message arrives. Script sends it
++                // before transaction() returns, and every global's messages reach this thread
++                // through the one channel, so of two transactions whose creations are ordered,
++                // in one global or across globals, the earlier one is registered first.
++                if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
++                    db.register_transaction(txn, mode, scope);
+                     db.schedule_transactions(origin, &db_name);
+-                    let _ = sender.send(Ok(transaction_id));
+                 } else {
+-                    let _ = sender.send(Err(BackendError::DbNotFound));
++                    // Its requests fail with DbNotFound, see `IndexedDBThreadMsg::Async`.
++                    debug!("Transaction {txn} created for a database that is gone.");
+                 }
+             },
+-            SyncOperation::UpgradeVersion(sender, ..) => {
+-                // An upgrade transaction sets the version when it begins (`upgrade_database`).
+-                let _ = sender.send(Err(BackendError::DbErr(
+-                    "UpgradeVersion is not supported".to_owned(),
+-                )));
+-            },
+             SyncOperation::Version(sender, origin, db_name) => {
+                 if let Some(db) = self.get_database(origin, db_name) {
+                     let _ = sender.send(db.version().map_err(backend_error_from_storage_error));
+@@ -2307,7 +2317,7 @@ impl IndexedDBManager {
+         abort_callback: GenericCallback<TxnCompleteMsg>,
+         origin: ImmutableOrigin,
+         database_name: String,
+-        transaction: u64,
++        transaction: IndexedDBTxnId,
+     ) {
+         let message = || TxnCompleteMsg {
+             origin: origin.clone(),
+@@ -2369,7 +2379,7 @@ mod tests {
+     use crate::indexeddb::backend::SqlEngine;
+     use crate::indexeddb::backend::executor::SqlExecutor;
+     use crate::indexeddb::backend::tests::{
+-        Faulty, executor_tests, faults_for, stored_version_and_store_names,
++        Faulty, executor_tests, faults_for, stored_version_and_store_names, txn,
+     };
+     use crate::indexeddb::engines::KvsEngine;
+ 
+@@ -2415,17 +2425,17 @@ mod tests {
+     fn run<X: SqlExecutor>(
+         env: &mut IndexedDBEnvironment<SqlEngine<X>>,
+         batches: &GenericReceiver<IndexedDBThreadMsg>,
+-        txn: u64,
++        serial: u64,
+         mode: IndexedDBTxnMode,
+         store_name: &str,
+         operation: AsyncOperation,
+     ) {
+-        env.queue_operation(store_name, txn, mode, operation);
++        env.queue_operation(store_name, txn(serial), mode, operation);
+         env.schedule_transactions(test_origin(), "test_db");
+         match batches.recv().unwrap() {
+             IndexedDBThreadMsg::EngineTxnBatchComplete { txn: done, .. } => {
+-                assert_eq!(done, txn);
+-                env.running_readonly.remove(&txn);
++                assert_eq!(done, txn(serial));
++                env.running_readonly.remove(&done);
+                 env.running_readwrite = None;
+             },
+             _ => panic!("expected the batch to complete"),
+@@ -2444,25 +2454,30 @@ mod tests {
+         (callback, receiver)
+     }
+ 
+-    fn abort<X: SqlExecutor>(env: &mut IndexedDBEnvironment<SqlEngine<X>>, txn: u64) {
++    fn abort<X: SqlExecutor>(env: &mut IndexedDBEnvironment<SqlEngine<X>>, serial: u64) {
+         let (callback, aborted) = txn_complete_callback();
+         env.pending_abort_callbacks
+-            .entry(txn)
++            .entry(txn(serial))
+             .or_default()
+             .push(callback);
+-        assert!(env.abort(&test_origin(), "test_db", txn));
++        assert!(env.abort(&test_origin(), "test_db", txn(serial)));
+         let message = aborted.recv_timeout(Duration::from_secs(10)).unwrap();
+         assert!(message.result.is_err());
+-        env.finish_transaction(txn);
++        env.finish_transaction(txn(serial));
+     }
+ 
+-    fn commit<X: SqlExecutor>(env: &mut IndexedDBEnvironment<SqlEngine<X>>, txn: u64) {
++    fn commit<X: SqlExecutor>(env: &mut IndexedDBEnvironment<SqlEngine<X>>, serial: u64) {
+         let (callback, committed) = txn_complete_callback();
+-        assert!(env.can_commit_now(txn));
+-        env.commit(test_origin(), "test_db".to_owned(), txn, vec![callback]);
++        assert!(env.can_commit_now(txn(serial)));
++        env.commit(
++            test_origin(),
++            "test_db".to_owned(),
++            txn(serial),
++            vec![callback],
++        );
+         let message = committed.recv_timeout(Duration::from_secs(10)).unwrap();
+         assert!(message.result.is_ok());
+-        env.finish_transaction(txn);
++        env.finish_transaction(txn(serial));
+     }
+ 
+     fn create_store_operation(auto_increment: bool) -> AsyncOperation {
+@@ -2479,8 +2494,8 @@ mod tests {
+         let (mut env, batches) = open_environment::<X>(&base_dir);
+         assert!(env.object_store_names().unwrap().is_empty());
+ 
+-        env.register_transaction(1, IndexedDBTxnMode::Versionchange, vec![]);
+-        env.engine.upgrade_version(1, 1);
++        env.register_transaction(txn(1), IndexedDBTxnMode::Versionchange, vec![]);
++        env.engine.upgrade_version(txn(1), 1);
+         let mode = IndexedDBTxnMode::Versionchange;
+         run(
+             &mut env,
+@@ -2524,8 +2539,8 @@ mod tests {
+         env: &mut IndexedDBEnvironment<SqlEngine<X>>,
+         batches: &GenericReceiver<IndexedDBThreadMsg>,
+     ) {
+-        env.register_transaction(1, IndexedDBTxnMode::Versionchange, vec![]);
+-        env.engine.upgrade_version(1, 1);
++        env.register_transaction(txn(1), IndexedDBTxnMode::Versionchange, vec![]);
++        env.engine.upgrade_version(txn(1), 1);
+         run(
+             env,
+             batches,
+@@ -2537,7 +2552,11 @@ mod tests {
+         commit(env, 1);
+         assert_eq!(env.engine.key_generator_current_number("books"), Some(1));
+ 
+-        env.register_transaction(2, IndexedDBTxnMode::Readwrite, vec!["books".to_string()]);
++        env.register_transaction(
++            txn(2),
++            IndexedDBTxnMode::Readwrite,
++            vec!["books".to_string()],
++        );
+         run(
+             env,
+             batches,
+@@ -2571,23 +2590,23 @@ mod tests {
+ 
+         faults_for(base_dir.path()).lock().unwrap().commit = true;
+         let (callback, committed) = txn_complete_callback();
+-        env.commit(test_origin(), "test_db".to_owned(), 2, vec![callback]);
++        env.commit(test_origin(), "test_db".to_owned(), txn(2), vec![callback]);
+         let message = committed.recv_timeout(Duration::from_secs(10)).unwrap();
+         faults_for(base_dir.path()).lock().unwrap().commit = false;
+ 
+-        assert_eq!(message.txn, 2);
++        assert_eq!(message.txn, txn(2));
+         assert!(matches!(message.result, Err(BackendError::DbErr(_))));
+         assert_eq!(env.engine.key_generator_current_number("books"), Some(1));
+     }
+ 
+     fn register<X: SqlExecutor>(
+         env: &mut IndexedDBEnvironment<SqlEngine<X>>,
+-        txn: u64,
++        serial: u64,
+         mode: IndexedDBTxnMode,
+         scope: &[&str],
+     ) {
+         env.register_transaction(
+-            txn,
++            txn(serial),
+             mode,
+             scope.iter().map(|name| name.to_string()).collect(),
+         );
+@@ -2606,8 +2625,8 @@ mod tests {
+         let (mut env, batches) = open_environment::<X>(&base_dir);
+         register(&mut env, 1, IndexedDBTxnMode::Readwrite, &["a"]);
+         register(&mut env, 2, IndexedDBTxnMode::Readwrite, &["b"]);
+-        assert!(env.can_start_by_spec(1));
+-        assert!(env.can_start_by_spec(2));
++        assert!(env.can_start_by_spec(txn(1)));
++        assert!(env.can_start_by_spec(txn(2)));
+ 
+         run(
+             &mut env,
+@@ -2617,12 +2636,12 @@ mod tests {
+             "a",
+             clear_operation(),
+         );
+-        assert!(!env.can_start_by_spec(2));
++        assert!(!env.can_start_by_spec(txn(2)));
+         register(&mut env, 3, IndexedDBTxnMode::Readonly, &["c"]);
+-        assert!(env.can_start_by_spec(3));
++        assert!(env.can_start_by_spec(txn(3)));
+ 
+         commit(&mut env, 1);
+-        assert!(env.can_start_by_spec(2));
++        assert!(env.can_start_by_spec(txn(2)));
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#transaction-scheduling>: a readonly transaction waits
+@@ -2634,10 +2653,10 @@ mod tests {
+         register(&mut env, 1, IndexedDBTxnMode::Readwrite, &["a"]);
+         register(&mut env, 2, IndexedDBTxnMode::Readonly, &["a", "b"]);
+         register(&mut env, 3, IndexedDBTxnMode::Readonly, &["b"]);
+-        assert!(!env.can_start_by_spec(2));
+-        assert!(env.can_start_by_spec(3));
+-        env.finish_transaction(1);
+-        assert!(env.can_start_by_spec(2));
++        assert!(!env.can_start_by_spec(txn(2)));
++        assert!(env.can_start_by_spec(txn(3)));
++        env.finish_transaction(txn(1));
++        assert!(env.can_start_by_spec(txn(2)));
+     }
+ 
+     /// A readwrite transaction without requests has no SQL transaction, and commits.
+@@ -2647,7 +2666,7 @@ mod tests {
+         register(&mut env, 1, IndexedDBTxnMode::Readwrite, &["a"]);
+         commit(&mut env, 1);
+         register(&mut env, 2, IndexedDBTxnMode::Readwrite, &["b"]);
+-        assert!(env.can_start_by_spec(2));
++        assert!(env.can_start_by_spec(txn(2)));
+     }
+ 
+     #[derive(Debug)]
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index d7229e0665a..c2501d23502 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -19,8 +19,8 @@ use storage_traits::StorageThreads;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+     BackendError, BackendResult, ConnectionMsg, IndexedDBKeyRange, IndexedDBKeyType,
+-    IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, IndexedDBValue,
+-    KeyPath, PutItemResult, StorageBottleSource, SyncOperation, TxnCompleteMsg,
++    IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode,
++    IndexedDBValue, KeyPath, PutItemResult, StorageBottleSource, SyncOperation, TxnCompleteMsg,
+ };
+ use tempfile::TempDir;
+ use uuid::Uuid;
+@@ -238,7 +238,7 @@ fn send_schema_operation(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+     store_name: &str,
+-    transaction: u64,
++    transaction: IndexedDBTxnId,
+     operation: AsyncSchemaOperation,
+ ) {
+     GenericSend::send(
+@@ -248,7 +248,7 @@ fn send_schema_operation(
+             database_name: db_name.to_string(),
+             store_name: store_name.to_string(),
+             operation,
+-            transaction_serial_number: transaction,
++            transaction,
+         },
+     )
+     .unwrap();
+@@ -258,7 +258,7 @@ fn create_object_store(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+     store_name: &str,
+-    transaction: u64,
++    transaction: IndexedDBTxnId,
+     key_path: Option<KeyPath>,
+     auto_increment: bool,
+ ) -> mpsc::Receiver<Option<BackendError>> {
+@@ -281,7 +281,7 @@ fn create_index(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+     store_name: &str,
+-    transaction: u64,
++    transaction: IndexedDBTxnId,
+     index_name: &str,
+     key_path: KeyPath,
+     unique: bool,
+@@ -345,31 +345,35 @@ fn get_version(ctx: &IndexedDbTestContext, db_name: &str) -> u64 {
+     recv_timeout(&receiver, "version reply").unwrap()
+ }
+ 
++/// Creates a transaction, as script does without waiting for a reply, and returns its id.
+ fn create_transaction(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+     mode: IndexedDBTxnMode,
+     scope: Vec<String>,
+-) -> u64 {
+-    let (sender, receiver) = generic_channel::channel().unwrap();
++) -> IndexedDBTxnId {
++    let txn = IndexedDBTxnId {
++        connection: Uuid::new_v4(),
++        serial: 1,
++    };
+     GenericSend::send(
+         &ctx.private_threads,
+         IndexedDBThreadMsg::Sync(SyncOperation::CreateTransaction {
+-            sender,
+             origin: ctx.origin.clone(),
+             db_name: db_name.to_string(),
++            txn,
+             mode,
+             scope,
+         }),
+     )
+     .unwrap();
+-    recv_timeout(&receiver, "create transaction reply").unwrap()
++    txn
+ }
+ 
+ fn commit_transaction(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+-    txn: u64,
++    txn: IndexedDBTxnId,
+ ) -> mpsc::Receiver<Option<TxnCompleteMsg>> {
+     let (sender, receiver) = make_profile_callback();
+     GenericSend::send(
+@@ -388,7 +392,11 @@ fn commit_transaction(
+ /// Mirror script's commit choreography for a versionchange transaction
+ /// (`idbtransaction.rs`): the upgrade is only reported finished once the
+ /// backend has confirmed the queued schema batch is durable.
+-fn commit_upgrade_transaction(ctx: &IndexedDbTestContext, db_name: &str, transaction: u64) {
++fn commit_upgrade_transaction(
++    ctx: &IndexedDbTestContext,
++    db_name: &str,
++    transaction: IndexedDBTxnId,
++) {
+     let receiver = commit_transaction(ctx, db_name, transaction);
+     recv_callback_timeout(&receiver, "upgrade commit reply")
+         .result
+@@ -401,7 +409,11 @@ fn commit_upgrade_transaction(ctx: &IndexedDbTestContext, db_name: &str, transac
+ /// (`idbtransaction.rs`): the backend abort is requested first and only its
+ /// reply — which waits out a running batch — releases the upgrade. Reporting
+ /// the upgrade finished without it would race the queued schema batch.
+-fn abort_upgrade_transaction(ctx: &IndexedDbTestContext, db_name: &str, transaction: u64) {
++fn abort_upgrade_transaction(
++    ctx: &IndexedDbTestContext,
++    db_name: &str,
++    transaction: IndexedDBTxnId,
++) {
+     let receiver = abort_transaction(ctx, db_name, transaction);
+     recv_callback_timeout(&receiver, "upgrade abort reply");
+     finish_upgrade_transaction(ctx, transaction, db_name, false);
+@@ -422,7 +434,7 @@ fn close_database(ctx: &IndexedDbTestContext, id: Uuid, db_name: &str) {
+ 
+ fn finish_upgrade_transaction(
+     ctx: &IndexedDbTestContext,
+-    txn: u64,
++    txn: IndexedDBTxnId,
+     db_name: &str,
+     committed: bool,
+ ) {
+@@ -438,7 +450,12 @@ fn finish_upgrade_transaction(
+     .unwrap();
+ }
+ 
+-fn mark_request_handled(ctx: &IndexedDbTestContext, db_name: &str, txn: u64, request_id: u64) {
++fn mark_request_handled(
++    ctx: &IndexedDbTestContext,
++    db_name: &str,
++    txn: IndexedDBTxnId,
++    request_id: u64,
++) {
+     GenericSend::send(
+         &ctx.private_threads,
+         IndexedDBThreadMsg::Sync(SyncOperation::RequestHandled {
+@@ -451,7 +468,7 @@ fn mark_request_handled(ctx: &IndexedDbTestContext, db_name: &str, txn: u64, req
+     .unwrap();
+ }
+ 
+-fn finish_transaction(ctx: &IndexedDbTestContext, db_name: &str, txn: u64) {
++fn finish_transaction(ctx: &IndexedDbTestContext, db_name: &str, txn: IndexedDBTxnId) {
+     GenericSend::send(
+         &ctx.private_threads,
+         IndexedDBThreadMsg::Sync(SyncOperation::TransactionFinished {
+@@ -467,7 +484,7 @@ fn put_item(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+     store_name: &str,
+-    txn: u64,
++    txn: IndexedDBTxnId,
+     key: IndexedDBKeyType,
+     value: Vec<u8>,
+ ) -> mpsc::Receiver<Option<BackendResult<PutItemResult>>> {
+@@ -478,7 +495,7 @@ fn put_item_request(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+     store_name: &str,
+-    txn: u64,
++    txn: IndexedDBTxnId,
+     request_id: u64,
+     key: Option<IndexedDBKeyType>,
+     value: Vec<u8>,
+@@ -510,7 +527,7 @@ fn get_all_keys_request(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+     store_name: &str,
+-    txn: u64,
++    txn: IndexedDBTxnId,
+     key_range: IndexedDBKeyRange,
+     request_id: u64,
+ ) -> mpsc::Receiver<Option<BackendResult<Vec<IndexedDBKeyType>>>> {
+@@ -540,7 +557,7 @@ fn iterate_request(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+     store_name: &str,
+-    txn: u64,
++    txn: IndexedDBTxnId,
+     key_range: IndexedDBKeyRange,
+     count: Option<u32>,
+     reverse: bool,
+@@ -572,7 +589,7 @@ fn get_item(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+     store_name: &str,
+-    txn: u64,
++    txn: IndexedDBTxnId,
+     key: IndexedDBKeyType,
+ ) -> mpsc::Receiver<Option<BackendResult<Option<IndexedDBValue>>>> {
+     let request_id = 1;
+@@ -600,7 +617,7 @@ fn remove_item(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+     store_name: &str,
+-    txn: u64,
++    txn: IndexedDBTxnId,
+     key: IndexedDBKeyType,
+ ) -> mpsc::Receiver<Option<BackendResult<()>>> {
+     let request_id = 1;
+@@ -628,7 +645,7 @@ fn remove_item_request(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+     store_name: &str,
+-    txn: u64,
++    txn: IndexedDBTxnId,
+     key_range: IndexedDBKeyRange,
+ ) -> mpsc::Receiver<Option<BackendResult<()>>> {
+     let request_id = 1;
+@@ -1000,7 +1017,7 @@ fn test_indexeddb_duplicate_store_is_not_an_error() {
+ fn abort_transaction(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+-    txn: u64,
++    txn: IndexedDBTxnId,
+ ) -> mpsc::Receiver<Option<TxnCompleteMsg>> {
+     let (sender, receiver) = make_profile_callback();
+     GenericSend::send(
+@@ -1869,7 +1886,7 @@ fn put_and_commit(ctx: &IndexedDbTestContext, db_name: &str, store_name: &str) {
+ 
+ /// Sends `count` puts into `a` in the readwrite transaction `txn`, which keep the engine busy
+ /// with a batch of them.
+-fn send_puts(ctx: &IndexedDbTestContext, db_name: &str, txn: u64, count: u64) {
++fn send_puts(ctx: &IndexedDbTestContext, db_name: &str, txn: IndexedDBTxnId, count: u64) {
+     for key in 0..count {
+         let _ = put_item_request(
+             ctx,

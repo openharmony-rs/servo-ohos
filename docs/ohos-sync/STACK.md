@@ -173,6 +173,14 @@ those scripts (they need network access). `check_stack.py` runs each with
 147. `indexeddb: Abort a global's unfinished transactions when it goes away` — C · CI+device · watch: components/script/dom/window/window.rs components/script/dom/workers/workerglobalscope.rs components/shared/storage/indexeddb.rs
 148. `indexeddb: Answer the manager's metadata reads from the committed metadata` — C · CI+device · watch: components/script/dom/indexeddb/idbtransaction.rs components/script/dom/indexeddb/idbdatabase.rs
 149. `docs: record patches 143 to 149 in the stack manifest` — B · none · watch: -
+150. `indexeddb: Obtain the storage bottle map in the backend` — C · CI+device · watch: components/storage/client_storage.rs components/shared/storage/client_storage.rs
+151. `indexeddb: Create transactions without waiting for the backend` — C · CI+device · watch: components/shared/storage/lib.rs
+152. `indexeddb: Address object stores and indexes by id, from a metadata snapshot` — C · CI+device · watch: components/script/dom/attributes/domstringlist.rs
+153. `indexeddb: Deliver a connection's results in request order on one channel` — C · CI+device · watch: components/shared/profile/generic_callback.rs
+154. `script: Keep the target of events that IndexedDB objects pass on` — C · CI+device · watch: components/script/dom/event/eventtarget.rs tests/wpt/tests/dom/events
+155. `indexeddb: Keep string keys and names as UTF-16 code units` — C · CI+device · watch: components/script_bindings/domstring.rs components/storage/cache_storage.rs
+156. `indexeddb: Look up key path identifiers by their code units` — C · CI+device · watch: components/script_bindings/js.rs components/script_bindings/utils.rs
+157. `docs: record patches 150 to 157 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
