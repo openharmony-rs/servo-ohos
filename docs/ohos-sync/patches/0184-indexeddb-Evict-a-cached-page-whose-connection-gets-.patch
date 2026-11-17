@@ -1,0 +1,416 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 12:45:39 +0000
+Subject: [PATCH] indexeddb: Evict a cached page whose connection gets a
+ versionchange event
+
+A document in the back/forward cache is not fully active, so the event
+loop holds back its tasks until it is shown again. A versionchange
+event for one of its IndexedDB connections waited there, and with it
+the upgrade or delete that fired it, which ran only once the user went
+back to the page, or never (back-forward-cache-open-connection timed
+out).
+
+Like Gecko and Chromium, evict the page instead: the connection result
+channel of a window hands versionchange events to a task that runs even
+while the document is not fully active. If the document isn't fully
+active, the task asks the constellation to evict it with a message of
+its own, EvictFromBackForwardCache. The constellation walks from the
+document's pipeline up to the first pipeline that isn't the current one
+of its browsing context, which is the pipeline of the cached session
+history entry also for a cross-site iframe in another script thread,
+closes it, and reloads the entry if it is traversed to again; it does
+nothing if the document is fully active again because the user went
+back. Either way the task then queues the event as a normal task, behind
+the tasks held back so far, such as the open request's success that
+creates the connection: the event loop drops it with an evicted
+document, and it fires as before in a fully active one. Closing the
+pipeline runs the window's IndexedDB teardown, and the backend counts a
+connection of a gone global as closed, so the upgrade or delete goes on.
+The IndexedDB specification doesn't cover this case. Pages with open
+connections stay eligible for the cache; only a versionchange evicts
+them. Worker globals are unaffected.
+
+The P5 review changed the first version of this commit (S3 and S4): it
+made the topmost inactive document of its own script thread
+unsalvageable and sent DiscardDocument, which closed only a cross-site
+iframe, so its cached parent was restored with the iframe closed, and
+could discard a page the user had just gone back to; and it fired the
+event inline, which could overtake the success that creates the
+connection and was then dropped. The fork test gained a cross-site
+iframe.
+
+Validation: build host SM and QuickJS release and run IndexedDB/back-forward-cache-open-connection.window.html, back-forward-cache-open-transaction.window.html and the new /_mozilla/IndexedDB/back-forward-cache-versionchange.window.html (a delete and an upgrade evict the cached page, also for a connection of its iframe; a cached page with a connection is still restored) with --repeat 3: all pass on both engines, while the previous commit's binary times out on both connection tests; host IndexedDB/ 4,484 of 4,511 on SM and on QuickJS with the new pass as the only change, /_mozilla/IndexedDB/ 312 of 312 SM, 310 of 312 QuickJS (interface lists, as before); /workers/ and html/browsers/browsing-the-web/back-forward-cache/ without unexpected results on both engines; after the P5 review fixes: the fork test has a fourth subtest, a cross-site iframe (HTTP_NOTSAMESITE_ORIGIN) whose connection gets the versionchange; it and the same-origin iframe subtest fail on a binary whose constellation discards the reporting pipeline itself as DiscardDocument did (P5.3/review-fixes/bfc-neg.raw), and all four pass on the stack tip, as do back-forward-cache-open-connection and back-forward-cache-open-transaction; host SM release builds, 151 passed, 1 skipped at this commit
+AI-assisted: Yes (agent session; the agent found where the test hung, implemented the eviction, wrote the fork test and measured it on both engines; the P5 review fixes added the constellation eviction message, queued the event behind held tasks, added the cross-site iframe subtest and ran a negative control)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/constellation/constellation.rs     | 46 +++++++++++
+ components/constellation/tracing.rs           |  1 +
+ components/script/dom/document/document.rs    | 13 +++
+ components/script/dom/indexeddb/idbfactory.rs | 28 +++++++
+ components/script/tasks/task_source.rs        | 22 +++++
+ .../constellation/from_script_message.rs      |  3 +
+ ...orward-cache-open-connection.window.js.ini |  4 -
+ tests/wpt/mozilla/meta/MANIFEST.json          | 43 ++++++++++
+ ...back-forward-cache-versionchange.window.js | 80 +++++++++++++++++++
+ 9 files changed, 236 insertions(+), 4 deletions(-)
+ delete mode 100644 tests/wpt/meta/IndexedDB/back-forward-cache-open-connection.window.js.ini
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/back-forward-cache-versionchange.window.js
+
+diff --git a/components/constellation/constellation.rs b/components/constellation/constellation.rs
+index 3467aa0a075..b2adafcc014 100644
+--- a/components/constellation/constellation.rs
++++ b/components/constellation/constellation.rs
+@@ -1721,6 +1721,9 @@ where
+             ScriptToConstellationMessage::DiscardDocument => {
+                 self.handle_discard_document(webview_id, source_pipeline_id);
+             },
++            ScriptToConstellationMessage::EvictFromBackForwardCache => {
++                self.handle_evict_from_back_forward_cache(webview_id, source_pipeline_id);
++            },
+             ScriptToConstellationMessage::DiscardTopLevelBrowsingContext => {
+                 self.handle_close_top_level_browsing_context(webview_id);
+             },
+@@ -6050,6 +6053,49 @@ where
+         })
+     }
+ 
++    /// Discards the pipeline of the session history entry that holds `pipeline_id`, which is the
++    /// pipeline itself or, for an iframe, the first ancestor that isn't the current pipeline of
++    /// its browsing context. Nothing is discarded if every one of them is current, as the user
++    /// went back to the entry in the meantime.
++    fn handle_evict_from_back_forward_cache(
++        &mut self,
++        webview_id: WebViewId,
++        pipeline_id: PipelineId,
++    ) {
++        let mut current = pipeline_id;
++        loop {
++            let Some(browsing_context) = self
++                .pipelines
++                .get(&current)
++                .and_then(|pipeline| self.browsing_contexts.get(&pipeline.browsing_context_id))
++            else {
++                return warn!("{pipeline_id}: Evicting a closed pipeline");
++            };
++            if browsing_context.pipeline_id != current {
++                break;
++            }
++            match browsing_context.parent_pipeline_id {
++                Some(parent) => current = parent,
++                None => return debug!("{pipeline_id}: Not evicting a fully active document"),
++            }
++        }
++        let in_session_history = self.webviews.get(&webview_id).is_some_and(|webview| {
++            let history = &webview.session_history;
++            history
++                .past
++                .iter()
++                .chain(history.future.iter())
++                .any(|diff| {
++                    diff.alive_old_pipeline() == Some(current) ||
++                        diff.alive_new_pipeline() == Some(current)
++                })
++        });
++        if !in_session_history {
++            return debug!("{current}: Not evicting a pipeline outside the session history");
++        }
++        self.handle_discard_document(webview_id, current);
++    }
++
+     // Discard the pipeline for a given document, udpdate the joint session history.
+     #[servo_tracing::instrument(skip_all)]
+     fn handle_discard_document(&mut self, webview_id: WebViewId, pipeline_id: PipelineId) {
+diff --git a/components/constellation/tracing.rs b/components/constellation/tracing.rs
+index 0f1031c12db..15f483ecded 100644
+--- a/components/constellation/tracing.rs
++++ b/components/constellation/tracing.rs
+@@ -186,6 +186,7 @@ mod from_script {
+                 Self::SetFinalUrl(..) => target!("SetFinalUrl"),
+                 Self::LogEntry(..) => target!("LogEntry"),
+                 Self::DiscardDocument => target!("DiscardDocument"),
++                Self::EvictFromBackForwardCache => target!("EvictFromBackForwardCache"),
+                 Self::DiscardTopLevelBrowsingContext => target!("DiscardTopLevelBrowsingContext"),
+                 Self::PipelineExited => target!("PipelineExited"),
+                 Self::ForwardDOMMessage(..) => target!("ForwardDOMMessage"),
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 6e8154d4af5..6305008daad 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -4899,6 +4899,19 @@ impl Document {
+         self.salvageable.get()
+     }
+ 
++    /// Evicts this document, which is not fully active, from the back/forward cache: the
++    /// constellation closes the pipeline of the session history entry that holds it, also for a
++    /// document in an iframe of another script thread, and reloads the entry if it is traversed
++    /// to again. It does nothing if the document is fully active again by then.
++    pub(crate) fn evict_from_back_forward_cache(&self) {
++        let msg = ScriptToConstellationMessage::EvictFromBackForwardCache;
++        let _ = self
++            .window
++            .as_global_scope()
++            .script_to_constellation_chan()
++            .send(msg);
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#make-document-unsalvageable>
+     pub(crate) fn make_document_unsalvageable(&self) {
+         // Step 1. Let details be a new not restored reason details whose reason is reason.
+diff --git a/components/script/dom/indexeddb/idbfactory.rs b/components/script/dom/indexeddb/idbfactory.rs
+index e9f280234ab..b8b4ba34a34 100644
+--- a/components/script/dom/indexeddb/idbfactory.rs
++++ b/components/script/dom/indexeddb/idbfactory.rs
+@@ -22,7 +22,9 @@ use crate::dom::RootedPromise;
+ use crate::dom::bindings::codegen::Bindings::IDBFactoryBinding::{
+     IDBDatabaseInfo, IDBFactoryMethods,
+ };
++use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
+ use crate::dom::bindings::error::{Error, ErrorToJsval, Fallible};
++use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot};
+@@ -36,6 +38,7 @@ use crate::dom::indexeddb::key::{
+ };
+ use crate::dom::promise::Promise;
+ use crate::dom::types::IDBTransaction;
++use crate::dom::window::Window;
+ 
+ /// A non-jstraceable string wrapper for use in `HashMapTracedValues`.
+ #[derive(Clone, Debug, Eq, Hash, MallocSizeOf, PartialEq)]
+@@ -234,12 +237,37 @@ impl IDBFactory {
+             .task_manager()
+             .database_access_task_source()
+             .to_sendable();
++        let in_window = global.is::<Window>();
+         GenericCallback::new(move |message| {
+             let event = match message {
+                 Ok(event) => event,
+                 Err(err) => return error!("Error in IndexedDB connection channel {:?}.", err),
+             };
+             let request = request.clone();
++            // A versionchange event at a connection of a document in the back/forward cache would
++            // wait there until the document is shown again, and the upgrade or delete with it.
++            // Like Gecko and Chromium, Servo evicts the document instead, which closes the
++            // connection; the IndexedDB specification doesn't say.
++            if in_window && matches!(event, ConnectionEvent::VersionChange { .. }) {
++                let event_task_source = task_source.clone();
++                task_source.queue_even_if_not_fully_active(
++                    task!(handle_indexeddb_versionchange: move |_cx| {
++                        if let Some(window) = request.root().global().downcast::<Window>() &&
++                            !window.Document().is_fully_active()
++                        {
++                            window.Document().evict_from_back_forward_cache();
++                        }
++                        // The event itself is a normal task, behind the tasks held back so far,
++                        // such as the open request's success that created the connection. It is
++                        // dropped with an evicted document, and fired if the document was shown
++                        // again before the eviction.
++                        event_task_source.queue(task!(handle_indexeddb_connection_event: move |cx| {
++                            request.root().handle_connection_event(cx, event);
++                        }));
++                    }),
++                );
++                return;
++            }
+             // https://w3c.github.io/IndexedDB/#dom-idbfactory-open
+             // Step 5.3: Queue a database task to run these steps:
+             task_source.queue(task!(handle_indexeddb_connection_event: move |cx| {
+diff --git a/components/script/tasks/task_source.rs b/components/script/tasks/task_source.rs
+index dfa78eff596..a91e9e502a3 100644
+--- a/components/script/tasks/task_source.rs
++++ b/components/script/tasks/task_source.rs
+@@ -202,6 +202,28 @@ impl SendableTaskSource {
+             );
+         }
+     }
++
++    /// Queues a task that the event loop runs even while the document of the task source's
++    /// global is not fully active, when it holds back the global's other tasks. The task runs
++    /// outside of any realm and must check the document's state itself.
++    pub(crate) fn queue_even_if_not_fully_active(&self, task: impl TaskOnce + 'static) {
++        if self.canceller.cancelled() {
++            return;
++        }
++        let task = self.canceller.wrap_task(task);
++        if self
++            .sender
++            .send(CommonScriptMsg::Task(
++                self.name.into(),
++                Box::new(task),
++                None,
++                self.name,
++            ))
++            .is_err()
++        {
++            warn!("Could not queue task {:?} during shutdown.", self.name);
++        }
++    }
+ }
+ 
+ impl Clone for SendableTaskSource {
+diff --git a/components/shared/constellation/from_script_message.rs b/components/shared/constellation/from_script_message.rs
+index 66bac3a6c99..1fef4511a08 100644
+--- a/components/shared/constellation/from_script_message.rs
++++ b/components/shared/constellation/from_script_message.rs
+@@ -828,6 +828,9 @@ pub enum ScriptToConstellationMessage {
+     LogEntry(Option<ScriptEventLoopId>, Option<String>, LogEntry),
+     /// Discard the document.
+     DiscardDocument,
++    /// Evict the session history entry whose document is or contains this pipeline's document
++    /// from the back/forward cache, unless that document is fully active again.
++    EvictFromBackForwardCache,
+     /// Discard the browsing context.
+     DiscardTopLevelBrowsingContext,
+     /// Notifies the constellation that this pipeline has exited.
+diff --git a/tests/wpt/meta/IndexedDB/back-forward-cache-open-connection.window.js.ini b/tests/wpt/meta/IndexedDB/back-forward-cache-open-connection.window.js.ini
+deleted file mode 100644
+index 85e375d1a06..00000000000
+--- a/tests/wpt/meta/IndexedDB/back-forward-cache-open-connection.window.js.ini
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[back-forward-cache-open-connection.window.html]
+-  expected: TIMEOUT
+-  [Testing BFCache support for page with open IndexedDB connection, and eviction behavior when receiving versionchange event.]
+-    expected: TIMEOUT
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 8f625cf3a04..6e9c1eb3c81 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11640,6 +11640,49 @@
+   },
+   "testharness": {
+    "IndexedDB": {
++    "back-forward-cache-versionchange.window.js": [
++     "2a30ff98ff0f8105c0d67766a5a158a5137e95f8",
++     [
++      "IndexedDB/back-forward-cache-versionchange.window.html",
++      {
++       "script_metadata": [
++        [
++         "title",
++         "IndexedDB: versionchange at a connection in the back/forward cache evicts its page"
++        ],
++        [
++         "script",
++         "/common/dispatcher/dispatcher.js"
++        ],
++        [
++         "script",
++         "/common/utils.js"
++        ],
++        [
++         "script",
++         "/common/get-host-info.sub.js"
++        ],
++        [
++         "script",
++         "/IndexedDB/resources/support.js"
++        ],
++        [
++         "script",
++         "/html/browsers/browsing-the-web/back-forward-cache/resources/rc-helper.js"
++        ],
++        [
++         "script",
++         "/html/browsers/browsing-the-web/remote-context-helper/resources/remote-context-helper.js"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ]
++    ],
+     "connection-after-aborted-upgrade.any.js": [
+      "8b7e54ee97d9c2a1a5702ae531acf242328bab25",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/back-forward-cache-versionchange.window.js b/tests/wpt/mozilla/tests/IndexedDB/back-forward-cache-versionchange.window.js
+new file mode 100644
+index 00000000000..2a30ff98ff0
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/back-forward-cache-versionchange.window.js
+@@ -0,0 +1,80 @@
++// META: title=IndexedDB: versionchange at a connection in the back/forward cache evicts its page
++// META: script=/common/dispatcher/dispatcher.js
++// META: script=/common/utils.js
++// META: script=/common/get-host-info.sub.js
++// META: script=/IndexedDB/resources/support.js
++// META: script=/html/browsers/browsing-the-web/back-forward-cache/resources/rc-helper.js
++// META: script=/html/browsers/browsing-the-web/remote-context-helper/resources/remote-context-helper.js
++// META: timeout=long
++
++'use strict';
++
++// A page in the back/forward cache can't fire a versionchange event, so a connection it holds
++// would block upgrades and deletes until the page is shown again. Servo evicts the page instead,
++// like Gecko and Chromium: the page's connections close, and going back loads it again.
++
++function deleteDatabase(rc, name) {
++  return rc.executeScript(name => new Promise((resolve, reject) => {
++    const request = indexedDB.deleteDatabase(name);
++    request.onsuccess = event => resolve(`deleted ${event.oldVersion}`);
++    request.onblocked = () => resolve('blocked');
++    request.onerror = () => reject(request.error);
++  }), [name]);
++}
++
++promise_test(async t => {
++  const rcHelper = new RemoteContextHelper();
++  const rc1 = await rcHelper.addWindow(null, {features: 'noopener'});
++  const name = t.name + Math.random();
++  await waitUntilIndexedDBOpenForTesting(rc1, name, 1);
++
++  await prepareForBFCache(rc1);
++  const rc2 = await rc1.navigateToNew();
++  assert_equals(await deleteDatabase(rc2, name), 'deleted 1');
++
++  await rc2.historyBack();
++  await assertNotRestoredFromBFCache(rc1);
++}, 'A delete evicts the cached page whose connection it waits for');
++
++promise_test(async t => {
++  const rcHelper = new RemoteContextHelper();
++  const rc1 = await rcHelper.addWindow(null, {features: 'noopener'});
++  const frame = await rc1.addIframe();
++  const name = t.name + Math.random();
++  await waitUntilIndexedDBOpenForTesting(frame, name, 1);
++
++  await prepareForBFCache(rc1);
++  const rc2 = await rc1.navigateToNew();
++  await waitUntilIndexedDBOpenForTesting(rc2, name, 2);
++
++  await rc2.historyBack();
++  await assertNotRestoredFromBFCache(rc1);
++}, 'An upgrade evicts the cached page whose iframe holds a connection');
++
++promise_test(async t => {
++  const rcHelper = new RemoteContextHelper();
++  const rc1 = await rcHelper.addWindow(null, {features: 'noopener'});
++  const frame = await rc1.addIframe({origin: 'HTTP_NOTSAMESITE_ORIGIN'});
++  const name = t.name + Math.random();
++  await waitUntilIndexedDBOpenForTesting(frame, name, 1);
++
++  await prepareForBFCache(rc1);
++  const rc2 = await rc1.navigateToNew();
++  const otherFrame = await rc2.addIframe({origin: 'HTTP_NOTSAMESITE_ORIGIN'});
++  await waitUntilIndexedDBOpenForTesting(otherFrame, name, 2);
++
++  await rc2.historyBack();
++  await assertNotRestoredFromBFCache(rc1);
++}, 'An upgrade evicts the cached page whose cross-site iframe holds a connection');
++
++promise_test(async t => {
++  const rcHelper = new RemoteContextHelper();
++  const rc1 = await rcHelper.addWindow(null, {features: 'noopener'});
++  const name = t.name + Math.random();
++  await waitUntilIndexedDBOpenForTesting(rc1, name, 1);
++
++  await prepareForBFCache(rc1);
++  const rc2 = await rc1.navigateToNew();
++  await rc2.historyBack();
++  await assertImplementsBFCacheOptional(rc1);
++}, 'A cached page with an open connection is restored when nothing waits for it');

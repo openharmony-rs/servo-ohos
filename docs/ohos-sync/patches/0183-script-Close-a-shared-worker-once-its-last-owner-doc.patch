@@ -1,0 +1,618 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 12:29:25 +0000
+Subject: [PATCH] script: Close a shared worker once its last owner document is
+ gone
+
+Servo kept no owner set for shared workers: a shared worker ran until it
+closed itself, even after every document that used it was gone. Its
+IndexedDB connections stayed open with it, so an upgrade or delete of
+their database by a later page waited for them forever. In WPT, a
+.any.sharedworker variant whose subtest failed inside upgradeneeded left
+its connection open, and the .any.worker variant of the same test, run
+after it in the same browser, timed out (idbobjectstore-rename-store).
+
+The script-side shared worker registry now keeps each worker's owner set
+(https://html.spec.whatwg.org/multipage/#the-worker's-lifetime) as the
+pipelines of its owner documents; Servo only lets windows construct
+shared workers. The constructor adds its document when it finds the
+worker (step 11.5.8, under the registry lock together with the lookup,
+so the worker can't be closed as an orphan in between) or when the
+worker it started is registered ("run a worker"); a constructor that
+then fails to connect takes out an owner it added. Destroying a document
+(step 10 of "destroy a document"), or the end of a window whose pipeline
+exits, removes it from every owner set. When a set becomes empty, the
+worker is closed as an orphan: its closing flag is set and the exit
+control message wakes its event loop, whose end runs the IndexedDB
+teardown. A worker with extendedLifetime is closed only if its owner set
+is still empty after 30 seconds (the extended lifetime shared worker
+timeout; Chromium keeps a service worker without clients that long).
+Servo keeps no worker for the between-loads timeout.
+
+The extended lifetime runs on a timer of the worker's own event loop,
+which the control message CloseIfStillOrphanedAfterTimeout schedules,
+not on a thread per orphaned worker that slept for 30 seconds and could
+outlive the browser's shutdown (P5 review N7).
+
+Validation: build host SM and QuickJS release and run /_mozilla/IndexedDB/shared-worker-owners.html with --repeat 3 (new: the only owner removed closes the worker's connection, a second owner keeps it, a constructor with mismatched options leaves the owner set as it was): 3 of 3 subtests 3 of 3 on both engines, while 92b5f086e08 + the wake-up commit times out the first; the rename-store pair in one browser with the sharedworker variant first (P5.2/scripts/pair.sh, PYTHONHASHSEED 1 and 2, --repeat 3): worker variant TIMEOUT 6 of 6 before, 0 of 6 now; host SM IndexedDB/ 4,483 of 4,511 with no unexpected results, /_mozilla/IndexedDB/ 309 of 309; /workers/ and html/browsers/browsing-the-web/back-forward-cache/ without unexpected results on both engines (SM 1,536 of 1,581 as with 92b5f086e08); after the P5 review fix (the worker's own timer): host SM release builds, 151 passed, 1 skipped at this commit; /_mozilla/IndexedDB/shared-worker-owners.html and /workers/ with every result as expected on the stack tip
+AI-assisted: Yes (agent session; the agent implemented the owner set and the orphan closing, wrote the fork test and measured it on both engines; the P5 review fix moved the extended lifetime onto the worker's own timer)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/document/document.rs    |   2 +
+ components/script/dom/window/window.rs        |   4 +
+ components/script/dom/workers/sharedworker.rs | 164 ++++++++++++++++--
+ .../dom/workers/sharedworkerglobalscope.rs    |  23 ++-
+ tests/wpt/mozilla/meta/MANIFEST.json          |  13 ++
+ .../shared-worker-connection-frame.html       |  10 ++
+ .../tests/IndexedDB/shared-worker-owners.html | 121 +++++++++++++
+ 7 files changed, 319 insertions(+), 18 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/resources/shared-worker-connection-frame.html
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/shared-worker-owners.html
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 1465cd070e3..6e8154d4af5 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -211,6 +211,7 @@ use crate::dom::sanitizer::Sanitizer;
+ use crate::dom::selection::Selection;
+ use crate::dom::servoparser::ServoParser;
+ use crate::dom::shadowroot::shadowroot::ShadowRoot;
++use crate::dom::sharedworker::SharedWorker;
+ use crate::dom::storageevent::StorageEvent;
+ use crate::dom::svg::svgsvgelement::SVGSVGElement;
+ use crate::dom::text::Text;
+@@ -3062,6 +3063,7 @@ impl Document {
+         exited_window
+             .as_global_scope()
+             .disable_owned_worker_animation_frame_providers();
++        SharedWorker::remove_owner_from_owner_sets(exited_window.pipeline_id());
+ 
+         // Step 11. For each workletGlobalScope in document's worklet global scopes,
+         // terminate workletGlobalScope.
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 839a8d71c83..a53a9ddef7b 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -185,6 +185,7 @@ use crate::dom::selection::Selection;
+ use crate::dom::selection_range::RootedSelectionBoundary;
+ use crate::dom::serviceworker::cachestorage::CacheStorage;
+ use crate::dom::shadowroot::shadowroot::ShadowRoot;
++use crate::dom::sharedworker::SharedWorker;
+ use crate::dom::storage::Storage;
+ #[cfg(feature = "bluetooth")]
+ use crate::dom::testrunner::TestRunner;
+@@ -598,6 +599,9 @@ impl Window {
+         self.stop_geolocation_watches();
+         self.as_global_scope()
+             .remove_web_messaging_and_dedicated_workers_infra();
++        // <https://html.spec.whatwg.org/multipage/#destroy-a-document> step 10, for documents
++        // that go away without being destroyed.
++        SharedWorker::remove_owner_from_owner_sets(self.pipeline_id());
+         self.current_state.set(WindowState::Zombie);
+         self.as_global_scope()
+             .task_manager()
+diff --git a/components/script/dom/workers/sharedworker.rs b/components/script/dom/workers/sharedworker.rs
+index 7ae84d12280..8b2f8aba1a2 100644
+--- a/components/script/dom/workers/sharedworker.rs
++++ b/components/script/dom/workers/sharedworker.rs
+@@ -6,6 +6,7 @@
+ 
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Condvar, LazyLock, Mutex};
++use std::time::Duration;
+ 
+ use crossbeam_channel::{Sender, unbounded};
+ #[cfg(feature = "devtools")]
+@@ -18,7 +19,7 @@ use net_traits::pub_domains::reg_suffix;
+ use net_traits::request::{CredentialsMode, Referrer};
+ use script_bindings::reflector::reflect_dom_object_with_proto;
+ use servo_base::generic_channel;
+-use servo_base::id::WorkerId;
++use servo_base::id::{PipelineId, WorkerId};
+ use servo_constellation_traits::{MessagePortImpl, WorkerScriptLoadOrigin};
+ use servo_url::{Host, ImmutableOrigin, ServoUrl};
+ use uuid::Uuid;
+@@ -142,8 +143,61 @@ enum SharedWorkerRegistryState {
+ struct SharedWorkerRegistryEntry {
+     key: SharedWorkerKey,
+     state: SharedWorkerRegistryState,
++    /// <https://html.spec.whatwg.org/multipage/#concept-WorkerGlobalScope-owner-set>, the documents
++    /// (by pipeline) that use the worker. Servo only lets windows create shared workers.
++    owners: Vec<PipelineId>,
++    /// Counts the changes of `owners`, so that an extended lifetime timer only closes the worker
++    /// if the owner set stayed empty since it started.
++    owners_generation: u64,
+ }
+ 
++impl SharedWorkerRegistryEntry {
++    fn new(key: SharedWorkerKey) -> Self {
++        SharedWorkerRegistryEntry {
++            key,
++            state: SharedWorkerRegistryState::Creating { waiters: 0 },
++            owners: Vec::new(),
++            owners_generation: 0,
++        }
++    }
++
++    /// Adds `owner` to the owner set, and returns whether it wasn't in it.
++    fn add_owner(&mut self, owner: PipelineId) -> bool {
++        self.owners_generation += 1;
++        if self.owners.contains(&owner) {
++            return false;
++        }
++        self.owners.push(owner);
++        true
++    }
++
++    /// Removes `owner` from the owner set and closes the worker if that leaves it orphaned.
++    fn remove_owner(&mut self, owner: PipelineId) {
++        let Some(index) = self.owners.iter().position(|existing| *existing == owner) else {
++            return;
++        };
++        self.owners.remove(index);
++        self.owners_generation += 1;
++        if !self.owners.is_empty() {
++            return;
++        }
++        let SharedWorkerRegistryState::Created(registration) = &self.state else {
++            return;
++        };
++        if !registration.extended_lifetime {
++            return registration.close_as_orphan();
++        }
++        // The worker waits on a timer of its own event loop, which ends with it.
++        let _ = registration._control_sender.send(
++            SharedWorkerControlMsg::CloseIfStillOrphanedAfterTimeout(self.owners_generation),
++        );
++    }
++}
++
++/// <https://html.spec.whatwg.org/multipage/#extended-lifetime-shared-worker-timeout>, which should
++/// be the time a service worker without clients lives; Chromium gives those 30 seconds.
++pub(crate) const EXTENDED_LIFETIME_SHARED_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
++
+ // A `SharedWorkerGlobalScope` object has associated constructor origin (an origin), constructor URL (a URL record), and credentials (a credentials mode), and extended lifetime (a boolean).
+ #[derive(Clone)]
+ struct SharedWorkerRegistration {
+@@ -157,6 +211,21 @@ struct SharedWorkerRegistration {
+     _control_sender: Sender<SharedWorkerControlMsg>,
+ }
+ 
++impl SharedWorkerRegistration {
++    /// <https://html.spec.whatwg.org/multipage/#run-a-worker>: "Closing orphan workers: Start
++    /// monitoring the worker such that no sooner than it stops being protected, and no later than
++    /// it stops being permissible, worker global scope's closing flag is set to true."
++    ///
++    /// A shared worker whose owner set is empty is not protected unless it is in extended
++    /// lifetime, so this runs when the owner set becomes empty, or when the extended lifetime
++    /// ends; Servo keeps no worker for the between-loads timeout. The exit message wakes the
++    /// worker, which then ends its event loop.
++    fn close_as_orphan(&self) {
++        self.closing.store(true, Ordering::SeqCst);
++        let _ = self._control_sender.send(SharedWorkerControlMsg::Exit);
++    }
++}
++
+ // A user agent has an associated shared worker manager which is the result of starting a new parallel queue.
+ // Each user agent has a single shared worker manager for simplicity.
+ //
+@@ -169,7 +238,8 @@ static SHARED_WORKERS: LazyLock<(Mutex<Vec<SharedWorkerRegistryEntry>>, Condvar)
+ // manager lookup/create work and avoid duplicate SharedWorker creation. These
+ // are not spec states.
+ enum SharedWorkerClaimResult {
+-    Created(SharedWorkerRegistration),
++    /// The worker exists; the boolean says whether the caller was added to its owner set.
++    Created(SharedWorkerRegistration, bool),
+     Claimed,
+     Failed,
+ }
+@@ -198,24 +268,27 @@ fn find_matching_shared_worker(
+ 
+ /// <https://html.spec.whatwg.org/multipage/#dom-sharedworker>
+ /// <https://html.spec.whatwg.org/multipage/#shared-worker-manager>
+-fn find_or_claim_shared_worker(key: SharedWorkerKey) -> SharedWorkerClaimResult {
++///
++/// A found worker gets `owner` in its owner set at once (step 11.5.8), so that it can't be closed
++/// as an orphan before the caller connects to it.
++fn find_or_claim_shared_worker(key: SharedWorkerKey, owner: PipelineId) -> SharedWorkerClaimResult {
+     let (workers, ready) = &*SHARED_WORKERS;
+     let mut workers = workers.lock().expect("SharedWorker registry poisoned");
+ 
+     prune_closed_shared_workers(&mut workers);
+ 
+     let Some(index) = find_matching_shared_worker(&workers, &key) else {
+-        workers.push(SharedWorkerRegistryEntry {
+-            key,
+-            state: SharedWorkerRegistryState::Creating { waiters: 0 },
+-        });
++        workers.push(SharedWorkerRegistryEntry::new(key));
+         return SharedWorkerClaimResult::Claimed;
+     };
+ 
+-    match &mut workers[index].state {
++    let entry = &mut workers[index];
++    match &mut entry.state {
+         SharedWorkerRegistryState::Creating { waiters } => *waiters += 1,
+         SharedWorkerRegistryState::Created(registration) => {
+-            return SharedWorkerClaimResult::Created(registration.clone());
++            let registration = registration.clone();
++            let added = entry.add_owner(owner);
++            return SharedWorkerClaimResult::Created(registration, added);
+         },
+         SharedWorkerRegistryState::Failed { waiters } => *waiters += 1,
+     };
+@@ -227,10 +300,13 @@ fn find_or_claim_shared_worker(key: SharedWorkerKey) -> SharedWorkerClaimResult
+             return SharedWorkerClaimResult::Failed;
+         };
+ 
+-        match &mut workers[index].state {
++        let entry = &mut workers[index];
++        match &mut entry.state {
+             SharedWorkerRegistryState::Creating { .. } => {},
+             SharedWorkerRegistryState::Created(registration) => {
+-                return SharedWorkerClaimResult::Created(registration.clone());
++                let registration = registration.clone();
++                let added = entry.add_owner(owner);
++                return SharedWorkerClaimResult::Created(registration, added);
+             },
+             SharedWorkerRegistryState::Failed { waiters } => {
+                 debug_assert!(*waiters > 0);
+@@ -251,6 +327,7 @@ fn find_or_claim_shared_worker(key: SharedWorkerKey) -> SharedWorkerClaimResult
+ fn transition_creating_to_created(
+     key: &SharedWorkerKey,
+     registration: SharedWorkerRegistration,
++    owner: PipelineId,
+ ) -> bool {
+     let (workers, ready) = &*SHARED_WORKERS;
+     let mut workers = workers.lock().expect("SharedWorker registry poisoned");
+@@ -275,6 +352,9 @@ fn transition_creating_to_created(
+     }
+ 
+     workers[index].state = SharedWorkerRegistryState::Created(registration);
++    // <https://html.spec.whatwg.org/multipage/#run-a-worker>: Append owner to worker global
++    // scope's owner set.
++    workers[index].add_owner(owner);
+     ready.notify_all();
+     true
+ }
+@@ -318,6 +398,47 @@ fn send_connect_to_created_worker(
+ }
+ 
+ impl SharedWorker {
++    /// Closes the worker `id` as an orphan if its owner set has stayed empty since its change
++    /// `generation`, at the end of its extended lifetime.
++    pub(crate) fn close_if_still_orphaned(id: Uuid, generation: u64) {
++        let (workers, _ready) = &*SHARED_WORKERS;
++        let workers = workers.lock().expect("SharedWorker registry poisoned");
++        for entry in workers.iter() {
++            if let SharedWorkerRegistryState::Created(registration) = &entry.state &&
++                registration.id == id &&
++                entry.owners_generation == generation
++            {
++                registration.close_as_orphan();
++            }
++        }
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#destroy-a-document>: Remove document from the
++    /// owner set of each WorkerGlobalScope object whose set contains document.
++    pub(crate) fn remove_owner_from_owner_sets(owner: PipelineId) {
++        let (workers, _ready) = &*SHARED_WORKERS;
++        let mut workers = workers.lock().expect("SharedWorker registry poisoned");
++        for entry in workers.iter_mut() {
++            entry.remove_owner(owner);
++        }
++    }
++
++    /// Takes `owner` out of the owner set of the worker `id` again, for a constructor that added
++    /// it there but then failed to connect to the worker.
++    fn remove_owner_of(id: Uuid, owner: PipelineId, added: bool) {
++        if !added {
++            return;
++        }
++        let (workers, _ready) = &*SHARED_WORKERS;
++        let mut workers = workers.lock().expect("SharedWorker registry poisoned");
++        for entry in workers.iter_mut() {
++            if matches!(&entry.state, SharedWorkerRegistryState::Created(worker) if worker.id == id)
++            {
++                entry.remove_owner(owner);
++            }
++        }
++    }
++
+     pub(crate) fn unregister_shared_worker(id: Uuid) {
+         let (workers, ready) = &*SHARED_WORKERS;
+         let mut workers = workers.lock().expect("SharedWorker registry poisoned");
+@@ -503,10 +624,11 @@ impl SharedWorkerMethods<crate::DomTypeHolder> for SharedWorker {
+         // Servo also atomically records a Creating entry here when no matching
+         // scope exists, so another same-key constructor cannot race into the
+         // Step 11.6 fresh-worker path.
+-        let shared_worker = find_or_claim_shared_worker(shared_worker_key.clone());
++        let owner = global.pipeline_id();
++        let shared_worker = find_or_claim_shared_worker(shared_worker_key.clone(), owner);
+ 
+         match shared_worker {
+-            SharedWorkerClaimResult::Created(registration) => {
++            SharedWorkerClaimResult::Created(registration, added_owner) => {
+                 // Step 11.2.2.1. Set workerGlobalScope to scope.
+                 // Step 11.2.2.2. Break.
+                 // TODO Step 11.3. If workerGlobalScope is not null, but the user agent has been configured to disallow communication between the worker represented by the workerGlobalScope and the scripts whose settings object is outsideSettings, then set workerGlobalScope to null.
+@@ -518,6 +640,7 @@ impl SharedWorkerMethods<crate::DomTypeHolder> for SharedWorker {
+                     registration.credentials != credentials ||
+                     registration.extended_lifetime != extended_lifetime
+                 {
++                    SharedWorker::remove_owner_of(registration.id, owner, added_owner);
+                     // Step 11.4.1. Queue a global task on the DOM manipulation task source given worker's relevant global object to fire an event named error at worker.
+                     SharedWorker::queue_simple_error(global, worker_addr);
+                     // Step 11.4.2. Abort these steps.
+@@ -529,6 +652,7 @@ impl SharedWorkerMethods<crate::DomTypeHolder> for SharedWorker {
+                 // Step 11.5.2. Let workerIsSecureContext be true if insideSettings is a secure context; otherwise, false.
+                 // Step 11.5.3. If workerIsSecureContext is not callerIsSecureContext:
+                 if registration.worker_is_secure_context != caller_is_secure_context {
++                    SharedWorker::remove_owner_of(registration.id, owner, added_owner);
+                     // Step 11.5.3.1. Queue a global task on the DOM manipulation task source given worker's relevant global object to fire an event named error at worker.
+                     SharedWorker::queue_simple_error(global, worker_addr);
+                     // Step 11.5.3.2. Abort these steps.
+@@ -539,12 +663,20 @@ impl SharedWorkerMethods<crate::DomTypeHolder> for SharedWorker {
+                 // Step 11.5.5. Let insidePort be a new MessagePort in insideSettings's realm.
+                 // Step 11.5.6. Entangle outsidePort and insidePort.
+                 let inside_port_impl =
+-                    SharedWorker::create_entangled_inside_port(cx, global, &outside_port)?;
++                    match SharedWorker::create_entangled_inside_port(cx, global, &outside_port) {
++                        Ok(inside_port_impl) => inside_port_impl,
++                        Err(error) => {
++                            SharedWorker::remove_owner_of(registration.id, owner, added_owner);
++                            return Err(error);
++                        },
++                    };
+                 // Step 11.5.7. Queue a global task on the DOM manipulation task source given workerGlobalScope to fire an event named connect at workerGlobalScope, using MessageEvent, with the data attribute initialized to the empty string, the ports attribute initialized to a new frozen array containing only insidePort, and the source attribute initialized to insidePort.
+                 if send_connect_to_created_worker(&registration, inside_port_impl) {
++                    SharedWorker::remove_owner_of(registration.id, owner, added_owner);
+                     SharedWorker::queue_simple_error(global, worker_addr);
+                 }
+-                // TODO Step 11.5.8. Append the relevant owner to add given outsideSettings to workerGlobalScope's owner set.
++                // Step 11.5.8. Append the relevant owner to add given outsideSettings to workerGlobalScope's owner set.
++                // Note: done by find_or_claim_shared_worker.
+                 return Ok(worker);
+             },
+             SharedWorkerClaimResult::Failed => {
+@@ -684,7 +816,7 @@ impl SharedWorkerMethods<crate::DomTypeHolder> for SharedWorker {
+             _control_sender: control_sender,
+         };
+ 
+-        if !transition_creating_to_created(&shared_worker_key, registration.clone()) {
++        if !transition_creating_to_created(&shared_worker_key, registration.clone(), owner) {
+             SharedWorker::queue_simple_error(global, worker_addr);
+             return Ok(worker);
+         }
+diff --git a/components/script/dom/workers/sharedworkerglobalscope.rs b/components/script/dom/workers/sharedworkerglobalscope.rs
+index bdb6c202514..1c2442c1663 100644
+--- a/components/script/dom/workers/sharedworkerglobalscope.rs
++++ b/components/script/dom/workers/sharedworkerglobalscope.rs
+@@ -35,6 +35,7 @@ use servo_constellation_traits::{MessagePortImpl, WorkerGlobalScopeInit, WorkerS
+ use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
+ use style::thread_state::{self, ThreadState};
+ use stylo_atoms::Atom;
++use timers::TimerEventRequest;
+ use uuid::Uuid;
+ 
+ use crate::dom::abstractworker::{SimpleWorkerErrorHandler, WorkerScriptMsg};
+@@ -55,7 +56,10 @@ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::html::htmlscriptelement::Script;
+ use crate::dom::messageport::MessagePort;
+-use crate::dom::sharedworker::{SharedWorker, SharedWorkerStorageKey, TrustedSharedWorkerAddress};
++use crate::dom::sharedworker::{
++    EXTENDED_LIFETIME_SHARED_WORKER_TIMEOUT, SharedWorker, SharedWorkerStorageKey,
++    TrustedSharedWorkerAddress,
++};
+ #[cfg(feature = "devtools")]
+ use crate::dom::types::DebuggerGlobalScope;
+ #[cfg(feature = "webgpu")]
+@@ -78,9 +82,11 @@ pub(crate) enum SharedWorkerScriptMsg {
+ }
+ 
+ pub(crate) enum SharedWorkerControlMsg {
+-    #[expect(dead_code)]
+     Exit,
+     SetNetworkOnlineState(bool),
++    /// The worker's owner set became empty in its extended lifetime: close the worker if the set
++    /// is still at this generation after the extended lifetime shared worker timeout.
++    CloseIfStillOrphanedAfterTimeout(u64),
+ }
+ 
+ pub(crate) enum MixedMessage {
+@@ -810,6 +816,19 @@ impl SharedWorkerGlobalScope {
+                 self.upcast::<WorkerGlobalScope>()
+                     .set_network_online_state(online);
+             },
++            MixedMessage::Control(SharedWorkerControlMsg::CloseIfStillOrphanedAfterTimeout(
++                generation,
++            )) => {
++                let id = self.registration_id;
++                self.upcast::<WorkerGlobalScope>()
++                    .timer_scheduler()
++                    .schedule_timer(TimerEventRequest {
++                        callback: Box::new(move || {
++                            SharedWorker::close_if_still_orphaned(id, generation)
++                        }),
++                        duration: EXTENDED_LIFETIME_SHARED_WORKER_TIMEOUT,
++                    });
++            },
+             MixedMessage::Timer => {},
+         }
+ 
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index a5aaaa1af2f..8f625cf3a04 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -8579,6 +8579,10 @@
+       "728c70ad75c2804ca49320cd69afec1026e7fad8",
+       []
+      ],
++     "shared-worker-connection-frame.html": [
++      "4bebc8581a9020d53b1c6f82a9370e45a4fa0161",
++      []
++     ],
+      "upgrade-frame.html": [
+       "3e3e64899775946887e3efbfcc6d5e6bf5d3de24",
+       []
+@@ -12467,6 +12471,15 @@
+       }
+      ]
+     ],
++    "shared-worker-owners.html": [
++     "b13748d238e4413c2085d52207c9e977c52a55ba",
++     [
++      null,
++      {
++       "timeout": "long"
++      }
++     ]
++    ],
+     "string-keys-code-units.any.js": [
+      "4959920d8f31f40d5d0a879a598d0888c74a09f5",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/resources/shared-worker-connection-frame.html b/tests/wpt/mozilla/tests/IndexedDB/resources/shared-worker-connection-frame.html
+new file mode 100644
+index 00000000000..4bebc8581a9
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/resources/shared-worker-connection-frame.html
+@@ -0,0 +1,10 @@
++<!doctype html>
++<meta charset="utf-8">
++<script>
++// Starts the shared worker resources/connection-holder.js?<query>, asks it to open the database
++// named in the query without closing on versionchange, and passes its messages to the parent.
++const query = location.search.slice(1);
++const worker = new SharedWorker('connection-holder.js?' + query);
++worker.port.onmessage = event => parent.postMessage(event.data, '*');
++worker.port.postMessage({name: decodeURIComponent(query), close: false});
++</script>
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/shared-worker-owners.html b/tests/wpt/mozilla/tests/IndexedDB/shared-worker-owners.html
+new file mode 100644
+index 00000000000..b13748d238e
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/shared-worker-owners.html
+@@ -0,0 +1,121 @@
++<!doctype html>
++<meta charset="utf-8">
++<title>IndexedDB: a shared worker closes its connections once its last owner document is gone</title>
++<link rel="help" href="https://html.spec.whatwg.org/multipage/#the-worker's-lifetime">
++<link rel="help" href="https://html.spec.whatwg.org/multipage/#destroy-a-document">
++<link rel="help" href="https://w3c.github.io/IndexedDB/#database-connection">
++<meta name="timeout" content="long">
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script>
++// A shared worker started by an iframe holds a connection that doesn't close on versionchange.
++// Removing the iframe destroys the worker's only owner, so the worker is closed and its connection
++// with it; while the window owns the worker as well, the worker and its connection stay.
++
++function requestDone(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++async function createDatabase(t) {
++  const name = 'shared-worker-owners-' + Math.random();
++  t.add_cleanup(() => {
++    indexedDB.deleteDatabase(name);
++  });
++  const request = indexedDB.open(name, 1);
++  request.onupgradeneeded = () => request.result.createObjectStore('store');
++  (await requestDone(request)).close();
++  return name;
++}
++
++// Returns a function that resolves with the next message of `target`, in order.
++function messages(target) {
++  const queue = [];
++  const waiting = [];
++  target.onmessage = event => {
++    if (waiting.length) {
++      waiting.shift()(event.data);
++    } else {
++      queue.push(event.data);
++    }
++  };
++  return () => queue.length ? Promise.resolve(queue.shift()) :
++      new Promise(resolve => waiting.push(resolve));
++}
++
++async function frameWithSharedWorker(t, name) {
++  const frame = document.createElement('iframe');
++  const opened = new Promise(resolve => {
++    window.onmessage = event => resolve(event.data);
++  });
++  frame.src = 'resources/shared-worker-connection-frame.html?' + encodeURIComponent(name);
++  document.body.appendChild(frame);
++  t.add_cleanup(() => frame.remove());
++  assert_equals(await opened, 'opened');
++  return frame;
++}
++
++promise_test(async t => {
++  const name = await createDatabase(t);
++  const frame = await frameWithSharedWorker(t, name);
++
++  const events = [];
++  const deletion = indexedDB.deleteDatabase(name);
++  deletion.onblocked = event => {
++    events.push(`blocked ${event.oldVersion} ${event.newVersion}`);
++    frame.remove();
++  };
++  await requestDone(deletion);
++  events.push('deleted');
++  assert_array_equals(events, ['blocked 1 null', 'deleted']);
++}, 'Removing the only owner of a shared worker closes the worker\'s connection');
++
++promise_test(async t => {
++  const name = await createDatabase(t);
++  const frame = await frameWithSharedWorker(t, name);
++  const worker = new SharedWorker(
++      'resources/connection-holder.js?' + encodeURIComponent(name));
++  const closed = new Promise(resolve => {
++    worker.port.onmessage = event => resolve(event.data);
++  });
++
++  let deleted = false;
++  const deletion = indexedDB.deleteDatabase(name);
++  const blocked = new Promise(resolve => deletion.onblocked = resolve);
++  const done = requestDone(deletion).then(() => deleted = true);
++  await blocked;
++  frame.remove();
++  await new Promise(resolve => t.step_timeout(resolve, 500));
++  assert_false(deleted, 'the worker still has an owner and keeps its connection');
++
++  worker.port.postMessage('close');
++  assert_equals(await closed, 'closed');
++  await done;
++}, 'A shared worker with another owner keeps its connection when one owner goes away');
++
++promise_test(async t => {
++  const name = await createDatabase(t);
++  const url = 'resources/connection-holder.js?' + encodeURIComponent(name);
++  const worker = new SharedWorker(url);
++  const next = messages(worker.port);
++  worker.port.postMessage({name, close: false});
++  assert_equals(await next(), 'opened');
++
++  const mismatch = new SharedWorker(url, {type: 'module'});
++  await new Promise(resolve => mismatch.onerror = resolve);
++
++  let deleted = false;
++  const deletion = indexedDB.deleteDatabase(name);
++  const done = requestDone(deletion).then(() => deleted = true);
++  assert_equals(await next(), 'versionchange 1 null');
++  await new Promise(resolve => t.step_timeout(resolve, 500));
++  assert_false(deleted, 'the worker is still owned by this document');
++
++  worker.port.postMessage('close');
++  assert_equals(await next(), 'closed');
++  await done;
++}, 'A SharedWorker constructor that fails to connect leaves the owner set as it was');
++</script>
++<body></body>

@@ -1,0 +1,429 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 18:49:06 +0000
+Subject: [PATCH] indexeddb: Close the connections of windows whose event loop
+ died
+
+The IndexedDB manager forgets a global's connections when the global's
+teardown sends AbortPendingUpgrades, which Window::clear_js_runtime and
+the end of a worker's event loop do. A window whose script thread
+panics, or whose content process dies, never sends it; its connections
+stayed open in the backend, and since deletes and upgrades wait for open
+connections, every later delete and upgrade of their databases waited
+until the browser restarted.
+
+Open requests now carry the pipeline of their window (None for workers,
+which close their connections when their event loop ends, also when it
+ends with a panic). When the constellation handles a panic of an event
+loop, or a failed send to a pipeline, which means its event loop is
+gone, it sends both storage groups
+SyncOperation::CloseConnectionsOfPipelines with the event loop's
+pipelines. The manager rolls back and finishes the transactions of those
+windows' connections, closes the connections, and ends their open
+requests as AbortPendingUpgrades does, reverting a running upgrade.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits` at this commit: 164 passed, 1 skipped (new test_indexeddb_connections_of_a_crashed_window_close: a delete that waits for a crashed window's connection, which has a live readwrite transaction, finishes with the old version once the pipeline is reported, and the window's running first upgrade is reverted, so the next open upgrades from 0); host SM release builds at this commit; `./mach check --ohos` of servo-storage with SQLite, RDB and both: no warnings; WPT and the board on the stack tip as in the previous commit. Not run: a real script-thread panic or content-process crash, as nothing in the test suites causes one
+AI-assisted: Yes (agent session; the agent implemented the pipeline tagging, the manager's close and the constellation hook, and wrote the integration test)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/constellation/constellation.rs     | 23 +++++
+ components/script/dom/indexeddb/idbfactory.rs |  1 +
+ components/shared/storage/indexeddb.rs        | 10 ++-
+ components/storage/indexeddb/mod.rs           | 71 ++++++++++++++--
+ components/storage/tests/indexeddb.rs         | 84 ++++++++++++++++++-
+ 5 files changed, 181 insertions(+), 8 deletions(-)
+
+diff --git a/components/constellation/constellation.rs b/components/constellation/constellation.rs
+index b2adafcc014..3a2eff42fae 100644
+--- a/components/constellation/constellation.rs
++++ b/components/constellation/constellation.rs
+@@ -3015,6 +3015,15 @@ where
+             return;
+         };
+ 
++        let event_loop = pipeline.event_loop.id();
++        let pipelines: Vec<PipelineId> = self
++            .pipelines
++            .values()
++            .filter(|pipeline| pipeline.event_loop.id() == event_loop)
++            .map(|pipeline| pipeline.id)
++            .collect();
++        self.close_indexeddb_connections_of(&pipelines);
++
+         // Treat send error the same as receiving a panic message
+         self.handle_panic_in_webview(
+             pipeline.webview_id,
+@@ -3055,6 +3064,7 @@ where
+             self.handle_panic_in_webview(webview_id, &reason, &backtrace);
+         }
+ 
++        self.close_indexeddb_connections_of(&crashed_pipelines);
+         for pipeline_id in crashed_pipelines {
+             self.close_pipeline(
+                 pipeline_id,
+@@ -3069,6 +3079,19 @@ where
+         }
+     }
+ 
++    /// Tells the IndexedDB managers that the windows of `pipelines` are gone without their
++    /// IndexedDB teardown, as their event loop died, so that their connections close.
++    fn close_indexeddb_connections_of(&self, pipelines: &[PipelineId]) {
++        for storage_threads in [&self.public_storage_threads, &self.private_storage_threads] {
++            let message = IndexedDBThreadMsg::Sync(SyncOperation::CloseConnectionsOfPipelines(
++                pipelines.to_vec(),
++            ));
++            if let Err(error) = storage_threads.send(message) {
++                warn!("Failed to close the IndexedDB connections of crashed pipelines: {error}");
++            }
++        }
++    }
++
+     fn handle_panic_in_webview(
+         &mut self,
+         webview_id: WebViewId,
+diff --git a/components/script/dom/indexeddb/idbfactory.rs b/components/script/dom/indexeddb/idbfactory.rs
+index 730a00bd159..7e91c079738 100644
+--- a/components/script/dom/indexeddb/idbfactory.rs
++++ b/components/script/dom/indexeddb/idbfactory.rs
+@@ -211,6 +211,7 @@ impl IDBFactory {
+             request.get_id(),
+             Self::storage_bottle_source(&global),
+             results,
++            global.downcast::<Window>().map(Window::pipeline_id),
+         );
+ 
+         // Note: algo continues in parallel.
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 0ce3e8317af..3387bba9b69 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -13,7 +13,7 @@ use profile_traits::generic_callback::GenericCallback;
+ use profile_traits::mem::ReportsChan;
+ use serde::{Deserialize, Serialize};
+ use servo_base::generic_channel::GenericSender;
+-use servo_base::id::WebViewId;
++use servo_base::id::{PipelineId, WebViewId};
+ use servo_url::origin::ImmutableOrigin;
+ use uuid::Uuid;
+ 
+@@ -917,6 +917,8 @@ pub enum SyncOperation {
+         StorageBottleSource,
+         // The result channel of the open request and of the connection, if it opens.
+         GenericCallback<ConnectionEvent>,
++        // The pipeline of the window that makes the request; `None` for a worker.
++        Option<PipelineId>,
+     ),
+ 
+     /// Deletes the database
+@@ -936,6 +938,12 @@ pub enum SyncOperation {
+         origin: ImmutableOrigin,
+     },
+ 
++    /// The windows of these pipelines went away without their IndexedDB teardown, as their
++    /// script thread or content process died: their open requests end and their connections
++    /// close, as with [`SyncOperation::AbortPendingUpgrades`], and their transactions are rolled
++    /// back.
++    CloseConnectionsOfPipelines(Vec<PipelineId>),
++
+     /// The versionchange event that the open or delete request `request` fired at the connection
+     /// `id` was dispatched, or skipped as the connection's close is pending.
+     NotifyEndOfVersionChange {
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 2eed142fad8..6029729c0d1 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -24,6 +24,7 @@ use profile_traits::path;
+ use rusqlite::Error as RusqliteError;
+ use rustc_hash::{FxHashMap, FxHashSet};
+ use servo_base::generic_channel::{self, GenericReceiver, GenericSender, ReceiveError};
++use servo_base::id::PipelineId;
+ use servo_base::threadpool::ThreadPool;
+ use servo_url::origin::ImmutableOrigin;
+ use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
+@@ -760,6 +761,8 @@ struct OpenRequest {
+     /// Whether the open request created its database, which then opens at version 1 if no
+     /// version is asked for.
+     created: bool,
++    /// The pipeline of the window that made the request, if a window did.
++    pipeline: Option<PipelineId>,
+ }
+ 
+ #[derive(MallocSizeOf)]
+@@ -815,13 +818,14 @@ struct ConnectionsToClose {
+ }
+ 
+ impl OpenRequest {
+-    fn new(id: Uuid, kind: OpenRequestKind) -> OpenRequest {
++    fn new(id: Uuid, kind: OpenRequestKind, pipeline: Option<PipelineId>) -> OpenRequest {
+         OpenRequest {
+             id,
+             kind,
+             proxy_map: None,
+             state: OpenRequestState::Queued,
+             created: false,
++            pipeline,
+         }
+     }
+ 
+@@ -930,6 +934,9 @@ struct Connection {
+ 
+     /// The result channel of the connection, for its transactions and versionchange events.
+     results: GenericCallback<ConnectionEvent>,
++
++    /// The pipeline of the window that opened the connection, if a window did.
++    pipeline: Option<PipelineId>,
+ }
+ 
+ /// A thread of the manager's own for its calls to the client storage thread, which run there one
+@@ -1280,8 +1287,9 @@ impl IndexedDBManager {
+         id: Uuid,
+         kind: OpenRequestKind,
+         bottle_source: StorageBottleSource,
++        pipeline: Option<PipelineId>,
+     ) {
+-        let mut request = OpenRequest::new(id, kind);
++        let mut request = OpenRequest::new(id, kind, pipeline);
+         let failed = self
+             .obtain_storage_proxy_map(&key, id, bottle_source)
+             .is_err_and(|error| {
+@@ -1753,7 +1761,43 @@ impl IndexedDBManager {
+         }
+     }
+ 
++    /// Ends the open requests and closes the connections of the windows of `pipelines`, which
++    /// went away without the IndexedDB teardown, as their event loop died: their transactions
++    /// are rolled back, and the rest is what [`Self::abort_pending_upgrades`] does for a global
++    /// that went away.
++    fn close_connections_of_pipelines(&mut self, pipelines: Vec<PipelineId>) {
++        let of_pipelines = |pipeline: Option<PipelineId>| {
++            pipeline.is_some_and(|pipeline| pipelines.contains(&pipeline))
++        };
++        let mut gone: HashMap<IndexedDBDescription, HashSet<Uuid>> = HashMap::new();
++        for (key, connections) in &self.connections {
++            for (id, connection) in connections {
++                if of_pipelines(connection.pipeline) {
++                    gone.entry(key.clone()).or_default().insert(*id);
++                }
++            }
++        }
++        for (key, queue) in &self.connection_queues {
++            for request in queue {
++                if of_pipelines(request.pipeline) {
++                    gone.entry(key.clone()).or_default().insert(request.id);
++                }
++            }
++        }
++        for (key, ids) in gone {
++            warn!(
++                "Closing the IndexedDB connections to {:?} of a window whose event loop died",
++                key.name
++            );
++            for id in &ids {
++                self.close_connection_of_gone_global(&key, *id);
++            }
++            self.abort_pending_upgrades(HashMap::from([(key.name, ids)]), key.origin);
++        }
++    }
++
+     /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>, steps 1 and 2.
++    #[expect(clippy::too_many_arguments)]
+     fn open_a_database_connection(
+         &mut self,
+         origin: ImmutableOrigin,
+@@ -1762,13 +1806,14 @@ impl IndexedDBManager {
+         id: Uuid,
+         bottle_source: StorageBottleSource,
+         results: GenericCallback<ConnectionEvent>,
++        pipeline: Option<PipelineId>,
+     ) {
+         let key = IndexedDBDescription {
+             name: db_name,
+             origin,
+         };
+         let kind = OpenRequestKind::Open { version, results };
+-        self.queue_open_request(key, id, kind, bottle_source);
++        self.queue_open_request(key, id, kind, bottle_source, pipeline);
+     }
+ 
+     fn get_database_mut(
+@@ -2021,11 +2066,12 @@ impl IndexedDBManager {
+             );
+             return false;
+         };
+-        let (id, requested_version, results, created) = (
++        let (id, requested_version, results, created, pipeline) = (
+             request.id,
+             *requested_version,
+             results.clone(),
+             request.created,
++            request.pipeline,
+         );
+ 
+         // A database that a failure showed to be unusable is opened again, once its connections
+@@ -2094,6 +2140,7 @@ impl IndexedDBManager {
+                 close_pending: false,
+                 opened,
+                 results,
++                pipeline,
+             },
+         );
+ 
+@@ -2150,7 +2197,7 @@ impl IndexedDBManager {
+         results: GenericCallback<DeleteDatabaseEvent>,
+     ) {
+         let kind = OpenRequestKind::Delete { results };
+-        self.queue_open_request(key, id, kind, bottle_source);
++        self.queue_open_request(key, id, kind, bottle_source, None);
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#delete-a-database>, steps 4 to 12, for the request at the
+@@ -2392,7 +2439,15 @@ impl IndexedDBManager {
+             SyncOperation::CloseDatabase(origin, id, db_name) => {
+                 self.close_database(origin, id, db_name);
+             },
+-            SyncOperation::OpenDatabase(origin, db_name, version, id, bottle_source, results) => {
++            SyncOperation::OpenDatabase(
++                origin,
++                db_name,
++                version,
++                id,
++                bottle_source,
++                results,
++                pipeline,
++            ) => {
+                 self.open_a_database_connection(
+                     origin,
+                     db_name,
+@@ -2400,8 +2455,12 @@ impl IndexedDBManager {
+                     id,
+                     bottle_source,
+                     results,
++                    pipeline,
+                 );
+             },
++            SyncOperation::CloseConnectionsOfPipelines(pipelines) => {
++                self.close_connections_of_pipelines(pipelines);
++            },
+             SyncOperation::AbortPendingUpgrades {
+                 pending_upgrades,
+                 origin,
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index f9602250589..a1aa8cb5b14 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -12,7 +12,8 @@ use profile::mem as profile_mem;
+ use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
+ use servo_base::generic_channel::{self, GenericSend};
+ use servo_base::id::{
+-    PIPELINE_NAMESPACE, PipelineNamespace, PipelineNamespaceId, TEST_PAINTER_ID, WebViewId,
++    PIPELINE_NAMESPACE, PipelineId, PipelineNamespace, PipelineNamespaceId, TEST_PAINTER_ID,
++    WebViewId,
+ };
+ use servo_config::prefs;
+ use servo_url::{ImmutableOrigin, ServoUrl};
+@@ -96,6 +97,7 @@ backend_tests!(
+     test_indexeddb_delete_blocked_by_a_closing_connection_asks_it_to_evict,
+     test_indexeddb_held_back_transaction_asks_the_holder_to_evict,
+     test_indexeddb_request_queued_behind_an_upgrade_asks_it_to_evict,
++    test_indexeddb_connections_of_a_crashed_window_close,
+ );
+ 
+ static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+@@ -396,6 +398,17 @@ fn open_database_request(
+     db_name: &str,
+     version: Option<u64>,
+     owned: impl Send + 'static,
++) -> (Uuid, mpsc::Receiver<Option<ConnectionMsg>>) {
++    open_database_request_of(ctx, db_name, version, owned, None)
++}
++
++/// [`open_database_request`] for the window of `pipeline`.
++fn open_database_request_of(
++    ctx: &IndexedDbTestContext,
++    db_name: &str,
++    version: Option<u64>,
++    owned: impl Send + 'static,
++    pipeline: Option<PipelineId>,
+ ) -> (Uuid, mpsc::Receiver<Option<ConnectionMsg>>) {
+     let (forward, receiver) = mpsc::channel();
+     let id = Uuid::new_v4();
+@@ -428,6 +441,7 @@ fn open_database_request(
+             id,
+             ctx.bottle_source.clone(),
+             results,
++            pipeline,
+         )),
+     )
+     .unwrap();
+@@ -3435,3 +3449,71 @@ fn test_indexeddb_request_queued_behind_an_upgrade_asks_it_to_evict() {
+     }
+     ctx.shutdown();
+ }
++
++/// The open requests and connections of a window whose event loop died without the IndexedDB
++/// teardown end when the constellation reports its pipeline: their transactions are rolled back,
++/// a delete that waits for such a connection goes on, and such an upgrade is reverted.
++fn test_indexeddb_connections_of_a_crashed_window_close() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-crashed-window";
++    let crashed = PipelineId::new();
++    let (connection, open) = open_database_request_of(&ctx, db_name, Some(1), (), Some(crashed));
++    let transaction = match recv_callback_timeout(&open, "upgrade") {
++        ConnectionMsg::Upgrade { transaction, .. } => transaction,
++        other => panic!("unexpected open message: {other:?}"),
++    };
++    create_object_store(&ctx, db_name, A, "a", transaction, None, false);
++    commit_upgrade_transaction(&ctx, db_name, transaction);
++    assert!(matches!(
++        recv_callback_timeout(&open, "connection"),
++        ConnectionMsg::Connection { .. }
++    ));
++    let txn = create_transaction(
++        &ctx,
++        db_name,
++        connection,
++        IndexedDBTxnMode::Readwrite,
++        vec![A],
++    );
++    let put = put_item(
++        &ctx,
++        db_name,
++        A,
++        txn,
++        IndexedDBKeyType::Number(1.0),
++        b"never committed".to_vec(),
++    );
++    assert!(recv_callback_timeout(&put, "put").is_ok());
++
++    let (_, delete) = delete_database(&ctx, db_name);
++    wait_for_events(connection, 3);
++    assert_nothing(
++        &delete,
++        "delete while the crashed window's connection is open",
++    );
++    let close_connections_of_crashed_window = || {
++        GenericSend::send(
++            &ctx.private_threads,
++            IndexedDBThreadMsg::Sync(SyncOperation::CloseConnectionsOfPipelines(vec![crashed])),
++        )
++        .unwrap()
++    };
++    close_connections_of_crashed_window();
++    match recv_callback_timeout(&delete, "delete result") {
++        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(1)),
++        other => panic!("unexpected delete event: {other:?}"),
++    }
++
++    let (_, open) = open_database_request_of(&ctx, db_name, Some(1), (), Some(crashed));
++    assert!(matches!(
++        recv_callback_timeout(&open, "upgrade"),
++        ConnectionMsg::Upgrade { .. }
++    ));
++    let next = open_database(&ctx, db_name, None);
++    assert_nothing(&next, "open behind the crashed window's upgrade");
++    close_connections_of_crashed_window();
++    let (connection, old_version) = upgrade_without_changes(&ctx, db_name, &next, 1);
++    assert_eq!(old_version, 0);
++    close_database(&ctx, connection, db_name);
++    ctx.shutdown();
++}

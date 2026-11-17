@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 16:17:08 +0000
+Subject: [PATCH] indexeddb: Make the manager's client storage calls on a
+ thread of their own
+
+Since "Obtain the storage proxy map of a queued request in parallel", the
+IndexedDB manager obtains the storage proxy map of each open and delete
+request on the global thread pool, where the call waits for the client
+storage thread. That thread's registry writes (obtaining a bottle map
+writes the shed, shelf and bucket rows, a new database writes its entry)
+each commit with fsyncs. The global pool has only four threads, and it
+also runs every database's work (the database actors' jobs), so a test
+that opens or deletes thirty databases at once can keep all four waiting
+for the registry while the databases' requests queue behind them.
+
+The manager now makes its client storage calls on a thread of its own
+(ClientStorageCalls), one after another, as the client storage thread
+serves them one after another anyway. The result still comes back as
+StorageProxyMapObtained, and neither the manager thread nor the pool
+waits for client storage. The next commit makes two more calls there:
+looking a request's database up in the registry, and listing a bottle's
+databases.
+
+A call that can't be handed over, as the thread is gone, fails its
+request instead of leaving it queued for good (P5 review N4).
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 152 passed, 1 skipped (unchanged); measured on top of the next two commits, which add the registry lookups, with 10 back-to-back full host IndexedDB/ runs per engine (8 processes): with the calls on the global pool, 5 of 10 QuickJS runs and 2 of 10 SpiderMonkey runs had an unexpected whole-test TIMEOUT (idb-partitioned-coverage 3, key_invalid 2, keygenerator 2), with this thread 0 of 10 and 0 of 10 (P5.2's binary: 1 of 10 and 2 of 10); QuickJS idb-partitioned-coverage took 1.6 to 10 s with the pool and 1.6 to 2.3 s with this thread; after the P5 review fix: host SM release builds, 154 passed, 1 skipped at this commit
+AI-assisted: Yes (agent session; the agent found the pool starvation in repeat runs, moved the calls to a thread of their own and measured both; the P5 review fix fails requests when the thread is gone)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/storage/indexeddb/mod.rs | 60 ++++++++++++++++++++++++-----
+ 1 file changed, 51 insertions(+), 9 deletions(-)
+
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 52eab9692e7..5e3222d9557 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -8,7 +8,7 @@ mod engines;
+ use std::borrow::ToOwned;
+ use std::collections::hash_map::Entry;
+ use std::collections::{HashMap, HashSet, VecDeque};
+-use std::sync::Arc;
++use std::sync::{Arc, mpsc};
+ use std::thread;
+ 
+ use log::{debug, error, warn};
+@@ -793,11 +793,42 @@ struct Connection {
+     results: GenericCallback<ConnectionEvent>,
+ }
+ 
++/// A thread of the manager's own for its calls to the client storage thread, which run there one
++/// after another and hand their results back to the manager as messages. Neither the manager
++/// thread, which serves every database, nor the thread pool, which runs the databases' work,
++/// waits for the client storage thread, whose registry writes are slow.
++struct ClientStorageCalls {
++    sender: mpsc::Sender<Box<dyn FnOnce() + Send>>,
++}
++
++impl ClientStorageCalls {
++    fn new() -> Self {
++        let (sender, receiver) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
++        thread::Builder::new()
++            .name("IndexedDBClientStorage".to_owned())
++            .spawn(move || {
++                while let Ok(call) = receiver.recv() {
++                    call();
++                }
++            })
++            .expect("Thread spawning failed");
++        Self { sender }
++    }
++
++    /// Runs `call` after the calls handed over before, unless the thread is gone.
++    fn run(&self, call: impl FnOnce() + Send + 'static) -> BackendResult<()> {
++        self.sender.send(Box::new(call)).map_err(|_| {
++            BackendError::DbErr("The IndexedDB manager's client storage thread is gone".to_owned())
++        })
++    }
++}
++
+ struct IndexedDBManager {
+     port: GenericReceiver<IndexedDBThreadMsg>,
+     manager_sender: GenericSender<IndexedDBThreadMsg>,
+     databases: HashMap<IndexedDBDescription, IndexedDBEnvironment<ActiveKvsEngine>>,
+     thread_pool: Arc<ThreadPool>,
++    client_storage_calls: ClientStorageCalls,
+ 
+     /// <https://w3c.github.io/IndexedDB/#connection-queue>
+     connection_queues: HashMap<IndexedDBDescription, VecDeque<OpenRequest>>,
+@@ -821,6 +852,7 @@ impl IndexedDBManager {
+             manager_sender,
+             databases: HashMap::new(),
+             thread_pool: ThreadPool::global(),
++            client_storage_calls: ClientStorageCalls::new(),
+             connection_queues: Default::default(),
+             connections: Default::default(),
+             next_connection: 0,
+@@ -1089,26 +1121,36 @@ impl IndexedDBManager {
+         kind: OpenRequestKind,
+         bottle_source: StorageBottleSource,
+     ) {
+-        self.obtain_storage_proxy_map(&key, id, bottle_source);
++        let mut request = OpenRequest::new(id, kind);
++        let failed = self
++            .obtain_storage_proxy_map(&key, id, bottle_source)
++            .is_err_and(|error| {
++                request.proxy_map = Some(Err(error));
++                true
++            });
+         // Step 1: Let queue be the connection queue for storageKey and name.
+         // Step 2: Add request to queue.
+         self.connection_queues
+-            .entry(key)
++            .entry(key.clone())
+             .or_default()
+-            .push_back(OpenRequest::new(id, kind));
++            .push_back(request);
++        if failed {
++            self.advance_connection_queue(key);
++        }
+     }
+ 
+-    /// Obtains the storage proxy map of the queued request `request` on the thread pool, which
+-    /// waits for the client storage thread instead of this one, and hands it to this thread.
++    /// Obtains the storage proxy map of the queued request `request` on the manager's client
++    /// storage thread, which waits for the client storage thread instead of this one, and hands
++    /// it to this thread.
+     fn obtain_storage_proxy_map(
+         &self,
+         key: &IndexedDBDescription,
+         request: Uuid,
+         bottle_source: StorageBottleSource,
+-    ) {
++    ) -> BackendResult<()> {
+         let manager_sender = self.manager_sender.clone();
+         let IndexedDBDescription { origin, name } = key.clone();
+-        self.thread_pool.spawn(move || {
++        self.client_storage_calls.run(move || {
+             let result = obtain_a_local_storage_bottle_map(&bottle_source, &origin);
+             if manager_sender
+                 .send(IndexedDBThreadMsg::StorageProxyMapObtained {
+@@ -1121,7 +1163,7 @@ impl IndexedDBManager {
+             {
+                 debug!("IndexedDB manager went away while obtaining a storage proxy map");
+             }
+-        });
++        })
+     }
+ 
+     fn storage_proxy_map_obtained(

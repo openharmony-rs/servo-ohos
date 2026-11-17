@@ -1,0 +1,548 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 12:59:06 +0000
+Subject: [PATCH] indexeddb: Close the connections to a database that can't be
+ used any more
+
+"Close a database connection" with the forced flag ran only when a
+global went away, which fires no events. The specification also has the
+user agent force the close "in exceptional circumstances, for example due
+to loss of access to the file system", and then fire close at the
+connection once its transactions have aborted. Servo had no such case: a
+corrupt database failed each transaction with an error, and its
+connections stayed open on it.
+
+The executors' errors for a damaged database file (SQLITE_CORRUPT and
+SQLITE_NOTADB, RDB_E_SQLITE_CORRUPT) now become BackendError::Unusable,
+which fails the request or commit like any other error, and also marks
+the engine unusable (KvsEngine::is_unusable). After every batch and
+every finished transaction, the manager checks it and closes each open
+connection to such a database: it sets the close pending flag and sends
+ConnectionEvent::ForcedClose on the connection's result channel. Script
+then runs the rest of "close a database connection" with the forced flag:
+it aborts the connection's transactions with an AbortError and fires
+close at the connection after their abort events. A window in the
+back/forward cache is evicted instead, as for versionchange. Once its
+connections are closed, the next open of the database opens it anew,
+and a delete deletes it. Full disks keep failing only the transaction
+(QuotaExceeded).
+
+A connection whose forced close can't be sent, as its global is gone, is
+closed as a connection of a gone global, with its transactions rolled
+back and finished, so it doesn't hold the next open back (P5 review S2).
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 151 passed, 1 skipped (new test_corrupt_database_makes_the_engine_unusable, both a plain and a corrupt injected failure); `./mach check --ohos -p servo-storage --all-targets` with SQLite, RDB and both: no warnings; with a temporary hook that marked a database unusable on a page's put (not committed, P5.2/wip/zz-force-close-probe.html), two connections got, in order: the put's error and the writer's abort, the other connection's reader aborted with AbortError, close at both connections (bubbles and cancelable false), transaction() then threw InvalidStateError, and a new open read the stored record (2 of 2 runs, host SM); host IndexedDB/ 4,484 of 4,511 on SM and on QuickJS without unexpected results, /_mozilla/IndexedDB/ 312 of 312 SM, 310 of 312 QuickJS (interface lists, as before); after the P5 review fix: host SM release builds, 152 passed, 1 skipped at this commit
+AI-assisted: Yes (agent session; the agent designed and implemented the forced close in the backend and script, tested it with a temporary fault hook and measured it on both engines; the P5 review fix closes a connection whose forced close can't be sent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../script/dom/indexeddb/idbdatabase.rs       | 36 +++++++++
+ components/script/dom/indexeddb/idbfactory.rs |  9 ++-
+ components/shared/storage/indexeddb.rs        |  9 +++
+ .../storage/indexeddb/backend/engine.rs       | 31 +++++++-
+ .../storage/indexeddb/backend/executor.rs     | 27 ++++++-
+ components/storage/indexeddb/backend/rdb.rs   |  6 ++
+ components/storage/indexeddb/backend/tests.rs | 44 +++++++++++
+ components/storage/indexeddb/engines/mod.rs   |  6 ++
+ components/storage/indexeddb/mod.rs           | 77 ++++++++++++++++++-
+ 9 files changed, 239 insertions(+), 6 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbdatabase.rs b/components/script/dom/indexeddb/idbdatabase.rs
+index 80910429c1a..0b8237bf21d 100644
+--- a/components/script/dom/indexeddb/idbdatabase.rs
++++ b/components/script/dom/indexeddb/idbdatabase.rs
+@@ -24,6 +24,7 @@ use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::IDBTransacti
+ use crate::dom::bindings::codegen::UnionTypes::StringOrStringSequence;
+ use crate::dom::bindings::error::{Error, Fallible};
+ use crate::dom::bindings::inheritance::Castable;
++use crate::dom::bindings::refcounted::Trusted;
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+ use crate::dom::bindings::str::DOMString;
+@@ -198,9 +199,44 @@ impl IDBDatabase {
+                     error!("Failed to send SyncOperation::NotifyEndOfVersionChange.");
+                 }
+             },
++            ConnectionEvent::ForcedClose => self.close_by_user_agent(cx),
+         }
+     }
+ 
++    /// <https://w3c.github.io/IndexedDB/#close-a-database-connection> with the forced flag, run
++    /// when the backend can't use the database any more.
++    fn close_by_user_agent(&self, cx: &mut JSContext) {
++        // Step 1: Set connection’s close pending flag to true.
++        self.close_pending.set(true);
++
++        // Step 2: If the forced flag is true, then for each transaction created using connection
++        // run abort a transaction with transaction and newly created "AbortError" DOMException.
++        let transactions: Vec<DomRoot<IDBTransaction>> = self
++            .transactions
++            .borrow()
++            .iter()
++            .map(|transaction| transaction.as_rooted())
++            .collect();
++        for transaction in transactions {
++            transaction.abort(
++                cx,
++                Error::Abort(Some("The database connection was closed".to_owned())),
++            );
++        }
++
++        // Step 3: Wait for all transactions created using connection to complete. Once they are
++        // complete, connection is closed.
++        // Step 4: If the forced flag is true, then fire an event named close at connection.
++        // Note: the tasks that finish the aborted transactions were queued before this one.
++        let this = Trusted::new(self);
++        self.global()
++            .task_manager()
++            .database_access_task_source()
++            .queue(task!(fire_indexeddb_close: move |cx| {
++                this.root().upcast::<EventTarget>().fire_event(cx, atom!("close"));
++            }));
++    }
++
+     /// The names of the connection's object stores, sorted.
+     pub(crate) fn object_store_names(&self, cx: &mut JSContext) -> DomRoot<DOMStringList> {
+         let names: Vec<Utf16String> = self
+diff --git a/components/script/dom/indexeddb/idbfactory.rs b/components/script/dom/indexeddb/idbfactory.rs
+index b8b4ba34a34..95c35e6ff16 100644
+--- a/components/script/dom/indexeddb/idbfactory.rs
++++ b/components/script/dom/indexeddb/idbfactory.rs
+@@ -247,8 +247,13 @@ impl IDBFactory {
+             // A versionchange event at a connection of a document in the back/forward cache would
+             // wait there until the document is shown again, and the upgrade or delete with it.
+             // Like Gecko and Chromium, Servo evicts the document instead, which closes the
+-            // connection; the IndexedDB specification doesn't say.
+-            if in_window && matches!(event, ConnectionEvent::VersionChange { .. }) {
++            // connection; the IndexedDB specification doesn't say. A forced close is the same.
++            if in_window &&
++                matches!(
++                    event,
++                    ConnectionEvent::VersionChange { .. } | ConnectionEvent::ForcedClose
++                )
++            {
+                 let event_task_source = task_source.clone();
+                 task_source.queue_even_if_not_fully_active(
+                     task!(handle_indexeddb_versionchange: move |_cx| {
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 479cba99b6f..4514df7617d 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -38,6 +38,10 @@ pub enum BackendError {
+     /// A unique index got the same key for two records while it was populated, which aborts the
+     /// upgrade transaction with a "ConstraintError" DOMException.
+     Constraint,
++    /// The database can't be used any more, for example because its file is corrupt: the
++    /// transaction fails, and the backend closes every connection to the database with the
++    /// forced flag (<https://w3c.github.io/IndexedDB/#close-a-database-connection>).
++    Unusable(DbError),
+ 
+     DbErr(DbError),
+ }
+@@ -56,6 +60,7 @@ impl Display for BackendError {
+             BackendError::QuotaExceeded => write!(f, "QuotaExceeded"),
+             BackendError::Abort => write!(f, "Abort"),
+             BackendError::Constraint => write!(f, "Constraint"),
++            BackendError::Unusable(err) => write!(f, "Unusable database: {err}"),
+             BackendError::DbErr(err) => write!(f, "{err}"),
+         }
+     }
+@@ -762,6 +767,10 @@ pub enum ConnectionEvent {
+         new_version: Option<u64>,
+         request: Uuid,
+     },
++    /// <https://w3c.github.io/IndexedDB/#close-a-database-connection> with the forced flag: the
++    /// backend can't use the database any more and has set the connection's close pending flag.
++    /// Script aborts the connection's transactions and fires close once they have finished.
++    ForcedClose,
+ }
+ 
+ /// What the backend reports about a request to delete a database
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index 04ea50d5200..4416e911c22 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -5,6 +5,7 @@
+ use std::collections::VecDeque;
+ use std::collections::hash_map::Entry;
+ use std::path::PathBuf;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+ 
+ use log::{error, warn};
+@@ -39,6 +40,7 @@ use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction, Transac
+ pub(crate) struct SqlEngine<X: SqlExecutor> {
+     actor: Arc<Actor<X>>,
+     metadata: Arc<Mutex<Metadata>>,
++    unusable: Arc<AtomicBool>,
+     created_db_path: bool,
+ }
+ 
+@@ -51,6 +53,7 @@ impl<X: SqlExecutor> SqlEngine<X> {
+     ) -> Result<Self, SqlError> {
+         let (mut executor, created_database) = schema::open_database::<X>(&path, db_info)?;
+         let metadata = Arc::new(Mutex::new(Metadata::load(&mut executor)?));
++        let unusable = Arc::new(AtomicBool::new(false));
+         Ok(Self {
+             actor: Arc::new(Actor {
+                 pool,
+@@ -64,12 +67,14 @@ impl<X: SqlExecutor> SqlEngine<X> {
+                     upgrade: None,
+                     versionchange: None,
+                     metadata: metadata.clone(),
++                    unusable: unusable.clone(),
+                     failed: FxHashMap::default(),
+                     population: None,
+                     stores: StoreRows::default(),
+                 })),
+             }),
+             metadata,
++            unusable,
+             created_db_path: created || created_database,
+         })
+     }
+@@ -296,6 +301,8 @@ pub(super) struct Database<X> {
+     versionchange: Option<IndexedDBTxnId>,
+     /// The metadata as of the last commit, which the [`SqlEngine`] reads.
+     metadata: Arc<Mutex<Metadata>>,
++    /// Set once a failure showed that the database can't be used any more.
++    unusable: Arc<AtomicBool>,
+     /// Transactions whose changes were rolled back by a failure, with the error that their later
+     /// requests and their commit report, until the transaction aborts.
+     failed: FxHashMap<IndexedDBTxnId, BackendError>,
+@@ -442,6 +449,7 @@ impl<X: SqlExecutor> Database<X> {
+             return results.send(request.failure_event(error.clone()));
+         }
+         if writes && let Err(error) = self.begin(transaction) {
++            self.note_failure(&error);
+             return results.send(request.failure_event(error));
+         }
+         let populating = self
+@@ -450,6 +458,9 @@ impl<X: SqlExecutor> Database<X> {
+             .filter(|population| population.transaction == transaction)
+             .and_then(|population| population.index);
+         let outcome = run_request(&mut self.executor, &mut self.stores, request, populating);
++        if let Some(failure) = &outcome.failure {
++            self.note_failure(failure.error());
++        }
+         if let Some(event) = outcome.event {
+             results.send(event);
+         }
+@@ -485,6 +496,13 @@ impl<X: SqlExecutor> Database<X> {
+         }
+     }
+ 
++    /// Notes a failure that shows that the database can't be used any more.
++    fn note_failure(&self, error: &BackendError) {
++        if matches!(error, BackendError::Unusable(_)) {
++            self.unusable.store(true, Ordering::Release);
++        }
++    }
++
+     /// Fails the writer if its SQL transaction has ended without the engine's commit or rollback.
+     /// SQLite ends it by itself after some errors, and the executors end it after the errors that
+     /// may have, also of a statement that isn't the writer's own, such as a readonly request that
+@@ -676,8 +694,13 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
+         transaction: IndexedDBTxnId,
+         on_done: Box<dyn FnOnce(BackendResult<()>) + Send>,
+     ) {
+-        self.actor
+-            .spawn(move |database| on_done(database.commit(transaction)));
++        self.actor.spawn(move |database| {
++            let result = database.commit(transaction);
++            if let Err(error) = &result {
++                database.note_failure(error);
++            }
++            on_done(result)
++        });
+     }
+ 
+     fn rollback(&self, transaction: IndexedDBTxnId, on_done: Box<dyn FnOnce() + Send>) {
+@@ -687,6 +710,10 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
+         });
+     }
+ 
++    fn is_unusable(&self) -> bool {
++        self.unusable.load(Ordering::Acquire)
++    }
++
+     fn object_stores(&self) -> Vec<IndexedDBObjectStore> {
+         lock(&self.metadata).stores.clone()
+     }
+diff --git a/components/storage/indexeddb/backend/executor.rs b/components/storage/indexeddb/backend/executor.rs
+index ff46642b4af..5c72eedd3c7 100644
+--- a/components/storage/indexeddb/backend/executor.rs
++++ b/components/storage/indexeddb/backend/executor.rs
+@@ -204,6 +204,9 @@ pub(crate) enum SqlError {
+     /// A statement that the RDB executor would reject, which the SQLite executor refuses too.
+     #[cfg(feature = "sqlite-backend")]
+     NotOnRdb(String),
++    /// A corrupt database, injected by a test.
++    #[cfg(test)]
++    InjectedCorruption,
+ }
+ 
+ impl fmt::Display for SqlError {
+@@ -225,6 +228,8 @@ impl fmt::Display for SqlError {
+             Self::Io(error) => error.fmt(formatter),
+             #[cfg(feature = "sqlite-backend")]
+             Self::NotOnRdb(sql) => write!(formatter, "statement that RDB would reject: {sql}"),
++            #[cfg(test)]
++            Self::InjectedCorruption => write!(formatter, "injected corruption"),
+         }
+     }
+ }
+@@ -270,10 +275,30 @@ impl SqlError {
+         }
+     }
+ 
+-    /// The error to report for this one: QuotaExceeded for a full disk, DbErr otherwise.
++    /// Whether the error says that the database file is damaged (SQLITE_CORRUPT or
++    /// SQLITE_NOTADB), so that no statement on the database can be trusted any more.
++    fn makes_database_unusable(&self) -> bool {
++        match self {
++            #[cfg(feature = "sqlite-backend")]
++            Self::Sqlite(error) => matches!(
++                error.sqlite_error_code(),
++                Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
++            ),
++            #[cfg(ohos_rdb)]
++            Self::Rdb(error) => super::rdb::is_corruption_error(error),
++            #[cfg(test)]
++            Self::InjectedCorruption => true,
++            _ => false,
++        }
++    }
++
++    /// The error to report for this one: QuotaExceeded for a full disk, Unusable for a damaged
++    /// database, DbErr otherwise.
+     pub(crate) fn to_backend_error(&self) -> BackendError {
+         if self.is_disk_full() {
+             BackendError::QuotaExceeded
++        } else if self.makes_database_unusable() {
++            BackendError::Unusable(format!("{self:?}"))
+         } else {
+             BackendError::DbErr(format!("{self:?}"))
+         }
+diff --git a/components/storage/indexeddb/backend/rdb.rs b/components/storage/indexeddb/backend/rdb.rs
+index b5a33a435a2..84955106cae 100644
+--- a/components/storage/indexeddb/backend/rdb.rs
++++ b/components/storage/indexeddb/backend/rdb.rs
+@@ -76,6 +76,12 @@ fn may_have_ended_transaction(error: &SqlError) -> bool {
+         .any(|ended| ended.0 == *code))
+ }
+ 
++/// Whether an RDB error reports a damaged database file.
++pub(crate) fn is_corruption_error(error: &OhosRdbError) -> bool {
++    matches!(error, OhosRdbError::Api { code, .. }
++        if *code == OH_Rdb_ErrCode::RDB_E_SQLITE_CORRUPT.0)
++}
++
+ /// Whether an RDB error reports a full disk or an exceeded size limit.
+ pub(crate) fn is_disk_full_error(error: &OhosRdbError) -> bool {
+     matches!(error, OhosRdbError::Api { code, .. }
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index 67a60fa24e1..b01fdb4e10f 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -112,6 +112,7 @@ executor_tests!(
+     test_begin_failure_fails_the_transaction,
+     test_statement_failure_that_ends_the_transaction_fails_it,
+     test_readonly_failure_that_ends_the_sql_transaction_fails_the_writer,
++    test_corrupt_database_makes_the_engine_unusable,
+     test_commit_failure_rolls_back,
+     test_batches_reply_in_dispatch_order,
+     test_job_that_ends_the_sql_transaction_fails_the_writer,
+@@ -2645,6 +2646,8 @@ pub(crate) struct Faults {
+     /// Fail the statement or query whose SQL contains this text, after letting the given number
+     /// of them through, and end the open transaction the way SQLite does after SQLITE_FULL.
+     statement: Option<(&'static str, usize)>,
++    /// Make that failure report a corrupt database.
++    corrupt: bool,
+     /// Leave the database in place on delete, as RDB does when it can't remove the files.
+     keep_on_delete: bool,
+ }
+@@ -2674,8 +2677,12 @@ impl<X: SqlExecutor> Faulty<X> {
+         match &mut faults.statement {
+             Some((text, 0)) if sql.contains(*text) => {
+                 faults.statement = None;
++                let corrupt = faults.corrupt;
+                 drop(faults);
+                 let _ = self.inner.rollback();
++                if corrupt {
++                    return Err(SqlError::InjectedCorruption);
++                }
+                 Err(SqlError::TransactionState("injected statement failure"))
+             },
+             Some((text, before)) if sql.contains(*text) => {
+@@ -2872,6 +2879,43 @@ fn test_statement_failure_that_ends_the_transaction_fails_it<X: SqlExecutor>() {
+     assert_eq!(commit(&db, 2), Ok(()));
+ }
+ 
++/// A failure that reports a corrupt database fails its request with Unusable and marks the
++/// engine unusable, so that the manager closes the database's connections; other failures don't.
++fn test_corrupt_database_makes_the_engine_unusable<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_faulty_engine::<X>(&dir);
++    let puts = [get_callback()];
++    run_batch(&db, 1, IndexedDBTxnMode::Readwrite, put_requests(&puts, 2));
++    assert!(recv(&puts[0].1).is_ok());
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    faults_for(dir.path()).lock().unwrap().statement = Some(("FROM object_data", 0));
++    let get = get_callback::<GetReply>();
++    run_batch(
++        &db,
++        2,
++        IndexedDBTxnMode::Readonly,
++        vec![get_request(get.0, 1.0)],
++    );
++    assert!(matches!(recv(&get.1), Err(BackendError::DbErr(_))));
++    assert!(!db.is_unusable());
++
++    let faults = faults_for(dir.path());
++    let mut injected = faults.lock().unwrap();
++    injected.statement = Some(("FROM object_data", 0));
++    injected.corrupt = true;
++    drop(injected);
++    let get = get_callback::<GetReply>();
++    run_batch(
++        &db,
++        3,
++        IndexedDBTxnMode::Readonly,
++        vec![get_request(get.0, 1.0)],
++    );
++    assert!(matches!(recv(&get.1), Err(BackendError::Unusable(_))));
++    assert!(db.is_unusable());
++}
++
+ /// A readonly request runs inside the open SQL transaction of a writer with a disjoint scope. If
+ /// it fails in a way that ends that SQL transaction, the writer's changes are gone, so the writer
+ /// fails, not only the readonly request.
+diff --git a/components/storage/indexeddb/engines/mod.rs b/components/storage/indexeddb/engines/mod.rs
+index eb7a8805c2a..e76c562b44c 100644
+--- a/components/storage/indexeddb/engines/mod.rs
++++ b/components/storage/indexeddb/engines/mod.rs
+@@ -152,6 +152,12 @@ pub trait KvsEngine: MallocSizeOf {
+     /// `on_done` once it is undone.
+     fn rollback(&self, transaction: IndexedDBTxnId, on_done: Box<dyn FnOnce() + Send>);
+ 
++    /// Whether a failure has shown that the database can't be used any more
++    /// ([`BackendError::Unusable`]), so that its connections must be closed.
++    fn is_unusable(&self) -> bool {
++        false
++    }
++
+     // The metadata reads answer as of the last commit, without waiting for the work handed over.
+     /// The object stores of the database, in the order they were created.
+     fn object_stores(&self) -> Vec<IndexedDBObjectStore>;
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 3bfe0c9416e..52eab9692e7 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -889,9 +889,13 @@ impl IndexedDBManager {
+ 
+                         // If more requests were queued while this batch was running,
+                         // schedule again now.
+-                        db.schedule_transactions(origin, &db_name);
++                        db.schedule_transactions(origin.clone(), &db_name);
+                         db.commit_ready_transactions();
+                     }
++                    self.close_connections_if_unusable(IndexedDBDescription {
++                        origin,
++                        name: db_name,
++                    });
+                 },
+                 IndexedDBThreadMsg::CollectMemoryReport(sender) => {
+                     let reports = self.collect_memory_reports();
+@@ -1372,6 +1376,63 @@ impl IndexedDBManager {
+         self.remove_connection(key, &id);
+     }
+ 
++    /// <https://w3c.github.io/IndexedDB/#database-connection>: "A connection may be closed by a
++    /// user agent in exceptional circumstances, for example due to loss of access to the file
++    /// system, a permission change, or clearing of the storage key's storage. If this occurs the
++    /// user agent must run close a database connection with the connection and with the forced
++    /// flag set to true." Servo does so for the connections to a database that a failure has
++    /// shown to be unusable, such as a corrupt one.
++    fn close_connections_if_unusable(&mut self, key: IndexedDBDescription) {
++        if !self
++            .databases
++            .get(&key)
++            .is_some_and(|db| db.engine.is_unusable())
++        {
++            return;
++        }
++        let Some(connections) = self.connections.get_mut(&key) else {
++            return;
++        };
++        let mut closing = Vec::new();
++        let mut gone = Vec::new();
++        for (id, connection) in connections.iter_mut() {
++            if connection.close_pending {
++                continue;
++            }
++            // <https://w3c.github.io/IndexedDB/#close-a-database-connection>
++            // Step 1: Set connection’s close pending flag to true.
++            connection.close_pending = true;
++            // Step 2: If the forced flag is true, then for each transaction created using
++            // connection run abort a transaction with transaction and newly created
++            // "AbortError" DOMException.
++            // Step 4: If the forced flag is true, then fire an event named close at connection.
++            // Note: script does both, and reports each aborted transaction as finished.
++            if connection
++                .results
++                .send(ConnectionEvent::ForcedClose)
++                .is_err()
++            {
++                debug!("Script went away before its connection was closed");
++                gone.push(*id);
++            }
++            closing.push(*id);
++        }
++        if closing.is_empty() {
++            return;
++        }
++        warn!("Closing the connections to an unusable IndexedDB database");
++        for id in gone {
++            self.close_connection_of_gone_global(&key, id);
++        }
++        // Step 3: Wait for all transactions created using connection to complete. Once they are
++        // complete, connection is closed.
++        for id in closing {
++            self.versionchange_settled(&key, id, None);
++            self.remove_connection_if_closed(&key, id);
++        }
++        self.advance_connection_queue(key);
++    }
++
+     /// Revert the backing database state after aborting an upgrade transaction.
+     ///
+     /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
+@@ -1645,6 +1706,19 @@ impl IndexedDBManager {
+             return false;
+         };
+ 
++        // A database that a failure showed to be unusable is opened again, once its connections
++        // are closed.
++        if self
++            .databases
++            .get(key)
++            .is_some_and(|db| db.engine.is_unusable())
++        {
++            if self.connections.contains_key(key) {
++                return false;
++            }
++            self.databases.remove(key);
++        }
++
+         // Step 4: Let db be the database named name in storageKey, or null otherwise.
+         let created = if self.databases.contains_key(key) {
+             false
+@@ -2046,6 +2120,7 @@ impl IndexedDBManager {
+                     name: db_name,
+                 };
+                 self.remove_connection_if_closed(&key, txn.connection);
++                self.close_connections_if_unusable(key.clone());
+                 self.advance_connection_queue(key);
+             },
+             SyncOperation::CreateTransaction {

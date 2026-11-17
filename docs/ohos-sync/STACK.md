@@ -202,6 +202,21 @@ those scripts (they need network access). `check_stack.py` runs each with
 176. `script: Add a pref that exposes SharedArrayBuffer for testing` — B · CI+device · watch: components/script/dom/bindings/structuredclone.rs support/quickjs/cargo-config.toml
 177. `indexeddb: Convert SharedArrayBuffers and views on them to binary keys` — C · CI+device · watch: tests/wpt/tests/IndexedDB
 178. `docs: record patches 166 to 178 in the stack manifest` — B · none · watch: -
+179. `script: Close a worker's IndexedDB connections when its event loop ends` — C · CI+device · watch: components/script/dom/workers/worker.rs tests/wpt/tests/IndexedDB
+180. `indexeddb: Wait for connections to close in a connection queue per database` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+181. `indexeddb: Obtain the storage proxy map of a queued request in parallel` — C · CI+device · watch: components/storage/client_storage.rs
+182. `script: Wake an idle dedicated worker when it is terminated` — C · CI+device · watch: components/script/dom/workers/dedicatedworkerglobalscope.rs
+183. `script: Close a shared worker once its last owner document is gone` — C · CI+device · watch: tests/wpt/tests/workers
+184. `indexeddb: Evict a cached page whose connection gets a versionchange event` — C · CI+device · watch: components/constellation/constellation.rs tests/wpt/tests/html/browsers/browsing-the-web/back-forward-cache
+185. `indexeddb: Close the connections to a database that can't be used any more` — C · CI+device · watch: -
+186. `storage: Find and list the databases of a storage bottle in the client storage registry` — C · CI+device · watch: -
+187. `indexeddb: Make the manager's client storage calls on a thread of their own` — C · CI+device · watch: components/shared/storage/client_storage.rs
+188. `indexeddb: Find the databases of earlier sessions in the client storage registry` — C · CI+device · watch: components/storage/client_storage.rs
+189. `indexeddb: Fail a request with the error that its backend failure calls for` — C · CI+device · watch: components/script/dom/bindings/error.rs tests/wpt/tests/IndexedDB
+190. `indexeddb: Evict a cached page that holds back another page's request or transaction` — C · CI+device · watch: components/script/tasks/task_queue.rs tests/wpt/tests/IndexedDB
+191. `indexeddb: Close the connections of windows whose event loop died` — C · CI+device · watch: components/constellation/constellation.rs
+192. `indexeddb: Reset a corrupt database when it is opened` — C · CI+device · watch: -
+193. `docs: record patches 179 to 193 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

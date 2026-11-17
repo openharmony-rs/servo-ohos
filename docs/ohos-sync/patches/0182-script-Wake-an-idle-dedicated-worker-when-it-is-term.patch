@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 12:06:06 +0000
+Subject: [PATCH] script: Wake an idle dedicated worker when it is terminated
+
+`Worker::terminate` sets the worker's closing flag and requests an interrupt,
+but the interrupt only stops running script. A worker that is waiting for its
+next message stays blocked in its event loop and only checks the closing flag
+after it receives something, so its thread, runtime and global stayed alive,
+together with its nested workers.
+
+Send the `WakeUp` message that the worker event loop already handles.
+
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+(cherry picked from commit f2e87c24b04150eb5ee3aab7cfef1dab81a25405)
+
+----
+
+Fork note: the owner's commit from the branch servo-leaks-worker-terminate, not
+upstream yet, cherry-picked without conflicts for the IndexedDB redesign. Since
+"script: Close a worker's IndexedDB connections when its event loop ends", the
+end of a worker's event loop also runs its IndexedDB teardown, so a terminated
+idle worker now aborts its transactions and closes its connections at once
+instead of when its next message arrives, and its writer no longer holds back
+the database. The fork part removes the FAIL expectation of
+IndexedDB/transaction-inflight-worker-terminate.window.js. Drop this patch once
+the commit lands upstream; keep the expectation change.
+
+Validation: build host release with SpiderMonkey and with QuickJS, then run IndexedDB/transaction-inflight-worker-terminate.window.html, IndexedDB/worker-termination-aborts-upgrade.window.html and /_mozilla/mozilla/worker-terminate-idle.html with --repeat 3: all pass 3 of 3 on both engines, while the 92b5f086e08 binary (SM) fails the first and the third 3 of 3 ("transaction never settled", "the nested worker stopped"); host SM IndexedDB/ 4,483 of 4,511 with the new pass as the only unexpected result (92b5f086e08: 4,482), /_mozilla/IndexedDB/ 306 of 306
+AI-assisted: Yes (agent session; the agent cherry-picked commit f2e87c24b04 onto the IndexedDB redesign branch, removed the fixed test's expectation and measured the effect on both engines)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/workers/worker.rs       |  3 ++
+ ...on-inflight-worker-terminate.window.js.ini |  3 --
+ tests/wpt/mozilla/meta/MANIFEST.json          | 15 ++++++++++
+ .../resources/worker-terminate-idle-inner.js  |  4 +++
+ .../resources/worker-terminate-idle-outer.js  |  6 ++++
+ .../tests/mozilla/worker-terminate-idle.html  | 29 +++++++++++++++++++
+ 6 files changed, 57 insertions(+), 3 deletions(-)
+ delete mode 100644 tests/wpt/meta/IndexedDB/transaction-inflight-worker-terminate.window.js.ini
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/resources/worker-terminate-idle-inner.js
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/resources/worker-terminate-idle-outer.js
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/worker-terminate-idle.html
+
+diff --git a/components/script/dom/workers/worker.rs b/components/script/dom/workers/worker.rs
+index f2e0dfca4be..79e4f0441ea 100644
+--- a/components/script/dom/workers/worker.rs
++++ b/components/script/dom/workers/worker.rs
+@@ -350,6 +350,9 @@ impl WorkerMethods<crate::DomTypeHolder> for Worker {
+         if let Some(cx) = self.context_for_interrupt.borrow().as_ref() {
+             cx.request_interrupt_callback()
+         }
++
++        // An idle worker is blocked waiting for a message, where the interrupt never reaches it.
++        let _ = self.sender.send(DedicatedWorkerScriptMsg::WakeUp);
+     }
+ 
+     // https://html.spec.whatwg.org/multipage/#handler-worker-onmessage
+diff --git a/tests/wpt/meta/IndexedDB/transaction-inflight-worker-terminate.window.js.ini b/tests/wpt/meta/IndexedDB/transaction-inflight-worker-terminate.window.js.ini
+deleted file mode 100644
+index 5f9c5d2bc81..00000000000
+--- a/tests/wpt/meta/IndexedDB/transaction-inflight-worker-terminate.window.js.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[transaction-inflight-worker-terminate.window.html]
+-  [IndexedDB: terminating a worker with a readwrite and a readonly transaction in flight must not wedge the database]
+-    expected: FAIL
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index a025525e213..a5aaaa1af2f 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11362,6 +11362,14 @@
+      "worker-success.js": [
+       "327986f34b9b20476b6a7b1189c732a9ea8b9f68",
+       []
++     ],
++     "worker-terminate-idle-inner.js": [
++      "9f09be5800f061537fd41adf3bf4b82d0190a04b",
++      []
++     ],
++     "worker-terminate-idle-outer.js": [
++      "2682a6b67b775117a4fb39822fc1be0442335ca0",
++      []
+      ]
+     },
+     "restyle-out-of-document-ref.html": [
+@@ -16892,6 +16900,13 @@
+       {}
+      ]
+     ],
++    "worker-terminate-idle.html": [
++     "e938e5d87d2eed8295674c787409af96ecf73f5d",
++     [
++      null,
++      {}
++     ]
++    ],
+     "worklets": {
+      "test-paint-worklet-loading.html": [
+       "e1d695c15fc5eaddf7197e638a8858e9b8e0ccf1",
+diff --git a/tests/wpt/mozilla/tests/mozilla/resources/worker-terminate-idle-inner.js b/tests/wpt/mozilla/tests/mozilla/resources/worker-terminate-idle-inner.js
+new file mode 100644
+index 00000000000..9f09be5800f
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/resources/worker-terminate-idle-inner.js
+@@ -0,0 +1,4 @@
++onmessage = e => {
++  const port = e.data;
++  setInterval(() => port.postMessage("tick"), 20);
++};
+diff --git a/tests/wpt/mozilla/tests/mozilla/resources/worker-terminate-idle-outer.js b/tests/wpt/mozilla/tests/mozilla/resources/worker-terminate-idle-outer.js
+new file mode 100644
+index 00000000000..2682a6b67b7
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/resources/worker-terminate-idle-outer.js
+@@ -0,0 +1,6 @@
++let nested;
++onmessage = e => {
++  nested = new Worker("worker-terminate-idle-inner.js");
++  nested.postMessage(e.data, [e.data]);
++  postMessage("started");
++};
+diff --git a/tests/wpt/mozilla/tests/mozilla/worker-terminate-idle.html b/tests/wpt/mozilla/tests/mozilla/worker-terminate-idle.html
+new file mode 100644
+index 00000000000..e938e5d87d2
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/worker-terminate-idle.html
+@@ -0,0 +1,29 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>Terminating an idle worker stops it, including its nested workers</title>
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script>
++// An idle worker waits for its next message, so it only notices that it was terminated if
++// termination wakes it up. Its nested worker keeps sending messages for as long as the
++// terminated worker is still running.
++promise_test(async t => {
++  const channel = new MessageChannel();
++  let ticks = 0;
++  channel.port1.onmessage = () => ticks++;
++
++  const worker = new Worker("resources/worker-terminate-idle-outer.js");
++  await new Promise(resolve => {
++    worker.onmessage = resolve;
++    worker.postMessage(channel.port2, [channel.port2]);
++  });
++  await new Promise(resolve => t.step_timeout(resolve, 200));
++  assert_greater_than(ticks, 0, "the nested worker is running");
++
++  worker.terminate();
++  await new Promise(resolve => t.step_timeout(resolve, 500));
++  const ticksAfterTerminate = ticks;
++  await new Promise(resolve => t.step_timeout(resolve, 500));
++  assert_equals(ticks, ticksAfterTerminate, "the nested worker stopped");
++}, "Terminating an idle worker stops its nested worker");
++</script>

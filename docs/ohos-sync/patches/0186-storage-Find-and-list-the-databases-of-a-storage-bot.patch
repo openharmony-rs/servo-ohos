@@ -1,0 +1,498 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 13:51:12 +0000
+Subject: [PATCH] storage: Find and list the databases of a storage bottle in
+ the client storage registry
+
+The client storage registry knows every IndexedDB database in storage:
+each has a row in `databases` (bottle, name) with its directory in
+`directories`. Until now it could only create (or look up while creating)
+and delete one, so the IndexedDB manager had no way to find a database it
+hadn't opened itself, such as one from an earlier session.
+
+Add two read-only registry operations, in both registry engines (SQLite
+and the RDB twin) with the same SQL:
+
+- FindDatabase / ClientStorageThreadHandle::find_database: the directory
+  of the database `name` in a bottle, if it exists.
+- ListDatabases / ClientStorageThreadHandle::list_databases: the databases
+  of a bottle with their directories, in creation order.
+
+Names are stored as text, or, for a name with an unpaired surrogate, as a
+BLOB of its UTF-16 code units (RegistryDatabaseName). The list reads both
+forms back, by `typeof(name)`: RDB fails to read the size of a NULL that a
+CASE expression gives, so the two forms can't be two columns. A BLOB that
+holds no name is skipped with a warning. Later commits use these for
+deleteDatabase, open and databases().
+
+The handle's requests don't unwrap their send: a message that the client
+storage thread can't take any more is dropped with its reply sender, so
+the receiver reports the disconnection instead of the asking thread
+panicking, such as the IndexedDB manager's client storage calls at
+shutdown (P5 review N4).
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 152 passed, 1 skipped (new tests/client_storage.rs test_find_and_list_databases: two bottles, a BLOB name, a deleted database); DAYU200 unit tests: client_storage_ohos_rdb.rs test_ohos_registry_finds_and_lists_databases passes with RDB only and with both backends (a first version that read the two name forms from two CASE columns failed there with OH_Cursor_GetSize 14800000); `./mach check --ohos -- -p servo-storage --all-targets` with SQLite, RDB and both: no warnings; after the P5 review fix: 154 passed, 1 skipped at this commit, with the new test_requests_after_exit_fail (the handle's requests after the client storage thread exited report the disconnection; it panics with the old unwraps)
+AI-assisted: Yes (agent session; the agent wrote the registry operations for both engines and their tests; the P5 review fix removed the unwraps, with its test)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/shared/storage/client_storage.rs   |  48 +++++++-
+ components/storage/client_storage.rs          |  94 +++++++++++++++
+ components/storage/client_storage_ohos_rdb.rs | 110 +++++++++++++++++-
+ components/storage/tests/client_storage.rs    |  82 +++++++++++++
+ 4 files changed, 330 insertions(+), 4 deletions(-)
+
+diff --git a/components/shared/storage/client_storage.rs b/components/shared/storage/client_storage.rs
+index bdd26748a80..8658bcb91fa 100644
+--- a/components/shared/storage/client_storage.rs
++++ b/components/shared/storage/client_storage.rs
+@@ -25,6 +25,12 @@ impl ClientStorageThreadHandle {
+         ClientStorageThreadHandle { sender }
+     }
+ 
++    /// Sends `message`, whose reply sender is dropped with it if the client storage thread is
++    /// gone, so that its receiver reports the disconnection.
++    fn send_request(&self, message: ClientStorageThreadMessage) {
++        let _ = self.sender.send(message);
++    }
++
+     pub fn obtain_a_storage_bottle_map(
+         &self,
+         storage_type: StorageType,
+@@ -40,7 +46,7 @@ impl ClientStorageThreadHandle {
+             origin,
+             sender,
+         };
+-        self.sender.send(message).unwrap();
++        self.send_request(message);
+         receiver
+     }
+ 
+@@ -55,7 +61,7 @@ impl ClientStorageThreadHandle {
+             name: name.into(),
+             sender,
+         };
+-        self.sender.send(message).unwrap();
++        self.send_request(message);
+         receiver
+     }
+ 
+@@ -70,7 +76,34 @@ impl ClientStorageThreadHandle {
+             name: name.into(),
+             sender,
+         };
+-        self.sender.send(message).unwrap();
++        self.send_request(message);
++        receiver
++    }
++
++    /// The directory of the database `name` in the bottle `bottle_id`, if it exists.
++    pub fn find_database(
++        &self,
++        bottle_id: i64,
++        name: impl Into<Utf16String>,
++    ) -> GenericReceiver<Result<Option<PathBuf>, String>> {
++        let (sender, receiver) = generic_channel::channel().unwrap();
++        let message = ClientStorageThreadMessage::FindDatabase {
++            bottle_id,
++            name: name.into(),
++            sender,
++        };
++        self.send_request(message);
++        receiver
++    }
++
++    /// The databases in the bottle `bottle_id`, each with its directory.
++    pub fn list_databases(
++        &self,
++        bottle_id: i64,
++    ) -> GenericReceiver<Result<Vec<(Utf16String, PathBuf)>, String>> {
++        let (sender, receiver) = generic_channel::channel().unwrap();
++        let message = ClientStorageThreadMessage::ListDatabases { bottle_id, sender };
++        self.send_request(message);
+         receiver
+     }
+ 
+@@ -258,6 +291,15 @@ pub enum ClientStorageThreadMessage {
+         name: Utf16String,
+         sender: GenericSender<Result<(), String>>,
+     },
++    FindDatabase {
++        bottle_id: i64,
++        name: Utf16String,
++        sender: GenericSender<Result<Option<PathBuf>, String>>,
++    },
++    ListDatabases {
++        bottle_id: i64,
++        sender: GenericSender<Result<Vec<(Utf16String, PathBuf)>, String>>,
++    },
+     Persisted {
+         origin: ImmutableOrigin,
+         sender: GenericCallback<Result<bool, String>>,
+diff --git a/components/storage/client_storage.rs b/components/storage/client_storage.rs
+index a194248b7ef..050f129fa20 100644
+--- a/components/storage/client_storage.rs
++++ b/components/storage/client_storage.rs
+@@ -55,6 +55,33 @@ impl From<&Utf16String> for RegistryDatabaseName {
+     }
+ }
+ 
++impl RegistryDatabaseName {
++    /// The name that the registry holds as `self`; `None` for a BLOB that holds no name.
++    fn into_name(self) -> Option<Utf16String> {
++        match self {
++            Self::Text(text) => Some(Utf16String::from(text)),
++            Self::Blob(blob) => Utf16String::from_be_bytes(&blob),
++        }
++    }
++}
++
++/// The directory of the database named `?2` in the bottle `?1`.
++const FIND_DATABASE_SQL: &str = "SELECT directories.path FROM databases
++     JOIN directories ON directories.database_id = databases.id
++     WHERE databases.bottle_id = ?1 AND databases.name = ?2;";
++
++/// The databases in the bottle `?1`, in the order they were created: whether the name is a BLOB
++/// rather than text, the name and the directory. (RDB fails to read the size of a NULL that an
++/// expression gives, so each kind of name doesn't get a column of its own.)
++const LIST_DATABASES_SQL: &str = "SELECT
++         typeof(databases.name) = 'blob',
++         databases.name,
++         directories.path
++     FROM databases
++     JOIN directories ON directories.database_id = databases.id
++     WHERE databases.bottle_id = ?1
++     ORDER BY databases.id;";
++
+ #[cfg(feature = "sqlite-backend")]
+ impl From<RegistryDatabaseName> for rusqlite::types::Value {
+     fn from(name: RegistryDatabaseName) -> Self {
+@@ -77,6 +104,17 @@ trait RegistryEngine {
+         bottle_id: i64,
+         name: Utf16String,
+     ) -> Result<(), ClientStorageErrorr<Self::Error>>;
++    /// The directory of the database `name` in the bottle `bottle_id`, if it exists.
++    fn find_database(
++        &mut self,
++        bottle_id: i64,
++        name: Utf16String,
++    ) -> Result<Option<PathBuf>, ClientStorageErrorr<Self::Error>>;
++    /// The databases in the bottle `bottle_id`, each with its directory.
++    fn list_databases(
++        &mut self,
++        bottle_id: i64,
++    ) -> Result<Vec<(Utf16String, PathBuf)>, ClientStorageErrorr<Self::Error>>;
+     fn obtain_a_storage_bottle_map(
+         &mut self,
+         storage_type: StorageType,
+@@ -587,6 +625,50 @@ impl RegistryEngine for SqliteEngine {
+         Ok(())
+     }
+ 
++    fn find_database(
++        &mut self,
++        bottle_id: i64,
++        name: Utf16String,
++    ) -> Result<Option<PathBuf>, ClientStorageErrorr<Self::Error>> {
++        let args = [
++            rusqlite::types::Value::Integer(bottle_id),
++            RegistryDatabaseName::from(&name).into(),
++        ];
++        let path: Option<String> = self
++            .connection
++            .query_row(
++                FIND_DATABASE_SQL,
++                rusqlite::params_from_iter(&args),
++                |row| row.get(0),
++            )
++            .optional()?;
++        Ok(path.map(PathBuf::from))
++    }
++
++    fn list_databases(
++        &mut self,
++        bottle_id: i64,
++    ) -> Result<Vec<(Utf16String, PathBuf)>, ClientStorageErrorr<Self::Error>> {
++        let mut statement = self.connection.prepare(LIST_DATABASES_SQL)?;
++        let rows = statement.query_map([bottle_id], |row| {
++            let name = if row.get::<_, bool>(0)? {
++                RegistryDatabaseName::Blob(row.get(1)?)
++            } else {
++                RegistryDatabaseName::Text(row.get(1)?)
++            };
++            Ok((name, row.get::<_, String>(2)?))
++        })?;
++        let mut databases = Vec::new();
++        for row in rows {
++            let (name, path) = row?;
++            match name.into_name() {
++                Some(name) => databases.push((name, PathBuf::from(path))),
++                None => warn!("Skipped a database whose registry name can't be read"),
++            }
++        }
++        Ok(databases)
++    }
++
+     /// <https://storage.spec.whatwg.org/#obtain-a-storage-bottle-map>
+     fn obtain_a_storage_bottle_map(
+         &mut self,
+@@ -849,6 +931,18 @@ where
+                     let result = self.engine.delete_database(bottle_id, name);
+                     let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
+                 },
++                ClientStorageThreadMessage::FindDatabase {
++                    bottle_id,
++                    name,
++                    sender,
++                } => {
++                    let result = self.engine.find_database(bottle_id, name);
++                    let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
++                },
++                ClientStorageThreadMessage::ListDatabases { bottle_id, sender } => {
++                    let result = self.engine.list_databases(bottle_id);
++                    let _ = sender.send(result.map_err(|e| format!("{:?}", e)));
++                },
+                 ClientStorageThreadMessage::Persisted { origin, sender } => {
+                     let _ = sender.send(self.engine.persisted(origin));
+                 },
+diff --git a/components/storage/client_storage_ohos_rdb.rs b/components/storage/client_storage_ohos_rdb.rs
+index 122e0bbe2ae..d6a2b85bb1a 100644
+--- a/components/storage/client_storage_ohos_rdb.rs
++++ b/components/storage/client_storage_ohos_rdb.rs
+@@ -7,6 +7,7 @@
+ use std::fs;
+ use std::path::PathBuf;
+ 
++use log::warn;
+ use servo_base::generic_channel::GenericSender;
+ use servo_base::id::{BrowsingContextId, WebViewId};
+ use servo_url::ImmutableOrigin;
+@@ -17,7 +18,7 @@ use storage_traits::client_storage::{
+ use storage_traits::indexeddb::Utf16String;
+ use uuid::Uuid;
+ 
+-use super::{RegistryDatabaseName, RegistryEngine};
++use super::{FIND_DATABASE_SQL, LIST_DATABASES_SQL, RegistryDatabaseName, RegistryEngine};
+ use crate::client_storage_shared::{self, StorageShelf};
+ use crate::ohos_rdb::{
+     OhosRdbError, OhosRdbStore, OhosRdbTransaction, OhosRdbValues, Result as OhosRdbResult,
+@@ -302,6 +303,46 @@ impl RegistryEngine for OhosRdbEngine {
+         Ok(())
+     }
+ 
++    fn find_database(
++        &mut self,
++        bottle_id: i64,
++        name: Utf16String,
++    ) -> Result<Option<PathBuf>, ClientStorageErrorr<Self::Error>> {
++        let mut args = OhosRdbValues::new()?;
++        args.push_int(bottle_id)?;
++        push_database_name(&mut args, &name)?;
++        let mut cursor = self.store.query_sql(FIND_DATABASE_SQL, &args)?;
++        if !cursor.next_row()? {
++            return Ok(None);
++        }
++        Ok(cursor.text(0)?.map(PathBuf::from))
++    }
++
++    fn list_databases(
++        &mut self,
++        bottle_id: i64,
++    ) -> Result<Vec<(Utf16String, PathBuf)>, ClientStorageErrorr<Self::Error>> {
++        let mut args = OhosRdbValues::new()?;
++        args.push_int(bottle_id)?;
++        let mut cursor = self.store.query_sql(LIST_DATABASES_SQL, &args)?;
++        let mut databases = Vec::new();
++        while cursor.next_row()? {
++            let name = if cursor.int64(0)? == Some(1) {
++                cursor.blob(1)?.map(RegistryDatabaseName::Blob)
++            } else {
++                cursor.text(1)?.map(RegistryDatabaseName::Text)
++            };
++            let path = cursor
++                .text(2)?
++                .ok_or_else(|| missing_row("database directory"))?;
++            match name.and_then(RegistryDatabaseName::into_name) {
++                Some(name) => databases.push((name, PathBuf::from(path))),
++                None => warn!("Skipped a database whose registry name can't be read"),
++            }
++        }
++        Ok(databases)
++    }
++
+     /// <https://storage.spec.whatwg.org/#obtain-a-storage-bottle-map>
+     fn obtain_a_storage_bottle_map(
+         &mut self,
+@@ -588,6 +629,73 @@ mod tests {
+         assert!(paths[1].exists() && paths[2].exists());
+     }
+ 
++    /// The registry finds and lists the databases of a bottle, also those whose names it holds
++    /// as BLOBs, and no longer once they are deleted.
++    #[cfg(ohos_rdb)]
++    #[test]
++    fn test_ohos_registry_finds_and_lists_databases() {
++        install_test_namespace();
++        let tmp_dir = tempfile::tempdir().unwrap();
++        let handle: ClientStorageThreadHandle =
++            ClientStorageThreadFactory::new(Some(tmp_dir.path().to_path_buf()), false);
++        let bottle_of = |url: &str| {
++            obtain_bottle_map(
++                &handle,
++                StorageType::Local,
++                Some(WebViewId::new(servo_base::id::TEST_PAINTER_ID)),
++                StorageIdentifier::IndexedDB,
++                ServoUrl::parse(url).unwrap().origin(),
++            )
++            .bottle_id
++        };
++        let (bottle, other_bottle) = (
++            bottle_of("https://example.com"),
++            bottle_of("https://example.org"),
++        );
++        let create = |bottle_id: i64, name: &Utf16String| {
++            handle
++                .create_database(bottle_id, name.clone())
++                .recv()
++                .unwrap()
++                .unwrap()
++                .0
++        };
++        let find = |bottle_id: i64, name: &Utf16String| {
++            handle
++                .find_database(bottle_id, name.clone())
++                .recv()
++                .unwrap()
++                .unwrap()
++        };
++        let list = |bottle_id: i64| handle.list_databases(bottle_id).recv().unwrap().unwrap();
++
++        let names = [
++            Utf16String::from("one"),
++            Utf16String::from_units(vec![0xD800, u16::from(b'x')]),
++            Utf16String::from("two"),
++        ];
++        let other = Utf16String::from("other");
++        let paths: Vec<PathBuf> = names.iter().map(|name| create(bottle, name)).collect();
++        let other_path = create(other_bottle, &other);
++
++        assert_eq!(find(bottle, &names[1]), Some(paths[1].clone()));
++        assert_eq!(find(bottle, &Utf16String::from("missing")), None);
++        assert_eq!(find(bottle, &other), None);
++        assert_eq!(find(other_bottle, &other), Some(other_path.clone()));
++        let listed: Vec<(Utf16String, PathBuf)> =
++            names.iter().cloned().zip(paths.iter().cloned()).collect();
++        assert_eq!(list(bottle), listed);
++        assert_eq!(list(other_bottle), vec![(other, other_path)]);
++
++        handle
++            .delete_database(bottle, names[0].clone())
++            .recv()
++            .unwrap()
++            .unwrap();
++        assert_eq!(find(bottle, &names[0]), None);
++        assert_eq!(list(bottle), listed[1..].to_vec());
++    }
++
+     #[cfg(ohos_rdb)]
+     #[test]
+     fn test_ohos_client_storage_roundtrip_uses_rdb_file() {
+diff --git a/components/storage/tests/client_storage.rs b/components/storage/tests/client_storage.rs
+index 32481aba30e..b545b74e9e7 100644
+--- a/components/storage/tests/client_storage.rs
++++ b/components/storage/tests/client_storage.rs
+@@ -70,6 +70,22 @@ fn test_exit() {
+     std::thread::sleep(std::time::Duration::from_millis(1000));
+ }
+ 
++/// Requests to a client storage thread that has exited report the disconnection.
++#[test]
++fn test_requests_after_exit_fail() {
++    let handle: ClientStorageThreadHandle = ClientStorageThreadFactory::new(None, false);
++    let (sender, receiver) = generic_channel::channel().unwrap();
++    handle
++        .send(ClientStorageThreadMessage::Exit(sender))
++        .unwrap();
++    receiver.recv().unwrap();
++
++    assert!(handle.find_database(1, "db").recv().is_err());
++    assert!(handle.list_databases(1).recv().is_err());
++    assert!(handle.create_database(1, "db").recv().is_err());
++    assert!(handle.delete_database(1, "db").recv().is_err());
++}
++
+ #[test]
+ fn test_workflow() {
+     install_test_namespace();
+@@ -207,6 +223,72 @@ fn test_database_names_with_unpaired_surrogates() {
+     assert!(paths[1..].iter().all(|path| path.exists()));
+ }
+ 
++/// The registry finds and lists the databases of a bottle, also those whose names it holds as
++/// BLOBs, and no longer once they are deleted.
++#[test]
++fn test_find_and_list_databases() {
++    install_test_namespace();
++    let tmp_dir = tempfile::tempdir().unwrap();
++    let handle: ClientStorageThreadHandle =
++        ClientStorageThreadFactory::new(Some(tmp_dir.path().to_path_buf()), false);
++    let bottle_of = |url: &str| {
++        obtain_bottle_map(
++            &handle,
++            StorageType::Local,
++            Some(WebViewId::new(servo_base::id::TEST_PAINTER_ID)),
++            StorageIdentifier::IndexedDB,
++            ServoUrl::parse(url).unwrap().origin(),
++        )
++        .bottle_id
++    };
++    let (bottle, other_bottle) = (
++        bottle_of("https://example.com"),
++        bottle_of("https://example.org"),
++    );
++    let create = |bottle_id: i64, name: &Utf16String| {
++        handle
++            .create_database(bottle_id, name.clone())
++            .recv()
++            .unwrap()
++            .unwrap()
++            .0
++    };
++    let find = |bottle_id: i64, name: &Utf16String| {
++        handle
++            .find_database(bottle_id, name.clone())
++            .recv()
++            .unwrap()
++            .unwrap()
++    };
++    let list = |bottle_id: i64| handle.list_databases(bottle_id).recv().unwrap().unwrap();
++
++    let names = [
++        Utf16String::from("one"),
++        Utf16String::from_units(vec![0xD800, u16::from(b'x')]),
++        Utf16String::from("two"),
++    ];
++    let other = Utf16String::from("other");
++    let paths: Vec<PathBuf> = names.iter().map(|name| create(bottle, name)).collect();
++    let other_path = create(other_bottle, &other);
++
++    assert_eq!(find(bottle, &names[1]), Some(paths[1].clone()));
++    assert_eq!(find(bottle, &Utf16String::from("missing")), None);
++    assert_eq!(find(bottle, &other), None);
++    assert_eq!(find(other_bottle, &other), Some(other_path.clone()));
++    let listed: Vec<(Utf16String, PathBuf)> =
++        names.iter().cloned().zip(paths.iter().cloned()).collect();
++    assert_eq!(list(bottle), listed);
++    assert_eq!(list(other_bottle), vec![(other, other_path)]);
++
++    handle
++        .delete_database(bottle, names[0].clone())
++        .recv()
++        .unwrap()
++        .unwrap();
++    assert_eq!(find(bottle, &names[0]), None);
++    assert_eq!(list(bottle), listed[1..].to_vec());
++}
++
+ #[test]
+ fn test_repeated_local_obtain_reuses_same_logical_rows() {
+     install_test_namespace();

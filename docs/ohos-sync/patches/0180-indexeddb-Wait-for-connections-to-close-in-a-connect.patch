@@ -1,0 +1,3289 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 11:45:43 +0000
+Subject: [PATCH] indexeddb: Wait for connections to close in a connection
+ queue per database
+
+Open and delete requests now follow "open a database connection", "delete a
+database" and "close a database connection" in the IndexedDB manager:
+
+- The connection queue of each (origin, name) runs its requests strictly in
+  order. Each queued request has a state: queued, waiting for the other
+  connections to close, or running its upgrade. Every event that can let the
+  front request go on (a versionchange report, a close, a finished
+  transaction, a global that went away, the end of an upgrade) ends in
+  advance_connection_queue. An open with an upgrade holds the queue until its
+  upgrade transaction has finished and its result was sent, so a later
+  request's versionchange event reaches the new connection after its success.
+- deleteDatabase fires versionchange (newVersion null) at the open connections
+  whose close isn't pending, fires blocked once the events were handled if one
+  of them is still open, and deletes the database once all have closed.
+  Before, it deleted the database under its open connections, which stayed in
+  the manager and held back the next open of the name. Its blocked event and
+  its result share one callback (DeleteDatabaseEvent).
+- A connection is closed once close() was called and all the transactions
+  created using it have finished; until then upgrades and deletes wait for it,
+  and it gets no versionchange event. Before, the manager forgot it at close(),
+  so an upgrade could start while its transactions still ran. A connection
+  closed during its upgrade lets the upgrade transaction commit, and the open
+  request then fails with AbortError (open step 10.7).
+- blocked fires only for connections without a pending close, as Gecko does
+  and Chromium does for close() in the versionchange handler: a connection
+  that only waits for its transactions closes without the page doing anything.
+- versionchange events name the request that fired them, and script's report
+  names it back, so a late report of an earlier request's event doesn't count
+  for the next one. Script fires no versionchange at a connection whose close
+  is pending, but still reports it.
+- A Commit for a database that is gone answers DbNotFound, as no transaction
+  can outlive its database now.
+
+Integration tests cover the request order, a delete waiting for two
+connections (with a report for another request and the database reopened
+empty), a closing connection's transactions holding back an upgrade, a close
+during the upgrade, and a gone global's connection. The fork tests
+connection-queue.any.js and connection-queue-globals.html cover the order of
+versionchange and blocked over several connections, interleaved opens and
+deletes, a delete, close during an upgrade, and connections in dedicated and
+shared workers and a removed iframe.
+
+A connection whose versionchange event can't be sent, as its global's
+result channel is gone (which only multiprocess reports), is closed as a
+connection of a gone global: its transactions are rolled back and
+finished, and it is forgotten, so the request doesn't wait for its
+report (P5 review S2). An upgrade whose transaction committed in the
+backend before its global went away isn't reverted when the global's
+teardown ends the open request; the manager only finishes the upgrade
+transaction, which script's teardown doesn't report. The spec keeps a
+committed upgrade (step 10.7 only fails the request), and for a new
+database the revert deleted the committed database (P5 review N1).
+
+Validation: host nextest -p servo-storage -p servo-storage-traits 150 passed, 1 skipped (5 new); host SM IndexedDB/ 4,482 of 4,511 (608a255f16b: 4,473; +9 are open-request-queue, close-in-upgradeneeded and idbdatabase_close "Unblock the delete database request", 3 globals each), every result as expected; /_mozilla/IndexedDB/ 306 of 306 (+21: connection-queue.any.js 6 subtests x 3 globals, connection-queue-globals.html 3); QuickJS, the OHOS checks, the device unit tests and the board ran at the next commit, which only moves the storage proxy map lookup; after the P5 review fixes: 151 passed, 1 skipped at this commit, with the new test_indexeddb_upgrade_committed_before_its_global_went_away_stays (an upgrade that committed before its global went away keeps its store, and a later readwrite transaction runs; it fails without the fix), and /_mozilla/IndexedDB/removed-iframe-during-upgrade.html, which timed out with a first version of the fix that didn't finish the committed upgrade transaction, passes on the stack tip
+AI-assisted: Yes (agent session; designed and implemented the connection queue, wrote the integration and fork tests, ran host WPT; the P5 review fixes closed connections of gone globals and kept committed upgrades, with their test)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../script/dom/indexeddb/idbdatabase.rs       |   17 +-
+ .../script/dom/indexeddb/idbopendbrequest.rs  |   22 +-
+ components/shared/storage/indexeddb.rs        |   29 +-
+ components/storage/indexeddb/mod.rs           | 1699 ++++++++---------
+ components/storage/tests/indexeddb.rs         |  411 +++-
+ .../close-in-upgradeneeded.any.js.ini         |   15 -
+ .../IndexedDB/idbdatabase_close.any.js.ini    |   15 -
+ .../IndexedDB/open-request-queue.any.js.ini   |   17 -
+ tests/wpt/mozilla/meta/MANIFEST.json          |   80 +
+ .../IndexedDB/connection-queue-globals.html   |  108 ++
+ .../tests/IndexedDB/connection-queue.any.js   |  237 +++
+ .../resources/connection-holder.html          |    9 +
+ .../IndexedDB/resources/connection-holder.js  |   35 +
+ 13 files changed, 1672 insertions(+), 1022 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/connection-queue-globals.html
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/connection-queue.any.js
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/resources/connection-holder.html
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/resources/connection-holder.js
+
+diff --git a/components/script/dom/indexeddb/idbdatabase.rs b/components/script/dom/indexeddb/idbdatabase.rs
+index 018f77420e8..80910429c1a 100644
+--- a/components/script/dom/indexeddb/idbdatabase.rs
++++ b/components/script/dom/indexeddb/idbdatabase.rs
+@@ -166,11 +166,20 @@ impl IDBDatabase {
+             ConnectionEvent::VersionChange {
+                 old_version,
+                 new_version,
++                request,
+             } => {
+                 // https://w3c.github.io/IndexedDB/#open-a-database-connection
+-                // Step 10.2: fire a version change event named versionchange at entry with db’s
+-                // version and version.
+-                self.dispatch_versionchange(cx, old_version, Some(new_version));
++                // Step 10.2: For each entry of openConnections that does not have its close
++                // pending flag set to true, queue a database task to fire a version change event
++                // named versionchange at entry with db’s version and version.
++                // https://w3c.github.io/IndexedDB/#delete-a-database
++                // Step 6: [...] with db’s version and null.
++                // Note: "Firing this event might cause one or more of the other objects in
++                // openConnections to be closed, in which case the versionchange event is not
++                // fired at those objects, even if that hasn’t yet been done."
++                if !self.close_pending.get() {
++                    self.dispatch_versionchange(cx, old_version, new_version);
++                }
+ 
+                 // Step 10.3: Wait for all of the events to be fired.
+                 // Note: backend is at this step; sending a message to continue algo there.
+@@ -178,7 +187,7 @@ impl IDBDatabase {
+                 let operation = SyncOperation::NotifyEndOfVersionChange {
+                     id: self.id,
+                     name: self.name.clone(),
+-                    old_version,
++                    request,
+                     origin: global.origin().immutable().clone(),
+                 };
+                 if self
+diff --git a/components/script/dom/indexeddb/idbopendbrequest.rs b/components/script/dom/indexeddb/idbopendbrequest.rs
+index fd35da89df6..963fe818074 100644
+--- a/components/script/dom/indexeddb/idbopendbrequest.rs
++++ b/components/script/dom/indexeddb/idbopendbrequest.rs
+@@ -12,8 +12,8 @@ use script_bindings::reflector::reflect_dom_object;
+ use servo_base::generic_channel::GenericSend;
+ use servo_url::origin::ImmutableOrigin;
+ use storage_traits::indexeddb::{
+-    BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBObjectStore, IndexedDBThreadMsg,
+-    IndexedDBTxnId, SyncOperation, Utf16String,
++    BackendResult, ConnectionEvent, ConnectionMsg, DeleteDatabaseEvent, IndexedDBObjectStore,
++    IndexedDBThreadMsg, IndexedDBTxnId, SyncOperation, Utf16String,
+ };
+ use stylo_atoms::Atom;
+ use uuid::Uuid;
+@@ -364,8 +364,24 @@ impl IDBOpenDBRequest {
+         };
+         let callback = GenericCallback::new(move |message| {
+             let response_listener = response_listener.clone();
++            let event = match message {
++                Ok(event) => event,
++                Err(error) => return error!("Error in IndexedDB delete channel {error:?}."),
++            };
+             task_source.queue(task!(request_callback: move |cx| {
+-                response_listener.handle_delete_db(cx, message.unwrap());
++                match event {
++                    // https://w3c.github.io/IndexedDB/#delete-a-database
++                    // Step 8: If any of the connections in openConnections are still not closed,
++                    // queue a database task to fire a version change event named blocked at
++                    // request with db’s version and null.
++                    DeleteDatabaseEvent::Blocked { old_version } => response_listener
++                        .open_request
++                        .root()
++                        .dispatch_blocked(cx, old_version, None),
++                    DeleteDatabaseEvent::Done(result) => {
++                        response_listener.handle_delete_db(cx, result)
++                    },
++                }
+             }))
+         })
+         .expect("Could not create delete database callback");
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index bbce1eb227b..e0600756825 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -753,9 +753,26 @@ pub enum ConnectionEvent {
+         serial: u64,
+         event: TransactionEvent,
+     },
+-    /// <https://w3c.github.io/IndexedDB/#eventdef-idbdatabase-versionchange>: another
+-    /// connection waits for this one to close, to open the database with `new_version`.
+-    VersionChange { old_version: u64, new_version: u64 },
++    /// <https://w3c.github.io/IndexedDB/#eventdef-idbdatabase-versionchange>: the open or delete
++    /// request `request` waits for this connection to close, to open the database with
++    /// `new_version`, or to delete it if that is `None`. Script reports with
++    /// [`SyncOperation::NotifyEndOfVersionChange`] once the event was fired.
++    VersionChange {
++        old_version: u64,
++        new_version: Option<u64>,
++        request: Uuid,
++    },
++}
++
++/// What the backend reports about a request to delete a database
++/// (<https://w3c.github.io/IndexedDB/#delete-a-database>).
++#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
++pub enum DeleteDatabaseEvent {
++    /// Step 8: connections to the database are still open after their versionchange events, so
++    /// a blocked event is fired at the request.
++    Blocked { old_version: u64 },
++    /// The request's result: the version the deleted database had, or 0 if there was none.
++    Done(BackendResult<u64>),
+ }
+ 
+ #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+@@ -886,7 +903,7 @@ pub enum SyncOperation {
+ 
+     /// Deletes the database
+     DeleteDatabase(
+-        GenericCallback<BackendResult<u64>>,
++        GenericCallback<DeleteDatabaseEvent>,
+         ImmutableOrigin,
+         // Database name.
+         Utf16String,
+@@ -901,10 +918,12 @@ pub enum SyncOperation {
+         origin: ImmutableOrigin,
+     },
+ 
++    /// The versionchange event that the open or delete request `request` fired at the connection
++    /// `id` was dispatched, or skipped as the connection's close is pending.
+     NotifyEndOfVersionChange {
+         id: Uuid,
+         name: Utf16String,
+-        old_version: u64,
++        request: Uuid,
+         origin: ImmutableOrigin,
+     },
+ 
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index ec6f5724e08..499557a1641 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -28,8 +28,9 @@ use servo_url::origin::ImmutableOrigin;
+ use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
+ use storage_traits::indexeddb::{
+     AsyncOperation, BackendError, BackendResult, ConnectionEvent, ConnectionMsg, DatabaseInfo,
+-    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId,
+-    IndexedDBTxnMode, StorageBottleSource, SyncOperation, TransactionEvent, Utf16String,
++    DeleteDatabaseEvent, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg,
++    IndexedDBTxnId, IndexedDBTxnMode, StorageBottleSource, SyncOperation, TransactionEvent,
++    Utf16String,
+ };
+ use uuid::Uuid;
+ 
+@@ -165,6 +166,11 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         self.txn_info.contains_key(&txn)
+     }
+ 
++    /// Whether a transaction created using the connection `connection` hasn't finished.
++    fn has_transactions_of(&self, connection: Uuid) -> bool {
++        self.txn_info.keys().any(|txn| txn.connection == connection)
++    }
++
+     /// Why `operation` can't run in `txn`, if it can't: DbNotFound for a transaction that isn't
+     /// registered, Abort for one that was aborted, and DbErr for an operation that its mode or
+     /// scope doesn't allow, which script never sends.
+@@ -621,191 +627,146 @@ fn obtain_a_local_storage_bottle_map(
+         .map_err(|error| BackendError::DbErr(format!("Client storage error: {error}")))
+ }
+ 
+-/// <https://w3c.github.io/IndexedDB/#request-open-request>
+-/// Used here to implement the
+-/// <https://w3c.github.io/IndexedDB/#connection-queue>
++/// <https://w3c.github.io/IndexedDB/#request-open-request> in a
++/// <https://w3c.github.io/IndexedDB/#connection-queue>: a request to open a connection to a
++/// database, or to delete the database.
+ #[derive(MallocSizeOf)]
+-enum OpenRequest {
+-    Open {
+-        /// The name of the database.
+-        db_name: Utf16String,
++struct OpenRequest {
++    /// The id of the request, which is also the id of the connection that an open request opens.
++    id: Uuid,
++    kind: OpenRequestKind,
++    /// <https://storage.spec.whatwg.org/#storage-proxy-map>, or why it couldn't be obtained.
++    proxy_map: BackendResult<StorageProxyMap>,
++    state: OpenRequestState,
++}
+ 
+-        /// Optionnaly, a requested db version.
+-        /// Note: when the open algorithm starts, this will be mutated and set to something as per the algo.
++#[derive(MallocSizeOf)]
++enum OpenRequestKind {
++    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>, with the version asked for,
++    /// if any.
++    Open {
+         version: Option<u64>,
+-
+-        /// <https://w3c.github.io/IndexedDB/#request-processed-flag>
+-        processed: bool,
+-
+-        /// Optionally, a version pending upgrade.
+-        pending_upgrade: Option<VersionUpgrade>,
+-
+-        /// This request is pending on these connections to close.
+-        pending_close: HashSet<Uuid>,
+-
+-        /// This request is pending on these connections to fire a versionchange event.
+-        /// Note: This starts as equal to `pending_close`, but when all events have fired,
+-        /// not all connections need to have closed, in which case the `blocked` event
+-        /// is fired on this request.
+-        pending_versionchange: HashSet<Uuid>,
+-
+-        id: Uuid,
+-
+-        /// <https://storage.spec.whatwg.org/#storage-proxy-map>
+-        proxy_map: StorageProxyMap,
+-
+         /// The result channel of the request and of the connection it opens: the request's
+         /// outcome and, once it opened, everything about the connection go there, in order.
+         results: GenericCallback<ConnectionEvent>,
+     },
++    /// <https://w3c.github.io/IndexedDB/#delete-a-database>
+     Delete {
+-        /// The callback used to send a result to script.
+-        sender: GenericCallback<BackendResult<u64>>,
+-
+-        _origin: ImmutableOrigin,
++        results: GenericCallback<DeleteDatabaseEvent>,
++    },
++}
+ 
+-        /// The name of the database.
+-        /// Note: will be used when the full spec is implemented.
+-        db_name: Utf16String,
++/// How far a request in a connection queue has got. Only the request at the front of the queue
++/// gets past `Queued`.
++#[derive(MallocSizeOf)]
++enum OpenRequestState {
++    /// Step 3: waiting for the requests before it to be processed.
++    Queued,
++    /// Waiting for the other connections to the database to close: steps 10.2 to 10.5 of open a
++    /// database connection, steps 6 to 9 of delete a database.
++    WaitingForConnections(ConnectionsToClose),
++    /// Step 10.6 of open a database connection: waiting for the upgrade transaction to finish.
++    Upgrading(VersionUpgrade),
++}
+ 
+-        /// <https://w3c.github.io/IndexedDB/#request-processed-flag>
+-        processed: bool,
++/// The connections that an open or delete request waits for to close.
++#[derive(MallocSizeOf)]
++struct ConnectionsToClose {
++    /// openConnections.
++    connections: Vec<Uuid>,
++    /// The connections that were fired a versionchange event at, and that have neither reported
++    /// it dispatched nor closed.
++    versionchange: HashSet<Uuid>,
++    /// The database's version.
++    old_version: u64,
++    /// The version that the open request asks for, or `None` for a delete.
++    new_version: Option<u64>,
++    /// Whether a blocked event was fired at the request.
++    blocked: bool,
++}
+ 
++impl OpenRequest {
++    fn new(
+         id: Uuid,
++        kind: OpenRequestKind,
++        proxy_map: BackendResult<StorageProxyMap>,
++    ) -> OpenRequest {
++        OpenRequest {
++            id,
++            kind,
++            proxy_map,
++            state: OpenRequestState::Queued,
++        }
++    }
+ 
+-        /// <https://storage.spec.whatwg.org/#storage-proxy-map>
+-        proxy_map: StorageProxyMap,
+-    },
+-}
++    fn proxy_map(&self) -> Option<&StorageProxyMap> {
++        self.proxy_map.as_ref().ok()
++    }
+ 
+-impl OpenRequest {
+-    fn get_id(&self) -> Uuid {
+-        let id = match self {
+-            OpenRequest::Open {
+-                db_name: _,
+-                version: _,
+-                processed: _,
+-                pending_upgrade: _,
+-                pending_close: _,
+-                pending_versionchange: _,
+-                id,
+-                proxy_map: _,
+-                results: _,
+-            } => id,
+-            OpenRequest::Delete {
+-                sender: _,
+-                _origin: _,
+-                db_name: _,
+-                processed: _,
+-                proxy_map: _,
+-                id,
+-            } => id,
++    /// Sends `message` about an open request to script.
++    fn send_open_message(&self, message: ConnectionMsg) {
++        let OpenRequestKind::Open { results, .. } = &self.kind else {
++            return debug_assert!(false, "Only an open request opens a connection");
+         };
+-        *id
++        if results.send(ConnectionEvent::Open(message)).is_err() {
++            debug!("Script went away during an IndexedDB open request");
++        }
+     }
+ 
+-    fn proxy_map(&self) -> &StorageProxyMap {
+-        match self {
+-            OpenRequest::Open { proxy_map, .. } | OpenRequest::Delete { proxy_map, .. } => {
+-                proxy_map
+-            },
++    /// Sends the result of a delete request to script.
++    fn send_delete_result(&self, result: BackendResult<u64>) {
++        let OpenRequestKind::Delete { results } = &self.kind else {
++            return debug_assert!(false, "Only a delete request deletes the database");
++        };
++        if results.send(DeleteDatabaseEvent::Done(result)).is_err() {
++            debug!("Script went away during an IndexedDB delete request");
+         }
+     }
+ 
+-    fn is_open(&self) -> bool {
+-        match self {
+-            OpenRequest::Open {
+-                db_name: _,
+-                version: _,
+-                processed: _,
+-                pending_upgrade: _,
+-                pending_close: _,
+-                pending_versionchange: _,
+-                id: _,
+-                proxy_map: _,
+-                results: _,
+-            } => true,
+-            OpenRequest::Delete {
+-                sender: _,
+-                _origin: _,
+-                db_name: _,
+-                processed: _,
+-                proxy_map: _,
+-                id: _,
+-            } => false,
++    /// Ends the request with `error`.
++    fn fail(&self, name: &Utf16String, error: BackendError) {
++        match self.kind {
++            OpenRequestKind::Open { .. } => self.send_open_message(ConnectionMsg::DatabaseError {
++                name: name.clone(),
++                id: self.id,
++                error,
++            }),
++            OpenRequestKind::Delete { .. } => self.send_delete_result(Err(error)),
+         }
+     }
+ 
+-    /// An open request remains pending until it has been processed,
+-    /// and while waiting on upgrade completion or other connections.
+-    fn is_pending(&self) -> bool {
+-        match self {
+-            OpenRequest::Open {
+-                db_name: _,
+-                version: _,
+-                processed,
+-                pending_upgrade,
+-                pending_close,
+-                pending_versionchange,
+-                id: _,
+-                proxy_map: _,
+-                results: _,
+-            } => {
+-                !processed ||
+-                    pending_upgrade.is_some() ||
+-                    !pending_close.is_empty() ||
+-                    !pending_versionchange.is_empty()
+-            },
+-            OpenRequest::Delete {
+-                sender: _,
+-                _origin: _,
+-                db_name: _,
+-                processed,
+-                id: _,
+-                proxy_map: _,
+-            } => !processed,
++    /// Ends the request with an "AbortError" DOMException, as its upgrade was aborted or its
++    /// global went away.
++    fn abort(&self, name: &Utf16String) {
++        match self.kind {
++            OpenRequestKind::Open { .. } => self.send_open_message(ConnectionMsg::AbortError {
++                name: name.clone(),
++                id: self.id,
++            }),
++            OpenRequestKind::Delete { .. } => self.send_delete_result(Err(BackendError::Abort)),
+         }
+     }
+ 
+-    /// Abort the open request,
+-    /// optionally returning a version to revert to.
+-    fn abort(&self) -> Option<VersionUpgrade> {
+-        match self {
+-            OpenRequest::Open {
+-                db_name,
+-                version: _,
+-                processed: _,
+-                pending_close: _,
+-                pending_versionchange: _,
+-                pending_upgrade,
+-                id,
+-                proxy_map: _,
+-                results,
+-            } => {
++    /// Fires a blocked event at the request: open step 10.4, delete step 8.
++    fn fire_blocked(&self, name: &Utf16String, old_version: u64, new_version: Option<u64>) {
++        match (&self.kind, new_version) {
++            (OpenRequestKind::Open { .. }, Some(version)) => {
++                self.send_open_message(ConnectionMsg::Blocked {
++                    name: name.clone(),
++                    id: self.id,
++                    version,
++                    old_version,
++                })
++            },
++            (OpenRequestKind::Delete { results }, None) => {
+                 if results
+-                    .send(ConnectionEvent::Open(ConnectionMsg::AbortError {
+-                        name: db_name.clone(),
+-                        id: *id,
+-                    }))
++                    .send(DeleteDatabaseEvent::Blocked { old_version })
+                     .is_err()
+                 {
+-                    error!("Failed to send ConnectionMsg::Connection to script.");
+-                };
+-                pending_upgrade.clone()
+-            },
+-            OpenRequest::Delete {
+-                sender,
+-                _origin: _,
+-                db_name: _,
+-                processed: _,
+-                id: _,
+-                proxy_map: _,
+-            } => {
+-                if sender.send(Err(BackendError::DbNotFound)).is_err() {
+-                    error!("Failed to send result of database delete to script.");
+-                };
+-                None
++                    debug!("Script went away during an IndexedDB delete request");
++                }
+             },
++            _ => debug_assert!(false, "Only an open request asks for a version"),
+         }
+     }
+ }
+@@ -820,9 +781,14 @@ struct VersionUpgrade {
+ /// <https://w3c.github.io/IndexedDB/#connection>
+ #[derive(MallocSizeOf)]
+ struct Connection {
+-    /// <https://w3c.github.io/IndexedDB/#connection-close-pending-flag>
++    /// <https://w3c.github.io/IndexedDB/#connection-close-pending-flag>. The connection is closed,
++    /// and forgotten, once this is set and the transactions created using it have finished.
+     close_pending: bool,
+ 
++    /// When the connection was opened, relative to the others: versionchange events are fired
++    /// in this order.
++    opened: u64,
++
+     /// The result channel of the connection, for its transactions and versionchange events.
+     results: GenericCallback<ConnectionEvent>,
+ }
+@@ -838,6 +804,9 @@ struct IndexedDBManager {
+ 
+     /// <https://w3c.github.io/IndexedDB/#connection>
+     connections: HashMap<IndexedDBDescription, HashMap<Uuid, Connection>>,
++
++    /// The opening order of the next connection.
++    next_connection: u64,
+ }
+ 
+ impl IndexedDBManager {
+@@ -854,6 +823,7 @@ impl IndexedDBManager {
+             thread_pool: ThreadPool::global(),
+             connection_queues: Default::default(),
+             connections: Default::default(),
++            next_connection: 0,
+         }
+     }
+ }
+@@ -1014,7 +984,9 @@ impl IndexedDBManager {
+         TransactionResults::new(txn, channel)
+     }
+ 
+-    /// Handle when an upgrade transaction finishes in script.
++    /// Handles the end of the upgrade transaction `txn`, which script reports once its complete or
++    /// abort event was fired: <https://w3c.github.io/IndexedDB/#open-a-database-connection> steps
++    /// 10.7 to 11.
+     fn handle_upgrade_transaction_finished(
+         &mut self,
+         name: Utf16String,
+@@ -1022,146 +994,292 @@ impl IndexedDBManager {
+         txn: IndexedDBTxnId,
+         committed: bool,
+     ) {
+-        let key = IndexedDBDescription {
+-            name: name.clone(),
+-            origin: origin.clone(),
++        let key = IndexedDBDescription { name, origin };
++        let Some(request) = self.front_request(&key) else {
++            return debug!("No open request for upgrade transaction {txn}");
++        };
++        let OpenRequestState::Upgrading(upgrade) = &request.state else {
++            return debug!("No upgrade for transaction {txn}");
+         };
++        if upgrade.transaction != txn {
++            return debug!("Upgrade transaction {txn} isn't the running one");
++        }
++        let id = request.id;
++        if !committed {
++            // Step 10.8: If request’s error is set, run the steps to close a database connection
++            // with connection, return a newly created "AbortError" DOMException and abort these
++            // steps.
++            // Note: an aborted upgrade transaction leaves the open request with an error.
++            return self.abort_pending_upgrade(key, id);
++        }
+ 
+-        if committed {
+-            let Some(queue) = self.connection_queues.get_mut(&key) else {
+-                return debug_assert!(false, "A connection queue should exist.");
++        // Step 10.7: If connection was closed, return a newly created "AbortError" DOMException
++        // and abort these steps.
++        // Note: its close is pending, and the upgrade transaction was its only transaction.
++        let closed = self
++            .connections
++            .get(&key)
++            .and_then(|connections| connections.get(&id))
++            .is_none_or(|connection| connection.close_pending);
++        let object_stores = self
++            .databases
++            .get(&key)
++            .map(|db| db.object_stores())
++            .unwrap_or_default();
++        let Some(request) = self.pop_front_request(&key) else {
++            return;
++        };
++        let OpenRequestState::Upgrading(upgrade) = &request.state else {
++            return;
++        };
++        if closed {
++            request.abort(&key.name);
++        } else {
++            // Step 11: Return connection.
++            request.send_open_message(ConnectionMsg::Connection {
++                id,
++                name: key.name.clone(),
++                version: upgrade.new,
++                upgraded: true,
++                object_stores,
++            });
++        }
++        self.advance_connection_queue(key);
++    }
++
++    fn front_request(&self, key: &IndexedDBDescription) -> Option<&OpenRequest> {
++        self.connection_queues.get(key).and_then(VecDeque::front)
++    }
++
++    fn front_request_mut(&mut self, key: &IndexedDBDescription) -> Option<&mut OpenRequest> {
++        self.connection_queues
++            .get_mut(key)
++            .and_then(VecDeque::front_mut)
++    }
++
++    fn pop_front_request(&mut self, key: &IndexedDBDescription) -> Option<OpenRequest> {
++        self.connection_queues
++            .get_mut(key)
++            .and_then(VecDeque::pop_front)
++    }
++
++    /// Steps 1 and 2 of <https://w3c.github.io/IndexedDB/#open-a-database-connection> and of
++    /// <https://w3c.github.io/IndexedDB/#delete-a-database>: adds the request `id` of `kind` to the
++    /// connection queue for `key`, with its storage proxy map, and runs the queue.
++    fn queue_open_request(
++        &mut self,
++        key: IndexedDBDescription,
++        id: Uuid,
++        kind: OpenRequestKind,
++        bottle_source: StorageBottleSource,
++    ) {
++        let proxy_map = obtain_a_local_storage_bottle_map(&bottle_source, &key.origin);
++        // Step 1: Let queue be the connection queue for storageKey and name.
++        // Step 2: Add request to queue.
++        self.connection_queues
++            .entry(key.clone())
++            .or_default()
++            .push_back(OpenRequest::new(id, kind, proxy_map));
++        self.advance_connection_queue(key);
++    }
++
++    /// Runs the requests in the connection queue for `key` in order, each as far as it can go:
++    /// "Wait until all previous requests in queue have been processed."
++    fn advance_connection_queue(&mut self, key: IndexedDBDescription) {
++        enum Next {
++            Wait,
++            Fail(BackendError),
++            Open,
++            Delete,
++            ContinueWhenConnectionsClosed,
++        }
++        loop {
++            let Some(request) = self.front_request(&key) else {
++                self.connection_queues.remove(&key);
++                return;
+             };
+-            let Some(front) = queue.front() else {
+-                return debug_assert!(false, "A pending open request should exist.");
++            let next = match (&request.state, &request.proxy_map, &request.kind) {
++                (OpenRequestState::Upgrading(_), ..) => Next::Wait,
++                (OpenRequestState::Queued, Err(error), _) => Next::Fail(error.clone()),
++                (OpenRequestState::Queued, Ok(_), OpenRequestKind::Open { .. }) => Next::Open,
++                (OpenRequestState::Queued, Ok(_), OpenRequestKind::Delete { .. }) => Next::Delete,
++                (OpenRequestState::WaitingForConnections(_), ..) => {
++                    Next::ContinueWhenConnectionsClosed
++                },
+             };
+-            let OpenRequest::Open {
+-                pending_upgrade: Some(pending_upgrade),
+-                ..
+-            } = front
+-            else {
+-                return;
++            let ended = match next {
++                Next::Wait => false,
++                Next::Fail(error) => {
++                    request.fail(&key.name, error);
++                    true
++                },
++                Next::Open => self.open_database(&key),
++                Next::Delete => self.delete_database(&key),
++                Next::ContinueWhenConnectionsClosed => self.continue_when_connections_closed(&key),
+             };
+-            if pending_upgrade.transaction != txn {
++            if !ended {
+                 return;
+             }
++            // <https://w3c.github.io/IndexedDB/#dom-idbfactory-open> and
++            // <https://w3c.github.io/IndexedDB/#dom-idbfactory-deletedatabase>, step 4.2: Set
++            // request’s processed flag to true.
++            self.pop_front_request(&key);
++        }
++    }
+ 
+-            let Some(open_request) = queue.pop_front() else {
+-                return;
+-            };
+-            let OpenRequest::Open {
+-                db_name,
+-                version: _,
+-                processed: _,
+-                pending_upgrade: Some(pending_upgrade),
+-                pending_close: _,
+-                pending_versionchange: _,
+-                id,
+-                proxy_map: _,
+-                results,
+-            } = open_request
++    /// Fires versionchange events at those of `connections` whose close pending flag isn't set,
++    /// for the open or delete request `request` (open step 10.2, delete step 6), in the order the
++    /// connections were opened, and returns those it fired at. A connection whose global is gone
++    /// is closed instead.
++    fn fire_versionchange(
++        &mut self,
++        key: &IndexedDBDescription,
++        connections: &[Uuid],
++        old_version: u64,
++        new_version: Option<u64>,
++        request: Uuid,
++    ) -> HashSet<Uuid> {
++        let Some(open) = self.connections.get(key) else {
++            return HashSet::new();
++        };
++        let mut fired = HashSet::new();
++        let mut gone = Vec::new();
++        for id in connections {
++            let Some(connection) = open.get(id).filter(|connection| !connection.close_pending)
+             else {
+-                return;
++                continue;
+             };
+-            let VersionUpgrade { new, .. } = pending_upgrade;
+-            let object_stores = self
+-                .databases
+-                .get(&key)
+-                .map(|db| db.object_stores())
+-                .unwrap_or_default();
+-            if results
+-                .send(ConnectionEvent::Open(ConnectionMsg::Connection {
+-                    id,
+-                    name: db_name,
+-                    version: new,
+-                    upgraded: true,
+-                    object_stores,
+-                }))
+-                .is_err()
+-            {
+-                error!("Failed to send ConnectionMsg::Connection to script.");
++            let event = ConnectionEvent::VersionChange {
++                old_version,
++                new_version,
++                request,
+             };
+-
+-            self.advance_connection_queue(key);
+-            return;
++            if connection.results.send(event).is_err() {
++                gone.push(*id);
++            } else {
++                fired.insert(*id);
++            }
+         }
+-
+-        let (request_id, proxy_map) = {
+-            let Some(queue) = self.connection_queues.get_mut(&key) else {
+-                return debug_assert!(false, "A connection queue should exist.");
+-            };
+-            let Some(front) = queue.front() else {
+-                return debug_assert!(false, "A pending open request should exist.");
+-            };
+-            let OpenRequest::Open {
+-                pending_upgrade: Some(pending_upgrade),
+-                id,
+-                proxy_map,
+-                ..
+-            } = front
+-            else {
+-                return;
+-            };
+-            if pending_upgrade.transaction != txn {
+-                return;
++        for id in gone {
++            debug!("Script went away before a versionchange event");
++            self.close_connection_of_gone_global(key, id);
++        }
++        fired
++    }
++
++    /// Closes the connection `id` to the database `key`, whose global went away without closing
++    /// it, so that nothing waits for it: rolls back and finishes the transactions created using
++    /// it, and forgets it.
++    fn close_connection_of_gone_global(&mut self, key: &IndexedDBDescription, id: Uuid) {
++        if let Some(db) = self.databases.get_mut(key) {
++            let transactions: Vec<IndexedDBTxnId> = db
++                .txn_info
++                .keys()
++                .filter(|txn| txn.connection == id)
++                .copied()
++                .collect();
++            for txn in transactions {
++                db.engine.rollback(txn, Box::new(|| {}));
++                db.finish_transaction(txn);
+             }
+-            (*id, (*proxy_map).clone())
+-        };
+-
+-        self.abort_pending_upgrade(name, request_id, origin, &proxy_map);
++            db.schedule_transactions(key.origin.clone(), &key.name);
++            db.commit_ready_transactions();
++        }
++        self.remove_connection(key, &id);
++        self.versionchange_settled(key, id, None);
+     }
+ 
+-    /// Run the next open request in the queue.
+-    fn advance_connection_queue(&mut self, key: IndexedDBDescription) {
+-        loop {
+-            let is_open = {
+-                let Some(queue) = self.connection_queues.get_mut(&key) else {
+-                    return;
+-                };
+-                if queue.is_empty() {
+-                    return;
+-                }
+-                queue.front().expect("Queue is not empty.").is_open()
+-            };
++    /// The connections to the database `key`, except `except`, in the order they were opened.
++    fn open_connections(&self, key: &IndexedDBDescription, except: Option<Uuid>) -> Vec<Uuid> {
++        let Some(connections) = self.connections.get(key) else {
++            return Vec::new();
++        };
++        let mut open: Vec<(u64, Uuid)> = connections
++            .iter()
++            .filter(|(id, _)| Some(**id) != except)
++            .map(|(id, connection)| (connection.opened, *id))
++            .collect();
++        open.sort_unstable();
++        open.into_iter().map(|(_, id)| id).collect()
++    }
++
++    /// Continues the request at the front of the connection queue for `key` once the connections
++    /// it waits for have handled their versionchange events and closed: open steps 10.3 to 10.6,
++    /// delete steps 7 to 12. Returns whether the request has ended.
++    fn continue_when_connections_closed(&mut self, key: &IndexedDBDescription) -> bool {
++        let connections = self.connections.get(key);
++        let Some(request) = self
++            .connection_queues
++            .get_mut(key)
++            .and_then(VecDeque::front_mut)
++        else {
++            return false;
++        };
++        let OpenRequestState::WaitingForConnections(wait) = &mut request.state else {
++            return false;
++        };
+ 
+-            if is_open {
+-                self.open_database(key.clone());
+-            } else {
+-                self.delete_database(key.clone());
+-            }
++        // Open step 10.3, delete step 7: Wait for all of the events to be fired.
++        if !wait.versionchange.is_empty() {
++            return false;
++        }
+ 
+-            let was_pruned = self.maybe_remove_front_from_queue(&key);
++        let still_open: Vec<&Connection> = wait
++            .connections
++            .iter()
++            .filter_map(|id| connections.and_then(|connections| connections.get(id)))
++            .collect();
++        let (old_version, new_version) = (wait.old_version, wait.new_version);
++        // Open step 10.4, delete step 8: If any of the connections in openConnections are still
++        // not closed, queue a database task to fire a version change event named blocked at
++        // request with db’s version and version (null for a delete).
++        // Note: as in Gecko and Chromium, a connection whose close is pending doesn't block: it
++        // closes once its transactions have finished, without the page doing anything.
++        let blocked = !wait.blocked &&
++            still_open
++                .iter()
++                .any(|connection| !connection.close_pending);
++        wait.blocked |= blocked;
++        if blocked {
++            request.fire_blocked(&key.name, old_version, new_version);
++        }
+ 
+-            if !was_pruned {
+-                // Note: requests to delete a database are, at this point in the implementation,
+-                // done in one step; so we can continue on to the next request.
+-                // Request to open a connection consists of multiple async steps, so we must break if
+-                // it is still pending.
+-                break;
+-            }
++        // Open step 10.5, delete step 9: Wait until all connections in openConnections are
++        // closed.
++        if !still_open.is_empty() {
++            return false;
++        }
++
++        match new_version {
++            Some(version) => {
++                // Open step 10.6: Run upgrade a database using connection, version and request.
++                self.upgrade_database(key, version);
++                false
++            },
++            None => {
++                self.delete_the_database(key);
++                true
++            },
+         }
+     }
+ 
+-    /// Remove the record at the front if it is not pending.
+-    fn maybe_remove_front_from_queue(&mut self, key: &IndexedDBDescription) -> bool {
+-        let (is_empty, was_pruned) = {
+-            let Some(queue) = self.connection_queues.get_mut(key) else {
+-                debug_assert!(false, "A connection queue should exist.");
+-                return false;
+-            };
+-            let mut pruned = false;
+-            let front_is_pending = queue.front().map(|record| record.is_pending());
+-            if let Some(is_pending) = front_is_pending &&
+-                !is_pending
+-            {
+-                queue.pop_front().expect("Queue has a non-pending item.");
+-                pruned = true
+-            }
+-            (queue.is_empty(), pruned)
++    /// Notes that the connection `id` was fired the versionchange event it was sent, or that it
++    /// can't be any more: the request at the front of the queue no longer waits for it.
++    fn versionchange_settled(
++        &mut self,
++        key: &IndexedDBDescription,
++        id: Uuid,
++        request: Option<Uuid>,
++    ) {
++        let Some(front) = self.front_request_mut(key) else {
++            return;
+         };
+-        if is_empty {
+-            self.connection_queues.remove(key);
++        if request.is_some_and(|request| request != front.id) {
++            return;
++        }
++        if let OpenRequestState::WaitingForConnections(wait) = &mut front.state {
++            wait.versionchange.remove(&id);
+         }
+-        was_pruned
+     }
+ 
+     fn remove_connection(&mut self, key: &IndexedDBDescription, id: &Uuid) {
+@@ -1178,6 +1296,24 @@ impl IndexedDBManager {
+         }
+     }
+ 
++    /// Forgets the connection `id` if it is closed: its close pending flag is set and the
++    /// transactions created using it have finished (close a database connection, step 3).
++    fn remove_connection_if_closed(&mut self, key: &IndexedDBDescription, id: Uuid) {
++        let close_pending = self
++            .connections
++            .get(key)
++            .and_then(|connections| connections.get(&id))
++            .is_some_and(|connection| connection.close_pending);
++        if !close_pending ||
++            self.databases
++                .get(key)
++                .is_some_and(|db| db.has_transactions_of(id))
++        {
++            return;
++        }
++        self.remove_connection(key, &id);
++    }
++
+     /// Revert the backing database state after aborting an upgrade transaction.
+     ///
+     /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
+@@ -1195,24 +1331,14 @@ impl IndexedDBManager {
+         &mut self,
+         key: &IndexedDBDescription,
+         upgrade: &VersionUpgrade,
+-        proxy_map: &StorageProxyMap,
++        proxy_map: Option<&StorageProxyMap>,
+     ) {
+         if upgrade.old == 0 {
+-            if let Some(db) = self.databases.remove(key) {
+-                // Note: ensure db is dropped before deleting directory,
+-                // to get around windows file locks.
+-                drop(db);
+-                let response = proxy_map
+-                    .handle
+-                    .delete_database(proxy_map.bottle_id, key.name.clone())
+-                    .recv();
+-                if response.is_err() {
+-                    error!("Failed to communicate with client storage.");
+-                    return;
+-                }
+-                if response.unwrap().is_err() {
+-                    error!("Failed to delete database {:?}", key.name);
+-                }
++            let Some(proxy_map) = proxy_map else {
++                return debug_assert!(false, "An upgraded database has a storage proxy map");
++            };
++            if let Err(error) = self.remove_database(key, proxy_map) {
++                error!("Failed to delete database {:?}: {error}", key.name);
+             }
+             return;
+         }
+@@ -1224,100 +1350,74 @@ impl IndexedDBManager {
+         db.engine.rollback(upgrade.transaction, Box::new(|| {}));
+     }
+ 
+-    /// Aborting the current upgrade for an origin.
++    /// Ends the open request `id` at the front of the connection queue for `key`, whose upgrade
++    /// transaction was aborted: reverts the upgrade, forgets the connection, which script closed,
++    /// and reports an "AbortError" DOMException.
+     /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
+-    fn abort_pending_upgrade(
+-        &mut self,
+-        name: Utf16String,
+-        id: Uuid,
+-        origin: ImmutableOrigin,
+-        proxy_map: &StorageProxyMap,
+-    ) {
+-        let key = IndexedDBDescription { name, origin };
+-        let upgrade = {
+-            let Some(queue) = self.connection_queues.get_mut(&key) else {
+-                return debug_assert!(
+-                    false,
+-                    "There should be a connection queue for the aborted upgrade."
+-                );
+-            };
+-            let Some(open_request) = queue.pop_front() else {
+-                return debug_assert!(false, "There should be an open request to upgrade.");
+-            };
+-            if open_request.get_id() != id {
+-                return debug_assert!(
+-                    false,
+-                    "Open request to abort should be at the head of the queue."
+-                );
+-            }
+-            open_request.abort()
++    fn abort_pending_upgrade(&mut self, key: IndexedDBDescription, id: Uuid) {
++        let Some(request) = self.pop_front_request(&key) else {
++            return debug_assert!(false, "There should be an open request to upgrade.");
+         };
+-        if let Some(upgrade) = upgrade {
+-            self.revert_aborted_upgrade(&key, &upgrade, proxy_map);
++        debug_assert_eq!(
++            request.id, id,
++            "The aborted upgrade should be the running one"
++        );
++        if let OpenRequestState::Upgrading(upgrade) = &request.state {
++            self.revert_aborted_upgrade(&key, upgrade, request.proxy_map());
+         }
+-
++        request.abort(&key.name);
+         self.remove_connection(&key, &id);
+-
+         self.advance_connection_queue(key);
+     }
+ 
+-    /// Aborting all upgrades for an origin
+-    // https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction
+-    /// Note: this only reverts the version at this point.
++    /// Ends the open requests and forgets the connections `ids` of each database, whose global
++    /// went away: a connection whose global is gone is closed. A request whose upgrade runs has
++    /// its upgrade reverted.
++    /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
+     fn abort_pending_upgrades(
+         &mut self,
+         pending_upgrades: HashMap<Utf16String, HashSet<Uuid>>,
+         origin: ImmutableOrigin,
+     ) {
+         for (name, ids) in pending_upgrades.into_iter() {
+-            let mut upgrade_to_revert: Option<(VersionUpgrade, StorageProxyMap)> = None;
+             let key = IndexedDBDescription {
+                 name: name.clone(),
+                 origin: origin.clone(),
+             };
+             for id in ids.iter() {
+                 self.remove_connection(&key, id);
++                self.versionchange_settled(&key, *id, None);
+             }
+-            let front_removed = {
+-                let (is_empty, front_removed) = {
+-                    let Some(queue) = self.connection_queues.get_mut(&key) else {
+-                        continue;
+-                    };
+-                    let front_removed = queue
+-                        .front()
+-                        .is_some_and(|open_request| ids.contains(&open_request.get_id()));
+-                    queue.retain_mut(|open_request| {
+-                        if ids.contains(&open_request.get_id()) {
+-                            let upgrade = open_request.abort();
+-                            if upgrade_to_revert.is_none() &&
+-                                let Some(upgrade) = upgrade
+-                            {
+-                                upgrade_to_revert =
+-                                    Some((upgrade, open_request.proxy_map().clone()));
+-                            }
+-                            false
+-                        } else {
+-                            true
+-                        }
+-                    });
+-                    (queue.is_empty(), front_removed)
+-                };
+-                if is_empty {
+-                    self.connection_queues.remove(&key);
+-                }
+-                front_removed
++            let removed: VecDeque<OpenRequest> = match self.connection_queues.get_mut(&key) {
++                Some(queue) => {
++                    let (removed, kept) = std::mem::take(queue)
++                        .into_iter()
++                        .partition(|request| ids.contains(&request.id));
++                    *queue = kept;
++                    removed
++                },
++                None => VecDeque::new(),
+             };
+-            if let Some((upgrade, proxy_map)) = upgrade_to_revert {
+-                self.revert_aborted_upgrade(&key, &upgrade, &proxy_map);
+-            }
+-            // The requests queued behind a removed request that was running go on.
+-            if front_removed {
+-                self.advance_connection_queue(key);
++            for request in removed {
++                if let OpenRequestState::Upgrading(upgrade) = &request.state {
++                    // An upgrade transaction that committed before its global went away stays
++                    // committed: step 10.7 only fails the request.
++                    let committed = self.databases.get(&key).and_then(|db| db.version().ok()) ==
++                        Some(upgrade.new);
++                    match self.databases.get_mut(&key) {
++                        Some(db) if committed => db.finish_transaction(upgrade.transaction),
++                        _ => self.revert_aborted_upgrade(&key, upgrade, request.proxy_map()),
++                    }
++                }
++                request.abort(&name);
+             }
++            // The requests queued behind a removed request go on, and so does one that waited
++            // for a removed connection.
++            self.advance_connection_queue(key);
+         }
+     }
+ 
+-    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
++    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>, steps 1 and 2.
+     fn open_a_database_connection(
+         &mut self,
+         origin: ImmutableOrigin,
+@@ -1327,51 +1427,12 @@ impl IndexedDBManager {
+         bottle_source: StorageBottleSource,
+         results: GenericCallback<ConnectionEvent>,
+     ) {
+-        let proxy_map = match obtain_a_local_storage_bottle_map(&bottle_source, &origin) {
+-            Ok(proxy_map) => proxy_map,
+-            Err(error) => {
+-                if results
+-                    .send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
+-                        name: db_name,
+-                        id,
+-                        error,
+-                    }))
+-                    .is_err()
+-                {
+-                    debug!("Script exit during indexeddb database open");
+-                }
+-                return;
+-            },
+-        };
+         let key = IndexedDBDescription {
+-            name: db_name.clone(),
++            name: db_name,
+             origin,
+         };
+-        let open_request = OpenRequest::Open {
+-            db_name,
+-            version,
+-            processed: false,
+-            pending_close: Default::default(),
+-            pending_versionchange: Default::default(),
+-            pending_upgrade: None,
+-            id,
+-            proxy_map,
+-            results,
+-        };
+-        let should_continue = {
+-            // Step 1: Let queue be the connection queue for storageKey and name.
+-            let queue = self.connection_queues.entry(key.clone()).or_default();
+-
+-            // Step 2: Add request to queue.
+-            queue.push_back(open_request);
+-            queue.len() == 1
+-        };
+-
+-        // Step 3: Wait until all previous requests in queue have been processed.
+-        if should_continue {
+-            self.open_database(key.clone());
+-            self.maybe_remove_front_from_queue(&key);
+-        }
++        let kind = OpenRequestKind::Open { version, results };
++        self.queue_open_request(key, id, kind, bottle_source);
+     }
+ 
+     fn get_database_mut(
+@@ -1390,43 +1451,33 @@ impl IndexedDBManager {
+     /// <https://w3c.github.io/IndexedDB/#upgrade-a-database>
+     /// To upgrade a database with connection (a connection),
+     /// a new version, and a request, run these steps:
+-    fn upgrade_database(&mut self, key: IndexedDBDescription, new_version: u64) {
+-        let Some(queue) = self.connection_queues.get_mut(&key) else {
+-            return debug_assert!(false, "A connection queue should exist.");
+-        };
+-        let Some(open_request) = queue.front_mut() else {
++    fn upgrade_database(&mut self, key: &IndexedDBDescription, new_version: u64) {
++        let Some(open_request) = self
++            .connection_queues
++            .get_mut(key)
++            .and_then(VecDeque::front_mut)
++        else {
+             return debug_assert!(false, "An open request should be in the queue.");
+         };
+-        let OpenRequest::Open {
+-            db_name,
+-            version: _,
+-            processed,
+-            id,
+-            pending_close: _,
+-            pending_versionchange: _,
+-            pending_upgrade,
+-            proxy_map: _,
+-            results,
+-        } = open_request
+-        else {
+-            return;
++        let OpenRequestKind::Open { results, .. } = &open_request.kind else {
++            return debug_assert!(false, "Only an open request upgrades the database.");
+         };
+ 
+         // Step 1: Let db be connection’s database.
+         let db = self
+             .databases
+-            .get_mut(&key)
++            .get_mut(key)
+             .expect("Db should have been opened.");
+ 
+         // Step 2: Let transaction be a new upgrade transaction with connection used as connection.
+-        let transaction = IndexedDBTxnId::upgrade(*id);
++        let transaction = IndexedDBTxnId::upgrade(open_request.id);
+ 
+         // Step 3: Set transaction’s scope to connection’s object store set.
+         let object_stores = db.object_stores();
+         let scope = object_stores.iter().map(|store| store.id).collect();
+ 
+         // Step 4: Set db’s upgrade transaction to transaction.
+-        // Backend tracks the active upgrade transaction in `pending_upgrade` below.
++        // Backend tracks the active upgrade transaction in the request's state below.
+         db.register_transaction(
+             transaction,
+             IndexedDBTxnMode::Versionchange,
+@@ -1447,580 +1498,338 @@ impl IndexedDBManager {
+         db.engine.upgrade_version(transaction, new_version);
+ 
+         // Step 9: Set request’s processed flag to true.
+-        *processed = true;
+-        let _ = pending_upgrade.insert(VersionUpgrade {
++        // Note: the next request in the queue waits until the upgrade transaction has finished
++        // and the request's result was sent, as in Chromium: "until this transaction is
++        // finished, no other connections can be opened to the same database", and the success
++        // event must reach the connection before a versionchange event.
++        open_request.state = OpenRequestState::Upgrading(VersionUpgrade {
+             old: old_version,
+             new: new_version,
+             transaction,
+         });
+ 
+-        // Step 10: Queue a database task to run these steps.
+-        if results
+-            .send(ConnectionEvent::Open(ConnectionMsg::Upgrade {
+-                id: *id,
+-                name: db_name.clone(),
+-                version: new_version,
+-                old_version,
+-                transaction,
+-                object_stores,
+-            }))
+-            .is_err()
+-        {
+-            error!("Couldn't queue task for indexeddb upgrade event.");
+-        }
++        // Step 10: Queue a database task to run these steps:
++        open_request.send_open_message(ConnectionMsg::Upgrade {
++            id: open_request.id,
++            name: key.name.clone(),
++            version: new_version,
++            old_version,
++            transaction,
++            object_stores,
++        });
+ 
+         // Step 11: Wait for transaction to finish.
+-        // Queue progression remains blocked while `pending_upgrade` is set.
++        // Note: see `handle_upgrade_transaction_finished`.
+     }
+ 
+-    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
++    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>, steps 10.3 and 10.5: the
++    /// connection `id` reports that it was fired the versionchange event of the request
++    /// `request`.
+     fn handle_version_change_done(
+         &mut self,
+         name: Utf16String,
+-        from_id: Uuid,
+-        old_version: u64,
++        id: Uuid,
++        request: Uuid,
+         origin: ImmutableOrigin,
+     ) {
+-        let key = IndexedDBDescription {
+-            name: name.clone(),
+-            origin,
+-        };
+-        let (can_upgrade, version) = {
+-            let Some(queue) = self.connection_queues.get_mut(&key) else {
+-                return debug_assert!(false, "A connection queue should exist.");
+-            };
+-            let Some(open_request) = queue.front_mut() else {
+-                return debug_assert!(false, "An open request should be in the queue.");
+-            };
+-            let OpenRequest::Open {
+-                db_name: _,
+-                version,
+-                id,
+-                pending_upgrade: _,
+-                processed: _,
+-                pending_versionchange,
+-                pending_close,
+-                proxy_map: _,
+-                results,
+-            } = open_request
+-            else {
+-                return debug_assert!(
+-                    false,
+-                    "An request to open a connection should be in the queue."
+-                );
+-            };
+-            // Note: a connection that closed first no longer counts, see `close_database`.
+-            if !pending_versionchange.remove(&from_id) {
+-                return;
+-            }
+-
+-            // Step 10.3: Wait for all of the events to be fired.
+-            if !pending_versionchange.is_empty() {
+-                return;
+-            }
+-
+-            let Some(version) = *version else {
+-                return debug_assert!(
+-                    false,
+-                    "An upgrade version should have been determined by now."
+-                );
+-            };
+-
+-            // Step 10.4: If any of the connections in openConnections are still not closed,
+-            // queue a database task to fire a version change event named blocked
+-            // at request with db’s version and version.
+-            if !pending_close.is_empty() &&
+-                results
+-                    .send(ConnectionEvent::Open(ConnectionMsg::Blocked {
+-                        name,
+-                        id: *id,
+-                        version,
+-                        old_version,
+-                    }))
+-                    .is_err()
+-            {
+-                return debug!("Script exit during indexeddb database open");
+-            }
+-
+-            (pending_close.is_empty(), version)
+-        };
+-
+-        // Step 10.5: Wait until all connections in openConnections are closed.
+-        // Note: if we still need to wait, the algorithm will continue in the handling of the close message.
+-        if can_upgrade {
+-            // Step 10.6: Run upgrade a database using connection, version and request.
+-            self.upgrade_database(key.clone(), version);
+-
+-            let was_pruned = self.maybe_remove_front_from_queue(&key);
+-            if was_pruned {
+-                self.advance_connection_queue(key);
+-            }
+-        }
++        let key = IndexedDBDescription { name, origin };
++        self.versionchange_settled(&key, id, Some(request));
++        self.advance_connection_queue(key);
+     }
+ 
+-    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
+-    /// The part where the open request is ready for processing.
+-    fn open_database(&mut self, key: IndexedDBDescription) {
+-        let Some(queue) = self.connection_queues.get_mut(&key) else {
+-            return debug_assert!(false, "A connection queue should exist.");
+-        };
+-        let Some(open_request) = queue.front_mut() else {
+-            return debug_assert!(false, "An open request should be in the queue.");
++    /// Creates the database `key` in the storage bottle of `proxy_map`
++    /// (<https://w3c.github.io/IndexedDB/#open-a-database-connection> step 6) or opens it if it
++    /// exists there, and returns whether it was created.
++    fn create_database(
++        &mut self,
++        key: &IndexedDBDescription,
++        proxy_map: &StorageProxyMap,
++    ) -> BackendResult<bool> {
++        let response = proxy_map
++            .handle
++            .create_database(proxy_map.bottle_id, key.name.clone())
++            .recv()
++            .map_err(|_| {
++                BackendError::DbErr("Failed to communicate with client storage.".to_string())
++            })?;
++        let (path, created) =
++            response.map_err(|error| BackendError::DbErr(format!("{error:?}")))?;
++        let engine = ActiveKvsEngine::new(path, created, key, self.thread_pool.clone())
++            .map_err(backend_error_from_storage_error)?;
++        let created = engine.created_db_path();
++        let db = IndexedDBEnvironment::new(engine, self.manager_sender.clone());
++        self.databases.insert(key.clone(), db);
++        Ok(created)
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>, steps 4 to 11, for the
++    /// request at the front of the connection queue for `key`. Returns whether the request has
++    /// ended.
++    fn open_database(&mut self, key: &IndexedDBDescription) -> bool {
++        let Some(request) = self.front_request(key) else {
++            debug_assert!(false, "An open request should be in the queue.");
++            return false;
+         };
+-        let OpenRequest::Open {
+-            db_name,
+-            version,
+-            id,
+-            processed,
+-            pending_upgrade: _pending_upgrade,
+-            pending_close,
+-            pending_versionchange,
+-            proxy_map,
++        let OpenRequestKind::Open {
++            version: requested_version,
+             results,
+-        } = open_request
++        } = &request.kind
+         else {
+-            return debug_assert!(
++            debug_assert!(
+                 false,
+-                "An request to open a connection should be in the queue."
++                "A request to open a connection should be in the queue."
+             );
++            return false;
++        };
++        let (id, requested_version, results) = (request.id, *requested_version, results.clone());
++        let Some(proxy_map) = request.proxy_map().cloned() else {
++            debug_assert!(false, "The request's storage proxy map should be there.");
++            return false;
+         };
+ 
+-        let requested_version = *version;
+-
+-        // Step 4: Let db be the database named name in origin, or null otherwise.
+-        let db_version = match self.databases.entry(key.clone()) {
+-            Entry::Vacant(e) => {
+-                // Step 5: If version is undefined, let version be 1 if db is null, or db’s version otherwise.
+-                // Note: done below with the zero as first tuple item.
+-
+-                // https://www.w3.org/TR/IndexedDB/#open-a-database-connection
+-                // Step 6: If db is null, let db be a new database
+-                // with name name, version 0 (zero), and with no object stores.
+-                // If this fails for any reason, return an appropriate error
+-                // (e.g. a "QuotaExceededError" or "UnknownError" DOMException).
+-                let Ok(response) = proxy_map
+-                    .handle
+-                    .create_database(proxy_map.bottle_id, db_name.clone())
+-                    .recv()
+-                else {
+-                    if let Err(e) =
+-                        results.send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
+-                            id: *id,
+-                            name: db_name.clone(),
+-                            error: BackendError::DbErr(
+-                                "Failed to communicate with client storage.".to_string(),
+-                            ),
+-                        }))
+-                    {
+-                        debug!("Script exit during indexeddb database open {:?}", e);
+-                    }
+-                    return;
+-                };
+-                let (path, created) = match response {
+-                    Ok((path, created)) => (path, created),
+-                    Err(err) => {
+-                        if let Err(e) =
+-                            results.send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
+-                                id: *id,
+-                                name: db_name.clone(),
+-                                error: BackendError::DbErr(format!("{err:?}")),
+-                            }))
+-                        {
+-                            debug!("Script exit during indexeddb database open {:?}", e);
+-                        }
+-                        return;
+-                    },
+-                };
+-                let engine =
+-                    match ActiveKvsEngine::new(path, created, &key, self.thread_pool.clone()) {
+-                        Ok(engine) => engine,
+-                        Err(err) => {
+-                            let error = backend_error_from_storage_error(err);
+-                            if let Err(e) =
+-                                results.send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
+-                                    id: *id,
+-                                    name: db_name.clone(),
+-                                    error,
+-                                }))
+-                            {
+-                                debug!("Script exit during indexeddb database open {:?}", e);
+-                            }
+-                            *processed = true;
+-                            return;
+-                        },
+-                    };
+-                let created_db_path = engine.created_db_path();
+-                let db = IndexedDBEnvironment::new(engine, self.manager_sender.clone());
+-                let db_version = match db.version() {
+-                    Ok(version) => version,
+-                    Err(err) => {
+-                        let error = backend_error_from_storage_error(err);
+-                        if let Err(e) =
+-                            results.send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
+-                                id: *id,
+-                                name: db_name.clone(),
+-                                error,
+-                            }))
+-                        {
+-                            debug!("Script exit during indexeddb database open {:?}", e);
+-                        }
+-                        *processed = true;
+-                        return;
+-                    },
+-                };
+-
+-                *version = if created_db_path {
+-                    Some(requested_version.unwrap_or(1))
+-                } else {
+-                    Some(requested_version.unwrap_or(db_version))
+-                };
+-
+-                e.insert(db);
+-                db_version
++        // Step 4: Let db be the database named name in storageKey, or null otherwise.
++        let created = if self.databases.contains_key(key) {
++            false
++        } else {
++            // Step 6: If db is null, let db be a new database with name name, version 0
++            // (zero), and with no object stores. If this fails for any reason, return an
++            // appropriate error (e.g. a "QuotaExceededError" or "UnknownError" DOMException).
++            match self.create_database(key, &proxy_map) {
++                Ok(created) => created,
++                Err(error) => {
++                    self.front_request(key)
++                        .expect("Checked above")
++                        .fail(&key.name, error);
++                    return true;
++                },
++            }
++        };
++        let db_version = match self.databases.get(key).map(|db| db.version()) {
++            Some(Ok(version)) => version,
++            Some(Err(error)) => {
++                let error = backend_error_from_storage_error(error);
++                self.front_request(key)
++                    .expect("Checked above")
++                    .fail(&key.name, error);
++                return true;
+             },
+-            Entry::Occupied(db) => {
+-                let db_version = match db.get().version() {
+-                    Ok(version) => version,
+-                    Err(err) => {
+-                        let error = backend_error_from_storage_error(err);
+-                        if let Err(e) =
+-                            results.send(ConnectionEvent::Open(ConnectionMsg::DatabaseError {
+-                                id: *id,
+-                                name: db_name.clone(),
+-                                error,
+-                            }))
+-                        {
+-                            debug!("Script exit during indexeddb database open {:?}", e);
+-                        }
+-                        *processed = true;
+-                        return;
+-                    },
+-                };
+-                // Step 5: If version is undefined, let version be 1 if db is null, or db’s version otherwise.
+-                *version = Some(requested_version.unwrap_or(db_version));
+-                db_version
++            None => {
++                debug_assert!(false, "The database should be open.");
++                return false;
+             },
+         };
+ 
+-        let Some(version) = *version else {
+-            return debug_assert!(
+-                false,
+-                "An upgrade version should have been determined by now."
+-            );
+-        };
++        // Step 5: If version is undefined, let version be 1 if db is null, or db’s version
++        // otherwise.
++        let version = requested_version.unwrap_or(if created { 1 } else { db_version });
+ 
+-        // Step 7: If db’s version is greater than version,
+-        // return a newly created "VersionError" DOMException
+-        // and abort these steps.
++        // Step 7: If db’s version is greater than version, return a newly created
++        // "VersionError" DOMException and abort these steps.
+         if version < db_version {
+-            if results
+-                .send(ConnectionEvent::Open(ConnectionMsg::VersionError {
+-                    name: db_name.clone(),
+-                    id: *id,
+-                }))
+-                .is_err()
+-            {
+-                debug!("Script exit during indexeddb database open");
+-            }
+-            *processed = true;
+-            return;
++            self.front_request(key)
++                .expect("Checked above")
++                .send_open_message(ConnectionMsg::VersionError {
++                    name: key.name.clone(),
++                    id,
++                });
++            return true;
+         }
+ 
+         // Step 8: Let connection be a new connection to db.
+         // Step 9: Set connection’s version to version.
+-        let connection = Connection {
+-            close_pending: false,
+-            results: results.clone(),
+-        };
+-        let entry = self.connections.entry(key.clone()).or_default();
+-        entry.insert(*id, connection);
++        let opened = self.next_connection;
++        self.next_connection += 1;
++        self.connections.entry(key.clone()).or_default().insert(
++            id,
++            Connection {
++                close_pending: false,
++                opened,
++                results,
++            },
++        );
+ 
+         // Step 10: If db’s version is less than version, then:
+         if db_version < version {
+-            // Step 10.1: Let openConnections be the set of all connections,
+-            // except connection, associated with db.
+-            let open_connections = entry
+-                .iter_mut()
+-                .filter(|(other_id, conn)| !conn.close_pending && *other_id != id);
+-            for (id_to_close, conn) in open_connections {
+-                // Step 10.2: For each entry of openConnections
+-                // queue a database task to fire a version change event
+-                // named versionchange at entry with db’s version and version.
+-                if conn
+-                    .results
+-                    .send(ConnectionEvent::VersionChange {
+-                        old_version: db_version,
+-                        new_version: version,
+-                    })
+-                    .is_err()
+-                {
+-                    error!("Failed to send ConnectionEvent::VersionChange to script.");
+-                };
+-                pending_close.insert(*id_to_close);
+-                pending_versionchange.insert(*id_to_close);
+-            }
+-            if !pending_close.is_empty() {
+-                // Step 10.3: Wait for all of the events to be fired.
+-                return;
++            // Step 10.1: Let openConnections be the set of all connections, except connection,
++            // associated with db.
++            let connections = self.open_connections(key, Some(id));
++
++            // Step 10.2: For each entry of openConnections that does not have its close pending
++            // flag set to true, queue a database task to fire a version change event named
++            // versionchange at entry with db’s version and version.
++            let versionchange =
++                self.fire_versionchange(key, &connections, db_version, Some(version), id);
++            if let Some(request) = self.front_request_mut(key) {
++                request.state = OpenRequestState::WaitingForConnections(ConnectionsToClose {
++                    connections,
++                    versionchange,
++                    old_version: db_version,
++                    new_version: Some(version),
++                    blocked: false,
++                });
+             }
+ 
+-            // Step 10.6: Run upgrade a database using connection, version and request.
+-            self.upgrade_database(key, version);
+-            return;
++            // Steps 10.3 to 10.6.
++            return self.continue_when_connections_closed(key);
+         }
+ 
+-        // Step 11:
++        // Step 11: Return connection.
+         let object_stores = self
+             .databases
+-            .get(&key)
++            .get(key)
+             .map(|db| db.object_stores())
+             .unwrap_or_default();
+-        *processed = true;
+-        if results
+-            .send(ConnectionEvent::Open(ConnectionMsg::Connection {
+-                name: db_name.clone(),
+-                id: *id,
++        self.front_request(key)
++            .expect("Checked above")
++            .send_open_message(ConnectionMsg::Connection {
++                name: key.name.clone(),
++                id,
+                 version: db_version,
+                 upgraded: false,
+                 object_stores,
+-            }))
+-            .is_err()
+-        {
+-            error!("Failed to send ConnectionMsg::Connection to script.");
+-        };
++            });
++        true
+     }
+ 
+-    /// <https://www.w3.org/TR/IndexedDB/#delete-a-database>
+-    /// The part adding the request to the connection queue.
++    /// <https://w3c.github.io/IndexedDB/#delete-a-database>, steps 1 and 2.
+     fn start_delete_database(
+         &mut self,
+         key: IndexedDBDescription,
+         id: Uuid,
+-        proxy_map: StorageProxyMap,
+-        sender: GenericCallback<BackendResult<u64>>,
++        bottle_source: StorageBottleSource,
++        results: GenericCallback<DeleteDatabaseEvent>,
+     ) {
+-        let open_request = OpenRequest::Delete {
+-            sender,
+-            _origin: key.origin.clone(),
+-            db_name: key.name.clone(),
+-            processed: false,
+-            proxy_map,
+-            id,
+-        };
++        let kind = OpenRequestKind::Delete { results };
++        self.queue_open_request(key, id, kind, bottle_source);
++    }
+ 
+-        let should_continue = {
+-            // Step 1: Let queue be the connection queue for storageKey and name.
+-            let queue = self.connection_queues.entry(key.clone()).or_default();
++    /// <https://w3c.github.io/IndexedDB/#delete-a-database>, steps 4 to 12, for the request at the
++    /// front of the connection queue for `key`. Returns whether the request has ended.
++    fn delete_database(&mut self, key: &IndexedDBDescription) -> bool {
++        let Some(request) = self.front_request(key) else {
++            debug_assert!(false, "A delete request should be in the queue.");
++            return false;
++        };
++        let id = request.id;
+ 
+-            // Step 2: Add request to queue.
+-            queue.push_back(open_request);
+-            queue.len() == 1
++        // Step 4: Let db be the database named name in storageKey, if one exists. Otherwise,
++        // return 0 (zero).
++        let old_version = match self.databases.get(key).map(|db| db.version()) {
++            None => {
++                request.send_delete_result(Ok(0));
++                return true;
++            },
++            Some(Ok(version)) => version,
++            Some(Err(error)) => {
++                request.fail(&key.name, backend_error_from_storage_error(error));
++                return true;
++            },
+         };
+ 
+-        // Step 3: Wait until all previous requests in queue have been processed.
+-        if should_continue {
+-            self.delete_database(key.clone());
+-            self.maybe_remove_front_from_queue(&key);
++        // Step 5: Let openConnections be the set of all connections associated with db.
++        let connections = self.open_connections(key, None);
++
++        // Step 6: For each entry of openConnections that does not have its close pending flag set
++        // to true, queue a database task to fire a version change event named versionchange at
++        // entry with db’s version and null.
++        let versionchange = self.fire_versionchange(key, &connections, old_version, None, id);
++        if let Some(request) = self.front_request_mut(key) {
++            request.state = OpenRequestState::WaitingForConnections(ConnectionsToClose {
++                connections,
++                versionchange,
++                old_version,
++                new_version: None,
++                blocked: false,
++            });
+         }
++
++        // Steps 7 to 12.
++        self.continue_when_connections_closed(key)
+     }
+ 
+-    /// <https://www.w3.org/TR/IndexedDB/#delete-a-database>
+-    fn delete_database(&mut self, key: IndexedDBDescription) {
+-        let Some(queue) = self.connection_queues.get_mut(&key) else {
+-            return debug_assert!(false, "A connection queue should exist.");
+-        };
+-        let Some(open_request) = queue.front_mut() else {
+-            return debug_assert!(false, "An open request should be in the queue.");
+-        };
+-        let OpenRequest::Delete {
+-            sender,
+-            _origin: _,
+-            db_name,
+-            processed,
+-            id: _,
+-            proxy_map,
+-        } = open_request
++    /// <https://w3c.github.io/IndexedDB/#delete-a-database>, steps 10 to 12, once no connection to
++    /// the database is open.
++    fn delete_the_database(&mut self, key: &IndexedDBDescription) {
++        let Some(proxy_map) = self
++            .front_request(key)
++            .and_then(OpenRequest::proxy_map)
++            .cloned()
+         else {
+-            return debug_assert!(
+-                false,
+-                "An request to open a connection should be in the queue."
+-            );
+-        };
+-
+-        // Step 4: Let db be the database named name in storageKey, if one exists. Otherwise, return 0 (zero).
+-        let version = if let Some(db) = self.databases.remove(&key) {
+-            // Step 5: Let openConnections be the set of all connections associated with db.
+-            // Step6: For each entry of openConnections that does not have its close pending flag set to true,
+-            // queue a database task to fire a version change event named versionchange
+-            // at entry with db’s version and null.
+-            // Step 7: Wait for all of the events to be fired.
+-            // Step 8: If any of the connections in openConnections are still not closed,
+-            // queue a database task to fire a version change event
+-            // named blocked at request with db’s version and null.
+-            // Step 9: Wait until all connections in openConnections are closed.
+-            // TODO: implement connections.
+-
+-            // Step 10: Let version be db’s version.
+-            let res = db.version();
+-            let Ok(version) = res else {
+-                *processed = true;
+-                if sender
+-                    .send(BackendResult::Err(BackendError::DbErr(
+-                        res.unwrap_err().to_string(),
+-                    )))
+-                    .is_err()
+-                {
+-                    debug!("Script went away during pending database delete.");
+-                }
+-                return;
+-            };
+-
+-            // Note: ensure db is dropped before deleting directory,
+-            // to get around windows file locks.
+-            drop(db);
+-
+-            // Step 11: Delete db.
+-            // If this fails for any reason,
+-            // return an appropriate error (e.g. a QuotaExceededError, or an "UnknownError" DOMException).
+-            let Ok(response) = proxy_map
+-                .handle
+-                .delete_database(proxy_map.bottle_id, db_name.clone())
+-                .recv()
+-            else {
+-                if sender
+-                    .send(BackendResult::Err(BackendError::DbErr(
+-                        "Failed to communicate with client storage.".to_string(),
+-                    )))
+-                    .is_err()
+-                {
+-                    debug!("Script went away during pending database delete.");
+-                }
+-                return;
+-            };
+-            if let Err(err) = response {
+-                if sender
+-                    .send(BackendResult::Err(BackendError::DbErr(format!(
+-                        "Client storage error: {err:?}"
+-                    ))))
+-                    .is_err()
+-                {
+-                    debug!("Script went away during pending database delete.");
+-                }
+-                return;
+-            }
+-            version
+-        } else {
+-            0
++            return debug_assert!(false, "The request's storage proxy map should be there.");
+         };
+-
+-        // step 12: Return version.
+-        if sender.send(BackendResult::Ok(version)).is_err() {
+-            debug!("Script went away during pending database delete.");
++        let result = self.remove_database(key, &proxy_map);
++        // Step 12: Return version.
++        if let Some(request) = self.front_request(key) {
++            request.send_delete_result(result);
+         }
+-
+-        *processed = true;
+     }
+ 
+-    /// <https://w3c.github.io/IndexedDB/#closing-connection>
+-    fn close_database(&mut self, origin: ImmutableOrigin, id: Uuid, name: Utf16String) {
+-        // Step 1: Set connection’s close pending flag to true.
+-        // TODO: seems like a script only flag.
+-
+-        // Step 2: If the forced flag is true,
+-        // then for each transaction created using connection
+-        // run abort a transaction with transaction and newly created "AbortError" DOMException.
+-        // Step 3: Wait for all transactions created using connection to complete.
+-        // Once they are complete, connection is closed.
+-        // TODO: transaction lifecycle.
+-
+-        // Step 4: If the forced flag is true, then fire an event named close at connection.
+-        // TODO: implement, probably only on the script side of things.
++    /// Deletes the database `key` and its files, and returns the version it had:
++    /// <https://w3c.github.io/IndexedDB/#delete-a-database> steps 10 and 11.
++    fn remove_database(
++        &mut self,
++        key: &IndexedDBDescription,
++        proxy_map: &StorageProxyMap,
++    ) -> BackendResult<u64> {
++        let Some(db) = self.databases.remove(key) else {
++            return Ok(0);
++        };
+ 
+-        // Note: below we are continuing
+-        // <https://w3c.github.io/IndexedDB/#open-a-database-connection>
+-        // in the case that an open request is waiting for connections to close.
++        // Step 10: Let version be db’s version.
++        let version = db
++            .version()
++            .map_err(|error| BackendError::DbErr(error.to_string()))?;
++
++        // Note: ensure db is dropped before deleting directory,
++        // to get around windows file locks.
++        drop(db);
++
++        // Step 11: Delete db. If this fails for any reason, return an appropriate error (e.g. a
++        // QuotaExceededError, or an "UnknownError" DOMException).
++        proxy_map
++            .handle
++            .delete_database(proxy_map.bottle_id, key.name.clone())
++            .recv()
++            .map_err(|_| {
++                BackendError::DbErr("Failed to communicate with client storage.".to_string())
++            })?
++            .map_err(|error| BackendError::DbErr(format!("Client storage error: {error:?}")))?;
++        Ok(version)
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#close-a-database-connection>
++    fn close_database(&mut self, origin: ImmutableOrigin, id: Uuid, name: Utf16String) {
+         let key = IndexedDBDescription { origin, name };
+-        let (can_upgrade, version) = {
+-            self.remove_connection(&key, &id);
+ 
+-            let Some(queue) = self.connection_queues.get_mut(&key) else {
+-                return;
+-            };
+-            let Some(open_request) = queue.front_mut() else {
+-                return;
+-            };
+-            if let OpenRequest::Open {
+-                db_name: _,
+-                version,
+-                id: request_id,
+-                processed: _,
+-                pending_upgrade,
+-                pending_versionchange,
+-                pending_close,
+-                proxy_map: _,
+-                results,
+-            } = open_request
+-            {
+-                pending_close.remove(&id);
+-                // A closed connection fires no versionchange event, so the request stops waiting
+-                // for it: the connection's global may be gone and never report the event.
+-                if pending_versionchange.remove(&id) &&
+-                    pending_versionchange.is_empty() &&
+-                    !pending_close.is_empty() &&
+-                    let Some(version) = *version
+-                {
+-                    // Step 10.4: If any of the connections in openConnections are still not
+-                    // closed, queue a database task to fire a version change event named blocked
+-                    // at request with db’s version and version.
+-                    let old_version = self
+-                        .databases
+-                        .get(&key)
+-                        .and_then(|db| db.version().ok())
+-                        .unwrap_or_default();
+-                    if results
+-                        .send(ConnectionEvent::Open(ConnectionMsg::Blocked {
+-                            name: key.name.clone(),
+-                            id: *request_id,
+-                            version,
+-                            old_version,
+-                        }))
+-                        .is_err()
+-                    {
+-                        debug!("Script exit during indexeddb database open");
+-                    }
+-                }
+-                (
+-                    // Note: need to exclude requests that have already started upgrading.
+-                    pending_close.is_empty() &&
+-                        pending_versionchange.is_empty() &&
+-                        !pending_upgrade.is_some(),
+-                    *version,
+-                )
+-            } else {
+-                (false, None)
+-            }
++        // Step 1: Set connection’s close pending flag to true.
++        let Some(connection) = self
++            .connections
++            .get_mut(&key)
++            .and_then(|connections| connections.get_mut(&id))
++        else {
++            return debug!("Connection {id} is closed already");
+         };
++        connection.close_pending = true;
+ 
+-        // <https://w3c.github.io/IndexedDB/#open-a-database-connection>
+-        // Step 10.3: Wait for all of the events to be fired.
+-        // Step 10.5: Wait until all connections in openConnections are closed.
+-        // Note: both conditions must be checked here,
+-        // because that is the condition enabling the upgrade to proceed.
+-        if can_upgrade {
+-            // Step 10.6: Run upgrade a database using connection, version and request.
+-            let Some(version) = version else {
+-                return debug_assert!(
+-                    false,
+-                    "An upgrade version should have been determined by now."
+-                );
+-            };
+-            self.upgrade_database(key.clone(), version);
++        // Step 2: If the forced flag is true, then for each transaction created using connection
++        // run abort a transaction with transaction and newly created "AbortError" DOMException.
++        // Note: script aborts them before it closes the connection.
+ 
+-            let was_pruned = self.maybe_remove_front_from_queue(&key);
+-            if was_pruned {
+-                self.advance_connection_queue(key);
+-            }
+-        }
++        // Step 3: Wait for all transactions created using connection to complete. Once they are
++        // complete, connection is closed.
++        // Note: also checked whenever a transaction finishes.
++        self.remove_connection_if_closed(&key, id);
++
++        // Step 4: If the forced flag is true, then fire an event named close at connection.
++        // Note: only a global that goes away forces the close, and it fires no events any more.
++
++        // <https://w3c.github.io/IndexedDB/#open-a-database-connection> step 10.2 and
++        // <https://w3c.github.io/IndexedDB/#delete-a-database> step 6: "Firing this event might
++        // cause one or more of the other objects in openConnections to be closed, in which case
++        // the versionchange event is not fired at those objects, even if that hasn’t yet been
++        // done."
++        self.versionchange_settled(&key, id, None);
++        self.advance_connection_queue(key);
+     }
+ 
+     fn handle_sync_operation(&mut self, operation: SyncOperation) {
+@@ -2032,8 +1841,10 @@ impl IndexedDBManager {
+                 // If this cannot be determined for any reason,
+                 // then queue a database task to reject p with an appropriate error
+                 // (e.g. an "UnknownError" DOMException) and terminate these steps.
+-                // TODO: separate database and connection concepts.
+-                // For now using `self.databases`, which track connections.
++                // Note: the databases that were opened since the manager started, each with the
++                // version of its last committed upgrade; a running upgrade's version doesn't
++                // count yet, and a database counts until its delete request deletes it.
++                // TODO: databases in storage that weren't opened since are missing.
+ 
+                 // Step 4.2: Let result be a new list.
+                 let info_list: Vec<DatabaseInfo> = self
+@@ -2092,20 +1903,11 @@ impl IndexedDBManager {
+                 self.abort_pending_upgrades(pending_upgrades, origin);
+             },
+             SyncOperation::DeleteDatabase(callback, origin, db_name, bottle_source, id) => {
+-                let proxy_map = match obtain_a_local_storage_bottle_map(&bottle_source, &origin) {
+-                    Ok(proxy_map) => proxy_map,
+-                    Err(error) => {
+-                        if callback.send(Err(error)).is_err() {
+-                            debug!("Script went away during pending database delete.");
+-                        }
+-                        return;
+-                    },
+-                };
+                 let idb_description = IndexedDBDescription {
+                     origin,
+                     name: db_name,
+                 };
+-                self.start_delete_database(idb_description, id, proxy_map, callback);
++                self.start_delete_database(idb_description, id, bottle_source, callback);
+             },
+             SyncOperation::Commit {
+                 origin,
+@@ -2138,10 +1940,10 @@ impl IndexedDBManager {
+                             .send(TransactionEvent::Committed(Err(error)));
+                     },
+                     None => {
+-                        // If the database entry has already been removed, treat commit as a
+-                        // no-op success so script side completion does not spuriously abort.
++                        // A database is only deleted once its connections are closed, so no
++                        // transaction of it is left to commit.
+                         self.transaction_results(&key, txn)
+-                            .send(TransactionEvent::Committed(Ok(())));
++                            .send(TransactionEvent::Committed(Err(BackendError::DbNotFound)));
+                     },
+                 }
+             },
+@@ -2175,9 +1977,18 @@ impl IndexedDBManager {
+                     // otherwise, such as one whose global went away, must not leave its SQL
+                     // transaction open.
+                     db.engine.rollback(txn, Box::new(|| {}));
+-                    db.schedule_transactions(origin, &db_name);
++                    db.schedule_transactions(origin.clone(), &db_name);
+                     db.commit_ready_transactions();
+                 }
++                // https://w3c.github.io/IndexedDB/#close-a-database-connection
++                // Step 3: Wait for all transactions created using connection to complete. Once
++                // they are complete, connection is closed.
++                let key = IndexedDBDescription {
++                    origin,
++                    name: db_name,
++                };
++                self.remove_connection_if_closed(&key, txn.connection);
++                self.advance_connection_queue(key);
+             },
+             SyncOperation::CreateTransaction {
+                 origin,
+@@ -2218,10 +2029,10 @@ impl IndexedDBManager {
+             SyncOperation::NotifyEndOfVersionChange {
+                 name,
+                 id,
+-                old_version,
++                request,
+                 origin,
+             } => {
+-                self.handle_version_change_done(name, id, old_version, origin);
++                self.handle_version_change_done(name, id, request, origin);
+             },
+             SyncOperation::Exit(_) => {
+                 unreachable!("We must've already broken out of event loop.");
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index 6e71fac7942..81bbd22511e 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -20,11 +20,12 @@ use storage::ClientStorageThreadFactory;
+ use storage_traits::StorageThreads;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+-    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexPopulationEvent,
+-    IndexPopulationStep, IndexedDBCursorDirection, IndexedDBCursorStep, IndexedDBIndexKey,
+-    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord,
+-    IndexedDBRecordIndexKeys, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue,
+-    KeyPath, PutItemResult, RequestOutput, StorageBottleSource, SyncOperation, TransactionEvent,
++    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, DeleteDatabaseEvent,
++    IndexPopulationEvent, IndexPopulationStep, IndexedDBCursorDirection, IndexedDBCursorStep,
++    IndexedDBIndexKey, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
++    IndexedDBObjectStore, IndexedDBRecord, IndexedDBRecordIndexKeys, IndexedDBThreadMsg,
++    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput,
++    StorageBottleSource, SyncOperation, TransactionEvent,
+ };
+ use tempfile::TempDir;
+ use uuid::Uuid;
+@@ -83,6 +84,12 @@ backend_tests!(
+     test_indexeddb_versionchange_follows_the_open_result_on_one_channel,
+     test_indexeddb_create_index_population_runs_before_later_requests,
+     test_indexeddb_aborted_pending_upgrade_lets_the_next_open_run,
++    test_indexeddb_open_and_delete_requests_run_in_order,
++    test_indexeddb_delete_waits_for_the_connections_to_close,
++    test_indexeddb_closed_connection_holds_back_the_upgrade_until_its_transactions_finish,
++    test_indexeddb_close_during_the_upgrade_fails_the_open,
++    test_indexeddb_connection_of_a_gone_global_counts_as_closed,
++    test_indexeddb_upgrade_committed_before_its_global_went_away_stays,
+ );
+ 
+ static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+@@ -342,7 +349,7 @@ fn open_database(
+     db_name: &str,
+     version: Option<u64>,
+ ) -> mpsc::Receiver<Option<ConnectionMsg>> {
+-    open_database_with(ctx, db_name, version, ())
++    open_database_request(ctx, db_name, version, ()).1
+ }
+ 
+ /// [`open_database`], whose result channel keeps `owned` until the backend drops the channel.
+@@ -352,6 +359,17 @@ fn open_database_with(
+     version: Option<u64>,
+     owned: impl Send + 'static,
+ ) -> mpsc::Receiver<Option<ConnectionMsg>> {
++    open_database_request(ctx, db_name, version, owned).1
++}
++
++/// [`open_database_with`], which also returns the id of the request, which is the id of the
++/// connection it opens.
++fn open_database_request(
++    ctx: &IndexedDbTestContext,
++    db_name: &str,
++    version: Option<u64>,
++    owned: impl Send + 'static,
++) -> (Uuid, mpsc::Receiver<Option<ConnectionMsg>>) {
+     let (forward, receiver) = mpsc::channel();
+     let id = Uuid::new_v4();
+     let results = ProfileGenericCallback::new(move |event| {
+@@ -386,7 +404,33 @@ fn open_database_with(
+         )),
+     )
+     .unwrap();
+-    receiver
++    (id, receiver)
++}
++
++/// Deletes `db_name` and returns the id of the request and the receiver of what the backend
++/// reports about it.
++fn delete_database(
++    ctx: &IndexedDbTestContext,
++    db_name: &str,
++) -> (Uuid, mpsc::Receiver<Option<DeleteDatabaseEvent>>) {
++    let (forward, receiver) = mpsc::channel();
++    let id = Uuid::new_v4();
++    let results = ProfileGenericCallback::new(move |event| {
++        let _ = forward.send(event.ok());
++    })
++    .unwrap();
++    GenericSend::send(
++        &ctx.private_threads,
++        IndexedDBThreadMsg::Sync(SyncOperation::DeleteDatabase(
++            results,
++            ctx.origin.clone(),
++            db_name.into(),
++            ctx.bottle_source.clone(),
++            id,
++        )),
++    )
++    .unwrap();
++    (id, receiver)
+ }
+ 
+ /// The id script gives the first store of a database, in tests that have one store.
+@@ -587,6 +631,26 @@ fn abort_upgrade_transaction(
+     finish_transaction(ctx, db_name, transaction);
+ }
+ 
++/// Reports that the versionchange event of the request `request` was fired at the connection
++/// `connection`, as script does.
++fn notify_end_of_versionchange(
++    ctx: &IndexedDbTestContext,
++    db_name: &str,
++    connection: Uuid,
++    request: Uuid,
++) {
++    GenericSend::send(
++        &ctx.private_threads,
++        IndexedDBThreadMsg::Sync(SyncOperation::NotifyEndOfVersionChange {
++            name: db_name.into(),
++            id: connection,
++            request,
++            origin: ctx.origin.clone(),
++        }),
++    )
++    .unwrap();
++}
++
+ fn close_database(ctx: &IndexedDbTestContext, id: Uuid, db_name: &str) {
+     GenericSend::send(
+         &ctx.private_threads,
+@@ -2080,17 +2144,9 @@ fn test_indexeddb_upgrade_waits_for_no_versionchange_of_a_closed_connection() {
+         other => panic!("unexpected second open message: {other:?}"),
+     };
+ 
+-    let upgrade = open_database(&ctx, db_name, Some(2));
+-    GenericSend::send(
+-        &ctx.private_threads,
+-        IndexedDBThreadMsg::Sync(SyncOperation::NotifyEndOfVersionChange {
+-            name: db_name.into(),
+-            id: stays,
+-            old_version: 1,
+-            origin: ctx.origin.clone(),
+-        }),
+-    )
+-    .unwrap();
++    let (request, upgrade) = open_database_request(&ctx, db_name, Some(2), ());
++    wait_for_events(stays, 2);
++    notify_end_of_versionchange(&ctx, db_name, stays, request);
+     close_database(&ctx, gone, db_name);
+     match recv_callback_timeout(&upgrade, "blocked event") {
+         ConnectionMsg::Blocked {
+@@ -2493,7 +2549,7 @@ fn test_indexeddb_versionchange_follows_the_open_result_on_one_channel() {
+     let events = wait_for_events(connection_id, 2);
+     assert!(events[0].starts_with("Connection {"), "{events:?}");
+     assert!(
+-        events[1].starts_with("VersionChange { old_version: 1, new_version: 2 }"),
++        events[1].starts_with("VersionChange { old_version: 1, new_version: Some(2)"),
+         "{events:?}"
+     );
+ 
+@@ -2685,3 +2741,320 @@ fn test_indexeddb_aborted_pending_upgrade_lets_the_next_open_run() {
+     close_database(&ctx, id, db_name);
+     ctx.shutdown();
+ }
++
++/// Runs the upgrade that `receiver`'s open request reports, without changes, and returns the
++/// connection it opens and the old version.
++fn upgrade_without_changes(
++    ctx: &IndexedDbTestContext,
++    db_name: &str,
++    receiver: &mpsc::Receiver<Option<ConnectionMsg>>,
++    version: u64,
++) -> (Uuid, u64) {
++    let (transaction, old_version) = match recv_callback_timeout(receiver, "upgrade") {
++        ConnectionMsg::Upgrade {
++            transaction,
++            version: new_version,
++            old_version,
++            ..
++        } => {
++            assert_eq!(new_version, version);
++            (transaction, old_version)
++        },
++        other => panic!("unexpected open message: {other:?}"),
++    };
++    commit_upgrade_transaction(ctx, db_name, transaction);
++    match recv_callback_timeout(receiver, "upgraded connection") {
++        ConnectionMsg::Connection {
++            id,
++            version: opened,
++            upgraded,
++            ..
++        } => {
++            assert_eq!((opened, upgraded), (version, true));
++            (id, old_version)
++        },
++        other => panic!("unexpected open message: {other:?}"),
++    }
++}
++
++/// The versionchange events that the connection `connection` was sent, as
++/// `(old version, new version, request)`.
++fn versionchange_events(connection: Uuid) -> Vec<String> {
++    ROUTES
++        .lock()
++        .unwrap()
++        .events
++        .get(&connection)
++        .into_iter()
++        .flatten()
++        .filter(|event| event.starts_with("VersionChange"))
++        .cloned()
++        .collect()
++}
++
++/// Asserts that nothing arrives on `receiver` for a while.
++fn assert_nothing<T: std::fmt::Debug>(receiver: &mpsc::Receiver<Option<T>>, what: &str) {
++    if let Ok(event) = receiver.recv_timeout(Duration::from_millis(200)) {
++        panic!("{what}: unexpected {event:?}");
++    }
++}
++
++/// <https://w3c.github.io/IndexedDB/#connection-queue>: open and delete requests are processed
++/// one after another, in the order they were made; each waits until the ones before it are
++/// done, including an upgrade, and a request that needs the other connections closed fires
++/// versionchange at them and blocked at itself (WPT open-request-queue.any.js).
++fn test_indexeddb_open_and_delete_requests_run_in_order() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-request-queue";
++    let held = open_database_with_two_stores(&ctx, db_name);
++
++    let (open1_id, open1) = open_database_request(&ctx, db_name, Some(2), ());
++    let (delete1_id, delete1) = delete_database(&ctx, db_name);
++    let (_, open2) = open_database_request(&ctx, db_name, Some(3), ());
++    let (delete2_id, delete2) = delete_database(&ctx, db_name);
++    wait_for_events(held, 3);
++    assert_eq!(versionchange_events(held).len(), 1);
++    assert_nothing(&open1, "open1 while the held connection is open");
++    close_database(&ctx, held, db_name);
++
++    let (open1_connection, old_version) = upgrade_without_changes(&ctx, db_name, &open1, 2);
++    assert_eq!((open1_connection, old_version), (open1_id, 1));
++    wait_for_events(open1_connection, 3);
++    assert_eq!(
++        versionchange_events(open1_connection),
++        vec![format!(
++            "VersionChange {{ old_version: 2, new_version: None, request: {delete1_id} }}"
++        )]
++    );
++    assert_nothing(&delete1, "delete1 before the versionchange event was fired");
++    notify_end_of_versionchange(&ctx, db_name, open1_connection, delete1_id);
++    match recv_callback_timeout(&delete1, "delete1 blocked") {
++        DeleteDatabaseEvent::Blocked { old_version } => assert_eq!(old_version, 2),
++        other => panic!("unexpected delete1 event: {other:?}"),
++    }
++    assert_nothing(&open2, "open2 while delete1 is blocked");
++    close_database(&ctx, open1_connection, db_name);
++    match recv_callback_timeout(&delete1, "delete1 result") {
++        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(2)),
++        other => panic!("unexpected delete1 event: {other:?}"),
++    }
++
++    let (open2_connection, old_version) = upgrade_without_changes(&ctx, db_name, &open2, 3);
++    assert_eq!(old_version, 0, "delete1 deleted the database");
++    wait_for_events(open2_connection, 3);
++    assert_eq!(
++        versionchange_events(open2_connection),
++        vec![format!(
++            "VersionChange {{ old_version: 3, new_version: None, request: {delete2_id} }}"
++        )]
++    );
++    close_database(&ctx, open2_connection, db_name);
++    match recv_callback_timeout(&delete2, "delete2 result") {
++        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(3)),
++        other => panic!("unexpected delete2 event: {other:?}"),
++    }
++    ctx.shutdown();
++}
++
++/// <https://w3c.github.io/IndexedDB/#delete-a-database>: a delete fires versionchange with a null
++/// new version at every open connection, fires blocked once they have all been fired and some
++/// is still open, and deletes the database once all have closed; the database then opens empty.
++/// A report for another request's event doesn't count.
++fn test_indexeddb_delete_waits_for_the_connections_to_close() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-delete-waits";
++    let first = open_database_with_two_stores(&ctx, db_name);
++    put_and_commit(&ctx, db_name, first, A);
++    let second = match recv_callback_timeout(&open_database(&ctx, db_name, None), "second") {
++        ConnectionMsg::Connection { id, .. } => id,
++        other => panic!("unexpected open message: {other:?}"),
++    };
++
++    let (request, delete) = delete_database(&ctx, db_name);
++    wait_for_events(first, 3);
++    wait_for_events(second, 2);
++    for connection in [first, second] {
++        assert_eq!(
++            versionchange_events(connection),
++            vec![format!(
++                "VersionChange {{ old_version: 1, new_version: None, request: {request} }}"
++            )]
++        );
++    }
++    notify_end_of_versionchange(&ctx, db_name, first, request);
++    notify_end_of_versionchange(&ctx, db_name, second, Uuid::new_v4());
++    assert_nothing(
++        &delete,
++        "delete before the second connection's event was fired",
++    );
++    close_database(&ctx, first, db_name);
++    notify_end_of_versionchange(&ctx, db_name, second, request);
++    match recv_callback_timeout(&delete, "blocked") {
++        DeleteDatabaseEvent::Blocked { old_version } => assert_eq!(old_version, 1),
++        other => panic!("unexpected delete event: {other:?}"),
++    }
++    assert_nothing(&delete, "delete while the second connection is open");
++    close_database(&ctx, second, db_name);
++    match recv_callback_timeout(&delete, "delete result") {
++        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(1)),
++        other => panic!("unexpected delete event: {other:?}"),
++    }
++
++    let reopened = open_database(&ctx, db_name, None);
++    match recv_callback_timeout(&reopened, "reopen") {
++        ConnectionMsg::Upgrade {
++            version,
++            old_version,
++            transaction,
++            object_stores,
++            ..
++        } => {
++            assert_eq!((version, old_version), (1, 0));
++            assert!(object_stores.is_empty());
++            commit_upgrade_transaction(&ctx, db_name, transaction);
++        },
++        other => panic!("unexpected reopen message: {other:?}"),
++    }
++    match recv_callback_timeout(&reopened, "reopened connection") {
++        ConnectionMsg::Connection {
++            id, object_stores, ..
++        } => {
++            assert!(object_stores.is_empty());
++            close_database(&ctx, id, db_name);
++        },
++        other => panic!("unexpected reopen message: {other:?}"),
++    }
++    ctx.shutdown();
++}
++
++/// <https://w3c.github.io/IndexedDB/#close-a-database-connection>: a connection whose close is
++/// pending is closed once the transactions created using it have finished. Until then an
++/// upgrade waits; the connection gets no versionchange event, and doesn't make the request
++/// blocked.
++fn test_indexeddb_closed_connection_holds_back_the_upgrade_until_its_transactions_finish() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-close-pending";
++    let connection = open_database_with_two_stores(&ctx, db_name);
++    let txn = create_transaction(
++        &ctx,
++        db_name,
++        connection,
++        IndexedDBTxnMode::Readwrite,
++        vec![A],
++    );
++    let put = put_item(
++        &ctx,
++        db_name,
++        A,
++        txn,
++        IndexedDBKeyType::Number(1.0),
++        b"written while closing".to_vec(),
++    );
++    assert!(recv_callback_timeout(&put, "put").is_ok());
++    close_database(&ctx, connection, db_name);
++
++    let upgrade = open_database(&ctx, db_name, Some(2));
++    assert_nothing(
++        &upgrade,
++        "upgrade while a transaction of the closed connection runs",
++    );
++    assert!(versionchange_events(connection).is_empty());
++
++    let commit = commit_transaction(&ctx, db_name, txn);
++    assert!(recv_callback_timeout(&commit, "commit").is_ok());
++    assert_nothing(&upgrade, "upgrade before the transaction finished");
++    finish_transaction(&ctx, db_name, txn);
++    let (upgraded, old_version) = upgrade_without_changes(&ctx, db_name, &upgrade, 2);
++    assert_eq!(old_version, 1);
++    assert_eq!(
++        get_item_in_new_readonly_transaction(
++            &ctx,
++            db_name,
++            upgraded,
++            A,
++            IndexedDBKeyType::Number(1.0)
++        ),
++        Some(b"written while closing".to_vec())
++    );
++    close_database(&ctx, upgraded, db_name);
++    ctx.shutdown();
++}
++
++/// <https://w3c.github.io/IndexedDB/#open-a-database-connection> step 10.7: a connection closed
++/// during its upgrade lets the upgrade transaction commit, and the open request fails with
++/// AbortError; the database keeps the upgrade (WPT close-in-upgradeneeded.any.js).
++fn test_indexeddb_close_during_the_upgrade_fails_the_open() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-close-in-upgrade";
++    let (id, open) = open_database_request(&ctx, db_name, Some(1), ());
++    let transaction = match recv_callback_timeout(&open, "upgrade") {
++        ConnectionMsg::Upgrade { transaction, .. } => transaction,
++        other => panic!("unexpected open message: {other:?}"),
++    };
++    create_object_store(&ctx, db_name, A, "a", transaction, None, false);
++    close_database(&ctx, id, db_name);
++    commit_upgrade_transaction(&ctx, db_name, transaction);
++    assert!(matches!(
++        recv_callback_timeout(&open, "open result"),
++        ConnectionMsg::AbortError { .. }
++    ));
++
++    let reopened = reopen_database(&ctx, db_name, "a");
++    close_database(&ctx, reopened, db_name);
++    ctx.shutdown();
++}
++
++/// A connection whose global went away is closed, also for a delete that waits for it.
++fn test_indexeddb_connection_of_a_gone_global_counts_as_closed() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-gone-global";
++    let connection = open_database_with_two_stores(&ctx, db_name);
++    let (_, delete) = delete_database(&ctx, db_name);
++    wait_for_events(connection, 3);
++    GenericSend::send(
++        &ctx.private_threads,
++        IndexedDBThreadMsg::Sync(SyncOperation::AbortPendingUpgrades {
++            pending_upgrades: HashMap::from([(db_name.into(), HashSet::from([connection]))]),
++            origin: ctx.origin.clone(),
++        }),
++    )
++    .unwrap();
++    match recv_callback_timeout(&delete, "delete result") {
++        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(1)),
++        other => panic!("unexpected delete event: {other:?}"),
++    }
++    ctx.shutdown();
++}
++
++/// An upgrade transaction that committed before its global went away, and so before script
++/// reported it finished, stays committed: the open request fails, but the database keeps its
++/// version and stores.
++fn test_indexeddb_upgrade_committed_before_its_global_went_away_stays() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-committed-upgrade-of-a-gone-global";
++    let (id, open) = open_database_request(&ctx, db_name, Some(1), ());
++    let transaction = match recv_callback_timeout(&open, "upgrade") {
++        ConnectionMsg::Upgrade { transaction, .. } => transaction,
++        other => panic!("unexpected open message: {other:?}"),
++    };
++    create_object_store(&ctx, db_name, A, "a", transaction, None, false);
++    let commit = commit_transaction(&ctx, db_name, transaction);
++    recv_callback_timeout(&commit, "upgrade commit reply").expect("the upgrade committed");
++    GenericSend::send(
++        &ctx.private_threads,
++        IndexedDBThreadMsg::Sync(SyncOperation::AbortPendingUpgrades {
++            pending_upgrades: HashMap::from([(db_name.into(), HashSet::from([id]))]),
++            origin: ctx.origin.clone(),
++        }),
++    )
++    .unwrap();
++    assert!(matches!(
++        recv_callback_timeout(&open, "open result"),
++        ConnectionMsg::AbortError { .. }
++    ));
++
++    let reopened = reopen_database(&ctx, db_name, "a");
++    put_and_commit(&ctx, db_name, reopened, A);
++    close_database(&ctx, reopened, db_name);
++    ctx.shutdown();
++}
+diff --git a/tests/wpt/meta/IndexedDB/close-in-upgradeneeded.any.js.ini b/tests/wpt/meta/IndexedDB/close-in-upgradeneeded.any.js.ini
+index cc5a520f8c1..d7684a187f7 100644
+--- a/tests/wpt/meta/IndexedDB/close-in-upgradeneeded.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/close-in-upgradeneeded.any.js.ini
+@@ -1,17 +1,2 @@
+-[close-in-upgradeneeded.any.html]
+-  [When db.close() is called in onupgradeneeded, the db is cleaned up on refresh]
+-    expected: FAIL
+-
+-
+-[close-in-upgradeneeded.any.worker.html]
+-  [When db.close() is called in onupgradeneeded, the db is cleaned up on refresh]
+-    expected: FAIL
+-
+-
+-[close-in-upgradeneeded.any.sharedworker.html]
+-  [When db.close() is called in onupgradeneeded, the db is cleaned up on refresh]
+-    expected: FAIL
+-
+-
+ [close-in-upgradeneeded.any.serviceworker.html]
+   expected: ERROR
+diff --git a/tests/wpt/meta/IndexedDB/idbdatabase_close.any.js.ini b/tests/wpt/meta/IndexedDB/idbdatabase_close.any.js.ini
+index 5d9bf771303..7eac39802eb 100644
+--- a/tests/wpt/meta/IndexedDB/idbdatabase_close.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbdatabase_close.any.js.ini
+@@ -1,17 +1,2 @@
+-[idbdatabase_close.any.html]
+-  [Unblock the delete database request.]
+-    expected: FAIL
+-
+-
+-[idbdatabase_close.any.sharedworker.html]
+-  [Unblock the delete database request.]
+-    expected: FAIL
+-
+-
+-[idbdatabase_close.any.worker.html]
+-  [Unblock the delete database request.]
+-    expected: FAIL
+-
+-
+ [idbdatabase_close.any.serviceworker.html]
+   expected: ERROR
+diff --git a/tests/wpt/meta/IndexedDB/open-request-queue.any.js.ini b/tests/wpt/meta/IndexedDB/open-request-queue.any.js.ini
+index 3e876e23388..8bcf75ca30c 100644
+--- a/tests/wpt/meta/IndexedDB/open-request-queue.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/open-request-queue.any.js.ini
+@@ -1,19 +1,2 @@
+-[open-request-queue.any.worker.html]
+-  expected: TIMEOUT
+-  [IndexedDB: open and delete requests are processed as a FIFO queue]
+-    expected: TIMEOUT
+-
+-
+ [open-request-queue.any.serviceworker.html]
+   expected: ERROR
+-
+-[open-request-queue.any.sharedworker.html]
+-  expected: TIMEOUT
+-  [IndexedDB: open and delete requests are processed as a FIFO queue]
+-    expected: TIMEOUT
+-
+-
+-[open-request-queue.any.html]
+-  expected: TIMEOUT
+-  [IndexedDB: open and delete requests are processed as a FIFO queue]
+-    expected: TIMEOUT
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index aeec96d237f..a025525e213 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -8567,6 +8567,14 @@
+    ],
+    "IndexedDB": {
+     "resources": {
++     "connection-holder.html": [
++      "1d7d4bf2b54269b1567797b3aec069002d0c10c5",
++      []
++     ],
++     "connection-holder.js": [
++      "cb8eab6592c3acf547b9194a1a6a5fcbf92952c1",
++      []
++     ],
+      "removed-iframe-writer.html": [
+       "728c70ad75c2804ca49320cd69afec1026e7fad8",
+       []
+@@ -11683,6 +11691,78 @@
+       }
+      ]
+     ],
++    "connection-queue-globals.html": [
++     "90a2a65a21d4fdd3bae6c41602b2526dd1463272",
++     [
++      null,
++      {
++       "timeout": "long"
++      }
++     ]
++    ],
++    "connection-queue.any.js": [
++     "bb994aef8f3c32ce8d6d1e858b9c5266b4e55df3",
++     [
++      "IndexedDB/connection-queue.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,dedicatedworker,sharedworker"
++        ],
++        [
++         "title",
++         "IndexedDB: connection queues, versionchange, blocked and close pending"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ],
++     [
++      "IndexedDB/connection-queue.any.sharedworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,dedicatedworker,sharedworker"
++        ],
++        [
++         "title",
++         "IndexedDB: connection queues, versionchange, blocked and close pending"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ],
++     [
++      "IndexedDB/connection-queue.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,dedicatedworker,sharedworker"
++        ],
++        [
++         "title",
++         "IndexedDB: connection queues, versionchange, blocked and close pending"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ]
++    ],
+     "cursor-prefetch.any.js": [
+      "a387d66729d5358ea2a4f4e57b73519d5a2d4926",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/connection-queue-globals.html b/tests/wpt/mozilla/tests/IndexedDB/connection-queue-globals.html
+new file mode 100644
+index 00000000000..90a2a65a21d
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/connection-queue-globals.html
+@@ -0,0 +1,108 @@
++<!doctype html>
++<meta charset="utf-8">
++<title>IndexedDB: versionchange and blocked across globals</title>
++<link rel="help" href="https://w3c.github.io/IndexedDB/#delete-a-database">
++<link rel="help" href="https://w3c.github.io/IndexedDB/#open-a-database-connection">
++<meta name="timeout" content="long">
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script>
++// Connections to one database from a window, a dedicated worker, a shared worker and an iframe:
++// an open or delete in the window fires versionchange at the connections of the other globals and
++// waits for them to close; the connection of a removed iframe counts as closed.
++
++function requestDone(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++async function createDatabase(t) {
++  const name = 'connection-queue-globals-' + Math.random();
++  t.add_cleanup(() => {
++    indexedDB.deleteDatabase(name);
++  });
++  const request = indexedDB.open(name, 1);
++  request.onupgradeneeded = () => request.result.createObjectStore('store');
++  (await requestDone(request)).close();
++  return name;
++}
++
++// Returns a function that resolves with the next message of `target`, in order.
++function messages(target) {
++  const queue = [];
++  const waiting = [];
++  target.onmessage = event => {
++    if (waiting.length) {
++      waiting.shift()(event.data);
++    } else {
++      queue.push(event.data);
++    }
++  };
++  return () => queue.length ? Promise.resolve(queue.shift()) :
++      new Promise(resolve => waiting.push(resolve));
++}
++
++promise_test(async t => {
++  const name = await createDatabase(t);
++  const worker = new Worker('resources/connection-holder.js');
++  t.add_cleanup(() => worker.terminate());
++  const next = messages(worker);
++  worker.postMessage({name, close: true});
++  assert_equals(await next(), 'opened');
++
++  const deletion = indexedDB.deleteDatabase(name);
++  deletion.onblocked = t.unreached_func('the worker closes its connection');
++  const deleted = await new Promise((resolve, reject) => {
++    deletion.onsuccess = resolve;
++    deletion.onerror = () => reject(deletion.error);
++  });
++  assert_equals(deleted.oldVersion, 1);
++  assert_equals(await next(), 'versionchange 1 null');
++}, 'A delete fires versionchange at a dedicated worker\'s connection, which closes');
++
++promise_test(async t => {
++  const name = await createDatabase(t);
++  const worker = new SharedWorker('resources/connection-holder.js?' + Math.random());
++  const next = messages(worker.port);
++  worker.port.postMessage({name, close: false});
++  assert_equals(await next(), 'opened');
++
++  const events = [];
++  const upgrade = indexedDB.open(name, 2);
++  upgrade.onblocked = event => {
++    events.push(`blocked ${event.oldVersion} ${event.newVersion}`);
++    worker.port.postMessage('close');
++  };
++  upgrade.onupgradeneeded = () => events.push('upgradeneeded');
++  (await requestDone(upgrade)).close();
++  events.push(await next());
++  events.push(await next());
++  assert_array_equals(events, ['blocked 1 2', 'upgradeneeded', 'versionchange 1 2', 'closed']);
++}, 'An upgrade is blocked by a shared worker\'s connection until it closes');
++
++promise_test(async t => {
++  const name = await createDatabase(t);
++  const frame = document.createElement('iframe');
++  const opened = new Promise(resolve => window.onmessage = event => resolve(event.data));
++  frame.src = 'resources/connection-holder.html?' + encodeURIComponent(name);
++  document.body.appendChild(frame);
++  t.add_cleanup(() => frame.remove());
++  assert_equals(await opened, 'opened');
++
++  const events = [];
++  const deletion = indexedDB.deleteDatabase(name);
++  deletion.onblocked = event => {
++    events.push(`blocked ${event.oldVersion} ${event.newVersion}`);
++    frame.remove();
++  };
++  await new Promise((resolve, reject) => {
++    deletion.onsuccess = resolve;
++    deletion.onerror = () => reject(deletion.error);
++  });
++  events.push('deleted');
++  assert_array_equals(events, ['blocked 1 null', 'deleted']);
++}, 'The connection of a removed iframe counts as closed');
++</script>
++<body></body>
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/connection-queue.any.js b/tests/wpt/mozilla/tests/IndexedDB/connection-queue.any.js
+new file mode 100644
+index 00000000000..bb994aef8f3
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/connection-queue.any.js
+@@ -0,0 +1,237 @@
++// META: global=window,dedicatedworker,sharedworker
++// META: title=IndexedDB: connection queues, versionchange, blocked and close pending
++// META: timeout=long
++
++// https://w3c.github.io/IndexedDB/#connection-queue: open and delete requests for a database are
++// processed one after another, in the order they were made. A request that needs the other
++// connections closed (a higher version, or a delete) fires versionchange at those whose close
++// isn't pending, then blocked at itself if any is still open, and proceeds once all have closed,
++// which a connection with transactions does when they have finished.
++
++'use strict';
++
++function requestDone(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = event => {
++      event.preventDefault();
++      reject(request.error);
++    };
++  });
++}
++
++function transactionDone(transaction) {
++  return new Promise((resolve, reject) => {
++    transaction.oncomplete = () => resolve();
++    transaction.onabort = () => reject(transaction.error);
++  });
++}
++
++async function createDatabase(t, version = 1) {
++  const name = 'connection-queue-' + Math.random();
++  t.add_cleanup(() => {
++    indexedDB.deleteDatabase(name);
++  });
++  const request = indexedDB.open(name, version);
++  request.onupgradeneeded = () => request.result.createObjectStore('store');
++  return [name, await requestDone(request)];
++}
++
++function versionChangeText(prefix, event) {
++  return `${prefix} ${event.oldVersion} ${event.newVersion}`;
++}
++
++promise_test(async t => {
++  const [name, first] = await createDatabase(t);
++  const second = await requestDone(indexedDB.open(name));
++  const third = await requestDone(indexedDB.open(name));
++  const events = [];
++  first.onversionchange = event => {
++    events.push(versionChangeText('first versionchange', event));
++    first.close();
++  };
++  second.onversionchange = event => {
++    events.push(versionChangeText('second versionchange', event));
++  };
++  third.onversionchange = event => {
++    events.push(versionChangeText('third versionchange', event));
++    third.close();
++  };
++  const upgrade = indexedDB.open(name, 2);
++  upgrade.onblocked = event => {
++    events.push(versionChangeText('blocked', event));
++    second.close();
++  };
++  upgrade.onupgradeneeded = event => events.push(versionChangeText('upgradeneeded', event));
++  const db = await requestDone(upgrade);
++  db.close();
++  assert_array_equals(events, [
++    'first versionchange 1 2',
++    'second versionchange 1 2',
++    'third versionchange 1 2',
++    'blocked 1 2',
++    'upgradeneeded 1 2',
++  ]);
++}, 'versionchange reaches every connection in the order they were opened, then blocked fires');
++
++promise_test(async t => {
++  const [name, db] = await createDatabase(t, 3);
++  const put = db.transaction('store', 'readwrite');
++  put.objectStore('store').put('value', 'key');
++  await transactionDone(put);
++
++  const events = [];
++  db.onversionchange = event => events.push(versionChangeText('versionchange', event));
++  const deletion = indexedDB.deleteDatabase(name);
++  deletion.onblocked = event => {
++    events.push(versionChangeText('blocked', event));
++    db.close();
++  };
++  const deleted = await new Promise((resolve, reject) => {
++    deletion.onsuccess = resolve;
++    deletion.onerror = () => reject(deletion.error);
++  });
++  events.push(versionChangeText('success', deleted));
++  assert_array_equals(events, ['versionchange 3 null', 'blocked 3 null', 'success 3 null']);
++
++  const reopen = indexedDB.open(name);
++  let oldVersion;
++  reopen.onupgradeneeded = event => oldVersion = event.oldVersion;
++  const reopened = await requestDone(reopen);
++  t.add_cleanup(() => reopened.close());
++  assert_equals(oldVersion, 0, 'the deleted database is created again');
++  assert_equals(reopened.version, 1);
++  assert_array_equals([...reopened.objectStoreNames], []);
++}, 'deleteDatabase() fires versionchange, waits for the connections to close, and deletes');
++
++promise_test(async t => {
++  const name = 'connection-queue-' + Math.random();
++  t.add_cleanup(() => {
++    indexedDB.deleteDatabase(name);
++  });
++  const events = [];
++  const record = text => () => events.push(text);
++  const done = [];
++  const expectOpen = (label, version, onSuccess) => {
++    const request = indexedDB.open(name, version);
++    request.onblocked = record(`${label} blocked`);
++    request.onupgradeneeded = event => events.push(versionChangeText(`${label} upgradeneeded`, event));
++    done.push(requestDone(request).then(db => {
++      events.push(`${label} success`);
++      db.onversionchange = event => {
++        events.push(versionChangeText(`${label} versionchange`, event));
++        t.step_timeout(() => db.close(), 0);
++      };
++      if (onSuccess) {
++        onSuccess(db);
++      }
++    }));
++  };
++  const expectDelete = label => {
++    const request = indexedDB.deleteDatabase(name);
++    request.onblocked = record(`${label} blocked`);
++    done.push(new Promise((resolve, reject) => {
++      request.onsuccess = event => {
++        events.push(versionChangeText(`${label} success`, event));
++        resolve();
++      };
++      request.onerror = () => reject(request.error);
++    }));
++  };
++
++  expectOpen('open1', 1);
++  expectDelete('delete1');
++  expectOpen('open2', 2);
++  expectOpen('open3', 2);
++  expectOpen('open4', 3);
++  expectDelete('delete2');
++  await Promise.all(done);
++  assert_array_equals(events, [
++    'open1 upgradeneeded 0 1',
++    'open1 success',
++    'open1 versionchange 1 null',
++    'delete1 blocked',
++    'delete1 success 1 null',
++    'open2 upgradeneeded 0 2',
++    'open2 success',
++    'open3 success',
++    'open2 versionchange 2 3',
++    'open3 versionchange 2 3',
++    'open4 blocked',
++    'open4 upgradeneeded 2 3',
++    'open4 success',
++    'open4 versionchange 3 null',
++    'delete2 blocked',
++    'delete2 success 3 null',
++  ]);
++}, 'Interleaved opens and deletes are processed in order');
++
++promise_test(async t => {
++  const name = 'connection-queue-' + Math.random();
++  t.add_cleanup(() => {
++    indexedDB.deleteDatabase(name);
++  });
++  const events = [];
++  const request = indexedDB.open(name, 1);
++  request.onupgradeneeded = () => {
++    const db = request.result;
++    db.createObjectStore('store').put('value', 'key');
++    db.close();
++    assert_throws_dom('InvalidStateError', () => db.transaction('store'));
++    request.transaction.oncomplete = () => events.push('complete');
++    request.transaction.onabort = () => events.push('abort');
++  };
++  const error = await requestDone(request).then(
++      () => assert_unreached('the open must fail'), error => error);
++  events.push(`error ${error.name}`);
++  assert_array_equals(events, ['complete', 'error AbortError']);
++
++  const reopened = await requestDone(indexedDB.open(name));
++  t.add_cleanup(() => reopened.close());
++  assert_equals(reopened.version, 1, 'the upgrade committed');
++  const read = reopened.transaction('store').objectStore('store').get('key');
++  assert_equals(await requestDone(read), 'value');
++}, 'A connection closed during its upgrade commits it, and the open fails with AbortError');
++
++promise_test(async t => {
++  const [name, db] = await createDatabase(t);
++  const events = [];
++  db.onversionchange = () => events.push('versionchange');
++  const transaction = db.transaction('store', 'readwrite');
++  const store = transaction.objectStore('store');
++  const writes = 200;
++  for (let i = 0; i < writes; i++) {
++    store.put('x'.repeat(1000), i);
++  }
++  transaction.oncomplete = () => events.push('complete');
++  db.close();
++
++  const upgrade = indexedDB.open(name, 2);
++  upgrade.onupgradeneeded = () => {
++    events.push('upgradeneeded');
++    const count = upgrade.transaction.objectStore('store').count();
++    count.onsuccess = () => events.push(`count ${count.result}`);
++  };
++  (await requestDone(upgrade)).close();
++  assert_array_equals(events, ['complete', 'upgradeneeded', `count ${writes}`]);
++}, 'An upgrade waits for the transactions of a connection whose close is pending, which gets ' +
++   'no versionchange event');
++
++promise_test(async t => {
++  const [name, db] = await createDatabase(t);
++  const events = [];
++  db.onversionchange = () => {
++    events.push('versionchange');
++    db.close();
++  };
++  const first = indexedDB.deleteDatabase(name);
++  const second = indexedDB.deleteDatabase(name);
++  first.onblocked = () => events.push('first blocked');
++  second.onblocked = () => events.push('second blocked');
++  const versions = await Promise.all([first, second].map(request => new Promise((resolve, reject) => {
++    request.onsuccess = event => resolve(event.oldVersion);
++    request.onerror = () => reject(request.error);
++  })));
++  assert_array_equals(versions, [1, 0], 'the second delete finds no database');
++  assert_array_equals(events, ['versionchange']);
++}, 'A connection that closes in its versionchange handler doesn\'t block a delete');
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/resources/connection-holder.html b/tests/wpt/mozilla/tests/IndexedDB/resources/connection-holder.html
+new file mode 100644
+index 00000000000..1d7d4bf2b54
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/resources/connection-holder.html
+@@ -0,0 +1,9 @@
++<!doctype html>
++<meta charset="utf-8">
++<script>
++// Opens the database named in the query, without a versionchange handler, and reports 'opened' to
++// the parent.
++const request = indexedDB.open(decodeURIComponent(location.search.slice(1)));
++request.onsuccess = () => parent.postMessage('opened', '*');
++request.onerror = () => parent.postMessage(`error ${request.error.name}`, '*');
++</script>
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/resources/connection-holder.js b/tests/wpt/mozilla/tests/IndexedDB/resources/connection-holder.js
+new file mode 100644
+index 00000000000..cb8eab6592c
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/resources/connection-holder.js
+@@ -0,0 +1,35 @@
++// Holds a connection to a database for the page that started this worker. Messages: {name, close}
++// opens the database named name and reports 'opened', then its versionchange events, closing the
++// connection on them if close is set; 'close' closes the connection and reports 'closed'.
++'use strict';
++
++let db;
++
++function handle(message, post) {
++  if (message === 'close') {
++    db.close();
++    post('closed');
++    return;
++  }
++  const request = indexedDB.open(message.name);
++  request.onsuccess = () => {
++    db = request.result;
++    db.onversionchange = event => {
++      post(`versionchange ${event.oldVersion} ${event.newVersion}`);
++      if (message.close) {
++        db.close();
++      }
++    };
++    post('opened');
++  };
++  request.onerror = () => post(`error ${request.error.name}`);
++}
++
++if ('onconnect' in self) {
++  self.onconnect = event => {
++    const port = event.ports[0];
++    port.onmessage = message => handle(message.data, data => port.postMessage(data));
++  };
++} else {
++  self.onmessage = message => handle(message.data, data => self.postMessage(data));
++}

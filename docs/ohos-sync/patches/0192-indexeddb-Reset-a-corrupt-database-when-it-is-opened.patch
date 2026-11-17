@@ -1,0 +1,539 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 18:52:23 +0000
+Subject: [PATCH] indexeddb: Reset a corrupt database when it is opened
+
+The owner's decision on corrupt databases: reset them at open, as Gecko
+does (CreateStorageConnection deletes a database that is corrupt when it
+opens it and opens an empty one). A page that creates its stores in
+upgradeneeded keeps working; the lost data couldn't be read anyway.
+
+- SqlEngine::new deletes a database whose open (the schema check, the
+  table creation, the metadata read) fails with a corruption error
+  (SQLITE_CORRUPT, SQLITE_NOTADB, RDB_E_SQLITE_CORRUPT) and opens it
+  anew, with a warning. RDB fails to open a file that isn't an SQLite
+  database with a generic error (14800000), so the RDB executor reports
+  such a failure as SqlError::NotADatabase when the file has content
+  that doesn't start with the SQLite header. The executors delete the
+  files without opening the database (SqlExecutor::delete_files): SQLite
+  removes the file and its -wal, -shm and -journal files, RDB calls
+  OH_Rdb_DeleteStoreV2 once the failed store handle is closed.
+- Corruption found while the database is in use still force-closes its
+  connections (stack 185). The next open of a database that was marked
+  unusable, once those connections are closed, deletes its files before
+  it opens it.
+
+The registry entry and directory stay, so the database is created anew in
+the same directory and the page gets upgradeneeded from version 0.
+Deleting a corrupt database of an earlier session still deletes it and
+reports version 0.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 168 passed, 1 skipped (new backend tests on each executor: corrupt_database_is_reset_when_opened, garbage in the database file, and injected_corruption_at_open_resets_the_database, a corruption that the Faulty executor reports for the first statement of the open, while another failure there resets nothing; new integration tests test_indexeddb_corrupt_database_is_reset_when_opened, garbage written between two sessions: databases() omits it, the next open upgrades from 0 in the same registry directory, and databases() lists it with version 1, also after a restart, and test_indexeddb_corrupt_database_of_an_earlier_session_is_deleted, which reports version 0); DAYU200 `./mach test-unit --ohos -p servo-storage`: RDB only 168 passed, 3 skipped, both backends 304 passed, 4 skipped (the RDB variants of both garbage-file tests failed with 14800000 from OH_Rdb_CreateOrOpen until the RDB executor reported it as NotADatabase); `./mach check --ohos` of servo-storage with SQLite, RDB and both: no warnings; WPT on the stack tip as in 182. Not covered by a test: the reset of a database that a failure marked unusable during a session, the manager path, as an open database can't be corrupted on disk reliably
+AI-assisted: Yes (agent session; the agent implemented the reset in the engine, the executors and the manager, wrote the backend and integration tests and ran them on the board)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../storage/indexeddb/backend/engine.rs       | 33 +++++++-
+ .../storage/indexeddb/backend/executor.rs     | 14 +++-
+ components/storage/indexeddb/backend/rdb.rs   | 32 +++++++-
+ .../storage/indexeddb/backend/sqlite.rs       | 31 +++++---
+ components/storage/indexeddb/backend/tests.rs | 76 +++++++++++++++++++
+ components/storage/indexeddb/backend/twin.rs  |  8 ++
+ components/storage/indexeddb/mod.rs           | 24 +++++-
+ components/storage/tests/indexeddb.rs         | 68 +++++++++++++++++
+ 8 files changed, 268 insertions(+), 18 deletions(-)
+
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index c861e496a3d..ae84721a256 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -45,14 +45,27 @@ pub(crate) struct SqlEngine<X: SqlExecutor> {
+ }
+ 
+ impl<X: SqlExecutor> SqlEngine<X> {
++    /// Opens the database stored in `path`. A database that turns out to be corrupt while it is
++    /// opened is deleted and created anew, as Gecko does: its data can't be read anyway, and the
++    /// page gets an upgrade from version 0 instead of an error on every open.
+     pub(crate) fn new(
+         path: PathBuf,
+         created: bool,
+         db_info: &IndexedDBDescription,
+         pool: Arc<ThreadPool>,
+     ) -> Result<Self, SqlError> {
+-        let (mut executor, created_database) = schema::open_database::<X>(&path, db_info)?;
+-        let metadata = Arc::new(Mutex::new(Metadata::load(&mut executor)?));
++        let (executor, created_database, metadata) = match Self::open_database(&path, db_info) {
++            Err(error) if error.makes_database_unusable() => {
++                warn!(
++                    "Resetting IndexedDB database {:?}, which is corrupt: {error:?}",
++                    db_info.name
++                );
++                X::delete_files(&path)?;
++                Self::open_database(&path, db_info)?
++            },
++            result => result?,
++        };
++        let metadata = Arc::new(Mutex::new(metadata));
+         let unusable = Arc::new(AtomicBool::new(false));
+         Ok(Self {
+             actor: Arc::new(Actor {
+@@ -79,6 +92,22 @@ impl<X: SqlExecutor> SqlEngine<X> {
+         })
+     }
+ 
++    /// Opens the database stored in `path` with [`schema::open_database`] and reads its metadata.
++    fn open_database(
++        path: &Path,
++        db_info: &IndexedDBDescription,
++    ) -> Result<(X, bool, Metadata), SqlError> {
++        let (mut executor, created) = schema::open_database::<X>(path, db_info)?;
++        let metadata = Metadata::load(&mut executor)?;
++        Ok((executor, created, metadata))
++    }
++
++    /// Deletes the database stored in `path` with all its files, without opening it. No engine
++    /// may have it open.
++    pub(crate) fn delete_files(path: &Path) -> Result<(), SqlError> {
++        X::delete_files(path)
++    }
++
+     /// The version of the database stored in `path` as of its last commit, for a database that
+     /// no engine has open; see [`schema::committed_version`].
+     pub(crate) fn committed_version(path: &Path) -> Result<u64, SqlError> {
+diff --git a/components/storage/indexeddb/backend/executor.rs b/components/storage/indexeddb/backend/executor.rs
+index 8b9ae42d657..812aad95b2e 100644
+--- a/components/storage/indexeddb/backend/executor.rs
++++ b/components/storage/indexeddb/backend/executor.rs
+@@ -90,6 +90,10 @@ pub(crate) trait SqlExecutor: Send + Sized + 'static {
+     /// Whether a database is stored in `directory`, which [`Self::open`] would otherwise create.
+     fn exists(directory: &Path) -> bool;
+ 
++    /// Deletes the database stored in `directory` with all its files without opening it, such as
++    /// a corrupt one. No connection to the database may be open.
++    fn delete_files(directory: &Path) -> Result<(), SqlError>;
++
+     /// Runs a statement that returns no rows. Returns the number of rows an `UPDATE` or `DELETE`
+     /// changed; the value is unspecified for other statements.
+     ///
+@@ -207,6 +211,10 @@ pub(crate) enum SqlError {
+     /// A statement that the RDB executor would reject, which the SQLite executor refuses too.
+     #[cfg(feature = "sqlite-backend")]
+     NotOnRdb(String),
++    /// A database file that isn't an SQLite database, which RDB fails to open with a generic error
++    /// instead of RDB_E_SQLITE_CORRUPT.
++    #[cfg(ohos_rdb)]
++    NotADatabase,
+     /// A corrupt database, injected by a test.
+     #[cfg(test)]
+     InjectedCorruption,
+@@ -231,6 +239,8 @@ impl fmt::Display for SqlError {
+             Self::Io(error) => error.fmt(formatter),
+             #[cfg(feature = "sqlite-backend")]
+             Self::NotOnRdb(sql) => write!(formatter, "statement that RDB would reject: {sql}"),
++            #[cfg(ohos_rdb)]
++            Self::NotADatabase => write!(formatter, "not an SQLite database"),
+             #[cfg(test)]
+             Self::InjectedCorruption => write!(formatter, "injected corruption"),
+         }
+@@ -280,7 +290,7 @@ impl SqlError {
+ 
+     /// Whether the error says that the database file is damaged (SQLITE_CORRUPT or
+     /// SQLITE_NOTADB), so that no statement on the database can be trusted any more.
+-    fn makes_database_unusable(&self) -> bool {
++    pub(crate) fn makes_database_unusable(&self) -> bool {
+         match self {
+             #[cfg(feature = "sqlite-backend")]
+             Self::Sqlite(error) => matches!(
+@@ -289,6 +299,8 @@ impl SqlError {
+             ),
+             #[cfg(ohos_rdb)]
+             Self::Rdb(error) => super::rdb::is_corruption_error(error),
++            #[cfg(ohos_rdb)]
++            Self::NotADatabase => true,
+             #[cfg(test)]
+             Self::InjectedCorruption => true,
+             _ => false,
+diff --git a/components/storage/indexeddb/backend/rdb.rs b/components/storage/indexeddb/backend/rdb.rs
+index 7a925e9cfcf..f3902ee3afd 100644
+--- a/components/storage/indexeddb/backend/rdb.rs
++++ b/components/storage/indexeddb/backend/rdb.rs
+@@ -4,6 +4,7 @@
+ 
+ use std::error::Error as StdError;
+ use std::fs;
++use std::io::Read;
+ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex, MutexGuard};
+ 
+@@ -20,6 +21,24 @@ use crate::shared::{DB_PRAGMAS, has_enospc};
+ 
+ const DATABASE_FILE_NAME: &str = "indexeddb.rdb";
+ 
++/// The first bytes of every SQLite database file.
++const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
++
++/// Whether the file `path` has content that doesn't start with [`SQLITE_HEADER`].
++fn is_not_a_database(path: &Path) -> bool {
++    let mut header = Vec::with_capacity(SQLITE_HEADER.len());
++    match fs::File::open(path) {
++        Ok(file) => {
++            file.take(SQLITE_HEADER.len() as u64)
++                .read_to_end(&mut header)
++                .is_ok() &&
++                !header.is_empty() &&
++                header != SQLITE_HEADER
++        },
++        Err(_) => false,
++    }
++}
++
+ /// A [`SqlExecutor`] on an OpenHarmony RDB store.
+ ///
+ /// RDB gives every transaction a dedicated connection from the store's pool, so the transaction
+@@ -160,7 +179,13 @@ impl SqlRow for RdbRow<'_, '_> {
+ impl SqlExecutor for RdbExecutor {
+     fn open(directory: &Path) -> Result<Self, SqlError> {
+         fs::create_dir_all(directory).map_err(OhosRdbError::from)?;
+-        let store = OhosRdbStore::open(directory, DATABASE_FILE_NAME)?;
++        let store = OhosRdbStore::open(directory, DATABASE_FILE_NAME).map_err(|error| {
++            if is_not_a_database(&directory.join("rdb").join(DATABASE_FILE_NAME)) {
++                SqlError::NotADatabase
++            } else {
++                error.into()
++            }
++        })?;
+         for pragma in DB_PRAGMAS {
+             let _ = store.execute(pragma);
+         }
+@@ -206,6 +231,11 @@ impl SqlExecutor for RdbExecutor {
+         directory.join("rdb").join(DATABASE_FILE_NAME).exists()
+     }
+ 
++    fn delete_files(directory: &Path) -> Result<(), SqlError> {
++        OhosRdbStore::delete(directory, DATABASE_FILE_NAME)?;
++        Ok(())
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         let values = values(params)?;
+         // RDB returns the number of changed rows for UPDATE and DELETE, and the row id or -1 for
+diff --git a/components/storage/indexeddb/backend/sqlite.rs b/components/storage/indexeddb/backend/sqlite.rs
+index 5585fbe7287..02d4ccffbc5 100644
+--- a/components/storage/indexeddb/backend/sqlite.rs
++++ b/components/storage/indexeddb/backend/sqlite.rs
+@@ -106,6 +106,21 @@ impl SqliteExecutor {
+     }
+ }
+ 
++/// Removes the database file `path` and the files SQLite keeps next to it.
++fn remove_database_files(path: &Path) -> Result<(), SqlError> {
++    for suffix in DATABASE_FILE_SUFFIXES {
++        let mut file = path.to_owned().into_os_string();
++        file.push(suffix);
++        match fs::remove_file(&file) {
++            Err(error) if error.kind() != io::ErrorKind::NotFound => {
++                return Err(SqlError::Io(error));
++            },
++            _ => {},
++        }
++    }
++    Ok(())
++}
++
+ impl ToSql for SqlParam<'_> {
+     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+         Ok(ToSqlOutput::Borrowed(match *self {
+@@ -155,23 +170,17 @@ impl SqlExecutor for SqliteExecutor {
+     fn delete(self) -> Result<(), SqlError> {
+         let Self { path, connection } = self;
+         connection.close().map_err(|(_, error)| error)?;
+-        for suffix in DATABASE_FILE_SUFFIXES {
+-            let mut file = path.clone().into_os_string();
+-            file.push(suffix);
+-            match fs::remove_file(&file) {
+-                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+-                    return Err(SqlError::Io(error));
+-                },
+-                _ => {},
+-            }
+-        }
+-        Ok(())
++        remove_database_files(&path)
+     }
+ 
+     fn exists(directory: &Path) -> bool {
+         directory.join(DATABASE_FILE_NAME).exists()
+     }
+ 
++    fn delete_files(directory: &Path) -> Result<(), SqlError> {
++        remove_database_files(&directory.join(DATABASE_FILE_NAME))
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         let result = match self.connection.prepare_cached(sql) {
+             Ok(mut statement) => {
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index e14fffa753b..5ca1230d7d7 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -84,6 +84,8 @@ executor_tests!(
+     schema_version_mismatch_resets_the_database,
+     indexeddb_version_is_independent_of_the_schema_version,
+     schema_reset_that_keeps_the_old_database_fails,
++    corrupt_database_is_reset_when_opened,
++    injected_corruption_at_open_resets_the_database,
+     committed_version_of_a_stored_database,
+     test_cycle,
+     test_create_store,
+@@ -771,6 +773,76 @@ fn schema_reset_that_keeps_the_old_database_fails<X: SqlExecutor>() {
+     assert!(store_names(&db).is_empty());
+ }
+ 
++/// Overwrites the database file in `directory` with bytes that aren't an SQLite database and
++/// removes the files SQLite keeps next to it.
++fn overwrite_database_with_garbage(directory: &Path) {
++    for entry in std::fs::read_dir(directory).unwrap() {
++        let path = entry.unwrap().path();
++        if path.is_dir() {
++            overwrite_database_with_garbage(&path);
++            continue;
++        }
++        let name = path.file_name().unwrap().to_string_lossy().into_owned();
++        if !name.starts_with("indexeddb.") {
++            continue;
++        }
++        if name.contains('-') {
++            std::fs::remove_file(&path).unwrap();
++        } else {
++            std::fs::write(&path, b"not an SQLite database, ".repeat(1000)).unwrap();
++        }
++    }
++}
++
++/// A database that turns out to be corrupt when it is opened is deleted and created anew, so the
++/// page gets an upgrade from version 0 instead of an error on every open.
++fn corrupt_database_is_reset_when_opened<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine_in::<X>(dir.path(), true);
++    create_store(&db, "store", None, false).unwrap();
++    set_version(&db, 3).unwrap();
++    drop(db);
++
++    overwrite_database_with_garbage(dir.path());
++    let db = open_engine_in::<X>(dir.path(), false);
++    assert!(db.created_db_path());
++    assert_eq!(db.version().unwrap(), 0);
++    assert!(store_names(&db).is_empty());
++    assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
++}
++
++/// The same with a corruption that the [`Faulty`] executor reports for the first statement of
++/// the open; other failures at open don't reset the database.
++fn injected_corruption_at_open_resets_the_database<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine_in::<Faulty<X>>(dir.path(), true);
++    create_store(&db, "store", None, false).unwrap();
++    set_version(&db, 2).unwrap();
++    drop(db);
++
++    faults_for(dir.path()).lock().unwrap().statement = Some(("user_version", 0));
++    let open = SqlEngine::<Faulty<X>>::new(
++        dir.path().to_path_buf(),
++        false,
++        &test_description(),
++        ThreadPool::global(),
++    );
++    assert!(matches!(open, Err(SqlError::TransactionState(_))));
++    let db = open_engine_in::<Faulty<X>>(dir.path(), false);
++    assert_eq!(db.version().unwrap(), 2);
++    drop(db);
++
++    let faults = faults_for(dir.path());
++    let mut injected = faults.lock().unwrap();
++    injected.statement = Some(("user_version", 0));
++    injected.corrupt = true;
++    drop(injected);
++    let db = open_engine_in::<Faulty<X>>(dir.path(), false);
++    assert!(db.created_db_path());
++    assert_eq!(db.version().unwrap(), 0);
++    assert!(store_names(&db).is_empty());
++}
++
+ fn test_cycle<X: SqlExecutor>() {
+     let dir = tempfile::tempdir().unwrap();
+     // Test create
+@@ -2758,6 +2830,10 @@ impl<X: SqlExecutor> SqlExecutor for Faulty<X> {
+         X::exists(directory)
+     }
+ 
++    fn delete_files(directory: &Path) -> Result<(), SqlError> {
++        X::delete_files(directory)
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         self.inject(sql)?;
+         let duplicate = self
+diff --git a/components/storage/indexeddb/backend/twin.rs b/components/storage/indexeddb/backend/twin.rs
+index 91df97a5ad2..53d284daadc 100644
+--- a/components/storage/indexeddb/backend/twin.rs
++++ b/components/storage/indexeddb/backend/twin.rs
+@@ -64,6 +64,14 @@ impl SqlExecutor for TwinExecutor {
+         }
+     }
+ 
++    fn delete_files(directory: &Path) -> Result<(), SqlError> {
++        if use_ohos_rdb_backend() {
++            RdbExecutor::delete_files(directory)
++        } else {
++            SqliteExecutor::delete_files(directory)
++        }
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         delegate!(self, |executor| executor.execute(sql, params))
+     }
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 6029729c0d1..7cb515af07d 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -763,6 +763,9 @@ struct OpenRequest {
+     created: bool,
+     /// The pipeline of the window that made the request, if a window did.
+     pipeline: Option<PipelineId>,
++    /// Whether a failure showed the database to be unusable, so that the open request deletes
++    /// it and creates it anew.
++    reset: bool,
+ }
+ 
+ #[derive(MallocSizeOf)]
+@@ -826,6 +829,7 @@ impl OpenRequest {
+             state: OpenRequestState::Queued,
+             created: false,
+             pipeline,
++            reset: false,
+         }
+     }
+ 
+@@ -1999,7 +2003,18 @@ impl IndexedDBManager {
+                 // Step 6: If db is null, let db be a new database with name name, version 0
+                 // (zero), and with no object stores. If this fails for any reason, return an
+                 // appropriate error (e.g. a "QuotaExceededError" or "UnknownError" DOMException).
+-                match ActiveKvsEngine::new(path, created, &key, self.thread_pool.clone()) {
++                let reset = if front.reset {
++                    warn!(
++                        "Resetting IndexedDB database {:?}, which is corrupt",
++                        key.name
++                    );
++                    ActiveKvsEngine::delete_files(&path)
++                } else {
++                    Ok(())
++                };
++                match reset.and_then(|()| {
++                    ActiveKvsEngine::new(path, created, &key, self.thread_pool.clone())
++                }) {
+                     Ok(engine) => {
+                         let created = engine.created_db_path();
+                         let db = IndexedDBEnvironment::new(engine, self.manager_sender.clone());
+@@ -2074,8 +2089,8 @@ impl IndexedDBManager {
+             request.pipeline,
+         );
+ 
+-        // A database that a failure showed to be unusable is opened again, once its connections
+-        // are closed.
++        // A database that a failure showed to be unusable is deleted and created anew, once its
++        // connections are closed, as one that turns out to be corrupt when it is opened.
+         if self
+             .databases
+             .get(key)
+@@ -2085,6 +2100,9 @@ impl IndexedDBManager {
+                 return false;
+             }
+             self.databases.remove(key);
++            if let Some(request) = self.front_request_mut(key) {
++                request.reset = true;
++            }
+         }
+ 
+         // Step 4: Let db be the database named name in storageKey, or null otherwise.
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index a1aa8cb5b14..9f17f255794 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -98,6 +98,8 @@ backend_tests!(
+     test_indexeddb_held_back_transaction_asks_the_holder_to_evict,
+     test_indexeddb_request_queued_behind_an_upgrade_asks_it_to_evict,
+     test_indexeddb_connections_of_a_crashed_window_close,
++    test_indexeddb_corrupt_database_is_reset_when_opened,
++    test_indexeddb_corrupt_database_of_an_earlier_session_is_deleted,
+ );
+ 
+ static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+@@ -3517,3 +3519,69 @@ fn test_indexeddb_connections_of_a_crashed_window_close() {
+     close_database(&ctx, connection, db_name);
+     ctx.shutdown();
+ }
++
++/// Overwrites the database file in `directory` with bytes that aren't an SQLite database and
++/// removes the files SQLite keeps next to it.
++fn overwrite_database_with_garbage(directory: &std::path::Path) {
++    for entry in std::fs::read_dir(directory).unwrap() {
++        let path = entry.unwrap().path();
++        if path.is_dir() {
++            overwrite_database_with_garbage(&path);
++            continue;
++        }
++        let name = path.file_name().unwrap().to_string_lossy().into_owned();
++        if !name.starts_with("indexeddb.") {
++            continue;
++        }
++        if name.contains('-') {
++            std::fs::remove_file(&path).unwrap();
++        } else {
++            std::fs::write(&path, b"not an SQLite database, ".repeat(1000)).unwrap();
++        }
++    }
++}
++
++/// A database that turns out to be corrupt when it is opened is deleted and created anew in its
++/// directory, so the open upgrades it from version 0, and its registry entry stays: databases()
++/// lists it with its new version, also after a restart. databases() omits it while it is corrupt.
++fn test_indexeddb_corrupt_database_is_reset_when_opened() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-corrupt";
++    upgrade_and_close(&ctx, db_name, 3, 0);
++    let directory = database_directory(&ctx, db_name).expect("A registry entry");
++
++    let ctx = ctx.restart();
++    overwrite_database_with_garbage(&directory);
++    assert_eq!(databases(&ctx), vec![]);
++    upgrade_and_close(&ctx, db_name, 1, 0);
++    assert_eq!(database_directory(&ctx, db_name), Some(directory));
++    assert_eq!(databases(&ctx), vec![(db_name.to_owned(), 1)]);
++
++    let ctx = ctx.restart();
++    assert_eq!(databases(&ctx), vec![(db_name.to_owned(), 1)]);
++    let open = open_database(&ctx, db_name, None);
++    match recv_callback_timeout(&open, "open") {
++        ConnectionMsg::Connection { id, version, .. } => {
++            assert_eq!(version, 1);
++            close_database(&ctx, id, db_name);
++        },
++        other => panic!("unexpected open message: {other:?}"),
++    }
++    ctx.shutdown();
++}
++
++/// A delete of a corrupt database of an earlier session deletes it and reports version 0, as its
++/// version can't be read.
++fn test_indexeddb_corrupt_database_of_an_earlier_session_is_deleted() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-corrupt-deleted";
++    upgrade_and_close(&ctx, db_name, 3, 0);
++    let directory = database_directory(&ctx, db_name).expect("A registry entry");
++
++    let ctx = ctx.restart();
++    overwrite_database_with_garbage(&directory);
++    assert_eq!(delete_result(&ctx, db_name), Ok(0));
++    assert!(!directory.exists());
++    assert_eq!(database_directory(&ctx, db_name), None);
++    ctx.shutdown();
++}

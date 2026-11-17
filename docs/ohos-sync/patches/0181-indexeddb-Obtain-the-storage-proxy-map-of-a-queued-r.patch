@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 11:52:18 +0000
+Subject: [PATCH] indexeddb: Obtain the storage proxy map of a queued request
+ in parallel
+
+The manager obtained the storage proxy map of every open and delete request
+with a blocking wait for the client storage thread, so all origins' IndexedDB
+work waited behind each lookup (P2 review N3). The request now enters its
+connection queue at once, the map is obtained on the global thread pool, which
+hands it back as StorageProxyMapObtained, and the queue processes the request
+once it is at the front and has its map. A failure to obtain it fails the
+request when its turn comes. The registry's create and delete calls and
+opening a database's SQL engine still run on the manager thread.
+
+Validation: host nextest -p servo-storage -p servo-storage-traits 150 passed, 1 skipped; host SM IndexedDB/ 4,482 of 4,511 with every result as expected and 2 whole-test timeouts, both expected, in each of 4 runs (c0d20e23493: 4,472 to 4,473, 5 to 7); QuickJS 4,482 in 3 runs, one with the known lone-surrogate idbobjectstore-rename-store.any.worker TIMEOUT after its sharedworker variant; /_mozilla/IndexedDB/ 306 of 306 SM, 304 of 306 QuickJS (interface lists, as before), 304 of 304 board; DAYU200 IndexedDB/ 4,461 (c0d20e23493: 4,456), unexpected only idb-partitioned-coverage and file_support as before; board unit tests RDB 151 passed, 3 skipped, SQLite and RDB 271 passed, 4 skipped; check --ohos of servo-storage with SQLite, RDB and both has no warnings; P5.1/scripts/pairs.sh, worker variant first: 0 of 12 timeouts (c0d20e23493: 15 of 15)
+AI-assisted: Yes (agent session; moved the lookup onto the thread pool and validated it)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/shared/storage/indexeddb.rs | 10 ++-
+ components/storage/indexeddb/mod.rs    | 94 +++++++++++++++++++++-----
+ 2 files changed, 85 insertions(+), 19 deletions(-)
+
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index e0600756825..479cba99b6f 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -16,7 +16,7 @@ use servo_base::id::WebViewId;
+ use servo_url::origin::ImmutableOrigin;
+ use uuid::Uuid;
+ 
+-use crate::client_storage::ClientStorageThreadHandle;
++use crate::client_storage::{ClientStorageThreadHandle, StorageProxyMap};
+ 
+ // TODO Box<dyn Error> is not serializable, fix needs to be found
+ pub type DbError = String;
+@@ -955,6 +955,14 @@ pub enum IndexedDBThreadMsg {
+         db_name: Utf16String,
+         txn: IndexedDBTxnId,
+     },
++    /// The storage proxy map of the queued open or delete request `request` was obtained, which
++    /// the manager does in parallel.
++    StorageProxyMapObtained {
++        origin: ImmutableOrigin,
++        db_name: Utf16String,
++        request: Uuid,
++        result: BackendResult<StorageProxyMap>,
++    },
+ 
+     /// Measure memory used by this thread and send the report over the provided channel.
+     CollectMemoryReport(ReportsChan),
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 499557a1641..3bfe0c9416e 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -635,8 +635,9 @@ struct OpenRequest {
+     /// The id of the request, which is also the id of the connection that an open request opens.
+     id: Uuid,
+     kind: OpenRequestKind,
+-    /// <https://storage.spec.whatwg.org/#storage-proxy-map>, or why it couldn't be obtained.
+-    proxy_map: BackendResult<StorageProxyMap>,
++    /// <https://storage.spec.whatwg.org/#storage-proxy-map>, which the manager obtains in
++    /// parallel once the request is queued; `None` until it has arrived.
++    proxy_map: Option<BackendResult<StorageProxyMap>>,
+     state: OpenRequestState,
+ }
+ 
+@@ -660,7 +661,8 @@ enum OpenRequestKind {
+ /// gets past `Queued`.
+ #[derive(MallocSizeOf)]
+ enum OpenRequestState {
+-    /// Step 3: waiting for the requests before it to be processed.
++    /// Step 3: waiting for the requests before it to be processed, and for its storage proxy
++    /// map.
+     Queued,
+     /// Waiting for the other connections to the database to close: steps 10.2 to 10.5 of open a
+     /// database connection, steps 6 to 9 of delete a database.
+@@ -686,21 +688,19 @@ struct ConnectionsToClose {
+ }
+ 
+ impl OpenRequest {
+-    fn new(
+-        id: Uuid,
+-        kind: OpenRequestKind,
+-        proxy_map: BackendResult<StorageProxyMap>,
+-    ) -> OpenRequest {
++    fn new(id: Uuid, kind: OpenRequestKind) -> OpenRequest {
+         OpenRequest {
+             id,
+             kind,
+-            proxy_map,
++            proxy_map: None,
+             state: OpenRequestState::Queued,
+         }
+     }
+ 
+     fn proxy_map(&self) -> Option<&StorageProxyMap> {
+-        self.proxy_map.as_ref().ok()
++        self.proxy_map
++            .as_ref()
++            .and_then(|proxy_map| proxy_map.as_ref().ok())
+     }
+ 
+     /// Sends `message` about an open request to script.
+@@ -897,6 +897,18 @@ impl IndexedDBManager {
+                     let reports = self.collect_memory_reports();
+                     sender.send(ProcessReports::new(reports));
+                 },
++                IndexedDBThreadMsg::StorageProxyMapObtained {
++                    origin,
++                    db_name,
++                    request,
++                    result,
++                } => {
++                    let key = IndexedDBDescription {
++                        origin,
++                        name: db_name,
++                    };
++                    self.storage_proxy_map_obtained(key, request, result);
++                },
+                 IndexedDBThreadMsg::AsyncSchemaOperation {
+                     origin,
+                     database_name,
+@@ -1065,7 +1077,7 @@ impl IndexedDBManager {
+ 
+     /// Steps 1 and 2 of <https://w3c.github.io/IndexedDB/#open-a-database-connection> and of
+     /// <https://w3c.github.io/IndexedDB/#delete-a-database>: adds the request `id` of `kind` to the
+-    /// connection queue for `key`, with its storage proxy map, and runs the queue.
++    /// connection queue for `key`, and obtains its storage proxy map in parallel.
+     fn queue_open_request(
+         &mut self,
+         key: IndexedDBDescription,
+@@ -1073,13 +1085,55 @@ impl IndexedDBManager {
+         kind: OpenRequestKind,
+         bottle_source: StorageBottleSource,
+     ) {
+-        let proxy_map = obtain_a_local_storage_bottle_map(&bottle_source, &key.origin);
++        self.obtain_storage_proxy_map(&key, id, bottle_source);
+         // Step 1: Let queue be the connection queue for storageKey and name.
+         // Step 2: Add request to queue.
+         self.connection_queues
+-            .entry(key.clone())
++            .entry(key)
+             .or_default()
+-            .push_back(OpenRequest::new(id, kind, proxy_map));
++            .push_back(OpenRequest::new(id, kind));
++    }
++
++    /// Obtains the storage proxy map of the queued request `request` on the thread pool, which
++    /// waits for the client storage thread instead of this one, and hands it to this thread.
++    fn obtain_storage_proxy_map(
++        &self,
++        key: &IndexedDBDescription,
++        request: Uuid,
++        bottle_source: StorageBottleSource,
++    ) {
++        let manager_sender = self.manager_sender.clone();
++        let IndexedDBDescription { origin, name } = key.clone();
++        self.thread_pool.spawn(move || {
++            let result = obtain_a_local_storage_bottle_map(&bottle_source, &origin);
++            if manager_sender
++                .send(IndexedDBThreadMsg::StorageProxyMapObtained {
++                    origin,
++                    db_name: name,
++                    request,
++                    result,
++                })
++                .is_err()
++            {
++                debug!("IndexedDB manager went away while obtaining a storage proxy map");
++            }
++        });
++    }
++
++    fn storage_proxy_map_obtained(
++        &mut self,
++        key: IndexedDBDescription,
++        request: Uuid,
++        result: BackendResult<StorageProxyMap>,
++    ) {
++        let Some(queued) = self
++            .connection_queues
++            .get_mut(&key)
++            .and_then(|queue| queue.iter_mut().find(|queued| queued.id == request))
++        else {
++            return debug!("IndexedDB request {request} went away");
++        };
++        queued.proxy_map = Some(result);
+         self.advance_connection_queue(key);
+     }
+ 
+@@ -1099,10 +1153,14 @@ impl IndexedDBManager {
+                 return;
+             };
+             let next = match (&request.state, &request.proxy_map, &request.kind) {
+-                (OpenRequestState::Upgrading(_), ..) => Next::Wait,
+-                (OpenRequestState::Queued, Err(error), _) => Next::Fail(error.clone()),
+-                (OpenRequestState::Queued, Ok(_), OpenRequestKind::Open { .. }) => Next::Open,
+-                (OpenRequestState::Queued, Ok(_), OpenRequestKind::Delete { .. }) => Next::Delete,
++                (OpenRequestState::Queued, None, _) | (OpenRequestState::Upgrading(_), ..) => {
++                    Next::Wait
++                },
++                (OpenRequestState::Queued, Some(Err(error)), _) => Next::Fail(error.clone()),
++                (OpenRequestState::Queued, Some(Ok(_)), OpenRequestKind::Open { .. }) => Next::Open,
++                (OpenRequestState::Queued, Some(Ok(_)), OpenRequestKind::Delete { .. }) => {
++                    Next::Delete
++                },
+                 (OpenRequestState::WaitingForConnections(_), ..) => {
+                     Next::ContinueWhenConnectionsClosed
+                 },

@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 11:42:07 +0000
+Subject: [PATCH] script: Close a worker's IndexedDB connections when its event
+ loop ends
+
+A dedicated or shared worker ran the IndexedDB teardown (abort its unfinished
+transactions in the backend, abort its pending upgrades, close its connections)
+only from WorkerGlobalScope::close(), which the worker's own close() reaches. A
+worker whose owner document goes away leaves its event loop through the closing
+flag instead, so its connections and unfinished transactions stayed in the
+IndexedDB manager for good, and every later upgrade of their databases waited
+for a connection that would never close. In WPT this is the worker/sharedworker
+same-database-name interference: a .any.worker variant left a connection that
+held back the .any.sharedworker variant of the same test run after it in the
+same browser.
+
+Run the teardown when either worker's event loop ends, before the global is
+torn down. Running it twice, after close(), is harmless: finished transactions
+are skipped and the backend ignores connections it already forgot.
+Worker.terminate() of an idle worker still leaves it parked until a message
+arrives, so its teardown waits until then.
+
+The teardown runs from drop guards, so that a worker whose thread ends
+with a panic closes its connections too (P5 review S2). The dedicated
+worker gets a CloseIndexedDBConnections guard, which a normal exit drops
+before the global is torn down; the shared worker's ClearJsRuntime
+guard, which already tore its global down on a panic, now runs the
+teardown first.
+
+Validation: build host SM release and run the worker and sharedworker variants of tests that share database names in one browser (P5.1/scripts/pairs.sh, --processes 1 --repeat 3) with the .any.worker variant first: idbdatabase-createObjectStore-exception-order and idbcursor-continuePrimaryKey-exception-order sharedworker, and idbfactory-origin-isolation after the continuePrimaryKey worker variant, timed out 9 of 9 with c0d20e23493 and 0 of 9 with this commit; host SM IndexedDB/ 4,473 of 4,511 with no unexpected results, /_mozilla/IndexedDB/ 285 of 285; after the P5 review fix: host SM release builds and `cargo nextest run -p servo-storage -p servo-storage-traits` gives 145 passed, 1 skipped at this commit; host SM /workers/ (337 tests) and /_mozilla/IndexedDB/ with every result as expected on the stack tip
+AI-assisted: Yes (agent session; implemented and tested the worker teardown, measured the WPT effect; the P5 review fix moved the teardown into drop guards)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../dom/workers/dedicatedworkerglobalscope.rs |  4 +++-
+ .../dom/workers/sharedworkerglobalscope.rs    |  4 +++-
+ .../script/dom/workers/workerglobalscope.rs   | 24 +++++++++++++++----
+ 3 files changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/components/script/dom/workers/dedicatedworkerglobalscope.rs b/components/script/dom/workers/dedicatedworkerglobalscope.rs
+index da3bb3818eb..0e468e26109 100644
+--- a/components/script/dom/workers/dedicatedworkerglobalscope.rs
++++ b/components/script/dom/workers/dedicatedworkerglobalscope.rs
+@@ -68,7 +68,7 @@ use crate::dom::types::DebuggerGlobalScope;
+ use crate::dom::webgpu::identityhub::IdentityHub;
+ use crate::dom::worker::{TrustedWorkerAddress, Worker};
+ use crate::dom::workerglobalscope::{
+-    ScriptFetchContext, WorkerDevtoolsControlMsg, WorkerGlobalScope,
++    CloseIndexedDBConnections, ScriptFetchContext, WorkerDevtoolsControlMsg, WorkerGlobalScope,
+ };
+ use crate::messaging::{CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSender};
+ use crate::realms::enter_auto_realm;
+@@ -584,6 +584,7 @@ impl DedicatedWorkerGlobalScope {
+                 }
+                 let worker_global_scope =
+                     dedicated_worker_global_scope.upcast::<WorkerGlobalScope>();
++                let close_indexeddb_connections = CloseIndexedDBConnections(worker_global_scope);
+                 let global_scope = dedicated_worker_global_scope.upcast::<GlobalScope>();
+ 
+                 // Step 12. Obtain script by switching on options["type"]:
+@@ -645,6 +646,7 @@ impl DedicatedWorkerGlobalScope {
+ 
+                 // Drop worker rAF state before destroying the JS runtime.
+                 dedicated_worker_global_scope.clear_animation_frame_callbacks_and_unregister();
++                drop(close_indexeddb_connections);
+                 global_scope.tear_down();
+                 worker_global_scope.clear_js_runtime();
+             })
+diff --git a/components/script/dom/workers/sharedworkerglobalscope.rs b/components/script/dom/workers/sharedworkerglobalscope.rs
+index 1b00ae2c01a..bdb6c202514 100644
+--- a/components/script/dom/workers/sharedworkerglobalscope.rs
++++ b/components/script/dom/workers/sharedworkerglobalscope.rs
+@@ -508,10 +508,12 @@ impl SharedWorkerGlobalScope {
+                 );
+ 
+                 /// A data structure that ensures that a panicking SharedWorker will
+-                /// always call `clear_js_runtime` in order to prevent it from leaking.
++                /// always close its IndexedDB connections and call `clear_js_runtime` in
++                /// order to prevent it from leaking.
+                 struct ClearJsRuntime<'a>(&'a WorkerGlobalScope);
+                 impl Drop for ClearJsRuntime<'_> {
+                     fn drop(&mut self) {
++                        self.0.close_indexeddb_connections();
+                         self.0.upcast::<GlobalScope>().tear_down();
+                         self.0.clear_js_runtime();
+                     }
+diff --git a/components/script/dom/workers/workerglobalscope.rs b/components/script/dom/workers/workerglobalscope.rs
+index 993277938e2..16f755bc12b 100644
+--- a/components/script/dom/workers/workerglobalscope.rs
++++ b/components/script/dom/workers/workerglobalscope.rs
+@@ -1193,16 +1193,32 @@ impl WorkerGlobalScope {
+             .task_manager()
+             .cancel_all_tasks_and_ignore_future_tasks();
+ 
+-        // From <https://w3c.github.io/IndexedDB/#database-connection>
+-        // > The connection can be closed through several means. If the execution context where
+-        // > the connection was created is destroyed (for example due to the user navigating away
+-        // > from that page), the connection is closed.
++        self.close_indexeddb_connections();
++    }
++
++    /// Closes the IndexedDB connections of this worker, whose event loop ends.
++    ///
++    /// From <https://w3c.github.io/IndexedDB/#database-connection>
++    /// > The connection can be closed through several means. If the execution context where
++    /// > the connection was created is destroyed (for example due to the user navigating away
++    /// > from that page), the connection is closed.
++    pub(crate) fn close_indexeddb_connections(&self) {
+         if let Some(factory) = self.upcast::<GlobalScope>().indexeddb_factory() {
+             factory.abort_pending_upgrades_and_close_databases();
+         }
+     }
+ }
+ 
++/// Closes the IndexedDB connections of a worker when dropped, so that a worker whose thread ends
++/// with a panic closes them too.
++pub(crate) struct CloseIndexedDBConnections<'a>(pub(crate) &'a WorkerGlobalScope);
++
++impl Drop for CloseIndexedDBConnections<'_> {
++    fn drop(&mut self) {
++        self.0.close_indexeddb_connections();
++    }
++}
++
+ #[cfg(feature = "devtools")]
+ impl WorkerGlobalScope {
+     pub(crate) fn init_debugger_global(
