@@ -181,6 +181,14 @@ those scripts (they need network access). `check_stack.py` runs each with
 155. `indexeddb: Keep string keys and names as UTF-16 code units` — C · CI+device · watch: components/script_bindings/domstring.rs components/storage/cache_storage.rs
 156. `indexeddb: Look up key path identifiers by their code units` — C · CI+device · watch: components/script_bindings/js.rs components/script_bindings/utils.rs
 157. `docs: record patches 150 to 157 in the stack manifest` — B · none · watch: -
+158. `indexeddb: Store index records with the records they index` — C · CI+device · watch: components/script/dom/bindings/structuredclone.rs tests/wpt/tests/IndexedDB
+159. `indexeddb: Evaluate a sequence key path into an Array` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+160. `indexeddb: Populate an index created on an object store with records` — C · CI+device · watch: components/script/dom/bindings/structuredclone.rs
+161. `indexeddb: Let the requests queued behind a gone global's upgrade go on` — C · CI+device · watch: components/script/dom/html/embedded_content/htmliframeelement.rs
+162. `indexeddb: Make a request's source its object store, index or cursor` — C · CI+device · watch: components/script_bindings/codegen/codegen.py
+163. `indexeddb: Read the records of an index` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+164. `indexeddb: Iterate cursors over indexes from their position in the index` — C · CI+device · watch: components/script_bindings/webidls/IDBCursor.webidl tests/wpt/tests/IndexedDB
+165. `docs: record patches 158 to 165 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

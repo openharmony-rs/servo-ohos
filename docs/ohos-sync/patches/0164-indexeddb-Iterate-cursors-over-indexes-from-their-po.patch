@@ -1,0 +1,3128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 02:54:16 +0000
+Subject: [PATCH] indexeddb: Iterate cursors over indexes from their position
+ in the index
+
+A cursor over an IDBIndex iterated the records of the index's object
+store: Iterate had no index, the backend read the store's records in
+the cursor's range, all of them for an index source, and script's steps
+to iterate a cursor searched that list. Index keys, the order by primary
+key within a key, nextunique and prevunique, continuePrimaryKey() and
+the object store position never worked, and every step of an index
+cursor read the whole range with its values.
+
+Iterate now names the index, like the other reads, and carries the
+direction and the step (IndexedDBCursorStep): the cursor's position and
+object store position, the key of continue() or continuePrimaryKey(),
+the primary key of the latter and the count of advance(). The backend
+runs step 9 of "iterate a cursor" with one statement per step, on the
+records as they are when the step runs (queries::cursor_records, with
+the spec's requirements in its comments):
+
+- It bounds the records on the side the cursor moves to by the tightest
+  of the range's bound, the key and the position, so that the statement
+  seeks there in the table's primary key order (StepBounds). For an index
+  in "next" and "prev" the position, and continuePrimaryKey()'s target,
+  are (key, primary key) row values, `(i.value, i.object_data_key) >
+  (?, ?)`; the other requirements bound the key alone.
+- advance(n) skips n - 1 records, or keys for the unique directions,
+  with OFFSET.
+- "nextunique" and "prevunique" on a non-unique index keep, of each
+  key's records, the one with the lowest primary key, in both
+  directions, as the spec's "first record whose key is equal to temp
+  record's key" asks for "prevunique": a NOT EXISTS condition with a
+  primary key seek per record. Not MIN(object_data_key) with GROUP BY:
+  RDB can't read a column that holds the MIN() or MAX() of BLOBs. A
+  unique index has one record per key and needs no condition.
+
+Script sends the step (IDBCursor::iterate_operation) and applies the
+record it gets back (iterate_cursor, steps 9.2 to 15). Object store
+cursors take the same path, so the narrowing that b17fe190449 did in
+script for them now happens in the backend.
+
+The reply lists records in step order, at most `records` of them: the
+one the step finds, then those that continue() without a key would find
+next. Script asks for one; the prefetch cache planned for later can ask
+for more without a protocol change. Key cursors (openKeyCursor) ask for
+no values, so their steps don't read object_data, and
+IndexedDBRecord.value is optional.
+
+Cursor update() and delete() already acted on the effective object
+store and recomputed the index keys; with the index records in place
+they now show in the index's iteration.
+
+Tests: backend tests check every step against a literal implementation
+of the spec's step 9 over the same records, for a store and a
+non-unique, a unique and a multiEntry index, in every direction and in
+four ranges, from every position, with continue(), advance(),
+continue(key), continuePrimaryKey() and several records per step, and
+with random puts and deletes between the steps of cursors over the store
+and two indexes; the integration test of b17fe190449 now sends steps.
+The fork WPT test index-cursors.any.js covers what the IndexedDB WPT
+tests leave out: the unique directions on keys with several records,
+continuePrimaryKey() and advance() across them, writes between the
+steps of an index cursor, a unique index whose key moves to another
+record, and update() and delete() through an index cursor with
+generated keys.
+
+Validation: Before the P3 review fixes were folded into the P3.1, P3.2 and P3.3 commits: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 139 passed, 1 skipped (P3.3: 137), including test_cursor_steps_find_what_the_spec_finds (4,726 steps checked against the spec's algorithm) and test_cursor_steps_see_the_writes_between_them. DAYU200 `./mach test-unit --ohos -p servo-storage`: RDB only 140 passed, 3 skipped (138); SQLite and RDB 249 passed, 4 skipped (245); a first version of the unique directions with GROUP BY and MIN(object_data_key) failed there. WPT IndexedDB/ (4,511 subtests): host SpiderMonkey, 8 processes, 3,971 pass (P3.3: 3,796); QuickJS 3,971 (3,797), 820 of 820 tests as expected; DAYU200 (QuickJS + RDB), 2 processes, 3,952 (3,773). The 174 new passes are the same on both host engines (idbcursor-continue, -advance, -primarykey, -continuePrimaryKey and its exception tests, -direction-index and -keyrange, -iterating-update, -advance-continue-async, idbcursor_continue_index, idbcursor_update_index, idbindex_tombstones, idbindex_reverse_cursor, idbindex_keyPath arrays, name-scopes, large-requests-abort, request-event-ordering-*, reading-autoincrement-indexes-cursors, index_sort_order, idbobjectstore_createIndex and idb-partitioned-coverage cursor subtests); the board has them except idb-partitioned-coverage, which times out as a whole there since P3.3 because pages in iframes run slowly on the board. The other unexpected results are known: order-dependent flips of worker and sharedworker variants that share database names (each passes alone), and interleaved-cursors-large and file_support on the board. Board durations of the object store cursor tests are unchanged: idbcursor_iterating 3.9-4.3 s (4.1-4.4), interleaved-cursors-small 26.6-29.1 s (27.0-30.2). /_mozilla/IndexedDB/: 172 of 172 on host SpiderMonkey, QuickJS and the board; the P3.3 binary passes none of the 21 subtests of index-cursors.any.js. `./mach fmt`; `./mach test-tidy`: only the known libsqlite3-sys advisory; `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`, and `RUSTFLAGS="-D warnings" ./mach build --locked --ohos --profile checked-release` for the default and harmonyos flavors, each with a signed HAP: no warning; `./mach test-unit --profile checked-release`: 1,342 passed, 1 skipped, after a first run that failed the randomized layout test floats::test_floats_rule_8; with --doc: pass. After them, at this commit: host nextest 140 passed, 1 skipped; DAYU200 RDB only 141 passed / 3 skipped, SQLite and RDB 251 / 4; WPT IndexedDB/ host SpiderMonkey 3,970 and QuickJS 3,970, each 819 of 820 tests as expected (idbfactory-origin-isolation on SM, the open.blocked flip of idbversionchangeevent.any.worker on QuickJS, both known), DAYU200 3,953 with the known unexpected set; /_mozilla/IndexedDB/ 187 of 187 on host SM, QuickJS and the board; `./mach fmt`, test-tidy (only the known advisory), clippy, the crown build, both OHOS flavors with signed HAPs, `./mach test-unit --profile checked-release` (1,343 passed, 1 skipped) and --doc pass.
+AI-assisted: Yes (agent session; the agent wrote the change and the tests, and ran the host, device and WPT runs, again after the P3 review fold)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbcursor.rs  | 380 ++--------
+ components/script/dom/indexeddb/idbindex.rs   |   5 +-
+ .../script/dom/indexeddb/idbobjectstore.rs    |   5 +-
+ components/shared/storage/indexeddb.rs        |  44 +-
+ .../storage/indexeddb/backend/engine.rs       |  21 +-
+ .../storage/indexeddb/backend/queries.rs      | 279 ++++++-
+ components/storage/indexeddb/backend/tests.rs | 692 +++++++++++++++++-
+ components/storage/tests/indexeddb.rs         | 109 +--
+ .../idb-partitioned-coverage.sub.html.ini     |   6 -
+ ...dbcursor-advance-continue-async.any.js.ini |  17 -
+ .../IndexedDB/idbcursor-advance.any.js.ini    |  53 --
+ .../IndexedDB/idbcursor-continue.any.js.ini   |  71 --
+ ...tinuePrimaryKey-exception-order.any.js.ini |  17 -
+ ...r-continuePrimaryKey-exceptions.any.js.ini |  17 -
+ .../idbcursor-continuePrimaryKey.any.js.ini   |  17 -
+ ...cursor-direction-index-keyrange.any.js.ini |  35 -
+ .../idbcursor-direction-index.any.js.ini      |  17 -
+ .../idbcursor-iterating-update.any.js.ini     |  20 -
+ .../IndexedDB/idbcursor-primarykey.any.js.ini |  26 -
+ .../idbcursor_continue_index.any.js.ini       |  35 -
+ .../idbcursor_update_index.any.js.ini         |   9 -
+ .../IndexedDB/idbindex_keyPath.any.js.ini     |  12 -
+ .../idbindex_reverse_cursor.any.js.ini        |  14 -
+ .../IndexedDB/idbindex_tombstones.any.js.ini  |  26 -
+ .../idbobjectstore_createIndex.any.js.ini     |   8 -
+ .../IndexedDB/index_sort_order.any.js.ini     |   8 -
+ .../IndexedDB/large-requests-abort.any.js.ini |  35 -
+ .../wpt/meta/IndexedDB/name-scopes.any.js.ini |  17 -
+ ...g-autoincrement-indexes-cursors.any.js.ini |  17 -
+ ...g-large-mixed-with-small-values.any.js.ini |   9 -
+ ...rdering-large-then-small-values.any.js.ini |   8 -
+ ...est-event-ordering-large-values.any.js.ini |   8 -
+ ...est-event-ordering-small-values.any.js.ini |   8 -
+ tests/wpt/mozilla/meta/MANIFEST.json          |  63 ++
+ .../tests/IndexedDB/index-cursors.any.js      | 236 ++++++
+ 35 files changed, 1427 insertions(+), 917 deletions(-)
+ delete mode 100644 tests/wpt/meta/IndexedDB/idb-partitioned-coverage.sub.html.ini
+ delete mode 100644 tests/wpt/meta/IndexedDB/idbindex_reverse_cursor.any.js.ini
+ delete mode 100644 tests/wpt/meta/IndexedDB/idbindex_tombstones.any.js.ini
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/index-cursors.any.js
+
+diff --git a/components/script/dom/indexeddb/idbcursor.rs b/components/script/dom/indexeddb/idbcursor.rs
+index 83b74c785b2..a16a97bf8fe 100644
+--- a/components/script/dom/indexeddb/idbcursor.rs
++++ b/components/script/dom/indexeddb/idbcursor.rs
+@@ -14,8 +14,8 @@ use js::rust::{HandleValue, MutableHandleValue};
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use storage_traits::indexeddb::{
+-    AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, IndexedDBKeyRange,
+-    IndexedDBKeyType, IndexedDBRecord,
++    AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, IndexedDBCursorDirection,
++    IndexedDBCursorStep, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
+ };
+ 
+ use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::{
+@@ -221,48 +221,47 @@ impl IDBCursor {
+         Ok(())
+     }
+ 
+-    /// The operation that gets the records for the steps to iterate a cursor with `key` and
+-    /// `count`, which pick from the records after the cursor's position in its direction. For an
+-    /// object store source, whose keys are unique, these steps only reach the next `count`
+-    /// records, so only those are read.
++    /// The operation of <https://w3c.github.io/IndexedDB/#iterate-a-cursor> with this cursor,
++    /// `key`, `primary_key` and `count`: the backend finds the record from the cursor's position
++    /// (step 9), which `iterate_cursor` then moves the cursor to.
+     pub(crate) fn iterate_operation(
+         &self,
+-        key: Option<&IndexedDBKeyType>,
++        key: Option<IndexedDBKeyType>,
++        primary_key: Option<IndexedDBKeyType>,
+         count: u32,
+     ) -> AsyncOperation {
+-        let mut key_range = self.range.clone();
+-        let (count, reverse) = match self.source {
+-            // TODO: The backends store no index records yet, so an index source still reads
+-            // every record in its range.
+-            ObjectStoreOrIndex::Index(_) => (None, false),
+-            ObjectStoreOrIndex::ObjectStore(_) => {
+-                let position = self.position.borrow();
+-                match self.direction {
+-                    IDBCursorDirection::Next | IDBCursorDirection::Nextunique => {
+-                        if let Some(position) = position.as_ref() {
+-                            key_range.restrict_lower(position.clone(), true);
+-                        }
+-                        if let Some(key) = key {
+-                            key_range.restrict_lower(key.clone(), false);
+-                        }
+-                        (Some(count), false)
+-                    },
+-                    IDBCursorDirection::Prev | IDBCursorDirection::Prevunique => {
+-                        if let Some(position) = position.as_ref() {
+-                            key_range.restrict_upper(position.clone(), true);
+-                        }
+-                        if let Some(key) = key {
+-                            key_range.restrict_upper(key.clone(), false);
+-                        }
+-                        (Some(count), true)
+-                    },
+-                }
+-            },
++        // Step 3. Assert: if primaryKey is given, source is an index and direction is "next" or
++        // "prev".
++        if primary_key.is_some() {
++            assert!(matches!(self.source, ObjectStoreOrIndex::Index(..)));
++            assert!(matches!(
++                self.direction,
++                IDBCursorDirection::Next | IDBCursorDirection::Prev
++            ));
++        }
++        let index = match &self.source {
++            ObjectStoreOrIndex::ObjectStore(_) => None,
++            ObjectStoreOrIndex::Index(index) => Some(index.id()),
++        };
++        let direction = match self.direction {
++            IDBCursorDirection::Next => IndexedDBCursorDirection::Next,
++            IDBCursorDirection::Nextunique => IndexedDBCursorDirection::NextUnique,
++            IDBCursorDirection::Prev => IndexedDBCursorDirection::Prev,
++            IDBCursorDirection::Prevunique => IndexedDBCursorDirection::PrevUnique,
+         };
+         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+-            key_range,
+-            count,
+-            reverse,
++            index,
++            key_range: self.range.clone(),
++            direction,
++            step: IndexedDBCursorStep {
++                position: self.position.borrow().clone(),
++                object_store_position: self.object_store_position.borrow().clone(),
++                key,
++                primary_key,
++                count,
++            },
++            records: 1,
++            key_only: self.key_only,
+         })
+     }
+ }
+@@ -377,15 +376,12 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+         // as targetRealm, this cursor and count.
+         let iteration_param = IterationParam {
+             cursor: Trusted::new(self),
+-            key: None,
+-            primary_key: None,
+-            count: Some(count),
+         };
+ 
+         IDBRequest::execute_async(
+             cx,
+             self.request_source(),
+-            self.iterate_operation(None, count),
++            self.iterate_operation(None, None, count),
+             Some(request),
+             Some(iteration_param),
+         )?;
+@@ -460,18 +456,14 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+         // Step 9: Run the steps to asynchronously execute a request with the cursor's source as
+         // source, the steps to iterate a cursor as operation and request, using the current Realm
+         // as targetRealm, this cursor and key (if given).
+-        let operation_key = key.clone();
+         let iteration_param = IterationParam {
+             cursor: Trusted::new(self),
+-            key,
+-            primary_key: None,
+-            count: None,
+         };
+ 
+         IDBRequest::execute_async(
+             cx,
+             self.request_source(),
+-            self.iterate_operation(operation_key.as_ref(), 1),
++            self.iterate_operation(key, None, 1),
+             Some(request),
+             Some(iteration_param),
+         )?;
+@@ -598,18 +590,14 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+         // Step 20: Run the steps to asynchronously execute a request with the cursor's source as
+         // source, the steps to iterate a cursor as operation and request, using the current Realm
+         // as targetRealm, this cursor, key and primaryKey.
+-        let operation_key = key.clone();
+         let iteration_param = IterationParam {
+             cursor: Trusted::new(self),
+-            key: Some(key),
+-            primary_key: Some(primary_key),
+-            count: None,
+         };
+ 
+         IDBRequest::execute_async(
+             cx,
+             self.request_source(),
+-            self.iterate_operation(Some(&operation_key), 1),
++            self.iterate_operation(Some(key), Some(primary_key), 1),
+             Some(request),
+             Some(iteration_param),
+         )?;
+@@ -765,299 +753,73 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+     }
+ }
+ 
+-/// A struct containing parameters for
+-/// <https://www.w3.org/TR/IndexedDB-3/#iterate-a-cursor>
++/// The cursor that a request runs <https://www.w3.org/TR/IndexedDB-3/#iterate-a-cursor> for.
+ #[derive(Clone)]
+ pub(crate) struct IterationParam {
+     pub(crate) cursor: Trusted<IDBCursor>,
+-    pub(crate) key: Option<IndexedDBKeyType>,
+-    pub(crate) primary_key: Option<IndexedDBKeyType>,
+-    pub(crate) count: Option<u32>,
+ }
+ 
+-/// <https://www.w3.org/TR/IndexedDB-3/#iterate-a-cursor>
++/// <https://www.w3.org/TR/IndexedDB-3/#iterate-a-cursor>, with `records` from the backend, which
++/// ran steps 2 to 9 but the cursor's changes (see `IDBCursor::iterate_operation`): first the
++/// record that the cursor moves to, none if it moves past the end.
+ ///
+-/// NOTE: Be cautious: this part of the specification seems to assume the cursor’s source is an
+-/// index. Therefore,
+-///   "record’s key" means the key of the record,
+-///   "record’s value" means the primary key of the record, and
+-///   "record’s referenced value" means the value of the record.
++/// NOTE: For an index source, "record’s key" is the index key, "record’s value" the primary key
++/// of the record in the object store, and "record’s referenced value" the value of that record.
+ pub(crate) fn iterate_cursor(
+     cx: &mut JSContext,
+     param: &IterationParam,
+     records: Vec<IndexedDBRecord>,
+ ) -> Result<Option<DomRoot<IDBCursor>>, Error> {
+-    // Unpack IterationParam
+     let cursor = param.cursor.root();
+-    let key = param.key.clone();
+-    let primary_key = param.primary_key.clone();
+-    let count = param.count;
+ 
+     // Step 1. Let source be cursor’s source.
+     let source = &cursor.source;
+ 
+-    // Step 2. Let direction be cursor’s direction.
+-    let direction = cursor.direction;
+-
+-    // Step 3. Assert: if primaryKey is given, source is an index and direction is "next" or "prev".
+-    if primary_key.is_some() {
+-        assert!(matches!(source, ObjectStoreOrIndex::Index(..)));
+-        assert!(matches!(
+-            direction,
+-            IDBCursorDirection::Next | IDBCursorDirection::Prev
+-        ));
+-    }
+-
+-    // Step 4. Let records be the list of records in source.
+-    // NOTE: It is given as a function parameter.
+-
+-    // Step 5. Let range be cursor’s range.
+-    let range = &cursor.range;
+-
+-    // Step 6. Let position be cursor’s position.
+-    let mut position = cursor.position.borrow().clone();
+-
+-    // Step 7. Let object store position be cursor’s object store position.
+-    let mut object_store_position = cursor.object_store_position.borrow().clone();
+-
+-    // Step 8. If count is not given, let count be 1.
+-    let mut count = count.unwrap_or(1);
+-
+-    let mut found_record: Option<&IndexedDBRecord> = None;
+-
+-    // Step 9. While count is greater than 0:
+-    while count > 0 {
+-        // Step 9.1. Switch on direction:
+-        found_record = match direction {
+-            // "next"
+-            IDBCursorDirection::Next => records.iter().find(|record| {
+-                // Let found record be the first record in records which satisfy all of the
+-                // following requirements:
+-
+-                // If key is defined, the record’s key is greater than or equal to key.
+-                let requirement1 = || match &key {
+-                    Some(key) => &record.key >= key,
+-                    None => true,
+-                };
+-
+-                // If primaryKey is defined, the record’s key is equal to key and the record’s
+-                // value is greater than or equal to primaryKey, or the record’s key is greater
+-                // than key.
+-                let requirement2 = || match &primary_key {
+-                    Some(primary_key) => key.as_ref().is_some_and(|key| {
+-                        (&record.key == key && &record.primary_key >= primary_key) ||
+-                            &record.key > key
+-                    }),
+-                    _ => true,
+-                };
+-
+-                // If position is defined, and source is an object store, the record’s key is
+-                // greater than position.
+-                let requirement3 = || match (&position, source) {
+-                    (Some(position), ObjectStoreOrIndex::ObjectStore(_)) => &record.key > position,
+-                    _ => true,
+-                };
+-
+-                // If position is defined, and source is an index, the record’s key is equal to
+-                // position and the record’s value is greater than object store position or the
+-                // record’s key is greater than position.
+-                let requirement4 = || match (&position, source) {
+-                    (Some(position), ObjectStoreOrIndex::Index(_)) => {
+-                        (&record.key == position &&
+-                            object_store_position.as_ref().is_some_and(
+-                                |object_store_position| &record.primary_key > object_store_position,
+-                            )) ||
+-                            &record.key > position
+-                    },
+-                    _ => true,
+-                };
+-
+-                // The record’s key is in range.
+-                let requirement5 = || range.contains(&record.key);
+-
+-                // NOTE: Use closures here for lazy computation on requirements.
+-                requirement1() &&
+-                    requirement2() &&
+-                    requirement3() &&
+-                    requirement4() &&
+-                    requirement5()
+-            }),
+-            // "nextunique"
+-            IDBCursorDirection::Nextunique => records.iter().find(|record| {
+-                // Let found record be the first record in records which satisfy all of the
+-                // following requirements:
+-
+-                // If key is defined, the record’s key is greater than or equal to key.
+-                let requirement1 = || match &key {
+-                    Some(key) => &record.key >= key,
+-                    None => true,
+-                };
+-
+-                // If position is defined, the record’s key is greater than position.
+-                let requirement2 = || match &position {
+-                    Some(position) => &record.key > position,
+-                    None => true,
+-                };
+-
+-                // The record’s key is in range.
+-                let requirement3 = || range.contains(&record.key);
+-
+-                // NOTE: Use closures here for lazy computation on requirements.
+-                requirement1() && requirement2() && requirement3()
+-            }),
+-            // "prev"
+-            IDBCursorDirection::Prev => {
+-                records.iter().rev().find(|&record| {
+-                    // Let found record be the last record in records which satisfy all of the
+-                    // following requirements:
+-
+-                    // If key is defined, the record’s key is less than or equal to key.
+-                    let requirement1 = || match &key {
+-                        Some(key) => &record.key <= key,
+-                        None => true,
+-                    };
+-
+-                    // If primaryKey is defined, the record’s key is equal to key and the record’s
+-                    // value is less than or equal to primaryKey, or the record’s key is less than
+-                    // key.
+-                    let requirement2 = || match &primary_key {
+-                        Some(primary_key) => key.as_ref().is_some_and(|key| {
+-                            (&record.key == key && &record.primary_key <= primary_key) ||
+-                                &record.key < key
+-                        }),
+-                        _ => true,
+-                    };
+-
+-                    // If position is defined, and source is an object store, the record’s key is
+-                    // less than position.
+-                    let requirement3 = || match (&position, source) {
+-                        (Some(position), ObjectStoreOrIndex::ObjectStore(_)) => {
+-                            &record.key < position
+-                        },
+-                        _ => true,
+-                    };
+-
+-                    // If position is defined, and source is an index, the record’s key is equal to
+-                    // position and the record’s value is less than object store position or the
+-                    // record’s key is less than position.
+-                    let requirement4 = || match (&position, source) {
+-                        (Some(position), ObjectStoreOrIndex::Index(_)) => {
+-                            (&record.key == position &&
+-                                object_store_position.as_ref().is_some_and(
+-                                    |object_store_position| {
+-                                        &record.primary_key < object_store_position
+-                                    },
+-                                )) ||
+-                                &record.key < position
+-                        },
+-                        _ => true,
+-                    };
+-
+-                    // The record’s key is in range.
+-                    let requirement5 = || range.contains(&record.key);
+-
+-                    // NOTE: Use closures here for lazy computation on requirements.
+-                    requirement1() &&
+-                        requirement2() &&
+-                        requirement3() &&
+-                        requirement4() &&
+-                        requirement5()
+-                })
+-            },
+-            // "prevunique"
+-            IDBCursorDirection::Prevunique => records
+-                .iter()
+-                .rev()
+-                .find(|&record| {
+-                    // Let temp record be the last record in records which satisfy all of the
+-                    // following requirements:
+-
+-                    // If key is defined, the record’s key is less than or equal to key.
+-                    let requirement1 = || match &key {
+-                        Some(key) => &record.key <= key,
+-                        None => true,
+-                    };
+-
+-                    // If position is defined, the record’s key is less than position.
+-                    let requirement2 = || match &position {
+-                        Some(position) => &record.key < position,
+-                        None => true,
+-                    };
+-
+-                    // The record’s key is in range.
+-                    let requirement3 = || range.contains(&record.key);
+-
+-                    // NOTE: Use closures here for lazy computation on requirements.
+-                    requirement1() && requirement2() && requirement3()
+-                })
+-                // If temp record is defined, let found record be the first record in records
+-                // whose key is equal to temp record’s key.
+-                .map(|temp_record| {
+-                    records
+-                        .iter()
+-                        .find(|&record| record.key == temp_record.key)
+-                        .expect(
+-                            "Record with key equal to temp record's key should exist in records",
+-                        )
+-                }),
+-        };
+-
+-        match found_record {
+-            // Step 9.2. If found record is not defined, then:
+-            None => {
+-                // Step 9.2.1. Set cursor’s key to undefined.
+-                cursor.set_key(None);
+-
+-                // Step 9.2.2. If source is an index, set cursor’s object store position to undefined.
+-                if matches!(source, ObjectStoreOrIndex::Index(_)) {
+-                    cursor.set_object_store_position(None);
+-                }
++    // Steps 2-9.1: the backend found the record, after count - 1 rounds of step 9.
++    let Some(found_record) = records.into_iter().next() else {
++        // Step 9.2. If found record is not defined, then:
++        // Step 9.2.1. Set cursor’s key to undefined.
++        cursor.set_key(None);
+ 
+-                // Step 9.2.3. If cursor’s key only flag is unset, set cursor’s value to undefined.
+-                if !cursor.key_only {
+-                    cursor.value.set(UndefinedValue());
+-                }
+-
+-                // Step 9.2.4. Return null.
+-                return Ok(None);
+-            },
+-            Some(found_record) => {
+-                // Step 9.3. Let position be found record’s key.
+-                position = Some(found_record.key.clone());
+-
+-                // Step 9.4. If source is an index, let object store position be found record’s value.
+-                if matches!(source, ObjectStoreOrIndex::Index(_)) {
+-                    object_store_position = Some(found_record.primary_key.clone());
+-                }
++        // Step 9.2.2. If source is an index, set cursor’s object store position to undefined.
++        if matches!(source, ObjectStoreOrIndex::Index(_)) {
++            cursor.set_object_store_position(None);
++        }
+ 
+-                // Step 9.5. Decrease count by 1.
+-                count -= 1;
+-            },
++        // Step 9.2.3. If cursor’s key only flag is unset, set cursor’s value to undefined.
++        if !cursor.key_only {
++            cursor.value.set(UndefinedValue());
+         }
+-    }
+-    let found_record =
+-        found_record.expect("The while loop above guarantees found_record is defined");
+ 
++        // Step 9.2.4. Return null.
++        return Ok(None);
++    };
++
++    // Step 9.3. Let position be found record’s key.
+     // Step 10. Set cursor’s position to position.
+-    cursor.set_position(position);
++    cursor.set_position(Some(found_record.key.clone()));
+ 
++    // Step 9.4. If source is an index, let object store position be found record’s value.
+     // Step 11. If source is an index, set cursor’s object store position to object store position.
+     if let ObjectStoreOrIndex::Index(_) = source {
+-        cursor.set_object_store_position(object_store_position);
++        cursor.set_object_store_position(Some(found_record.primary_key.clone()));
+     }
+ 
+     // Step 12. Set cursor’s key to found record’s key.
+-    cursor.set_key(Some(found_record.key.clone()));
++    cursor.set_key(Some(found_record.key));
+ 
+     // Step 13. If cursor’s key only flag is unset, then:
+     if !cursor.key_only {
+         // Step 13.1. Let serialized be found record’s referenced value.
+         // Step 13.2. Set cursor’s value to ! StructuredDeserialize(serialized, targetRealm)
++        let serialized = found_record
++            .value
++            .ok_or_else(|| Error::Data(Some("A cursor record without its value".to_owned())))?;
+         rooted!(&in(cx) let mut new_cursor_value = UndefinedValue());
+         cursor.effective_object_store().deserialize_value(
+             cx,
+             &found_record.primary_key,
+-            &found_record.value,
++            &serialized,
+             new_cursor_value.handle_mut(),
+         )?;
+         cursor.value.set(new_cursor_value.get());
+diff --git a/components/script/dom/indexeddb/idbindex.rs b/components/script/dom/indexeddb/idbindex.rs
+index aec15d05a69..b155da57510 100644
+--- a/components/script/dom/indexeddb/idbindex.rs
++++ b/components/script/dom/indexeddb/idbindex.rs
+@@ -222,15 +222,12 @@ impl IDBIndex {
+         // Step 6. Asynchronously execute a request with iteration_param.
+         let iteration_param = IterationParam {
+             cursor: Trusted::new(&cursor),
+-            key: None,
+-            primary_key: None,
+-            count: None,
+         };
+ 
+         IDBRequest::execute_async(
+             cx,
+             RequestSource::Index(self),
+-            cursor.iterate_operation(None, 1),
++            cursor.iterate_operation(None, None, 1),
+             None,
+             Some(iteration_param),
+         )
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index 083bb65f047..4baa83bbc29 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -580,15 +580,12 @@ impl IDBObjectStore {
+         // cursor.
+         let iteration_param = IterationParam {
+             cursor: Trusted::new(&cursor),
+-            key: None,
+-            primary_key: None,
+-            count: None,
+         };
+ 
+         IDBRequest::execute_async(
+             cx,
+             RequestSource::ObjectStore(self),
+-            cursor.iterate_operation(None, 1),
++            cursor.iterate_operation(None, None, 1),
+             None,
+             Some(iteration_param),
+         )
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 9b320e8dca8..dcdd86bc328 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -402,12 +402,39 @@ pub struct IndexedDBValue {
+     pub value: Vec<u8>,
+ }
+ 
+-/// <https://w3c.github.io/IndexedDB/#record-snapshot>
++/// <https://w3c.github.io/IndexedDB/#record-snapshot>: the key, the primary key (the key for a
++/// record of an object store) and the (referenced) value, which is `None` if the request read
++/// keys only.
+ #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+ pub struct IndexedDBRecord {
+     pub key: IndexedDBKeyType,
+     pub primary_key: IndexedDBKeyType,
+-    pub value: Vec<u8>,
++    pub value: Option<Vec<u8>>,
++}
++
++/// <https://w3c.github.io/IndexedDB/#cursor-direction>
++#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
++pub enum IndexedDBCursorDirection {
++    Next,
++    NextUnique,
++    Prev,
++    PrevUnique,
++}
++
++/// A step of a cursor: the cursor's position and the arguments of
++/// <https://w3c.github.io/IndexedDB/#iterate-a-cursor>.
++#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
++pub struct IndexedDBCursorStep {
++    /// The cursor's position, undefined before its first step.
++    pub position: Option<IndexedDBKeyType>,
++    /// The cursor's object store position, for a cursor over an index.
++    pub object_store_position: Option<IndexedDBKeyType>,
++    /// The key given to continue() or continuePrimaryKey().
++    pub key: Option<IndexedDBKeyType>,
++    /// The primary key given to continuePrimaryKey().
++    pub primary_key: Option<IndexedDBKeyType>,
++    /// The count given to advance(), 1 otherwise.
++    pub count: u32,
+ }
+ 
+ /// The id of an object store, unique in its database. An upgrade transaction in script gives a
+@@ -543,12 +570,17 @@ pub enum AsyncReadOnlyOperation {
+         index: Option<IndexedDBIndexId>,
+         key_range: IndexedDBKeyRange,
+     },
+-    /// Gets the records in `key_range` in ascending key order: the first `count` of them, or the
+-    /// last `count` if `reverse` is set, or all of them if `count` is `None`.
++    /// <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9 for a cursor over the records in
++    /// `key_range`: the record that `step` moves the cursor to in `direction`, none if it moves
++    /// past the end. Then the records that further steps without a key would move it to, up to
++    /// `records` records in all, in the order of the steps. With `key_only`, without values.
+     Iterate {
++        index: Option<IndexedDBIndexId>,
+         key_range: IndexedDBKeyRange,
+-        count: Option<u32>,
+-        reverse: bool,
++        direction: IndexedDBCursorDirection,
++        step: IndexedDBCursorStep,
++        records: u32,
++        key_only: bool,
+     },
+ }
+ 
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index 3b0ddaee0a9..ad09bec1b33 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -801,17 +801,18 @@ fn run_read_only<X: SqlExecutor>(
+         AsyncReadOnlyOperation::Count { index, key_range } => source(index)
+             .map(|source| queries::count(executor, source, &key_range).map(RequestOutput::Count)),
+         AsyncReadOnlyOperation::Iterate {
++            index,
+             key_range,
+-            count,
+-            reverse,
+-        } => Ok(queries::get_records(
+-            executor,
+-            RecordSource::ObjectStore(store),
+-            &key_range,
+-            count,
+-            reverse,
+-        )
+-        .map(RequestOutput::Records)),
++            direction,
++            step,
++            records,
++            key_only,
++        } => source(index).map(|source| {
++            queries::cursor_records(
++                executor, source, &key_range, direction, &step, records, key_only,
++            )
++            .map(RequestOutput::Records)
++        }),
+     };
+     match result {
+         Ok(result) => outcome(result, |output| output, Failure::Read),
+diff --git a/components/storage/indexeddb/backend/queries.rs b/components/storage/indexeddb/backend/queries.rs
+index 7119a403e20..510b5fd8f79 100644
+--- a/components/storage/indexeddb/backend/queries.rs
++++ b/components/storage/indexeddb/backend/queries.rs
+@@ -9,9 +9,10 @@ use std::ops::ControlFlow;
+ 
+ use rustc_hash::FxHashSet;
+ use storage_traits::indexeddb::{
+-    IndexedDBIndex, IndexedDBIndexId, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
+-    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBRecordIndexKeys,
+-    IndexedDBValue, KeyPath, PutItemResult, Utf16String,
++    IndexedDBCursorDirection, IndexedDBCursorStep, IndexedDBIndex, IndexedDBIndexId,
++    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore,
++    IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBRecordIndexKeys, IndexedDBValue, KeyPath,
++    PutItemResult, Utf16String,
+ };
+ 
+ use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
+@@ -418,6 +419,32 @@ impl RangeCondition {
+         self.bounds.push(encoding::serialize(bound));
+     }
+ 
++    /// Adds the condition `operator` (such as `>`) on the (key, primary key) pairs of an index's
++    /// records, compared with (`key`, `primary_key`) in that order.
++    fn push_pair(
++        &mut self,
++        operator: &str,
++        key: &IndexedDBKeyType,
++        primary_key: &IndexedDBKeyType,
++    ) {
++        self.sql
++            .push_str(&format!(" AND ({{}}, i.object_data_key) {operator} (?, ?)"));
++        self.bounds.push(encoding::serialize(key));
++        self.bounds.push(encoding::serialize(primary_key));
++    }
++
++    /// Keeps, of the records of `index` with the same key, only the one with the lowest primary
++    /// key.
++    fn first_record_of_each_key(&mut self, index: StoreIndex) {
++        // NOTE: Not `MIN(i.object_data_key)` with `GROUP BY i.value`: RDB fails to read a column
++        // that holds the MIN() or MAX() of BLOBs (E_ERROR from OH_Cursor_IsNull).
++        self.sql.push_str(&format!(
++            " AND NOT EXISTS (SELECT 1 FROM {} AS f WHERE f.index_id = i.index_id \
++             AND f.value = i.value AND f.object_data_key < i.object_data_key)",
++            index.table()
++        ));
++    }
++
+     /// The range of the one encoded key `key`.
+     fn only(key: Vec<u8>) -> Self {
+         Self {
+@@ -482,6 +509,8 @@ pub(crate) enum RecordColumns {
+     Value,
+     /// The key, the primary key and the (referenced) value.
+     Record,
++    /// The key and the primary key.
++    Keys,
+ }
+ 
+ impl RecordSource<'_> {
+@@ -500,12 +529,16 @@ impl RecordSource<'_> {
+                 "o.key",
+                 "o.data",
+             ),
+-            Self::Index(index) if columns == RecordColumns::PrimaryKey => (
+-                format!("{} AS i WHERE i.index_id = ?", index.table()),
+-                "i.value",
+-                "i.object_data_key",
+-                "",
+-            ),
++            Self::Index(index)
++                if matches!(columns, RecordColumns::PrimaryKey | RecordColumns::Keys) =>
++            {
++                (
++                    format!("{} AS i WHERE i.index_id = ?", index.table()),
++                    "i.value",
++                    "i.object_data_key",
++                    "",
++                )
++            },
+             Self::Index(index) => (
+                 format!(
+                     "{} AS i JOIN object_data AS o \
+@@ -522,6 +555,7 @@ impl RecordSource<'_> {
+             RecordColumns::PrimaryKey => primary_key.to_owned(),
+             RecordColumns::Value => format!("{primary_key}, {value}"),
+             RecordColumns::Record => format!("{key}, {primary_key}, {value}"),
++            RecordColumns::Keys => format!("{key}, {primary_key}"),
+         };
+         (format!("{from}{}", condition.on(key)), selected)
+     }
+@@ -560,7 +594,25 @@ fn select_records<X: SqlExecutor, T>(
+     map_row: impl Fn(&dyn SqlRow) -> Result<T, SqlError>,
+ ) -> Result<Vec<T>, SqlError> {
+     let condition = range_condition(range);
+-    let (table_and_condition, selected) = source.table_and_condition(columns, &condition);
++    select(
++        executor, source, columns, &condition, reverse, count, 0, map_row,
++    )
++}
++
++/// Selects `columns` of the records of `source` whose keys meet `condition`, in ascending key
++/// order or descending if `reverse` is set, at most `count` of them, after skipping `offset`.
++#[allow(clippy::too_many_arguments)]
++fn select<X: SqlExecutor, T>(
++    executor: &mut X,
++    source: RecordSource,
++    columns: RecordColumns,
++    condition: &RangeCondition,
++    reverse: bool,
++    count: Option<u32>,
++    offset: u32,
++    map_row: impl Fn(&dyn SqlRow) -> Result<T, SqlError>,
++) -> Result<Vec<T>, SqlError> {
++    let (table_and_condition, selected) = source.table_and_condition(columns, condition);
+     let mut sql = format!(
+         "SELECT {selected} FROM {table_and_condition} ORDER BY {}",
+         source.order(reverse)
+@@ -569,6 +621,10 @@ fn select_records<X: SqlExecutor, T>(
+     if let Some(count) = count {
+         sql.push_str(" LIMIT ?");
+         params.push(SqlParam::Integer(count.into()));
++        if offset > 0 {
++            sql.push_str(" OFFSET ?");
++            params.push(SqlParam::Integer(offset.into()));
++        }
+     }
+     query_rows(executor, &sql, &params, map_row)
+ }
+@@ -674,34 +730,207 @@ pub(crate) fn get_all_values<X: SqlExecutor>(
+     )
+ }
+ 
+-/// The records of `source` in `range` in ascending key order: the first `count` of them, or the
+-/// last `count` if `reverse` is set.
+-pub(crate) fn get_records<X: SqlExecutor>(
++/// The bounds on the records that a step of a cursor can find, on the side of its position that
++/// it moves to: `range`'s bound there, or `pair`, a bound on the (key, primary key) pairs of an
++/// index's records, whichever is tighter, and `range`'s other bound.
++struct StepBounds {
++    range: IndexedDBKeyRange,
++    /// The (key, primary key) pair, and whether the bound excludes it.
++    pair: Option<(IndexedDBKeyType, IndexedDBKeyType, bool)>,
++    reverse: bool,
++}
++
++impl StepBounds {
++    /// Requires the records' keys to be at or beyond `key`, or beyond it if `open`.
++    fn restrict_key(&mut self, key: &IndexedDBKeyType, open: bool) {
++        if self.reverse {
++            self.range.restrict_upper(key.clone(), open);
++        } else {
++            self.range.restrict_lower(key.clone(), open);
++        }
++        self.drop_looser_bound();
++    }
++
++    /// Requires the records to be at or beyond (`key`, `primary_key`) in (key, primary key)
++    /// order, or beyond it if `open`.
++    fn restrict_pair(
++        &mut self,
++        key: &IndexedDBKeyType,
++        primary_key: &IndexedDBKeyType,
++        open: bool,
++    ) {
++        let tighter =
++            self.pair
++                .as_ref()
++                .is_none_or(|(current_key, current_primary_key, current_open)| {
++                    let beyond = |a: &IndexedDBKeyType, b: &IndexedDBKeyType| {
++                        if self.reverse { a < b } else { a > b }
++                    };
++                    beyond(key, current_key) ||
++                        (key == current_key &&
++                            (beyond(primary_key, current_primary_key) ||
++                                (primary_key == current_primary_key &&
++                                    open &&
++                                    !current_open)))
++                });
++        if tighter {
++            self.pair = Some((key.clone(), primary_key.clone(), open));
++        }
++        self.drop_looser_bound();
++    }
++
++    /// Keeps only the tighter of the range's bound on the side the cursor moves to and the
++    /// pair, so that the statement's seek starts at the tighter one.
++    fn drop_looser_bound(&mut self) {
++        let Some((pair_key, _, _)) = &self.pair else {
++            return;
++        };
++        let (bound, bound_open) = if self.reverse {
++            (&mut self.range.upper, self.range.upper_open)
++        } else {
++            (&mut self.range.lower, self.range.lower_open)
++        };
++        let Some(bound_key) = bound.as_ref() else {
++            return;
++        };
++        let pair_is_beyond = if self.reverse {
++            pair_key < bound_key
++        } else {
++            pair_key > bound_key
++        };
++        // At the same key, an open key bound excludes every pair with the key, a closed one none.
++        if pair_is_beyond || (pair_key == bound_key && !bound_open) {
++            *bound = None;
++        } else {
++            self.pair = None;
++        }
++    }
++
++    /// The conditions of these bounds on the records of an index or store.
++    fn condition(&self) -> RangeCondition {
++        let mut condition = range_condition(&self.range);
++        if let Some((key, primary_key, open)) = &self.pair {
++            let operator = match (self.reverse, open) {
++                (false, true) => ">",
++                (false, false) => ">=",
++                (true, true) => "<",
++                (true, false) => "<=",
++            };
++            condition.push_pair(operator, key, primary_key);
++        }
++        condition
++    }
++}
++
++/// <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9, for a cursor over the records of
++/// `source` in `range`: the record that `step` moves the cursor to in `direction`, then the
++/// records that further steps without a key would move it to, at most `records` records in all,
++/// in the order of the steps. Without values if `key_only`.
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn cursor_records<X: SqlExecutor>(
+     executor: &mut X,
+     source: RecordSource,
+     range: &IndexedDBKeyRange,
+-    count: Option<u32>,
+-    reverse: bool,
++    direction: IndexedDBCursorDirection,
++    step: &IndexedDBCursorStep,
++    records: u32,
++    key_only: bool,
+ ) -> Result<Vec<IndexedDBRecord>, SqlError> {
+-    let mut records = select_records(
++    let IndexedDBCursorStep {
++        position,
++        object_store_position,
++        key,
++        primary_key,
++        count,
++    } = step;
++    let reverse = matches!(
++        direction,
++        IndexedDBCursorDirection::Prev | IndexedDBCursorDirection::PrevUnique
++    );
++    let unique = matches!(
++        direction,
++        IndexedDBCursorDirection::NextUnique | IndexedDBCursorDirection::PrevUnique
++    );
++    // Step 9.1. Switch on direction:
++    // "next": Let found record be the first record in records which satisfy all of the following
++    // requirements:
++    // - If key is defined, the record’s key is greater than or equal to key.
++    // - If primaryKey is defined, the record’s key is equal to key and the record’s value is
++    //   greater than or equal to primaryKey, or the record’s key is greater than key.
++    // - If position is defined, and source is an object store, the record’s key is greater than
++    //   position.
++    // - If position is defined, and source is an index, the record’s key is equal to position and
++    //   the record’s value is greater than object store position or the record’s key is greater
++    //   than position.
++    // - The record’s key is in range.
++    // "nextunique": Let found record be the first record in records which satisfy all of the
++    // following requirements:
++    // - If key is defined, the record’s key is greater than or equal to key.
++    // - If position is defined, the record’s key is greater than position.
++    // - The record’s key is in range.
++    // "prev": Let found record be the last record in records which satisfy all of the following
++    // requirements: the requirements of "next", with "less" for "greater".
++    // "prevunique": Let temp record be the last record in records which satisfy all of the
++    // following requirements: those of "nextunique", with "less" for "greater". If temp record is
++    // defined, let found record be the first record in records whose key is equal to temp
++    // record’s key.
++    // NOTE: The requirements bound the records on the side the cursor moves to; the statement
++    // seeks to the tightest bound. The records of a source are in (key, primary key) order, so
++    // the found record is the first one in the direction, and for "prevunique" the one with the
++    // lowest primary key of the first key.
++    let mut bounds = StepBounds {
++        range: range.clone(),
++        pair: None,
++        reverse,
++    };
++    let index = match source {
++        RecordSource::Index(index) => Some(index),
++        RecordSource::ObjectStore(_) => None,
++    };
++    if let Some(key) = key {
++        match primary_key {
++            Some(primary_key) => bounds.restrict_pair(key, primary_key, false),
++            None => bounds.restrict_key(key, false),
++        }
++    }
++    if let Some(position) = position {
++        match object_store_position {
++            Some(object_store_position) if index.is_some() && !unique => {
++                bounds.restrict_pair(position, object_store_position, true)
++            },
++            _ => bounds.restrict_key(position, true),
++        }
++    }
++    // Step 9.5. Decrease count by 1.
++    // NOTE: Each of the count steps moves on to the next record that the steps find, or to the
++    // next key for the unique directions: the step skips count - 1 of them.
++    let offset = count.saturating_sub(1);
++    let mut condition = bounds.condition();
++    // A unique index has one record per key.
++    if let Some(index) = index.filter(|index| unique && !index.unique) {
++        condition.first_record_of_each_key(index);
++    }
++    let columns = if key_only {
++        RecordColumns::Keys
++    } else {
++        RecordColumns::Record
++    };
++    select(
+         executor,
+         source,
+-        RecordColumns::Record,
+-        range,
+-        count,
++        columns,
++        &condition,
+         reverse,
++        Some(records),
++        offset,
+         |row| {
+             Ok(IndexedDBRecord {
+                 key: decode_key(&row.blob(0)?)?,
+                 primary_key: decode_key(&row.blob(1)?)?,
+-                value: row.blob(2)?,
++                value: if key_only { None } else { Some(row.blob(2)?) },
+             })
+         },
+-    )?;
+-    if reverse {
+-        records.reverse();
+-    }
+-    Ok(records)
++    )
+ }
+ 
+ /// <https://w3c.github.io/IndexedDB/#count-the-records-in-a-range>
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index 307fff1805a..e534ed084ed 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -17,10 +17,10 @@ use servo_url::ImmutableOrigin;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+     BackendError, BackendResult, ConnectionEvent, IndexPopulationEvent, IndexPopulationStep,
+-    IndexedDBIndex, IndexedDBIndexKey, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
+-    IndexedDBObjectStore, IndexedDBRecord, IndexedDBRecordIndexKeys, IndexedDBTxnId,
+-    IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput, TransactionEvent,
+-    Utf16String,
++    IndexedDBCursorDirection, IndexedDBCursorStep, IndexedDBIndex, IndexedDBIndexKey,
++    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord,
++    IndexedDBRecordIndexKeys, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath,
++    PutItemResult, RequestOutput, TransactionEvent, Utf16String,
+ };
+ use tempfile::TempDir;
+ use url::Host;
+@@ -137,6 +137,8 @@ executor_tests!(
+     test_index_reads_go_in_key_then_primary_key_order,
+     test_index_reads_see_the_writes_before_them,
+     test_index_reads_after_create_index_see_the_whole_index,
++    test_cursor_steps_find_what_the_spec_finds,
++    test_cursor_steps_see_the_writes_between_them,
+ );
+ 
+ const TIMEOUT: Duration = Duration::from_secs(10);
+@@ -4873,6 +4875,688 @@ fn test_index_reads_after_create_index_see_the_whole_index<X: SqlExecutor>() {
+     assert_eq!(commit(&db, 2), Ok(()));
+ }
+ 
++/// A record of a cursor's source in the cursor tests: (key, value), where an index's record's
++/// value is the primary key and a store's record's value is its key.
++type SourceRecord = (IndexedDBKeyType, IndexedDBKeyType);
++
++/// <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9 as the spec words it, over
++/// `records`, the records of the source in (key, value) order: the record that the steps find.
++fn spec_found_record(
++    records: &[SourceRecord],
++    is_index: bool,
++    direction: IndexedDBCursorDirection,
++    range: &IndexedDBKeyRange,
++    step: &IndexedDBCursorStep,
++) -> Option<SourceRecord> {
++    let IndexedDBCursorStep {
++        key,
++        primary_key,
++        count,
++        ..
++    } = step;
++    let mut position = step.position.clone();
++    let mut object_store_position = step.object_store_position.clone();
++    let mut found = None;
++    for _ in 0..*count {
++        let forward = |record: &&SourceRecord| {
++            let (record_key, record_value) = *record;
++            key.as_ref().is_none_or(|key| record_key >= key) &&
++                primary_key.as_ref().is_none_or(|primary_key| {
++                    let key = key.as_ref().unwrap();
++                    (record_key == key && record_value >= primary_key) || record_key > key
++                }) &&
++                (is_index ||
++                    position
++                        .as_ref()
++                        .is_none_or(|position| record_key > position)) &&
++                (!is_index ||
++                    position.as_ref().is_none_or(|position| {
++                        (record_key == position &&
++                            object_store_position
++                                .as_ref()
++                                .is_some_and(|osp| record_value > osp)) ||
++                            record_key > position
++                    })) &&
++                range.contains(record_key)
++        };
++        let forward_unique = |record: &&SourceRecord| {
++            let record_key = &record.0;
++            key.as_ref().is_none_or(|key| record_key >= key) &&
++                position
++                    .as_ref()
++                    .is_none_or(|position| record_key > position) &&
++                range.contains(record_key)
++        };
++        let backward = |record: &&SourceRecord| {
++            let (record_key, record_value) = *record;
++            key.as_ref().is_none_or(|key| record_key <= key) &&
++                primary_key.as_ref().is_none_or(|primary_key| {
++                    let key = key.as_ref().unwrap();
++                    (record_key == key && record_value <= primary_key) || record_key < key
++                }) &&
++                (is_index ||
++                    position
++                        .as_ref()
++                        .is_none_or(|position| record_key < position)) &&
++                (!is_index ||
++                    position.as_ref().is_none_or(|position| {
++                        (record_key == position &&
++                            object_store_position
++                                .as_ref()
++                                .is_some_and(|osp| record_value < osp)) ||
++                            record_key < position
++                    })) &&
++                range.contains(record_key)
++        };
++        let backward_unique = |record: &&SourceRecord| {
++            let record_key = &record.0;
++            key.as_ref().is_none_or(|key| record_key <= key) &&
++                position
++                    .as_ref()
++                    .is_none_or(|position| record_key < position) &&
++                range.contains(record_key)
++        };
++        found = match direction {
++            IndexedDBCursorDirection::Next => records.iter().find(forward),
++            IndexedDBCursorDirection::NextUnique => records.iter().find(forward_unique),
++            IndexedDBCursorDirection::Prev => records.iter().rev().find(backward),
++            IndexedDBCursorDirection::PrevUnique => records
++                .iter()
++                .rev()
++                .find(backward_unique)
++                .map(|temp| records.iter().find(|record| record.0 == temp.0).unwrap()),
++        };
++        let (found_key, found_value) = found?;
++        position = Some(found_key.clone());
++        if is_index {
++            object_store_position = Some(found_value.clone());
++        }
++    }
++    found.cloned()
++}
++
++/// The records that a step that asks for `records` records gives by the spec: the one the step
++/// finds, then those of the steps without a key after it.
++fn spec_cursor_records(
++    records: &[SourceRecord],
++    is_index: bool,
++    direction: IndexedDBCursorDirection,
++    range: &IndexedDBKeyRange,
++    step: &IndexedDBCursorStep,
++    count: u32,
++) -> Vec<SourceRecord> {
++    let mut found = Vec::new();
++    let mut step = step.clone();
++    while found.len() < count as usize {
++        let Some(record) = spec_found_record(records, is_index, direction, range, &step) else {
++            break;
++        };
++        step = cursor_step_at(&record, is_index);
++        found.push(record);
++    }
++    found
++}
++
++/// A step without a key from the record `at`.
++fn cursor_step_at(at: &SourceRecord, is_index: bool) -> IndexedDBCursorStep {
++    IndexedDBCursorStep {
++        position: Some(at.0.clone()),
++        object_store_position: is_index.then(|| at.1.clone()),
++        key: None,
++        primary_key: None,
++        count: 1,
++    }
++}
++
++const CURSOR_DIRECTIONS: [IndexedDBCursorDirection; 4] = [
++    IndexedDBCursorDirection::Next,
++    IndexedDBCursorDirection::NextUnique,
++    IndexedDBCursorDirection::Prev,
++    IndexedDBCursorDirection::PrevUnique,
++];
++
++/// A cursor's source in the cursor tests, the store's row, and its records in order.
++fn cursor_source<X: SqlExecutor>(
++    db: &SqlEngine<X>,
++    store: i64,
++    index: Option<i64>,
++) -> (queries::ObjectStore, Vec<SourceRecord>) {
++    let mut connection = db.connection();
++    let object_store = queries::object_store(&mut *connection, store)
++        .unwrap()
++        .unwrap();
++    drop(connection);
++    let records = match index {
++        Some(index) => index_records_of(db, store, index),
++        None => keys_of(&mut *db.connection(), store)
++            .into_iter()
++            .map(|key| (key.clone(), key))
++            .collect(),
++    };
++    (object_store, records)
++}
++
++/// Runs a cursor step on `index` of `store`, or on the store, as [`queries::cursor_records`]
++/// does, and returns the records as (key, value) with their values, which `value_of` must give
++/// for the record's primary key.
++#[allow(clippy::too_many_arguments)]
++fn backend_cursor_records<X: SqlExecutor>(
++    connection: &mut X,
++    store: &queries::ObjectStore,
++    index: Option<i64>,
++    direction: IndexedDBCursorDirection,
++    range: &IndexedDBKeyRange,
++    step: &IndexedDBCursorStep,
++    records: u32,
++    key_only: bool,
++    value_of: &dyn Fn(&IndexedDBKeyType) -> Vec<u8>,
++) -> Vec<SourceRecord> {
++    let source = match index {
++        Some(index) => RecordSource::Index(store.index(index).unwrap()),
++        None => RecordSource::ObjectStore(store),
++    };
++    let found = queries::cursor_records(
++        connection, source, range, direction, step, records, key_only,
++    )
++    .unwrap_or_else(|error| {
++        panic!("{error:?}: {index:?} {direction:?} {range:?} {step:?} {records} {key_only}")
++    });
++    found
++        .into_iter()
++        .map(|record| {
++            let expected = (!key_only).then(|| value_of(&record.primary_key));
++            assert_eq!(record.value, expected, "the value of {record:?}");
++            if index.is_none() {
++                assert_eq!(record.key, record.primary_key);
++            }
++            (record.key, record.primary_key)
++        })
++        .collect()
++}
++
++/// Cursor steps find the records that the spec's steps to iterate a cursor find: on a store and
++/// on a non-unique, a unique and a multiEntry index, in every direction, over ranges, from every
++/// position, with continue(), advance(), continue(key) and continuePrimaryKey(), and asking for
++/// several records per step.
++fn test_cursor_steps_find_what_the_spec_finds<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let index = |name: &str, unique, multi_entry| {
++        let key_path = KeyPath::String(name.to_owned());
++        create_index(&db, store, name.to_owned(), key_path, unique, multi_entry).unwrap()
++    };
++    let (by_kind, by_id, by_tag) = (
++        index("kind", false, false),
++        index("id", true, false),
++        index("tag", false, true),
++    );
++    let primary_keys: Vec<_> = (0..10)
++        .map(|n| number(f64::from(n)))
++        .chain([string("x"), string("y")])
++        .collect();
++    let kinds = [
++        number(1.0),
++        number(2.0),
++        string("a"),
++        number(2.0),
++        string("b"),
++    ];
++    // Put in an order that is neither the key order nor any index's.
++    let order = [7, 2, 11, 0, 9, 4, 1, 10, 5, 8, 3, 6];
++    let puts = order
++        .iter()
++        .map(|&n| {
++            let tags = match n % 3 {
++                0 => vec![],
++                1 => vec![string("t"), number(f64::from(n % 4))],
++                _ => vec![string("t"), string("u")],
++            };
++            (
++                Some(primary_keys[n as usize].clone()),
++                vec![n as u8],
++                vec![
++                    index_keys(by_kind, [kinds[n as usize % kinds.len()].clone()]),
++                    index_keys(by_id, [number(100.0 - f64::from(n))]),
++                    index_keys(by_tag, tags),
++                ],
++            )
++        })
++        .collect();
++    let replies = run_indexed_puts(&db, 1, store, puts, false);
++    assert!(replies.iter().all(Result::is_ok), "{replies:?}");
++    assert_eq!(commit(&db, 1), Ok(()));
++    let value_of = |primary_key: &IndexedDBKeyType| {
++        let n = primary_keys
++            .iter()
++            .position(|key| key == primary_key)
++            .unwrap();
++        vec![n as u8]
++    };
++
++    // The request goes to the index it names, and one that the store doesn't have fails.
++    let first = |index| AsyncReadOnlyOperation::Iterate {
++        index,
++        key_range: IndexedDBKeyRange::default(),
++        direction: IndexedDBCursorDirection::Next,
++        step: IndexedDBCursorStep {
++            position: None,
++            object_store_position: None,
++            key: None,
++            primary_key: None,
++            count: 1,
++        },
++        records: 1,
++        key_only: false,
++    };
++    assert_eq!(
++        read::<X, BackendResult<Vec<IndexedDBRecord>>>(&db, 2, store, first(Some(by_id))),
++        Ok(vec![IndexedDBRecord {
++            key: number(89.0),
++            primary_key: string("y"),
++            value: Some(vec![11]),
++        }])
++    );
++    assert!(matches!(
++        read::<X, BackendResult<Vec<IndexedDBRecord>>>(&db, 2, store, first(Some(by_tag + 1))),
++        Err(BackendError::DbErr(_))
++    ));
++
++    let absent_primary_key = string("w");
++    let mut steps = 0;
++    for index in [None, Some(by_kind), Some(by_id), Some(by_tag)] {
++        let is_index = index.is_some();
++        let (object_store, records) = cursor_source(&db, store, index);
++        let mut keys: Vec<IndexedDBKeyType> = Vec::new();
++        for (key, _) in &records {
++            if keys.last() != Some(key) {
++                keys.push(key.clone());
++            }
++        }
++        // Keys that no record has, between and around the records' keys.
++        let absent_keys = [number(-1.0), number(1.5), string("aa"), string("zz")];
++        let (second, before_last) = (&keys[1], &keys[keys.len() - 2]);
++        let ranges = [
++            IndexedDBKeyRange::default(),
++            IndexedDBKeyRange::new(
++                Some(second.clone()),
++                Some(before_last.clone()),
++                false,
++                false,
++            ),
++            IndexedDBKeyRange::new(Some(second.clone()), Some(before_last.clone()), true, true),
++            IndexedDBKeyRange::only(second.clone()),
++        ];
++        let mut connection = db.connection();
++        for direction in CURSOR_DIRECTIONS {
++            let forward = matches!(
++                direction,
++                IndexedDBCursorDirection::Next | IndexedDBCursorDirection::NextUnique
++            );
++            let plain = matches!(
++                direction,
++                IndexedDBCursorDirection::Next | IndexedDBCursorDirection::Prev
++            );
++            for range in &ranges {
++                let mut check = |step: &IndexedDBCursorStep, count: u32, key_only: bool| {
++                    steps += 1;
++                    assert_eq!(
++                        backend_cursor_records(
++                            &mut *connection,
++                            &object_store,
++                            index,
++                            direction,
++                            range,
++                            step,
++                            count,
++                            key_only,
++                            &value_of,
++                        ),
++                        spec_cursor_records(&records, is_index, direction, range, step, count),
++                        "{index:?} {direction:?} {range:?} {step:?} records {count}"
++                    );
++                };
++                let first = IndexedDBCursorStep {
++                    position: None,
++                    object_store_position: None,
++                    key: None,
++                    primary_key: None,
++                    count: 1,
++                };
++                check(&first, 1, false);
++                check(&first, 1, true);
++                check(&first, 100, false);
++                let mut at = spec_found_record(&records, is_index, direction, range, &first);
++                while let Some(record) = at {
++                    let step = cursor_step_at(&record, is_index);
++                    // continue()
++                    check(&step, 1, false);
++                    // Several records per step, as a prefetch asks for.
++                    check(&step, 3, false);
++                    // advance()
++                    for count in [2, 3, 50] {
++                        check(
++                            &IndexedDBCursorStep {
++                                count,
++                                ..step.clone()
++                            },
++                            1,
++                            false,
++                        );
++                    }
++                    // continue(key), with keys beyond the position, which continue() requires.
++                    let beyond = |key: &&IndexedDBKeyType| {
++                        if forward {
++                            *key > &record.0
++                        } else {
++                            *key < &record.0
++                        }
++                    };
++                    let mut continue_keys: Vec<_> = keys.iter().filter(beyond).collect();
++                    if !forward {
++                        continue_keys.reverse();
++                    }
++                    continue_keys.truncate(2);
++                    continue_keys.extend(absent_keys.iter().filter(beyond).take(1));
++                    for key in continue_keys {
++                        let step = IndexedDBCursorStep {
++                            key: Some(key.clone()),
++                            ..step.clone()
++                        };
++                        check(&step, 1, false);
++                        check(&step, 2, false);
++                    }
++                    // continuePrimaryKey(), on indexes in the plain directions, with (key, primary
++                    // key) beyond the position, which it requires, and a primary key that no
++                    // record has.
++                    if is_index && plain {
++                        let beyond = |(key, primary_key): &&SourceRecord| {
++                            if forward {
++                                key > &record.0 || (key == &record.0 && primary_key > &record.1)
++                            } else {
++                                key < &record.0 || (key == &record.0 && primary_key < &record.1)
++                            }
++                        };
++                        let mut targets: Vec<_> = records.iter().filter(beyond).collect();
++                        if !forward {
++                            targets.reverse();
++                        }
++                        let absent = (record.0.clone(), absent_primary_key.clone());
++                        let targets = targets
++                            .into_iter()
++                            .take(2)
++                            .chain(Some(&absent).filter(beyond))
++                            .cloned()
++                            .collect::<Vec<_>>();
++                        for (key, primary_key) in targets {
++                            check(
++                                &IndexedDBCursorStep {
++                                    key: Some(key),
++                                    primary_key: Some(primary_key),
++                                    ..step.clone()
++                                },
++                                1,
++                                false,
++                            );
++                        }
++                    }
++                    at = spec_found_record(&records, is_index, direction, range, &step);
++                }
++            }
++        }
++    }
++    assert!(steps > 1000, "{steps} steps");
++}
++
++/// A tiny pseudo-random generator for the tests, xorshift64.
++struct TestRandom(u64);
++
++impl TestRandom {
++    fn below(&mut self, bound: u64) -> u64 {
++        self.0 ^= self.0 << 13;
++        self.0 ^= self.0 >> 7;
++        self.0 ^= self.0 << 17;
++        self.0 % bound
++    }
++}
++
++/// Each cursor step reads the records as they are when it runs: records put, replaced and
++/// deleted between the steps, ahead of and behind the cursor and at its position, are found or
++/// skipped as the spec's steps find them on the records of the time.
++fn test_cursor_steps_see_the_writes_between_them<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let by_kind = create_index(
++        &db,
++        store,
++        "kind".to_owned(),
++        KeyPath::String("kind".to_owned()),
++        false,
++        false,
++    )
++    .unwrap();
++    let by_id = create_index(
++        &db,
++        store,
++        "id".to_owned(),
++        KeyPath::String("id".to_owned()),
++        true,
++        false,
++    )
++    .unwrap();
++    let mut connection = db.connection();
++    let object_store = queries::object_store(&mut *connection, store)
++        .unwrap()
++        .unwrap();
++    // The value of a record is its kind and id, which give its index keys.
++    let put = |connection: &mut X, primary_key: f64, kind: u8, id: u8| {
++        queries::put_record(
++            connection,
++            &object_store,
++            Some(number(primary_key)),
++            &[kind, id],
++            true,
++            vec![
++                index_keys(by_kind, [number(f64::from(kind))]),
++                index_keys(by_id, [number(f64::from(id))]),
++            ],
++        )
++        .unwrap()
++    };
++    let delete = |connection: &mut X, primary_key: f64| {
++        queries::delete_records(
++            connection,
++            &object_store,
++            &IndexedDBKeyRange::only(number(primary_key)),
++        )
++        .unwrap()
++    };
++    let stored_values = |connection: &mut X| {
++        queries::get_all_values(
++            connection,
++            RecordSource::ObjectStore(&object_store),
++            &IndexedDBKeyRange::default(),
++            None,
++        )
++        .unwrap()
++    };
++    let records_of = |connection: &mut X, index: Option<i64>| -> Vec<SourceRecord> {
++        let source = match index {
++            Some(index) => RecordSource::Index(object_store.index(index).unwrap()),
++            None => RecordSource::ObjectStore(&object_store),
++        };
++        let all = IndexedDBCursorStep {
++            position: None,
++            object_store_position: None,
++            key: None,
++            primary_key: None,
++            count: 1,
++        };
++        queries::cursor_records(
++            connection,
++            source,
++            &IndexedDBKeyRange::default(),
++            IndexedDBCursorDirection::Next,
++            &all,
++            u32::MAX,
++            true,
++        )
++        .unwrap()
++        .into_iter()
++        .map(|record| (record.key, record.primary_key))
++        .collect()
++    };
++    let step_and_check = |connection: &mut X,
++                          index: Option<i64>,
++                          direction: IndexedDBCursorDirection,
++                          step: &IndexedDBCursorStep|
++     -> Option<SourceRecord> {
++        let records = records_of(connection, index);
++        let values = stored_values(connection);
++        let expected = spec_found_record(
++            &records,
++            index.is_some(),
++            direction,
++            &IndexedDBKeyRange::default(),
++            step,
++        );
++        let found = backend_cursor_records(
++            connection,
++            &object_store,
++            index,
++            direction,
++            &IndexedDBKeyRange::default(),
++            step,
++            1,
++            false,
++            &|primary_key| {
++                let value = values
++                    .iter()
++                    .find(|value| &value.primary_key == primary_key);
++                value.unwrap().value.clone()
++            },
++        );
++        assert_eq!(
++            found.first(),
++            expected.as_ref(),
++            "{index:?} {direction:?} {step:?}"
++        );
++        expected
++    };
++    let reset = |connection: &mut X| {
++        queries::clear(connection, &object_store).unwrap();
++        for n in 0..8u8 {
++            assert!(matches!(
++                put(connection, f64::from(n), n % 3, 10 + n),
++                PutItemResult::Key(_)
++            ));
++        }
++    };
++
++    // A unique index whose record at the cursor's position goes, and another record gets its
++    // key with a larger primary key: "next" visits that record, "nextunique" doesn't.
++    for (direction, expected) in [
++        (
++            IndexedDBCursorDirection::Next,
++            Some((number(13.0), number(9.0))),
++        ),
++        (
++            IndexedDBCursorDirection::NextUnique,
++            Some((number(14.0), number(4.0))),
++        ),
++    ] {
++        reset(&mut *connection);
++        let at = (number(13.0), number(3.0));
++        delete(&mut *connection, 3.0);
++        assert!(matches!(
++            put(&mut *connection, 9.0, 0, 13),
++            PutItemResult::Key(_)
++        ));
++        assert_eq!(
++            step_and_check(
++                &mut *connection,
++                Some(by_id),
++                direction,
++                &cursor_step_at(&at, true)
++            ),
++            expected
++        );
++    }
++
++    // A reverse cursor over the non-unique index sees a record that moved behind it, and not one
++    // that moved ahead (idbindex_reverse_cursor).
++    reset(&mut *connection);
++    let at = spec_found_record(
++        &records_of(&mut *connection, Some(by_kind)),
++        true,
++        IndexedDBCursorDirection::Prev,
++        &IndexedDBKeyRange::default(),
++        &IndexedDBCursorStep {
++            position: None,
++            object_store_position: None,
++            key: None,
++            primary_key: None,
++            count: 1,
++        },
++    )
++    .unwrap();
++    assert_eq!(at, (number(2.0), number(5.0)));
++    assert!(matches!(
++        put(&mut *connection, 0.0, 2, 10),
++        PutItemResult::Key(_)
++    ));
++    assert!(matches!(
++        put(&mut *connection, 2.0, 2, 12),
++        PutItemResult::Key(_)
++    ));
++    assert_eq!(
++        step_and_check(
++            &mut *connection,
++            Some(by_kind),
++            IndexedDBCursorDirection::Prev,
++            &cursor_step_at(&at, true)
++        ),
++        Some((number(2.0), number(2.0)))
++    );
++
++    // Random writes between the steps of cursors over the store and both indexes.
++    let mut random = TestRandom(0x2545_f491_4f6c_dd1d);
++    for index in [None, Some(by_kind), Some(by_id)] {
++        for direction in CURSOR_DIRECTIONS {
++            for _ in 0..3 {
++                reset(&mut *connection);
++                let mut step = IndexedDBCursorStep {
++                    position: None,
++                    object_store_position: None,
++                    key: None,
++                    primary_key: None,
++                    count: 1,
++                };
++                for _ in 0..40 {
++                    let Some(record) = step_and_check(&mut *connection, index, direction, &step)
++                    else {
++                        break;
++                    };
++                    step = cursor_step_at(&record, index.is_some());
++                    for _ in 0..random.below(3) {
++                        let primary_key = random.below(12) as f64;
++                        match random.below(3) {
++                            0 => delete(&mut *connection, primary_key),
++                            _ => {
++                                let kind = random.below(4) as u8;
++                                let id = 10 + random.below(14) as u8;
++                                // A put whose id another record has changes nothing.
++                                put(&mut *connection, primary_key, kind, id);
++                            },
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
+ #[test]
+ fn has_enospc_detects_enospc_and_nothing_else() {
+     use crate::shared::has_enospc;
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index 343d445f81b..45d8a25ff33 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -21,10 +21,10 @@ use storage_traits::StorageThreads;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+     BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexPopulationEvent,
+-    IndexPopulationStep, IndexedDBIndexKey, IndexedDBIndexKeys, IndexedDBKeyRange,
+-    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBRecordIndexKeys,
+-    IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
+-    RequestOutput, StorageBottleSource, SyncOperation, TransactionEvent,
++    IndexPopulationStep, IndexedDBCursorDirection, IndexedDBCursorStep, IndexedDBIndexKey,
++    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord,
++    IndexedDBRecordIndexKeys, IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue,
++    KeyPath, PutItemResult, RequestOutput, StorageBottleSource, SyncOperation, TransactionEvent,
+ };
+ use tempfile::TempDir;
+ use uuid::Uuid;
+@@ -66,7 +66,7 @@ backend_tests!(
+     test_indexeddb_aborted_transaction_restores_pre_transaction_state,
+     test_indexeddb_aborted_upgrade_reverts_version_and_stores,
+     test_indexeddb_cross_type_key_sort_order,
+-    test_indexeddb_iterate_count_and_reverse,
++    test_indexeddb_cursor_steps_start_at_the_position,
+     test_indexeddb_delete_item_range_respects_open_bounds,
+     test_indexeddb_auto_increment_assigns_sequential_keys,
+     test_indexeddb_batch_commit_failure_surfaces_an_error,
+@@ -733,8 +733,9 @@ fn iterate_request(
+     store: i64,
+     txn: IndexedDBTxnId,
+     key_range: IndexedDBKeyRange,
+-    count: Option<u32>,
+-    reverse: bool,
++    direction: IndexedDBCursorDirection,
++    step: IndexedDBCursorStep,
++    records: u32,
+     request_id: u64,
+ ) -> mpsc::Receiver<Option<BackendResult<Vec<IndexedDBRecord>>>> {
+     send_request(
+@@ -745,9 +746,12 @@ fn iterate_request(
+         request_id,
+         IndexedDBTxnMode::Readonly,
+         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
++            index: None,
+             key_range,
+-            count,
+-            reverse,
++            direction,
++            step,
++            records,
++            key_only: false,
+         }),
+     )
+ }
+@@ -1430,7 +1434,7 @@ fn test_indexeddb_cross_type_key_sort_order() {
+     ctx.shutdown();
+ }
+ 
+-fn test_indexeddb_iterate_count_and_reverse() {
++fn test_indexeddb_cursor_steps_start_at_the_position() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-iterate";
+     let store_name = "items";
+@@ -1471,42 +1475,52 @@ fn test_indexeddb_iterate_count_and_reverse() {
+     finish_transaction(&ctx, db_name, txn);
+ 
+     let number = |n: f64| IndexedDBKeyType::Number(n);
++    let step = |position: Option<f64>, key: Option<f64>, count| IndexedDBCursorStep {
++        position: position.map(number),
++        object_store_position: None,
++        key: key.map(number),
++        primary_key: None,
++        count,
++    };
++    let (next, prev) = (
++        IndexedDBCursorDirection::Next,
++        IndexedDBCursorDirection::Prev,
++    );
++    let all = IndexedDBKeyRange::default();
+     let cases = [
+         (
+-            IndexedDBKeyRange::default(),
+-            None,
+-            false,
+-            vec![1, 2, 3, 4, 5],
+-        ),
+-        (
+-            IndexedDBKeyRange::default(),
+-            None,
+-            true,
++            all.clone(),
++            next,
++            step(None, None, 1),
++            5,
+             vec![1, 2, 3, 4, 5],
+         ),
+         (
+-            IndexedDBKeyRange::lower_bound(number(2.0), true),
+-            Some(2),
+-            false,
+-            vec![3, 4],
+-        ),
+-        (
+-            IndexedDBKeyRange::upper_bound(number(4.0), true),
+-            Some(2),
+-            true,
+-            vec![2, 3],
++            all.clone(),
++            prev,
++            step(None, None, 1),
++            5,
++            vec![5, 4, 3, 2, 1],
+         ),
++        (all.clone(), next, step(Some(2.0), None, 1), 2, vec![3, 4]),
++        (all.clone(), prev, step(Some(4.0), None, 1), 2, vec![3, 2]),
+         (
+             IndexedDBKeyRange::new(Some(number(2.0)), Some(number(4.0)), false, false),
+-            Some(10),
+-            true,
+-            vec![2, 3, 4],
++            prev,
++            step(None, None, 1),
++            10,
++            vec![4, 3, 2],
+         ),
++        (all.clone(), next, step(Some(5.0), None, 1), 1, vec![]),
++        (all.clone(), next, step(Some(1.0), None, 3), 1, vec![4]),
++        (all.clone(), next, step(Some(1.0), Some(3.0), 1), 1, vec![3]),
++        (all.clone(), prev, step(Some(5.0), Some(2.5), 1), 1, vec![2]),
+         (
+-            IndexedDBKeyRange::lower_bound(number(5.0), true),
+-            Some(1),
+-            false,
+-            vec![],
++            IndexedDBKeyRange::lower_bound(number(3.0), false),
++            IndexedDBCursorDirection::PrevUnique,
++            step(Some(5.0), None, 2),
++            5,
++            vec![3],
+         ),
+     ];
+ 
+@@ -1520,35 +1534,40 @@ fn test_indexeddb_iterate_count_and_reverse() {
+     let receivers: Vec<_> = cases
+         .iter()
+         .zip(1..)
+-        .map(|((key_range, count, reverse, _), request_id)| {
++        .map(|((key_range, direction, step, records, _), request_id)| {
+             iterate_request(
+                 &ctx,
+                 db_name,
+                 STORE,
+                 txn,
+                 key_range.clone(),
+-                *count,
+-                *reverse,
++                *direction,
++                step.clone(),
++                *records,
+                 request_id,
+             )
+         })
+         .collect();
+     let commit_result = commit_transaction(&ctx, db_name, txn);
+-    for (receiver, (key_range, count, reverse, expected)) in receivers.iter().zip(&cases) {
+-        let records = recv_callback_timeout(receiver, "iterate reply").unwrap();
+-        let keys: Vec<_> = records.iter().map(|record| record.key.clone()).collect();
+-        let values: Vec<_> = records.iter().map(|record| record.value.clone()).collect();
++    for (receiver, (key_range, direction, step, records, expected)) in receivers.iter().zip(&cases)
++    {
++        let found = recv_callback_timeout(receiver, "iterate reply").unwrap();
++        let keys: Vec<_> = found.iter().map(|record| record.key.clone()).collect();
++        let values: Vec<_> = found.iter().map(|record| record.value.clone()).collect();
+         assert_eq!(
+             keys,
+             expected
+                 .iter()
+                 .map(|n| number(*n as f64))
+                 .collect::<Vec<_>>(),
+-            "{key_range:?} count {count:?} reverse {reverse}"
++            "{key_range:?} {direction:?} {step:?} records {records}"
+         );
+         assert_eq!(
+             values,
+-            expected.iter().map(|n| vec![*n as u8]).collect::<Vec<_>>()
++            expected
++                .iter()
++                .map(|n| Some(vec![*n as u8]))
++                .collect::<Vec<_>>()
+         );
+     }
+     let commit_msg = recv_callback_timeout(&commit_result, "iterate read commit reply");
+diff --git a/tests/wpt/meta/IndexedDB/idb-partitioned-coverage.sub.html.ini b/tests/wpt/meta/IndexedDB/idb-partitioned-coverage.sub.html.ini
+deleted file mode 100644
+index 75a4d16f15b..00000000000
+--- a/tests/wpt/meta/IndexedDB/idb-partitioned-coverage.sub.html.ini
++++ /dev/null
+@@ -1,6 +0,0 @@
+-[idb-partitioned-coverage.sub.html]
+-  [ - continue]
+-    expected: FAIL
+-
+-  [ - fresh advance still async]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor-advance-continue-async.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor-advance-continue-async.any.js.ini
+index c37f7c9fd00..e324262ae47 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor-advance-continue-async.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor-advance-continue-async.any.js.ini
+@@ -1,25 +1,8 @@
+ [idbcursor-advance-continue-async.any.worker.html]
+-  [IDBCursor asyncness - continue]
+-    expected: FAIL
+-
+-  [IDBCursor asyncness - fresh advance still async]
+-    expected: FAIL
+-
+ 
+ [idbcursor-advance-continue-async.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbcursor-advance-continue-async.any.sharedworker.html]
+-  [IDBCursor asyncness - continue]
+-    expected: FAIL
+-
+-  [IDBCursor asyncness - fresh advance still async]
+-    expected: FAIL
+-
+ 
+ [idbcursor-advance-continue-async.any.html]
+-  [IDBCursor asyncness - continue]
+-    expected: FAIL
+-
+-  [IDBCursor asyncness - fresh advance still async]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor-advance.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor-advance.any.js.ini
+index afc039cba8a..af096a8c18e 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor-advance.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor-advance.any.js.ini
+@@ -2,60 +2,7 @@
+   expected: ERROR
+ 
+ [idbcursor-advance.any.sharedworker.html]
+-  [IDBCursor.advance() - advances]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - advances backwards]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - skip far forward]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - within range]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - within single key range]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - within single key range, with several results]
+-    expected: FAIL
+-
+ 
+ [idbcursor-advance.any.html]
+-  [IDBCursor.advance() - advances]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - advances backwards]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - skip far forward]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - within range]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - within single key range]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - within single key range, with several results]
+-    expected: FAIL
+-
+ 
+ [idbcursor-advance.any.worker.html]
+-  [IDBCursor.advance() - advances]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - advances backwards]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - skip far forward]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - within range]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - within single key range]
+-    expected: FAIL
+-
+-  [IDBCursor.advance() - within single key range, with several results]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor-continue.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor-continue.any.js.ini
+index 72777d68493..ae8e0bc8c9f 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor-continue.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor-continue.any.js.ini
+@@ -2,78 +2,7 @@
+   expected: ERROR
+ 
+ [idbcursor-continue.any.html]
+-  [IDBCursor.continue() - continues]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - with given key]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - skip far forward]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - within range]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - within single key range]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - within single key range, with several results]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - with given key in prev direction]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - continues in prev direction]
+-    expected: FAIL
+-
+ 
+ [idbcursor-continue.any.sharedworker.html]
+-  [IDBCursor.continue() - continues]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - with given key]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - skip far forward]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - within range]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - within single key range]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - within single key range, with several results]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - with given key in prev direction]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - continues in prev direction]
+-    expected: FAIL
+-
+ 
+ [idbcursor-continue.any.worker.html]
+-  [IDBCursor.continue() - continues]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - with given key]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - skip far forward]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - within range]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - within single key range]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - within single key range, with several results]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - with given key in prev direction]
+-    expected: FAIL
+-
+-  [IDBCursor.continue() - continues in prev direction]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey-exception-order.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey-exception-order.any.js.ini
+index b86a42d9019..800990d8e42 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey-exception-order.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey-exception-order.any.js.ini
+@@ -2,24 +2,7 @@
+   expected: ERROR
+ 
+ [idbcursor-continuePrimaryKey-exception-order.any.html]
+-  [DataError(keys are lower then current one) in 'next' direction]
+-    expected: FAIL
+-
+-  [DataError(keys are larger then current one) in 'prev' direction]
+-    expected: FAIL
+-
+ 
+ [idbcursor-continuePrimaryKey-exception-order.any.worker.html]
+-  [DataError(keys are lower then current one) in 'next' direction]
+-    expected: FAIL
+-
+-  [DataError(keys are larger then current one) in 'prev' direction]
+-    expected: FAIL
+-
+ 
+ [idbcursor-continuePrimaryKey-exception-order.any.sharedworker.html]
+-  [DataError(keys are lower then current one) in 'next' direction]
+-    expected: FAIL
+-
+-  [DataError(keys are larger then current one) in 'prev' direction]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey-exceptions.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey-exceptions.any.js.ini
+index 8eef583c478..370f1ab4be5 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey-exceptions.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey-exceptions.any.js.ini
+@@ -1,25 +1,8 @@
+ [idbcursor-continuePrimaryKey-exceptions.any.worker.html]
+-  [IDBCursor continuePrimaryKey() on "nextunique" cursor]
+-    expected: FAIL
+-
+-  [IDBCursor continuePrimaryKey() on "prevunique" cursor]
+-    expected: FAIL
+-
+ 
+ [idbcursor-continuePrimaryKey-exceptions.any.sharedworker.html]
+-  [IDBCursor continuePrimaryKey() on "nextunique" cursor]
+-    expected: FAIL
+-
+-  [IDBCursor continuePrimaryKey() on "prevunique" cursor]
+-    expected: FAIL
+-
+ 
+ [idbcursor-continuePrimaryKey-exceptions.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbcursor-continuePrimaryKey-exceptions.any.html]
+-  [IDBCursor continuePrimaryKey() on "nextunique" cursor]
+-    expected: FAIL
+-
+-  [IDBCursor continuePrimaryKey() on "prevunique" cursor]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey.any.js.ini
+index 4482a1ade87..e41291c3983 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor-continuePrimaryKey.any.js.ini
+@@ -1,25 +1,8 @@
+ [idbcursor-continuePrimaryKey.any.worker.html]
+-  [IndexedDB: IDBCursor method continuePrimaryKey()]
+-    expected: FAIL
+-
+-  [IDBCursor.continuePrimaryKey() with "prev" direction]
+-    expected: FAIL
+-
+ 
+ [idbcursor-continuePrimaryKey.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbcursor-continuePrimaryKey.any.sharedworker.html]
+-  [IndexedDB: IDBCursor method continuePrimaryKey()]
+-    expected: FAIL
+-
+-  [IDBCursor.continuePrimaryKey() with "prev" direction]
+-    expected: FAIL
+-
+ 
+ [idbcursor-continuePrimaryKey.any.html]
+-  [IndexedDB: IDBCursor method continuePrimaryKey()]
+-    expected: FAIL
+-
+-  [IDBCursor.continuePrimaryKey() with "prev" direction]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor-direction-index-keyrange.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor-direction-index-keyrange.any.js.ini
+index 60e9fe8cc83..3250db9a828 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor-direction-index-keyrange.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor-direction-index-keyrange.any.js.ini
+@@ -2,42 +2,7 @@
+   expected: ERROR
+ 
+ [idbcursor-direction-index-keyrange.any.sharedworker.html]
+-  [IDBCursor direction - index with keyrange - next]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index with keyrange - prev]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index with keyrange - nextunique]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index with keyrange - prevunique]
+-    expected: FAIL
+-
+ 
+ [idbcursor-direction-index-keyrange.any.html]
+-  [IDBCursor direction - index with keyrange - next]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index with keyrange - prev]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index with keyrange - nextunique]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index with keyrange - prevunique]
+-    expected: FAIL
+-
+ 
+ [idbcursor-direction-index-keyrange.any.worker.html]
+-  [IDBCursor direction - index with keyrange - next]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index with keyrange - prev]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index with keyrange - nextunique]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index with keyrange - prevunique]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor-direction-index.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor-direction-index.any.js.ini
+index 009d462075f..8673ffb16da 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor-direction-index.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor-direction-index.any.js.ini
+@@ -1,25 +1,8 @@
+ [idbcursor-direction-index.any.worker.html]
+-  [IDBCursor direction - index - nextunique]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index - prevunique]
+-    expected: FAIL
+-
+ 
+ [idbcursor-direction-index.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbcursor-direction-index.any.sharedworker.html]
+-  [IDBCursor direction - index - nextunique]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index - prevunique]
+-    expected: FAIL
+-
+ 
+ [idbcursor-direction-index.any.html]
+-  [IDBCursor direction - index - nextunique]
+-    expected: FAIL
+-
+-  [IDBCursor direction - index - prevunique]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor-iterating-update.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor-iterating-update.any.js.ini
+index 14908221eac..ace143dc782 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor-iterating-update.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor-iterating-update.any.js.ini
+@@ -1,28 +1,8 @@
+ [idbcursor-iterating-update.any.sharedworker.html]
+-  expected: TIMEOUT
+-  [Calling (cursor) => cursor.update({}) doesn't affect index iteration]
+-    expected: TIMEOUT
+-
+-  [Calling (cursor) => cursor.delete() doesn't affect index iteration]
+-    expected: TIMEOUT
+-
+ 
+ [idbcursor-iterating-update.any.html]
+-  expected: ERROR
+-  [Calling (cursor) => cursor.update({}) doesn't affect index iteration]
+-    expected: TIMEOUT
+-
+-  [Calling (cursor) => cursor.delete() doesn't affect index iteration]
+-    expected: TIMEOUT
+-
+ 
+ [idbcursor-iterating-update.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbcursor-iterating-update.any.worker.html]
+-  expected: ERROR
+-  [Calling (cursor) => cursor.update({}) doesn't affect index iteration]
+-    expected: TIMEOUT
+-
+-  [Calling (cursor) => cursor.delete() doesn't affect index iteration]
+-    expected: TIMEOUT
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor-primarykey.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor-primarykey.any.js.ini
+index a14084bffb9..96a218763e8 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor-primarykey.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor-primarykey.any.js.ini
+@@ -1,34 +1,8 @@
+ [idbcursor-primarykey.any.sharedworker.html]
+-  [IDBCursor.primaryKey]
+-    expected: FAIL
+-
+-  [IDBCursor.primaryKey 1]
+-    expected: FAIL
+-
+-  [IDBCursor.primaryKey 2]
+-    expected: FAIL
+-
+ 
+ [idbcursor-primarykey.any.worker.html]
+-  [IDBCursor.primaryKey]
+-    expected: FAIL
+-
+-  [IDBCursor.primaryKey 1]
+-    expected: FAIL
+-
+-  [IDBCursor.primaryKey 2]
+-    expected: FAIL
+-
+ 
+ [idbcursor-primarykey.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbcursor-primarykey.any.html]
+-  [IDBCursor.primaryKey]
+-    expected: FAIL
+-
+-  [IDBCursor.primaryKey 1]
+-    expected: FAIL
+-
+-  [IDBCursor.primaryKey 2]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor_continue_index.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor_continue_index.any.js.ini
+index f2731892ce9..9661e517e4b 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor_continue_index.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor_continue_index.any.js.ini
+@@ -1,43 +1,8 @@
+ [idbcursor_continue_index.any.sharedworker.html]
+-  [Attempt to iterate to the next record when the direction is set for the previous record]
+-    expected: FAIL
+-
+-  [Iterate using 'prevunique']
+-    expected: FAIL
+-
+-  [Iterate using nextunique]
+-    expected: FAIL
+-
+-  [Add next element, and iterate to it]
+-    expected: FAIL
+-
+ 
+ [idbcursor_continue_index.any.worker.html]
+-  [Attempt to iterate to the next record when the direction is set for the previous record]
+-    expected: FAIL
+-
+-  [Iterate using 'prevunique']
+-    expected: FAIL
+-
+-  [Iterate using nextunique]
+-    expected: FAIL
+-
+-  [Add next element, and iterate to it]
+-    expected: FAIL
+-
+ 
+ [idbcursor_continue_index.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbcursor_continue_index.any.html]
+-  [Attempt to iterate to the next record when the direction is set for the previous record]
+-    expected: FAIL
+-
+-  [Iterate using 'prevunique']
+-    expected: FAIL
+-
+-  [Iterate using nextunique]
+-    expected: FAIL
+-
+-  [Add next element, and iterate to it]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor_update_index.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor_update_index.any.js.ini
+index 7cb935f62e5..323460f0dd9 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor_update_index.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor_update_index.any.js.ini
+@@ -1,17 +1,8 @@
+ [idbcursor_update_index.any.worker.html]
+-  [Modify records during cursor iteration and verify updated records]
+-    expected: FAIL
+-
+ 
+ [idbcursor_update_index.any.sharedworker.html]
+-  [Modify records during cursor iteration and verify updated records]
+-    expected: FAIL
+-
+ 
+ [idbcursor_update_index.any.html]
+-  [Modify records during cursor iteration and verify updated records]
+-    expected: FAIL
+-
+ 
+ [idbcursor_update_index.any.serviceworker.html]
+   expected: ERROR
+diff --git a/tests/wpt/meta/IndexedDB/idbindex_keyPath.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex_keyPath.any.js.ini
+index 7d78a374050..3c9d2dcb346 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex_keyPath.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex_keyPath.any.js.ini
+@@ -2,19 +2,7 @@
+   [IDBIndex's keyPath attribute returns the same object.]
+     expected: FAIL
+ 
+-  [IDBIndex's keyPath array with a single value]
+-    expected: FAIL
+-
+-  [IDBIndex's keyPath array with multiple values]
+-    expected: FAIL
+-
+ 
+ [idbindex_keyPath.any.worker.html]
+   [IDBIndex's keyPath attribute returns the same object.]
+     expected: FAIL
+-
+-  [IDBIndex's keyPath array with a single value]
+-    expected: FAIL
+-
+-  [IDBIndex's keyPath array with multiple values]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex_reverse_cursor.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex_reverse_cursor.any.js.ini
+deleted file mode 100644
+index 1f9643afcc4..00000000000
+--- a/tests/wpt/meta/IndexedDB/idbindex_reverse_cursor.any.js.ini
++++ /dev/null
+@@ -1,14 +0,0 @@
+-[idbindex_reverse_cursor.any.html]
+-  [Reverse cursor sees update from separate transactions.]
+-    expected: FAIL
+-
+-  [Reverse cursor sees in-transaction update.]
+-    expected: FAIL
+-
+-
+-[idbindex_reverse_cursor.any.worker.html]
+-  [Reverse cursor sees update from separate transactions.]
+-    expected: FAIL
+-
+-  [Reverse cursor sees in-transaction update.]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex_tombstones.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex_tombstones.any.js.ini
+deleted file mode 100644
+index 8cf477dc390..00000000000
+--- a/tests/wpt/meta/IndexedDB/idbindex_tombstones.any.js.ini
++++ /dev/null
+@@ -1,26 +0,0 @@
+-[idbindex_tombstones.any.worker.html]
+-  [Forward iteration over an index in a readonly transaction]
+-    expected: FAIL
+-
+-  [Backward iteration over an index in a readonly transaction]
+-    expected: FAIL
+-
+-  [Forward iteration over an index in a readwrite transaction]
+-    expected: FAIL
+-
+-  [Backward iteration over an index in a readwrite transaction]
+-    expected: FAIL
+-
+-
+-[idbindex_tombstones.any.html]
+-  [Forward iteration over an index in a readonly transaction]
+-    expected: FAIL
+-
+-  [Backward iteration over an index in a readonly transaction]
+-    expected: FAIL
+-
+-  [Forward iteration over an index in a readwrite transaction]
+-    expected: FAIL
+-
+-  [Backward iteration over an index in a readwrite transaction]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini b/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini
+index 4d5cca719c6..6593d5470ec 100644
+--- a/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini
+@@ -1,16 +1,8 @@
+ [idbobjectstore_createIndex.any.worker.html]
+-  [Auto-Increment Primary Key - invalid key values elsewhere]
+-    expected: FAIL
+-
+ 
+ [idbobjectstore_createIndex.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbobjectstore_createIndex.any.sharedworker.html]
+-  [Auto-Increment Primary Key - invalid key values elsewhere]
+-    expected: FAIL
+-
+ 
+ [idbobjectstore_createIndex.any.html]
+-  [Auto-Increment Primary Key - invalid key values elsewhere]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/index_sort_order.any.js.ini b/tests/wpt/meta/IndexedDB/index_sort_order.any.js.ini
+index f066052d438..df48ce2ca11 100644
+--- a/tests/wpt/meta/IndexedDB/index_sort_order.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/index_sort_order.any.js.ini
+@@ -1,16 +1,8 @@
+ [index_sort_order.any.html]
+-  [Verify IDBIndex key sort order is 'number < Date < DOMString']
+-    expected: FAIL
+-
+ 
+ [index_sort_order.any.serviceworker.html]
+   expected: ERROR
+ 
+ [index_sort_order.any.sharedworker.html]
+-  [Verify IDBIndex key sort order is 'number < Date < DOMString']
+-    expected: FAIL
+-
+ 
+ [index_sort_order.any.worker.html]
+-  [Verify IDBIndex key sort order is 'number < Date < DOMString']
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/large-requests-abort.any.js.ini b/tests/wpt/meta/IndexedDB/large-requests-abort.any.js.ini
+index df002e61c00..1cfff5d375b 100644
+--- a/tests/wpt/meta/IndexedDB/large-requests-abort.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/large-requests-abort.any.js.ini
+@@ -1,43 +1,8 @@
+ [large-requests-abort.any.sharedworker.html]
+-  [small values]
+-    expected: FAIL
+-
+-  [large values]
+-    expected: FAIL
+-
+-  [large value followed by small values]
+-    expected: FAIL
+-
+-  [large values mixed with small values]
+-    expected: FAIL
+-
+ 
+ [large-requests-abort.any.html]
+-  [small values]
+-    expected: FAIL
+-
+-  [large values]
+-    expected: FAIL
+-
+-  [large value followed by small values]
+-    expected: FAIL
+-
+-  [large values mixed with small values]
+-    expected: FAIL
+-
+ 
+ [large-requests-abort.any.serviceworker.html]
+   expected: ERROR
+ 
+ [large-requests-abort.any.worker.html]
+-  [small values]
+-    expected: FAIL
+-
+-  [large values]
+-    expected: FAIL
+-
+-  [large value followed by small values]
+-    expected: FAIL
+-
+-  [large values mixed with small values]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/name-scopes.any.js.ini b/tests/wpt/meta/IndexedDB/name-scopes.any.js.ini
+index c94406a6bea..25cf4bb8137 100644
+--- a/tests/wpt/meta/IndexedDB/name-scopes.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/name-scopes.any.js.ini
+@@ -2,24 +2,7 @@
+   expected: ERROR
+ 
+ [name-scopes.any.worker.html]
+-  [Non-unique index keys]
+-    expected: FAIL
+-
+-  [Unique index keys]
+-    expected: FAIL
+-
+ 
+ [name-scopes.any.html]
+-  [Non-unique index keys]
+-    expected: FAIL
+-
+-  [Unique index keys]
+-    expected: FAIL
+-
+ 
+ [name-scopes.any.sharedworker.html]
+-  [Non-unique index keys]
+-    expected: FAIL
+-
+-  [Unique index keys]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/reading-autoincrement-indexes-cursors.any.js.ini b/tests/wpt/meta/IndexedDB/reading-autoincrement-indexes-cursors.any.js.ini
+index dc3130240ba..19177092acd 100644
+--- a/tests/wpt/meta/IndexedDB/reading-autoincrement-indexes-cursors.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/reading-autoincrement-indexes-cursors.any.js.ini
+@@ -1,25 +1,8 @@
+ [reading-autoincrement-indexes-cursors.any.worker.html]
+-  [IDBIndex.openCursor() iterates over an index not covering the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.openKeyCursor() iterates over an index not covering the autoincrement key]
+-    expected: FAIL
+-
+ 
+ [reading-autoincrement-indexes-cursors.any.serviceworker.html]
+   expected: ERROR
+ 
+ [reading-autoincrement-indexes-cursors.any.sharedworker.html]
+-  [IDBIndex.openCursor() iterates over an index not covering the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.openKeyCursor() iterates over an index not covering the autoincrement key]
+-    expected: FAIL
+-
+ 
+ [reading-autoincrement-indexes-cursors.any.html]
+-  [IDBIndex.openCursor() iterates over an index not covering the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.openKeyCursor() iterates over an index not covering the autoincrement key]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/request-event-ordering-large-mixed-with-small-values.any.js.ini b/tests/wpt/meta/IndexedDB/request-event-ordering-large-mixed-with-small-values.any.js.ini
+index d3f5a0c4775..73d81e2efc9 100644
+--- a/tests/wpt/meta/IndexedDB/request-event-ordering-large-mixed-with-small-values.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/request-event-ordering-large-mixed-with-small-values.any.js.ini
+@@ -1,17 +1,8 @@
+ [request-event-ordering-large-mixed-with-small-values.any.sharedworker.html]
+-  [large values mixed with small values]
+-    expected: FAIL
+-
+ 
+ [request-event-ordering-large-mixed-with-small-values.any.worker.html]
+-  [large values mixed with small values]
+-    expected: FAIL
+-
+ 
+ [request-event-ordering-large-mixed-with-small-values.any.html]
+-  [large values mixed with small values]
+-    expected: FAIL
+-
+ 
+ [request-event-ordering-large-mixed-with-small-values.any.serviceworker.html]
+   expected: ERROR
+diff --git a/tests/wpt/meta/IndexedDB/request-event-ordering-large-then-small-values.any.js.ini b/tests/wpt/meta/IndexedDB/request-event-ordering-large-then-small-values.any.js.ini
+index 3704c0b4ca0..c135844dc8c 100644
+--- a/tests/wpt/meta/IndexedDB/request-event-ordering-large-then-small-values.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/request-event-ordering-large-then-small-values.any.js.ini
+@@ -1,16 +1,8 @@
+ [request-event-ordering-large-then-small-values.any.sharedworker.html]
+-  [large value followed by small values]
+-    expected: FAIL
+-
+ 
+ [request-event-ordering-large-then-small-values.any.serviceworker.html]
+   expected: ERROR
+ 
+ [request-event-ordering-large-then-small-values.any.html]
+-  [large value followed by small values]
+-    expected: FAIL
+-
+ 
+ [request-event-ordering-large-then-small-values.any.worker.html]
+-  [large value followed by small values]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/request-event-ordering-large-values.any.js.ini b/tests/wpt/meta/IndexedDB/request-event-ordering-large-values.any.js.ini
+index 4998e4fd2e1..ac69be367ca 100644
+--- a/tests/wpt/meta/IndexedDB/request-event-ordering-large-values.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/request-event-ordering-large-values.any.js.ini
+@@ -2,15 +2,7 @@
+   expected: ERROR
+ 
+ [request-event-ordering-large-values.any.worker.html]
+-  [large values]
+-    expected: FAIL
+-
+ 
+ [request-event-ordering-large-values.any.sharedworker.html]
+-  [large values]
+-    expected: FAIL
+-
+ 
+ [request-event-ordering-large-values.any.html]
+-  [large values]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/request-event-ordering-small-values.any.js.ini b/tests/wpt/meta/IndexedDB/request-event-ordering-small-values.any.js.ini
+index 57105742ed4..1435877ca44 100644
+--- a/tests/wpt/meta/IndexedDB/request-event-ordering-small-values.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/request-event-ordering-small-values.any.js.ini
+@@ -1,16 +1,8 @@
+ [request-event-ordering-small-values.any.worker.html]
+-  [small values]
+-    expected: FAIL
+-
+ 
+ [request-event-ordering-small-values.any.serviceworker.html]
+   expected: ERROR
+ 
+ [request-event-ordering-small-values.any.html]
+-  [small values]
+-    expected: FAIL
+-
+ 
+ [request-event-ordering-small-values.any.sharedworker.html]
+-  [small values]
+-    expected: FAIL
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 3fa7d28a049..11cee006d8c 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11746,6 +11746,69 @@
+       }
+      ]
+     ],
++    "index-cursors.any.js": [
++     "d1c7658343402c0a2f3945385f88145a319dd867",
++     [
++      "IndexedDB/index-cursors.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: cursors over the records of an index"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/index-cursors.any.serviceworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: cursors over the records of an index"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/index-cursors.any.sharedworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: cursors over the records of an index"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/index-cursors.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: cursors over the records of an index"
++        ]
++       ]
++      }
++     ]
++    ],
+     "index-keys-page-code.any.js": [
+      "5a4fccd09b72cd07b55ce718e89055880f891ce9",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/index-cursors.any.js b/tests/wpt/mozilla/tests/IndexedDB/index-cursors.any.js
+new file mode 100644
+index 00000000000..d1c76583434
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/index-cursors.any.js
+@@ -0,0 +1,236 @@
++// META: global=window,worker
++// META: title=IndexedDB: cursors over the records of an index
++
++// https://w3c.github.io/IndexedDB/#iterate-a-cursor: a cursor over an index moves through its
++// records sorted by key and then by value, the primary key of the referenced record, from its
++// position and object store position, and each step sees the records as they are when it runs.
++// These tests cover what the IndexedDB WPT tests leave out: the record the unique directions
++// visit for a key with several records, continuePrimaryKey() and advance() over keys with several
++// records, and records that change between the steps of index cursors.
++
++'use strict';
++
++// Opens a new database with `upgrade` as its upgradeneeded handler.
++function openDatabase(t, upgrade) {
++  const name = 'index-cursors-' + Math.random();
++  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open(name, 1);
++    request.onupgradeneeded = () => upgrade(request.result);
++    request.onsuccess = () => {
++      t.add_cleanup(() => { request.result.close(); });
++      resolve(request.result);
++    };
++    request.onerror = () => reject(request.error);
++  });
++}
++
++// The records of 'items', under the keys 1 to 6, and their keys in the index 'k'.
++const KEYS = {1: 'b', 2: 'a', 3: 'b', 4: 'a', 5: 'c', 6: 'b'};
++
++function createItems(db) {
++  const store = db.createObjectStore('items');
++  store.createIndex('k', 'k');
++  store.createIndex('tags', 'tags', {multiEntry: true});
++  store.createIndex('u', 'u', {unique: true});
++  for (const [key, k] of Object.entries(KEYS)) {
++    store.put({k, tags: [k, 'all'], u: -Number(key)}, Number(key));
++  }
++}
++
++// Runs `onCursor` on each record that `request`, a cursor request, visits, then resolves with
++// [key, primaryKey] of each. `onCursor` may move the cursor itself by returning true.
++function visit(request, onCursor = () => false) {
++  return new Promise((resolve, reject) => {
++    const visited = [];
++    request.onsuccess = () => {
++      const cursor = request.result;
++      if (!cursor) {
++        resolve(visited);
++        return;
++      }
++      visited.push([cursor.key, cursor.primaryKey]);
++      if (!onCursor(cursor, visited.length - 1)) {
++        cursor.continue();
++      }
++    };
++    request.onerror = () => reject(request.error);
++  });
++}
++
++// The index 'k' of 'items', in a new transaction.
++function indexK(db, mode = 'readonly') {
++  return db.transaction('items', mode).objectStore('items').index('k');
++}
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems);
++  const expected = {
++    next: [['a', 2], ['a', 4], ['b', 1], ['b', 3], ['b', 6], ['c', 5]],
++    prev: [['c', 5], ['b', 6], ['b', 3], ['b', 1], ['a', 4], ['a', 2]],
++    nextunique: [['a', 2], ['b', 1], ['c', 5]],
++    prevunique: [['c', 5], ['b', 1], ['a', 2]],
++  };
++  for (const [direction, records] of Object.entries(expected)) {
++    const values = [];
++    const visited = await visit(indexK(db).openCursor(null, direction), cursor => {
++      values.push(cursor.value);
++    });
++    assert_array_equals(visited.flat(), records.flat(), `openCursor ${direction}`);
++    assert_array_equals(values.map(value => value.k), records.map(([k]) => k));
++    const keys = await visit(indexK(db).openKeyCursor(null, direction), cursor => {
++      assert_false('value' in cursor, 'a key cursor has no value');
++    });
++    assert_array_equals(keys.flat(), records.flat(), `openKeyCursor ${direction}`);
++  }
++  const range = IDBKeyRange.bound('a', 'b', true, false);
++  const inRange = await visit(indexK(db).openCursor(range, 'prevunique'));
++  assert_array_equals(inRange.flat(), ['b', 1], 'prevunique in a range');
++}, 'Index cursors visit the records by key and then primary key, and the unique directions ' +
++   'visit the record with the lowest primary key of each key');
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems);
++  const tags = db.transaction('items').objectStore('items').index('tags');
++  const visited = await visit(tags.openCursor(null, 'prevunique'));
++  assert_array_equals(visited.flat(), ['c', 5, 'b', 1, 'all', 1, 'a', 2]);
++  const unique = db.transaction('items').objectStore('items').index('u');
++  const values = [];
++  const all = await visit(unique.openCursor(IDBKeyRange.upperBound(-3), 'next'), cursor => {
++    values.push(cursor.value.k);
++  });
++  assert_array_equals(all.flat(), [-6, 6, -5, 5, -4, 4, -3, 3]);
++  assert_array_equals(values, ['b', 'c', 'a', 'b']);
++}, 'Cursors over a multiEntry and a unique index');
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems);
++  const next = await visit(indexK(db).openCursor(), (cursor, i) => {
++    switch (i) {
++      case 0:
++        // At ('a', 2).
++        cursor.continuePrimaryKey('b', 2);
++        return true;
++      case 1:
++        // At ('b', 3): the position's primary key is not beyond it, a larger one is.
++        assert_throws_dom('DataError', () => cursor.continuePrimaryKey('b', 3));
++        cursor.continuePrimaryKey('b', 4);
++        return true;
++      case 2:
++        // At ('b', 6): the second record on is past the end.
++        cursor.advance(2);
++        return true;
++    }
++    return false;
++  });
++  assert_array_equals(next.flat(), ['a', 2, 'b', 3, 'b', 6]);
++
++  const prev = await visit(indexK(db).openCursor(null, 'prev'), (cursor, i) => {
++    if (i === 0) {
++      cursor.continuePrimaryKey('b', 5);
++      return true;
++    }
++    if (i === 1) {
++      cursor.continuePrimaryKey('a', 10);
++      return true;
++    }
++    return false;
++  });
++  assert_array_equals(prev.flat(), ['c', 5, 'b', 3, 'a', 4, 'a', 2]);
++
++  const nextUnique = await visit(indexK(db).openCursor(null, 'nextunique'), (cursor, i) => {
++    if (i === 0) {
++      cursor.advance(2);
++      return true;
++    }
++    return false;
++  });
++  assert_array_equals(nextUnique.flat(), ['a', 2, 'c', 5]);
++
++  const prevUnique = await visit(indexK(db).openCursor(null, 'prevunique'), (cursor, i) => {
++    if (i === 0) {
++      cursor.continue('a');
++      return true;
++    }
++    return false;
++  });
++  assert_array_equals(prevUnique.flat(), ['c', 5, 'a', 2]);
++}, 'continuePrimaryKey(), continue() and advance() on an index with several records per key');
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems);
++  const index = indexK(db, 'readwrite');
++  const store = index.objectStore;
++  const visited = await visit(index.openCursor(), (cursor, i) => {
++    if (i === 0) {
++      // At ('a', 2): a record ahead goes, one comes ahead and one behind.
++      store.delete(4);
++      store.put({k: 'a'}, 7);
++      store.put({k: 'a'}, 0);
++    } else if (i === 1) {
++      // At ('a', 7): a record moves ahead and one moves behind.
++      store.put({k: 'z'}, 1);
++      store.put({k: '0'}, 3);
++    } else if (i === 3) {
++      // At ('c', 5): the record moves behind the cursor.
++      cursor.update({k: 'a'});
++    }
++    return false;
++  });
++  assert_array_equals(visited.flat(), ['a', 2, 'a', 7, 'b', 6, 'c', 5, 'z', 1]);
++}, 'Each step of an index cursor sees the records put, replaced and deleted before it');
++
++for (const [direction, expected] of [
++  ['next', ['a', 'moved', 'b', 'a', 'b']],
++  ['nextunique', ['a', 'b', 'a', 'b']],
++]) {
++  promise_test(async t => {
++    const db = await openDatabase(t, createItems);
++    const store = db.transaction('items', 'readwrite').objectStore('items');
++    const values = [];
++    await visit(store.index('u').openCursor(IDBKeyRange.lowerBound(-4), direction), cursor => {
++      values.push(cursor.value.k);
++      if (values.length === 1) {
++        // The record at the cursor's position goes, and another one takes its key.
++        store.delete(4);
++        store.put({k: 'moved', u: -4}, 6);
++      }
++    });
++    assert_array_equals(values, expected);
++  }, `A unique index cursor in "${direction}" after another record took the key at its position`);
++}
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('items', {keyPath: 'id', autoIncrement: true});
++    store.createIndex('x', 'x');
++    store.put({x: 'b'});
++    store.put({x: 'a'});
++  });
++  const tx = db.transaction('items', 'readwrite');
++  const committed = new Promise((resolve, reject) => {
++    tx.oncomplete = resolve;
++    tx.onabort = () => reject(tx.error);
++  });
++  const values = [];
++  await visit(tx.objectStore('items').index('x').openCursor(), cursor => {
++    values.push(cursor.value);
++    if (cursor.value.x === 'a') {
++      // The record moves ahead of the cursor, which reaches it again.
++      cursor.update({x: 'c', id: cursor.primaryKey});
++    } else if (cursor.value.x === 'b') {
++      cursor.delete();
++    }
++  });
++  assert_object_equals(values, [{x: 'a', id: 2}, {x: 'b', id: 1}, {x: 'c', id: 2}]);
++  await committed;
++  const index = db.transaction('items').objectStore('items').index('x');
++  const [all, count] = await Promise.all([index.getAll(), index.count()].map(request =>
++    new Promise((resolve, reject) => {
++      request.onsuccess = () => resolve(request.result);
++      request.onerror = () => reject(request.error);
++    })));
++  assert_object_equals(all, [{x: 'c', id: 2}]);
++  assert_equals(count, 1);
++}, 'Values of index cursors carry their generated keys, and update() and delete() change the ' +
++   'record and its index records');

@@ -1,0 +1,578 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 00:49:01 +0000
+Subject: [PATCH] indexeddb: Make a request's source its object store, index or
+ cursor
+
+https://w3c.github.io/IndexedDB/#dom-idbrequest-source is an
+(IDBObjectStore or IDBIndex or IDBCursor)?, but IDBRequest kept only an
+object store: requests of an index's openCursor() reported the index's
+object store, and those of cursor.update() and cursor.delete() the
+cursor's effective object store.
+
+IDBRequest::execute_async now takes a RequestSource (an object store,
+an index or a cursor, borrowed) and the request keeps it as a traced
+SourceHandle. The backend is still addressed by an object store id: the
+source's own, the index's, or the cursor's effective object store's.
+openCursor() and openKeyCursor() of an index pass the index; update()
+and delete() of a cursor pass the cursor ("asynchronously execute a
+request with this"); continue(), advance() and continuePrimaryKey()
+pass the cursor's source with the request that opening the cursor made.
+Values that a request reads are deserialized by the source's object
+store (P1.2's key injection), which for an index is its object store.
+
+The IDL attribute takes the spec's union type.
+
+Validation: Host WPT tests/wpt/tests/IndexedDB (4,511 subtests), 8 processes: SpiderMonkey 3,418 (P3.2 tip 3,392), QuickJS 3,398 (P3.2 tip 3,389); the 27 new passes on both engines are idbcursor-request-source (6: index cursors and the cursor's update()/delete()), idbindex-request-source openCursor/openKeyCursor (2) and idbcursor_continue_index "Delete next element, and iterate to it" (1, uses request.source.objectStore), in window, worker and sharedworker; the other differences are whole-test timeouts of the known flaky set (SM idbfactory-origin-isolation, rename-store sharedworker; QuickJS continuePrimaryKey-exception-order sharedworker, plus key_valid.any.worker, 5 of 5 on repeat, and idbindex-rename.any.worker, which times out whenever it runs after its sharedworker variant in one browser, the P3.2 binary too, 2 of 2 pairs each); expectations updated with `./mach update-wpt` from both engines' runs. /_mozilla/IndexedDB/ 172 of 172 on SM. Board results are with the next commit. `./mach build --release` and `--js-engine quickjs` build. These counts predate the P3 review fixes folded into the P3.1 and P3.2 commits, which add a backend test and fork subtests.
+AI-assisted: Yes (agent session; implemented the request source union and its call sites, ran the WPT comparisons and updated the expectations)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbcursor.rs  | 30 +++----
+ components/script/dom/indexeddb/idbindex.rs   |  4 +-
+ .../script/dom/indexeddb/idbobjectstore.rs    | 20 ++---
+ components/script/dom/indexeddb/idbrequest.rs | 89 ++++++++++++++++---
+ .../script_bindings/webidls/IDBRequest.webidl |  3 +-
+ .../idbcursor-request-source.any.js.ini       | 53 -----------
+ .../idbcursor_continue_index.any.js.ini       |  9 --
+ .../idbindex-request-source.any.js.ini        | 18 ----
+ 8 files changed, 103 insertions(+), 123 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbcursor.rs b/components/script/dom/indexeddb/idbcursor.rs
+index f38fe6d1619..83b74c785b2 100644
+--- a/components/script/dom/indexeddb/idbcursor.rs
++++ b/components/script/dom/indexeddb/idbcursor.rs
+@@ -30,7 +30,7 @@ use crate::dom::bindings::structuredclone;
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::indexeddb::idbindex::IDBIndex;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+-use crate::dom::indexeddb::idbrequest::IDBRequest;
++use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource};
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::key::{
+     ExtractionResult, convert_value_to_key, extract_key, key_type_to_jsval,
+@@ -178,6 +178,15 @@ impl IDBCursor {
+         }
+     }
+ 
++    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-source>, as the source of the requests that
++    /// iterate the cursor.
++    fn request_source(&self) -> RequestSource<'_> {
++        match &self.source {
++            ObjectStoreOrIndex::ObjectStore(store) => RequestSource::ObjectStore(store),
++            ObjectStoreOrIndex::Index(index) => RequestSource::Index(index),
++        }
++    }
++
+     /// <https://www.w3.org/TR/IndexedDB-3/#cursor-effective-object-store>
+     pub(crate) fn effective_object_store(&self) -> DomRoot<IDBObjectStore> {
+         match &self.source {
+@@ -373,12 +382,9 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+             count: Some(count),
+         };
+ 
+-        // NOTE: According to the spec, execute_async should take the cursor's source
+-        // (which may be an index). Using effective_object_store here is a temporary
+-        // workaround until execute_async supports ObjectStoreOrIndex as source.
+         IDBRequest::execute_async(
+             cx,
+-            &self.effective_object_store(),
++            self.request_source(),
+             self.iterate_operation(None, count),
+             Some(request),
+             Some(iteration_param),
+@@ -462,12 +468,9 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+             count: None,
+         };
+ 
+-        // NOTE: According to the spec, execute_async should take the cursor's source
+-        // (which may be an index). Using effective_object_store here is a temporary
+-        // workaround until execute_async supports ObjectStoreOrIndex as source.
+         IDBRequest::execute_async(
+             cx,
+-            &self.effective_object_store(),
++            self.request_source(),
+             self.iterate_operation(operation_key.as_ref(), 1),
+             Some(request),
+             Some(iteration_param),
+@@ -603,12 +606,9 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+             count: None,
+         };
+ 
+-        // NOTE: According to the spec, execute_async should take the cursor's source
+-        // (which may be an index). Using effective_object_store here is a temporary
+-        // workaround until execute_async supports ObjectStoreOrIndex as source.
+         IDBRequest::execute_async(
+             cx,
+-            &self.effective_object_store(),
++            self.request_source(),
+             self.iterate_operation(Some(&operation_key), 1),
+             Some(request),
+             Some(iteration_param),
+@@ -702,7 +702,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+         // with this and operation.
+         IDBRequest::execute_async(
+             cx,
+-            &effective_object_store,
++            RequestSource::Cursor(self),
+             AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
+                 key: self.effective_key(),
+                 value: serialized_value,
+@@ -755,7 +755,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+ 
+         IDBRequest::execute_async(
+             cx,
+-            &effective_object_store,
++            RequestSource::Cursor(self),
+             AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
+                 key_range: IndexedDBKeyRange::only(effective_key),
+             }),
+diff --git a/components/script/dom/indexeddb/idbindex.rs b/components/script/dom/indexeddb/idbindex.rs
+index 591812c24bc..5f12b77b631 100644
+--- a/components/script/dom/indexeddb/idbindex.rs
++++ b/components/script/dom/indexeddb/idbindex.rs
+@@ -23,7 +23,7 @@ use crate::dom::idbobjectstore::KeyPath;
+ use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
+ use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+-use crate::dom::indexeddb::idbrequest::IDBRequest;
++use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource};
+ use crate::dom::indexeddb::key::{
+     convert_value_to_key_range, dom_string_from_name, name_from_dom_string,
+ };
+@@ -178,7 +178,7 @@ impl IDBIndex {
+ 
+         IDBRequest::execute_async(
+             cx,
+-            &self.object_store,
++            RequestSource::Index(self),
+             cursor.iterate_operation(None, 1),
+             None,
+             Some(iteration_param),
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index fd6fa89d5e4..5c045b2ca4b 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -39,7 +39,7 @@ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
+ use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
+ use crate::dom::indexeddb::idbindex::IDBIndex;
+-use crate::dom::indexeddb::idbrequest::IDBRequest;
++use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource};
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::key::{
+     EvaluationResult, ExtractionResult, can_inject_key_into_value, clear_pending_exception,
+@@ -507,7 +507,7 @@ impl IDBObjectStore {
+         // with handle and operation.
+         IDBRequest::execute_async(
+             cx,
+-            self,
++            RequestSource::ObjectStore(self),
+             AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
+                 key: serialized_key,
+                 value: serialized_value,
+@@ -587,7 +587,7 @@ impl IDBObjectStore {
+ 
+         IDBRequest::execute_async(
+             cx,
+-            self,
++            RequestSource::ObjectStore(self),
+             cursor.iterate_operation(None, 1),
+             None,
+             Some(iteration_param),
+@@ -718,7 +718,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         serialized_query.and_then(|key_range| {
+             IDBRequest::execute_async(
+                 cx,
+-                self,
++                RequestSource::ObjectStore(self),
+                 AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem { key_range }),
+                 None,
+                 None,
+@@ -741,7 +741,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         // Step 7. Return the result (an IDBRequest) of running asynchronously execute a request with this and operation.
+         IDBRequest::execute_async(
+             cx,
+-            self,
++            RequestSource::ObjectStore(self),
+             AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear),
+             None,
+             None,
+@@ -766,7 +766,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         serialized_query.and_then(|q| {
+             IDBRequest::execute_async(
+                 cx,
+-                self,
++                RequestSource::ObjectStore(self),
+                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem { key_range: q }),
+                 None,
+                 None,
+@@ -793,7 +793,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         serialized_query.and_then(|q| {
+             IDBRequest::execute_async(
+                 cx,
+-                self,
++                RequestSource::ObjectStore(self),
+                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey { key_range: q }),
+                 None,
+                 None,
+@@ -825,7 +825,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         serialized_query.and_then(|q| {
+             IDBRequest::execute_async(
+                 cx,
+-                self,
++                RequestSource::ObjectStore(self),
+                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
+                     key_range: q,
+                     count,
+@@ -860,7 +860,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         serialized_query.and_then(|q| {
+             IDBRequest::execute_async(
+                 cx,
+-                self,
++                RequestSource::ObjectStore(self),
+                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
+                     key_range: q,
+                     count,
+@@ -889,7 +889,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         serialized_query.and_then(|q| {
+             IDBRequest::execute_async(
+                 cx,
+-                self,
++                RequestSource::ObjectStore(self),
+                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count { key_range: q }),
+                 None,
+                 None,
+diff --git a/components/script/dom/indexeddb/idbrequest.rs b/components/script/dom/indexeddb/idbrequest.rs
+index 7067fb3643e..563fb2a55fa 100644
+--- a/components/script/dom/indexeddb/idbrequest.rs
++++ b/components/script/dom/indexeddb/idbrequest.rs
+@@ -12,6 +12,7 @@ use js::conversions::ToJSValConvertible;
+ use js::jsapi::Heap;
+ use js::jsval::{DoubleValue, JSVal, NullValue, ObjectValue, UndefinedValue};
+ use js::rust::{HandleValue, MutableHandleValue};
++use script_bindings::cell::DomRefCell;
+ use script_bindings::reflector::{DomObject, reflect_dom_object};
+ use servo_base::generic_channel::GenericSend;
+ use storage_traits::indexeddb::{
+@@ -25,16 +26,18 @@ use crate::dom::bindings::codegen::Bindings::IDBRequestBinding::{
+     IDBRequestMethods, IDBRequestReadyState,
+ };
+ use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::IDBTransactionMode;
++use crate::dom::bindings::codegen::UnionTypes::IDBObjectStoreOrIDBIndexOrIDBCursor;
+ use crate::dom::bindings::error::{Error, Fallible, create_dom_exception};
+ use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::reflector::DomGlobal;
+-use crate::dom::bindings::root::{DomRoot, MutNullableDom};
++use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+ use crate::dom::domexception::DOMException;
+ use crate::dom::event::{Event, EventBubbles, EventCancelable};
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::globalscope::GlobalScope;
+-use crate::dom::indexeddb::idbcursor::{IterationParam, iterate_cursor};
++use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, iterate_cursor};
+ use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
++use crate::dom::indexeddb::idbindex::IDBIndex;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::key::key_type_to_jsval;
+@@ -133,13 +136,43 @@ impl From<RequestOutput> for IdbResult {
+     }
+ }
+ 
++/// <https://w3c.github.io/IndexedDB/#request-source> of a request that
++/// [`IDBRequest::execute_async`] executes.
++#[derive(Clone, Copy)]
++pub(crate) enum RequestSource<'a> {
++    ObjectStore(&'a IDBObjectStore),
++    Index(&'a IDBIndex),
++    Cursor(&'a IDBCursor),
++}
++
++impl RequestSource<'_> {
++    /// The object store whose records the request reads or writes: the object store, the
++    /// index's object store or the cursor's effective object store.
++    pub(crate) fn object_store(&self) -> DomRoot<IDBObjectStore> {
++        match self {
++            Self::ObjectStore(store) => DomRoot::from_ref(*store),
++            Self::Index(index) => index.object_store(),
++            Self::Cursor(cursor) => cursor.effective_object_store(),
++        }
++    }
++}
++
++/// A [`RequestSource`] that a request keeps.
++#[derive(JSTraceable, MallocSizeOf)]
++#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
++enum SourceHandle {
++    ObjectStore(Dom<IDBObjectStore>),
++    Index(Dom<IDBIndex>),
++    Cursor(Dom<IDBCursor>),
++}
++
+ #[dom_struct]
+ pub struct IDBRequest {
+     eventtarget: EventTarget,
+     #[ignore_malloc_size_of = "mozjs"]
+     result: Heap<JSVal>,
+     error: MutNullableDom<DOMException>,
+-    source: MutNullableDom<IDBObjectStore>,
++    source: DomRefCell<Option<SourceHandle>>,
+     transaction: MutNullableDom<IDBTransaction>,
+     ready_state: Cell<IDBRequestReadyState>,
+ }
+@@ -161,8 +194,21 @@ impl IDBRequest {
+         reflect_dom_object(cx, Box::new(IDBRequest::new_inherited()), global)
+     }
+ 
+-    pub fn set_source(&self, source: Option<&IDBObjectStore>) {
+-        self.source.set(source);
++    fn set_source(&self, source: RequestSource) {
++        *self.source.borrow_mut() = Some(match source {
++            RequestSource::ObjectStore(store) => SourceHandle::ObjectStore(Dom::from_ref(store)),
++            RequestSource::Index(index) => SourceHandle::Index(Dom::from_ref(index)),
++            RequestSource::Cursor(cursor) => SourceHandle::Cursor(Dom::from_ref(cursor)),
++        });
++    }
++
++    /// The object store whose values this request reads, see [`RequestSource::object_store`].
++    fn source_object_store(&self) -> Option<DomRoot<IDBObjectStore>> {
++        self.source.borrow().as_ref().map(|source| match source {
++            SourceHandle::ObjectStore(store) => store.as_rooted(),
++            SourceHandle::Index(index) => index.object_store(),
++            SourceHandle::Cursor(cursor) => cursor.effective_object_store(),
++        })
+     }
+ 
+     pub fn set_ready_state_done(&self) {
+@@ -207,15 +253,16 @@ impl IDBRequest {
+     ///
+     /// The result arrives on the connection's result channel and is delivered by the
+     /// transaction, in request order, see `IDBTransaction::handle_event`.
+-    pub fn execute_async(
++    pub(crate) fn execute_async(
+         cx: &mut JSContext,
+-        source: &IDBObjectStore,
++        source: RequestSource,
+         operation: AsyncOperation,
+         request: Option<DomRoot<IDBRequest>>,
+         iteration_param: Option<IterationParam>,
+     ) -> Fallible<DomRoot<IDBRequest>> {
+         // Step 1: Let transaction be the transaction associated with source.
+-        let transaction = source.transaction();
++        let object_store = source.object_store();
++        let transaction = object_store.transaction();
+         let global = transaction.global();
+         // Step 2: Assert: transaction is active.
+         if !transaction.is_active() || !transaction.is_usable() {
+@@ -242,7 +289,7 @@ impl IDBRequest {
+         // Step 3: If request was not given, let request be a new request with source as source.
+         let request = request.unwrap_or_else(|| {
+             let new_request = IDBRequest::new(cx, &global);
+-            new_request.set_source(Some(source));
++            new_request.set_source(source);
+             new_request.set_transaction(&transaction);
+             new_request
+         });
+@@ -264,7 +311,7 @@ impl IDBRequest {
+             .send(IndexedDBThreadMsg::Async(
+                 global.origin().immutable().clone(),
+                 transaction.get_db_name(),
+-                source.id(),
++                object_store.id(),
+                 transaction.id(),
+                 request_id,
+                 transaction_mode,
+@@ -303,13 +350,17 @@ impl IDBRequest {
+                 array.to_jsval(cx, answer);
+             },
+             IdbResult::Value(value) => {
+-                let store = self.source.get().expect("Value requests have a source");
++                let store = self
++                    .source_object_store()
++                    .expect("Value requests have a source");
+                 store
+                     .deserialize_value(cx, &value.primary_key, &value.value, answer)
+                     .inspect_err(|_| warn!("Error reading structuredclone data"))?;
+             },
+             IdbResult::Values(serialized_values) => {
+-                let store = self.source.get().expect("Value requests have a source");
++                let store = self
++                    .source_object_store()
++                    .expect("Value requests have a source");
+                 rooted!(&in(cx) let mut values = vec![JSVal::default(); serialized_values.len()]);
+                 for (i, value) in serialized_values.into_iter().enumerate() {
+                     store
+@@ -539,8 +590,18 @@ impl IDBRequestMethods<crate::DomTypeHolder> for IDBRequest {
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbrequest-source>
+-    fn GetSource(&self) -> Option<DomRoot<IDBObjectStore>> {
+-        self.source.get()
++    fn GetSource(&self) -> Option<IDBObjectStoreOrIDBIndexOrIDBCursor> {
++        self.source.borrow().as_ref().map(|source| match source {
++            SourceHandle::ObjectStore(store) => {
++                IDBObjectStoreOrIDBIndexOrIDBCursor::IDBObjectStore(store.as_rooted())
++            },
++            SourceHandle::Index(index) => {
++                IDBObjectStoreOrIDBIndexOrIDBCursor::IDBIndex(index.as_rooted())
++            },
++            SourceHandle::Cursor(cursor) => {
++                IDBObjectStoreOrIDBIndexOrIDBCursor::IDBCursor(cursor.as_rooted())
++            },
++        })
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbrequest-transaction>
+diff --git a/components/script_bindings/webidls/IDBRequest.webidl b/components/script_bindings/webidls/IDBRequest.webidl
+index 0e09cd6827c..f1714ada456 100644
+--- a/components/script_bindings/webidls/IDBRequest.webidl
++++ b/components/script_bindings/webidls/IDBRequest.webidl
+@@ -12,8 +12,7 @@
+ interface IDBRequest : EventTarget {
+   [Throws] readonly attribute any result;
+   [Throws] readonly attribute DOMException? error;
+-  // readonly attribute (IDBObjectStore or IDBIndex or IDBCursor)? source;
+-  readonly attribute IDBObjectStore? source;
++  readonly attribute (IDBObjectStore or IDBIndex or IDBCursor)? source;
+   readonly attribute IDBTransaction? transaction;
+   readonly attribute IDBRequestReadyState readyState;
+ 
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor-request-source.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor-request-source.any.js.ini
+index da7c3865996..71f810157b0 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor-request-source.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor-request-source.any.js.ini
+@@ -1,61 +1,8 @@
+ [idbcursor-request-source.any.sharedworker.html]
+-  [IDBIndex::openCursor's request source must be the IDBIndex instance that opened the cursor]
+-    expected: FAIL
+-
+-  [IDBIndex::openKeyCursor's request source must be the IDBIndex instance that opened the cursor]
+-    expected: FAIL
+-
+-  [The source of the request from IDBObjectStore::update() is the cursor itself]
+-    expected: FAIL
+-
+-  [The source of the request from IDBObjectStore::delete() is the cursor itself]
+-    expected: FAIL
+-
+-  [The source of the request from IDBIndex::update() is the cursor itself]
+-    expected: FAIL
+-
+-  [The source of the request from IDBIndex::delete() is the cursor itself]
+-    expected: FAIL
+-
+ 
+ [idbcursor-request-source.any.worker.html]
+-  [IDBIndex::openCursor's request source must be the IDBIndex instance that opened the cursor]
+-    expected: FAIL
+-
+-  [IDBIndex::openKeyCursor's request source must be the IDBIndex instance that opened the cursor]
+-    expected: FAIL
+-
+-  [The source of the request from IDBObjectStore::update() is the cursor itself]
+-    expected: FAIL
+-
+-  [The source of the request from IDBObjectStore::delete() is the cursor itself]
+-    expected: FAIL
+-
+-  [The source of the request from IDBIndex::update() is the cursor itself]
+-    expected: FAIL
+-
+-  [The source of the request from IDBIndex::delete() is the cursor itself]
+-    expected: FAIL
+-
+ 
+ [idbcursor-request-source.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbcursor-request-source.any.html]
+-  [IDBIndex::openCursor's request source must be the IDBIndex instance that opened the cursor]
+-    expected: FAIL
+-
+-  [IDBIndex::openKeyCursor's request source must be the IDBIndex instance that opened the cursor]
+-    expected: FAIL
+-
+-  [The source of the request from IDBObjectStore::update() is the cursor itself]
+-    expected: FAIL
+-
+-  [The source of the request from IDBObjectStore::delete() is the cursor itself]
+-    expected: FAIL
+-
+-  [The source of the request from IDBIndex::update() is the cursor itself]
+-    expected: FAIL
+-
+-  [The source of the request from IDBIndex::delete() is the cursor itself]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbcursor_continue_index.any.js.ini b/tests/wpt/meta/IndexedDB/idbcursor_continue_index.any.js.ini
+index 51e07bacfee..f2731892ce9 100644
+--- a/tests/wpt/meta/IndexedDB/idbcursor_continue_index.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbcursor_continue_index.any.js.ini
+@@ -8,9 +8,6 @@
+   [Iterate using nextunique]
+     expected: FAIL
+ 
+-  [Delete next element, and iterate to it]
+-    expected: FAIL
+-
+   [Add next element, and iterate to it]
+     expected: FAIL
+ 
+@@ -25,9 +22,6 @@
+   [Iterate using nextunique]
+     expected: FAIL
+ 
+-  [Delete next element, and iterate to it]
+-    expected: FAIL
+-
+   [Add next element, and iterate to it]
+     expected: FAIL
+ 
+@@ -45,8 +39,5 @@
+   [Iterate using nextunique]
+     expected: FAIL
+ 
+-  [Delete next element, and iterate to it]
+-    expected: FAIL
+-
+   [Add next element, and iterate to it]
+     expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex-request-source.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex-request-source.any.js.ini
+index 0c40b4bbf20..45c2329a058 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex-request-source.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex-request-source.any.js.ini
+@@ -14,12 +14,6 @@
+   [The source of the request from index => index.count() is the index itself]
+     expected: FAIL
+ 
+-  [The source of the request from index => index.openCursor() is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.openKeyCursor() is the index itself]
+-    expected: FAIL
+-
+ 
+ [idbindex-request-source.any.worker.html]
+   [The source of the request from index => index.get(0) is the index itself]
+@@ -37,12 +31,6 @@
+   [The source of the request from index => index.count() is the index itself]
+     expected: FAIL
+ 
+-  [The source of the request from index => index.openCursor() is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.openKeyCursor() is the index itself]
+-    expected: FAIL
+-
+ 
+ [idbindex-request-source.any.serviceworker.html]
+   expected: ERROR
+@@ -62,9 +50,3 @@
+ 
+   [The source of the request from index => index.count() is the index itself]
+     expected: FAIL
+-
+-  [The source of the request from index => index.openCursor() is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.openKeyCursor() is the index itself]
+-    expected: FAIL
