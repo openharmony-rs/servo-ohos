@@ -159,6 +159,13 @@ those scripts (they need network access). `check_stack.py` runs each with
 133. `backport: deny: Allow chrono in cargo deny (#50002)` — B · CI · watch: -
 134. `wpt: Let fetch-cannot-overwhelm-system wait for its requests to a small file` — B · CI · watch: -
 135. `docs: record patches 131 to 135 in the stack manifest` — B · none · watch: -
+136. `indexeddb: Read only the records a cursor step needs` — C · CI+device · watch: components/script/dom/indexeddb components/shared/storage/indexeddb.rs tests/wpt/tests/IndexedDB
+137. `indexeddb: Run the SQLite and RDB backends as executors of one engine` — C · CI+device · watch: components/storage/indexeddb components/shared/storage/indexeddb.rs components/storage/client_storage.rs
+138. `storage: Run the IndexedDB integration tests on every backend` — A · CI+device · watch: components/shared/storage/indexeddb.rs components/storage/indexeddb/mod.rs
+139. `indexeddb: Reset databases stored with another schema version` — A · CI+device · watch: components/storage/indexeddb/mod.rs components/storage/client_storage.rs
+140. `indexeddb: End the executor's transaction after errors that may roll it back` — A · CI+device · watch: -
+141. `storage: Test the transaction and statement behaviour the executors rely on` — A · CI+device · watch: -
+142. `docs: record patches 136 to 142 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

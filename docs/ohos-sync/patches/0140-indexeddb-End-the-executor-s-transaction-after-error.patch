@@ -1,0 +1,354 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 07:07:48 +0000
+Subject: [PATCH] indexeddb: End the executor's transaction after errors that
+ may roll it back
+
+SQLite rolls back the whole transaction by itself when some statements
+fail with SQLITE_FULL, SQLITE_IOERR, SQLITE_BUSY or SQLITE_NOMEM, and
+only the failed statement when others do: a statement that may stop
+half-way, such as a multi-row INSERT ... SELECT, has a statement journal
+and keeps the transaction open. SQLite recommends answering these errors
+with an explicit ROLLBACK
+(https://sqlite.org/lang_transaction.html#response_to_errors_within_a_transaction).
+
+The executors left that to the caller, which checked `in_transaction()`.
+That works for the SQLite executor, which asks the connection, but not
+for the RDB executor, which only knows whether it holds a transaction
+handle. On the DAYU200, after a single-row INSERT failed with
+RDB_E_SQLITE_FULL inside a transaction, the executor still reported the
+transaction as open, the next INSERT on the transaction's connection ran
+in autocommit and stayed in the database, and the rollback failed with
+RDB_E_ERROR. The batch runner only escaped this because a failed write
+ends the batch; a read failing with SQLITE_IOERR would have let the rest
+of the batch write outside a transaction, and the database actor of the
+next change keeps transactions open across requests.
+
+Both executors now roll back and end the open transaction after a
+statement or query fails with one of those four codes, so the caller
+sees the same thing everywhere: `in_transaction()` is false, the
+transaction's changes are gone and the error is returned. For the cases
+where SQLite keeps the transaction open, this gives up the rest of it,
+which every caller does anyway after a write fails.
+
+RDB doesn't pass SQLite's code on for most failing queries: a failure
+to prepare or step one comes back as RDB_E_STEP_RESULT_CLOSED, and
+SQLITE_BUSY during a step, after RDB's retries, as
+E_STEP_RESULT_QUERY_EXCEEDED. So the RDB executor ends the open
+transaction after any query whose statement failed; a failure to read a
+row's columns, or of the caller's row callback, leaves it alone.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 80 passed. DAYU200 `./mach test-unit --ohos -p servo-storage -- --no-default-features --features ohos-rdb-backend --status-level all`: 79 passed (1 documented skip); with both backends 130 passed (1 skip). The new executor_disk_full_ends_the_transaction fills the database with `PRAGMA max_page_count` inside a transaction, with a single-row INSERT (SQLite ends the transaction) and with a two-row INSERT ... SELECT (SQLite keeps it), and checks that the transaction ended, that commit fails and that only the row from before the transaction is left; without the change it fails on RDB for the first statement and on SQLite for the second. executor_failing_query_reports_the_transaction_state checks that after a failing query in a transaction the executor reports the transaction as open only if rolling it back still discards its writes. `./mach check --ohos -- -p servo-storage --all-targets` warning-free in the three configurations. WPT IndexedDB/ with the whole P0 series applied, as measured for "indexeddb: Run the SQLite and RDB backends as executors of one engine": host SpiderMonkey 3,224, host QuickJS 3,229 and DAYU200 3,222 passing subtests of 4,511, every unexpected result also seen with the baseline build; idbtransaction-oncomplete 60 of 60.
+AI-assisted: Yes (agent session; the agent found the problem with a probe on the DAYU200, wrote the fix and the test, and ran the test with and without the fix; after a review, it made the RDB executor also end the transaction after any failing query statement, added the test for that and measured again)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../storage/indexeddb/backend/executor.rs     |  7 ++
+ components/storage/indexeddb/backend/rdb.rs   | 76 +++++++++++++++++--
+ .../storage/indexeddb/backend/sqlite.rs       | 67 ++++++++++++----
+ components/storage/indexeddb/backend/tests.rs | 55 ++++++++++++++
+ 4 files changed, 183 insertions(+), 22 deletions(-)
+
+diff --git a/components/storage/indexeddb/backend/executor.rs b/components/storage/indexeddb/backend/executor.rs
+index e348ef4847c..626d86af08b 100644
+--- a/components/storage/indexeddb/backend/executor.rs
++++ b/components/storage/indexeddb/backend/executor.rs
+@@ -81,6 +81,13 @@ pub(crate) trait SqlExecutor: Send + Sized + 'static {
+ 
+     /// Runs a statement that returns no rows. Returns the number of rows an `UPDATE` or `DELETE`
+     /// changed; the value is unspecified for other statements.
++    ///
++    /// SQLite may roll back the whole transaction when a statement fails with SQLITE_FULL,
++    /// SQLITE_IOERR, SQLITE_BUSY or SQLITE_NOMEM. After such an error, in a statement or a query,
++    /// the open transaction is always rolled back and ended. The RDB executor, which doesn't
++    /// learn SQLite's code for most failing queries, also ends it after any query whose
++    /// statement failed, so [`Self::in_transaction`] stays true only while the transaction is
++    /// open.
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError>;
+ 
+     /// Runs a query and calls `on_row` with its rows. An error from `on_row` stops the query and
+diff --git a/components/storage/indexeddb/backend/rdb.rs b/components/storage/indexeddb/backend/rdb.rs
+index dd0ff836ca2..711f5bf91c9 100644
+--- a/components/storage/indexeddb/backend/rdb.rs
++++ b/components/storage/indexeddb/backend/rdb.rs
+@@ -41,6 +41,39 @@ impl RdbExecutor {
+             .lock()
+             .map_err(|_| SqlError::TransactionState("poisoned RDB store lock"))
+     }
++
++    /// Ends the open transaction, which SQLite may have rolled back already. RDB can't tell
++    /// whether it did, and if it did, the transaction's connection runs every later statement in
++    /// autocommit.
++    fn end_transaction(&mut self) {
++        if let Some(transaction) = self.transaction.take() {
++            // Fails if SQLite has rolled back already.
++            let _ = transaction.rollback();
++        }
++    }
++
++    /// Ends the open transaction after an execute error that SQLite may have rolled it back for.
++    fn end_transaction_after<T>(&mut self, result: Result<T, SqlError>) -> Result<T, SqlError> {
++        if result.as_ref().is_err_and(may_have_ended_transaction) {
++            self.end_transaction();
++        }
++        result
++    }
++}
++
++/// Whether SQLite may have rolled back the open transaction after `error` of an execute call:
++/// SQLITE_FULL, SQLITE_IOERR, SQLITE_BUSY or SQLITE_NOMEM. Failing queries mostly come without
++/// SQLite's code, see [`QueryError::Statement`].
++fn may_have_ended_transaction(error: &SqlError) -> bool {
++    matches!(error, SqlError::Rdb(OhosRdbError::Api { code, .. })
++        if [
++            OH_Rdb_ErrCode::RDB_E_SQLITE_FULL,
++            OH_Rdb_ErrCode::RDB_E_SQLITE_IOERR,
++            OH_Rdb_ErrCode::RDB_E_SQLITE_BUSY,
++            OH_Rdb_ErrCode::RDB_E_SQLITE_NOMEM,
++        ]
++        .iter()
++        .any(|ended| ended.0 == *code))
+ }
+ 
+ /// Whether an RDB error reports a full disk or an exceeded size limit.
+@@ -64,9 +97,27 @@ fn values(params: &[SqlParam<'_>]) -> Result<OhosRdbValues, SqlError> {
+     Ok(values)
+ }
+ 
+-fn read_rows(mut cursor: OhosRdbCursor<'_>, on_row: &mut OnRow<'_>) -> Result<(), SqlError> {
+-    while cursor.next_row()? {
+-        if on_row(&RdbRow(&cursor))?.is_break() {
++/// How a query failed.
++enum QueryError {
++    /// The statement failed. RDB reports most such failures without SQLite's code, as
++    /// RDB_E_STEP_RESULT_CLOSED or, after SQLITE_BUSY, as E_STEP_RESULT_QUERY_EXCEEDED, so any of
++    /// them may have ended the open transaction.
++    Statement(SqlError),
++    /// Reading a row, or `on_row`, failed, which leaves the statement and the transaction alone.
++    Row(SqlError),
++}
++
++fn read_rows(
++    cursor: crate::ohos_rdb::Result<OhosRdbCursor<'_>>,
++    on_row: &mut OnRow<'_>,
++) -> Result<(), QueryError> {
++    let statement_error = |error: OhosRdbError| QueryError::Statement(error.into());
++    let mut cursor = cursor.map_err(statement_error)?;
++    while cursor.next_row().map_err(statement_error)? {
++        if on_row(&RdbRow(&cursor))
++            .map_err(QueryError::Row)?
++            .is_break()
++        {
+             break;
+         }
+     }
+@@ -138,9 +189,10 @@ impl SqlExecutor for RdbExecutor {
+         // RDB returns the number of changed rows for UPDATE and DELETE, and the row id or -1 for
+         // INSERT.
+         let result = match &self.transaction {
+-            Some(transaction) => transaction.execute_with_result(sql, &values)?,
+-            None => self.store()?.execute_with_args(sql, &values)?,
++            Some(transaction) => transaction.execute_with_result(sql, &values),
++            None => self.store()?.execute_with_args(sql, &values),
+         };
++        let result = self.end_transaction_after(result.map_err(SqlError::from))?;
+         Ok(result.filter(|value| *value > 0).unwrap_or(0) as u64)
+     }
+ 
+@@ -151,11 +203,19 @@ impl SqlExecutor for RdbExecutor {
+         on_row: &mut OnRow<'_>,
+     ) -> Result<(), SqlError> {
+         let values = values(params)?;
+-        match &self.transaction {
+-            Some(transaction) => read_rows(transaction.query_sql(sql, &values)?, on_row),
++        let result = match &self.transaction {
++            Some(transaction) => read_rows(transaction.query_sql(sql, &values), on_row),
+             None => {
+                 let store = self.store()?;
+-                read_rows(store.query_sql(sql, &values)?, on_row)
++                read_rows(store.query_sql(sql, &values), on_row)
++            },
++        };
++        match result {
++            Ok(()) => Ok(()),
++            Err(QueryError::Row(error)) => Err(error),
++            Err(QueryError::Statement(error)) => {
++                self.end_transaction();
++                Err(error)
+             },
+         }
+     }
+diff --git a/components/storage/indexeddb/backend/sqlite.rs b/components/storage/indexeddb/backend/sqlite.rs
+index 3b1e2c48dbc..59b20bcbe1d 100644
+--- a/components/storage/indexeddb/backend/sqlite.rs
++++ b/components/storage/indexeddb/backend/sqlite.rs
+@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
+ use std::{fs, io};
+ 
+ use rusqlite::types::{ToSqlOutput, ValueRef};
+-use rusqlite::{Connection, ToSql, ffi};
++use rusqlite::{Connection, ErrorCode, ToSql, ffi};
+ 
+ use super::executor::{
+     Connector, OnRow, SqlError, SqlExecutor, SqlParam, SqlRow, TransactionBehavior,
+@@ -70,6 +70,25 @@ impl SqliteExecutor {
+         Ok(Self { path, connection })
+     }
+ 
++    /// Ends the open transaction after an error that SQLite may have rolled it back for, as
++    /// <https://sqlite.org/lang_transaction.html#response_to_errors_within_a_transaction>
++    /// recommends.
++    fn end_transaction_after<T>(&mut self, result: rusqlite::Result<T>) -> Result<T, SqlError> {
++        if let Err(rusqlite::Error::SqliteFailure(error, _)) = &result &&
++            matches!(
++                error.code,
++                ErrorCode::DiskFull |
++                    ErrorCode::SystemIoFailure |
++                    ErrorCode::DatabaseBusy |
++                    ErrorCode::OutOfMemory
++            ) &&
++            self.in_transaction()
++        {
++            let _ = self.connection.execute_batch("ROLLBACK");
++        }
++        Ok(result?)
++    }
++
+     fn db_status(&self, op: i32) -> usize {
+         let mut current = 0;
+         let mut highwater = 0;
+@@ -141,13 +160,18 @@ impl SqlExecutor for SqliteExecutor {
+     }
+ 
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+-        let mut statement = self.connection.prepare_cached(sql)?;
+-        check_runs_on_rdb(sql, &statement, false)?;
+-        match statement.execute(rusqlite::params_from_iter(params)) {
++        let result = match self.connection.prepare_cached(sql) {
++            Ok(mut statement) => {
++                check_runs_on_rdb(sql, &statement, false)?;
++                statement.execute(rusqlite::params_from_iter(params))
++            },
++            Err(error) => Err(error),
++        };
++        match result {
+             Ok(changed) => Ok(changed as u64),
+             // A statement like `PRAGMA journal_mode = WAL` has run when it returns its row.
+             Err(rusqlite::Error::ExecuteReturnedResults) => Ok(0),
+-            Err(error) => Err(error.into()),
++            Err(error) => self.end_transaction_after(Err(error)),
+         }
+     }
+ 
+@@ -157,15 +181,30 @@ impl SqlExecutor for SqliteExecutor {
+         params: &[SqlParam<'_>],
+         on_row: &mut OnRow<'_>,
+     ) -> Result<(), SqlError> {
+-        let mut statement = self.connection.prepare_cached(sql)?;
+-        check_runs_on_rdb(sql, &statement, true)?;
+-        let mut rows = statement.query(rusqlite::params_from_iter(params))?;
+-        while let Some(row) = rows.next()? {
+-            if on_row(&SqliteRow(row))?.is_break() {
+-                break;
+-            }
+-        }
+-        Ok(())
++        let mut on_row_error = None;
++        let result = match self.connection.prepare_cached(sql) {
++            Ok(mut statement) => {
++                check_runs_on_rdb(sql, &statement, true)?;
++                statement
++                    .query(rusqlite::params_from_iter(params))
++                    .and_then(|mut rows| {
++                        while let Some(row) = rows.next()? {
++                            match on_row(&SqliteRow(row)) {
++                                Ok(flow) if flow.is_break() => break,
++                                Ok(_) => {},
++                                Err(error) => {
++                                    on_row_error = Some(error);
++                                    break;
++                                },
++                            }
++                        }
++                        Ok(())
++                    })
++            },
++            Err(error) => Err(error),
++        };
++        self.end_transaction_after(result)?;
++        on_row_error.map_or(Ok(()), Err)
+     }
+ 
+     fn begin(&mut self, behavior: TransactionBehavior) -> Result<(), SqlError> {
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index 48c98fb1a97..6b805af620c 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -64,6 +64,8 @@ executor_tests!(
+     executor_round_trips_params,
+     executor_counts_changed_rows,
+     executor_disk_full_maps_to_quota_exceeded,
++    executor_disk_full_ends_the_transaction,
++    executor_failing_query_reports_the_transaction_state,
+     executor_user_version_is_transactional_and_persistent,
+     executor_delete_removes_the_database,
+     schema_version_is_stamped_on_a_new_database,
+@@ -303,6 +305,59 @@ fn executor_disk_full_maps_to_quota_exceeded<X: SqlExecutor>() {
+     assert_eq!(error.into_backend_error(), BackendError::QuotaExceeded);
+ }
+ 
++fn executor_disk_full_ends_the_transaction<X: SqlExecutor>() {
++    let value = vec![0u8; 65536];
++    let statements = [
++        "INSERT INTO t (k, v) VALUES (?, ?)",
++        // A statement that can fail half-way, after which SQLite keeps the transaction open.
++        "INSERT INTO t (k, v) SELECT ? + n, ? FROM (SELECT 0 AS n UNION ALL SELECT 1000)",
++    ];
++    for statement in statements {
++        let dir = tempfile::tempdir().unwrap();
++        let mut executor = open_executor::<X>(dir.path());
++        insert_into_t(&mut executor, 1);
++        executor.begin(TransactionBehavior::Immediate).unwrap();
++        insert_into_t(&mut executor, 2);
++        executor.execute("PRAGMA max_page_count = 8", &[]).unwrap();
++        let error = (10..100)
++            .find_map(|key| {
++                executor
++                    .execute(statement, &[SqlParam::Integer(key), SqlParam::Blob(&value)])
++                    .err()
++            })
++            .expect("The database should have filled up");
++        assert_eq!(error.into_backend_error(), BackendError::QuotaExceeded);
++        assert!(!executor.in_transaction(), "{statement}");
++        assert!(executor.commit().is_err());
++        executor.rollback().unwrap();
++        assert_eq!(keys_in_t(&mut executor), vec![1], "{statement}");
++    }
++}
++
++/// After a failing query, the executor reports a transaction as open only if it still is: then
++/// rolling it back discards what it wrote, and if not, nothing of it is left.
++fn executor_failing_query_reports_the_transaction_state<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let mut executor = open_executor::<X>(dir.path());
++    insert_into_t(&mut executor, 1);
++    executor.begin(TransactionBehavior::Immediate).unwrap();
++    insert_into_t(&mut executor, 2);
++    assert!(
++        query_row(&mut executor, "SELECT k FROM missing", &[], |row| {
++            row.integer(0)
++        })
++        .is_err()
++    );
++    let open = executor.in_transaction();
++    insert_into_t(&mut executor, 3);
++    if open {
++        executor.rollback().unwrap();
++        assert_eq!(keys_in_t(&mut executor), vec![1]);
++    } else {
++        assert_eq!(keys_in_t(&mut executor), vec![1, 3]);
++    }
++}
++
+ fn executor_user_version_is_transactional_and_persistent<X: SqlExecutor>() {
+     let dir = tempfile::tempdir().unwrap();
+     let mut executor = open_executor::<X>(dir.path());

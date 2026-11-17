@@ -1,0 +1,810 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 2 Nov 2026 15:57:47 +0000
+Subject: [PATCH] indexeddb: Read only the records a cursor step needs
+
+Each step of a cursor, openCursor, continue, advance and
+continuePrimaryKey, asked the backend for every record in the cursor's
+range, with its value, and then searched the list for the first record
+after the cursor's position. Iterating n records read about n * n / 2
+rows: interleaved-cursors-small reads 4.65 GiB of values to visit
+9.4 MiB, and on a DAYU200 three cursor tests timed out with the RDB
+backend.
+
+The Iterate operation now takes a count and a direction. The backend
+returns the first count records of the range, or the last count ones in
+reverse, still in ascending order, so the steps to iterate a cursor are
+unchanged. For an object store source, whose keys are unique, the
+cursor narrows its range to the records after its position, and to key
+for continue(key), and asks for the step count. An index source still
+reads its whole range, as the backends store no index records yet.
+
+The SQLite backend now orders getAll and the cursor reads by key
+instead of relying on the primary key index, and both backends apply
+the limit.
+
+Validation: host `cargo nextest run -p servo-storage-traits -p servo-storage` with SQLite: 56 passed, including the new test_restrict_bounds and test_indexeddb_iterate_count_and_reverse. On a DAYU200, a QuickJS checked-release build with both backends ran the whole IndexedDB/ directory with 2 processes and default timeouts, before and after this change, with each backend: with RDB, TIMEOUT 16 -> 6 of 820 and passing subtests 3,217 -> 3,225; with SQLite, TIMEOUT 15 -> 10 and 3,218 -> 3,224. The nine RDB cursor timeouts pass now (idbcursor_iterating 2.5 s, interleaved-cursors-small 19.5 s, interleaved-cursors-large 50 s, in window, worker and sharedworker); the tests that still time out did so in all four runs, and the remaining differences flip between runs of the same build. ./mach test-tidy passes. Host clippy: the workspace command fails building tikv-jemalloc-sys in this container, as it does without this change; with -p for the changed packages, all findings are in code this change doesn't touch.
+AI-assisted: Yes (agent session; the agent found the cause, wrote the change and the tests, and measured it on the board)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbcursor.rs  |  78 +++++---
+ components/script/dom/indexeddb/idbindex.rs   |  12 +-
+ .../script/dom/indexeddb/idbobjectstore.rs    |  11 +-
+ components/shared/storage/indexeddb.rs        |  61 +++++++
+ .../storage/indexeddb/engines/ohos_rdb.rs     |  77 ++++----
+ .../storage/indexeddb/engines/shared.rs       |  10 +-
+ .../storage/indexeddb/engines/sqlite.rs       |  37 +++-
+ components/storage/tests/indexeddb.rs         | 169 +++++++++++++++++-
+ 8 files changed, 370 insertions(+), 85 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbcursor.rs b/components/script/dom/indexeddb/idbcursor.rs
+index 0ed1ac346cc..d484e01e0ff 100644
+--- a/components/script/dom/indexeddb/idbcursor.rs
++++ b/components/script/dom/indexeddb/idbcursor.rs
+@@ -11,11 +11,12 @@ use js::context::JSContext;
+ use js::jsapi::Heap;
+ use js::jsval::{JSVal, NullValue, UndefinedValue};
+ use js::rust::{HandleValue, MutableHandleValue};
++use profile_traits::generic_callback::GenericCallback;
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use storage_traits::indexeddb::{
+-    AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, IndexedDBKeyRange,
+-    IndexedDBKeyType, IndexedDBRecord,
++    AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, BackendResult,
++    IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
+ };
+ 
+ use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::{
+@@ -211,6 +212,53 @@ impl IDBCursor {
+         }
+         Ok(())
+     }
++
++    /// The operation that gets the records for the steps to iterate a cursor with `key` and
++    /// `count`, which pick from the records after the cursor's position in its direction. For an
++    /// object store source, whose keys are unique, these steps only reach the next `count`
++    /// records, so only those are read.
++    pub(crate) fn iterate_operation(
++        &self,
++        callback: GenericCallback<BackendResult<Vec<IndexedDBRecord>>>,
++        key: Option<&IndexedDBKeyType>,
++        count: u32,
++    ) -> AsyncOperation {
++        let mut key_range = self.range.clone();
++        let (count, reverse) = match self.source {
++            // TODO: The backends store no index records yet, so an index source still reads
++            // every record in its range.
++            ObjectStoreOrIndex::Index(_) => (None, false),
++            ObjectStoreOrIndex::ObjectStore(_) => {
++                let position = self.position.borrow();
++                match self.direction {
++                    IDBCursorDirection::Next | IDBCursorDirection::Nextunique => {
++                        if let Some(position) = position.as_ref() {
++                            key_range.restrict_lower(position.clone(), true);
++                        }
++                        if let Some(key) = key {
++                            key_range.restrict_lower(key.clone(), false);
++                        }
++                        (Some(count), false)
++                    },
++                    IDBCursorDirection::Prev | IDBCursorDirection::Prevunique => {
++                        if let Some(position) = position.as_ref() {
++                            key_range.restrict_upper(position.clone(), true);
++                        }
++                        if let Some(key) = key {
++                            key_range.restrict_upper(key.clone(), false);
++                        }
++                        (Some(count), true)
++                    },
++                }
++            },
++        };
++        AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
++            callback,
++            key_range,
++            count,
++            reverse,
++        })
++    }
+ }
+ 
+ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+@@ -328,19 +376,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+             count: Some(count),
+         };
+ 
+-        let range = self.range.clone();
+         // NOTE: According to the spec, execute_async should take the cursor's source
+         // (which may be an index). Using effective_object_store here is a temporary
+         // workaround until execute_async supports ObjectStoreOrIndex as source.
+         IDBRequest::execute_async(
+             cx,
+             &self.effective_object_store(),
+-            |callback| {
+-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+-                    callback,
+-                    key_range: range,
+-                })
+-            },
++            |callback| self.iterate_operation(callback, None, count),
+             Some(request),
+             Some(iteration_param),
+         )?;
+@@ -415,6 +457,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+         // Step 9: Run the steps to asynchronously execute a request with the cursor's source as
+         // source, the steps to iterate a cursor as operation and request, using the current Realm
+         // as targetRealm, this cursor and key (if given).
++        let operation_key = key.clone();
+         let iteration_param = IterationParam {
+             cursor: Trusted::new(self),
+             key,
+@@ -422,19 +465,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+             count: None,
+         };
+ 
+-        let range = self.range.clone();
+         // NOTE: According to the spec, execute_async should take the cursor's source
+         // (which may be an index). Using effective_object_store here is a temporary
+         // workaround until execute_async supports ObjectStoreOrIndex as source.
+         IDBRequest::execute_async(
+             cx,
+             &self.effective_object_store(),
+-            |callback| {
+-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+-                    callback,
+-                    key_range: range,
+-                })
+-            },
++            |callback| self.iterate_operation(callback, operation_key.as_ref(), 1),
+             Some(request),
+             Some(iteration_param),
+         )?;
+@@ -561,6 +598,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+         // Step 20: Run the steps to asynchronously execute a request with the cursor's source as
+         // source, the steps to iterate a cursor as operation and request, using the current Realm
+         // as targetRealm, this cursor, key and primaryKey.
++        let operation_key = key.clone();
+         let iteration_param = IterationParam {
+             cursor: Trusted::new(self),
+             key: Some(key),
+@@ -568,19 +606,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+             count: None,
+         };
+ 
+-        let range = self.range.clone();
+         // NOTE: According to the spec, execute_async should take the cursor's source
+         // (which may be an index). Using effective_object_store here is a temporary
+         // workaround until execute_async supports ObjectStoreOrIndex as source.
+         IDBRequest::execute_async(
+             cx,
+             &self.effective_object_store(),
+-            |callback| {
+-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+-                    callback,
+-                    key_range: range,
+-                })
+-            },
++            |callback| self.iterate_operation(callback, Some(&operation_key), 1),
+             Some(request),
+             Some(iteration_param),
+         )?;
+diff --git a/components/script/dom/indexeddb/idbindex.rs b/components/script/dom/indexeddb/idbindex.rs
+index 67f5df0b1f6..7ab0849309d 100644
+--- a/components/script/dom/indexeddb/idbindex.rs
++++ b/components/script/dom/indexeddb/idbindex.rs
+@@ -13,7 +13,6 @@ use script_bindings::domstring::TracedDOMString;
+ use script_bindings::error::{Error, ErrorResult, Fallible};
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use script_bindings::str::DOMString;
+-use storage_traits::indexeddb::{AsyncOperation, AsyncReadOnlyOperation};
+ 
+ use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
+ use crate::dom::bindings::refcounted::Trusted;
+@@ -130,7 +129,7 @@ impl IDBIndex {
+                 direction,
+                 false,
+                 ObjectStoreOrIndex::Index(Dom::from_ref(self)),
+-                range.clone(),
++                range,
+                 key_only,
+             )
+         } else {
+@@ -141,7 +140,7 @@ impl IDBIndex {
+                 direction,
+                 false,
+                 ObjectStoreOrIndex::Index(Dom::from_ref(self)),
+-                range.clone(),
++                range,
+                 key_only,
+             ))
+         };
+@@ -157,12 +156,7 @@ impl IDBIndex {
+         IDBRequest::execute_async(
+             cx,
+             &self.object_store,
+-            |callback| {
+-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+-                    callback,
+-                    key_range: range,
+-                })
+-            },
++            |callback| cursor.iterate_operation(callback, None, 1),
+             None,
+             Some(iteration_param),
+         )
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index 5183a2dd518..549023b0d97 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -537,7 +537,7 @@ impl IDBObjectStore {
+                 direction,
+                 false,
+                 ObjectStoreOrIndex::ObjectStore(Dom::from_ref(self)),
+-                range.clone(),
++                range,
+                 key_only,
+             )
+         } else {
+@@ -548,7 +548,7 @@ impl IDBObjectStore {
+                 direction,
+                 false,
+                 ObjectStoreOrIndex::ObjectStore(Dom::from_ref(self)),
+-                range.clone(),
++                range,
+                 key_only,
+             ))
+         };
+@@ -567,12 +567,7 @@ impl IDBObjectStore {
+         IDBRequest::execute_async(
+             cx,
+             self,
+-            |callback| {
+-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+-                    callback,
+-                    key_range: range,
+-                })
+-            },
++            |callback| cursor.iterate_operation(callback, None, 1),
+             None,
+             Some(iteration_param),
+         )
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index b2da50e386b..131252756a5 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -249,6 +249,30 @@ impl IndexedDBKeyRange {
+         }
+         None
+     }
++
++    /// Raises the lower bound to `key` (excluded if `open`), unless the current one is tighter.
++    pub fn restrict_lower(&mut self, key: IndexedDBKeyType, open: bool) {
++        let tighter = self
++            .lower
++            .as_ref()
++            .is_none_or(|lower| &key > lower || (&key == lower && open && !self.lower_open));
++        if tighter {
++            self.lower = Some(key);
++            self.lower_open = open;
++        }
++    }
++
++    /// Lowers the upper bound to `key` (excluded if `open`), unless the current one is tighter.
++    pub fn restrict_upper(&mut self, key: IndexedDBKeyType, open: bool) {
++        let tighter = self
++            .upper
++            .as_ref()
++            .is_none_or(|upper| &key < upper || (&key == upper && open && !self.upper_open));
++        if tighter {
++            self.upper = Some(key);
++            self.upper_open = open;
++        }
++    }
+ }
+ 
+ /// <https://w3c.github.io/IndexedDB/#record-snapshot>
+@@ -309,9 +333,13 @@ pub enum AsyncReadOnlyOperation {
+         callback: GenericCallback<BackendResult<u64>>,
+         key_range: IndexedDBKeyRange,
+     },
++    /// Gets the records in `key_range` in ascending key order: the first `count` of them, or the
++    /// last `count` if `reverse` is set, or all of them if `count` is `None`.
+     Iterate {
+         callback: GenericCallback<BackendResult<Vec<IndexedDBRecord>>>,
+         key_range: IndexedDBKeyRange,
++        count: Option<u32>,
++        reverse: bool,
+     },
+ }
+ 
+@@ -682,4 +710,37 @@ mod test {
+         assert!(!full_range.is_singleton());
+         assert!(full_range.as_singleton().is_none());
+     }
++
++    #[test]
++    fn test_restrict_bounds() {
++        let one = IndexedDBKeyType::Number(1.0);
++        let two = IndexedDBKeyType::Number(2.0);
++        let three = IndexedDBKeyType::Number(3.0);
++
++        let mut range =
++            IndexedDBKeyRange::new(Some(two.clone()), Some(three.clone()), false, false);
++        range.restrict_lower(one.clone(), true);
++        assert_eq!(range.lower, Some(two.clone()));
++        assert!(!range.lower_open);
++        range.restrict_lower(two.clone(), false);
++        assert!(!range.lower_open);
++        range.restrict_lower(two.clone(), true);
++        assert!(range.lower_open);
++        range.restrict_lower(three.clone(), false);
++        assert_eq!(range.lower, Some(three.clone()));
++        assert!(!range.lower_open);
++
++        let mut range = IndexedDBKeyRange::default();
++        range.restrict_upper(two.clone(), true);
++        assert_eq!(range.upper, Some(two.clone()));
++        assert!(range.upper_open);
++        range.restrict_upper(two.clone(), false);
++        assert!(range.upper_open);
++        range.restrict_upper(three, true);
++        assert_eq!(range.upper, Some(two));
++        range.restrict_upper(one.clone(), false);
++        assert_eq!(range.upper, Some(one));
++        assert!(!range.upper_open);
++        assert!(range.lower.is_none());
++    }
+ }
+diff --git a/components/storage/indexeddb/engines/ohos_rdb.rs b/components/storage/indexeddb/engines/ohos_rdb.rs
+index 47c2c0cb99f..8fcd1d470f8 100644
+--- a/components/storage/indexeddb/engines/ohos_rdb.rs
++++ b/components/storage/indexeddb/engines/ohos_rdb.rs
+@@ -305,19 +305,23 @@ impl OhosRdbEngine {
+         store: &ObjectStoreModel,
+         key_range: IndexedDBKeyRange,
+         count: Option<u32>,
++        reverse: bool,
+     ) -> OhosRdbResult<Vec<ObjectDataModel>> {
+         let (sql, args) = shared::object_data_select_sql::<OhosRdbTransaction>(
+             "object_store_id, key, data",
+             store.id,
+             key_range,
+             count,
+-            true,
++            reverse,
+         )?;
+         let mut cursor = tx.query_sql(&sql, &args)?;
+         let mut rows = Vec::new();
+         while cursor.next_row()? {
+             rows.push(Self::read_object_data(&cursor)?);
+         }
++        if reverse {
++            rows.reverse();
++        }
+         Ok(rows)
+     }
+ 
+@@ -584,7 +588,7 @@ impl KvsEngine for OhosRdbEngine {
+                             &mut success_actions,
+                             &mut commit_error_actions,
+                             callback,
+-                            Self::object_data_rows(&tx, &object_store, key_range, Some(1))
++                            Self::object_data_rows(&tx, &object_store, key_range, Some(1), false)
+                                 .map(|mut rows| rows.pop().map(|row| row.data))
+                                 .map_err(|error| BackendError::DbErr(format!("{error:?}"))),
+                         );
+@@ -594,13 +598,16 @@ impl KvsEngine for OhosRdbEngine {
+                         key_range,
+                         count,
+                     }) => {
+-                        let result = Self::object_data_rows(&tx, &object_store, key_range, count)
+-                            .and_then(|rows| {
+-                                rows.into_iter()
+-                                    .map(|row| Self::decode_key(&row.key, "object data key decode"))
+-                                    .collect::<OhosRdbResult<Vec<_>>>()
+-                            })
+-                            .map_err(|error| BackendError::DbErr(format!("{error:?}")));
++                        let result =
++                            Self::object_data_rows(&tx, &object_store, key_range, count, false)
++                                .and_then(|rows| {
++                                    rows.into_iter()
++                                        .map(|row| {
++                                            Self::decode_key(&row.key, "object data key decode")
++                                        })
++                                        .collect::<OhosRdbResult<Vec<_>>>()
++                                })
++                                .map_err(|error| BackendError::DbErr(format!("{error:?}")));
+                         Self::enqueue_result(
+                             &mut success_actions,
+                             &mut commit_error_actions,
+@@ -617,7 +624,7 @@ impl KvsEngine for OhosRdbEngine {
+                             &mut success_actions,
+                             &mut commit_error_actions,
+                             callback,
+-                            Self::object_data_rows(&tx, &object_store, key_range, count)
++                            Self::object_data_rows(&tx, &object_store, key_range, count, false)
+                                 .map(|rows| rows.into_iter().map(|row| row.data).collect())
+                                 .map_err(|error| BackendError::DbErr(format!("{error:?}"))),
+                         );
+@@ -657,22 +664,27 @@ impl KvsEngine for OhosRdbEngine {
+                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+                         callback,
+                         key_range,
++                        count,
++                        reverse,
+                     }) => {
+-                        let result = Self::object_data_rows(&tx, &object_store, key_range, None)
+-                            .and_then(|rows| {
+-                                rows.into_iter()
+-                                    .map(|row| {
+-                                        let key =
+-                                            Self::decode_key(&row.key, "object data key decode")?;
+-                                        Ok(IndexedDBRecord {
+-                                            key: key.clone(),
+-                                            primary_key: key,
+-                                            value: row.data,
++                        let result =
++                            Self::object_data_rows(&tx, &object_store, key_range, count, reverse)
++                                .and_then(|rows| {
++                                    rows.into_iter()
++                                        .map(|row| {
++                                            let key = Self::decode_key(
++                                                &row.key,
++                                                "object data key decode",
++                                            )?;
++                                            Ok(IndexedDBRecord {
++                                                key: key.clone(),
++                                                primary_key: key,
++                                                value: row.data,
++                                            })
+                                         })
+-                                    })
+-                                    .collect::<OhosRdbResult<Vec<_>>>()
+-                            })
+-                            .map_err(|error| BackendError::DbErr(format!("{error:?}")));
++                                        .collect::<OhosRdbResult<Vec<_>>>()
++                                })
++                                .map_err(|error| BackendError::DbErr(format!("{error:?}")));
+                         Self::enqueue_result(
+                             &mut success_actions,
+                             &mut commit_error_actions,
+@@ -700,13 +712,16 @@ impl KvsEngine for OhosRdbEngine {
+                         callback,
+                         key_range,
+                     }) => {
+-                        let result = Self::object_data_rows(&tx, &object_store, key_range, Some(1))
+-                            .and_then(|mut rows| {
+-                                rows.pop()
+-                                    .map(|row| Self::decode_key(&row.key, "object data key decode"))
+-                                    .transpose()
+-                            })
+-                            .map_err(|error| BackendError::DbErr(format!("{error:?}")));
++                        let result =
++                            Self::object_data_rows(&tx, &object_store, key_range, Some(1), false)
++                                .and_then(|mut rows| {
++                                    rows.pop()
++                                        .map(|row| {
++                                            Self::decode_key(&row.key, "object data key decode")
++                                        })
++                                        .transpose()
++                                })
++                                .map_err(|error| BackendError::DbErr(format!("{error:?}")));
+                         Self::enqueue_result(
+                             &mut success_actions,
+                             &mut commit_error_actions,
+diff --git a/components/storage/indexeddb/engines/shared.rs b/components/storage/indexeddb/engines/shared.rs
+index fe91cf19406..5813ae16082 100644
+--- a/components/storage/indexeddb/engines/shared.rs
++++ b/components/storage/indexeddb/engines/shared.rs
+@@ -532,7 +532,7 @@ pub(crate) fn object_data_select_sql<T: StorageSqlTransaction>(
+     store_id: i64,
+     key_range: IndexedDBKeyRange,
+     count: Option<u32>,
+-    order_by_key: bool,
++    reverse: bool,
+ ) -> Result<(String, T::Values), T::Error> {
+     let mut values = T::new_values()?;
+     T::push_int(&mut values, store_id)?;
+@@ -541,9 +541,11 @@ pub(crate) fn object_data_select_sql<T: StorageSqlTransaction>(
+     let mut sql = format!(
+         "SELECT {select_list} FROM object_data WHERE object_store_id = ?1 AND {range_clause}"
+     );
+-    if order_by_key {
+-        sql.push_str(" ORDER BY key ASC");
+-    }
++    sql.push_str(if reverse {
++        " ORDER BY key DESC"
++    } else {
++        " ORDER BY key ASC"
++    });
+     if let Some(count) = count {
+         T::push_int(&mut values, count as i64)?;
+         sql.push_str(&format!(" LIMIT ?{}", T::value_count(&values)?));
+diff --git a/components/storage/indexeddb/engines/sqlite.rs b/components/storage/indexeddb/engines/sqlite.rs
+index 21c002a7f02..9b1d68e1295 100644
+--- a/components/storage/indexeddb/engines/sqlite.rs
++++ b/components/storage/indexeddb/engines/sqlite.rs
+@@ -7,7 +7,7 @@ use std::sync::Arc;
+ use log::{info, warn};
+ use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+ use rusqlite::{Connection, Error, OptionalExtension, params};
+-use sea_query::{Condition, Expr, ExprTrait, IntoCondition, SqliteQueryBuilder};
++use sea_query::{Condition, Expr, ExprTrait, IntoCondition, Order, SqliteQueryBuilder};
+ use sea_query_rusqlite::RusqliteBinder;
+ use servo_base::threadpool::ThreadPool;
+ use storage_traits::indexeddb::{
+@@ -179,6 +179,7 @@ impl SqliteEngine {
+         store: object_store_model::Model,
+         key_range: IndexedDBKeyRange,
+         count: Option<u32>,
++        reverse: bool,
+     ) -> Result<Vec<object_data_model::Model>, Error> {
+         let query = range_to_query(key_range);
+         let mut sql_query = sea_query::Query::select();
+@@ -189,7 +190,11 @@ impl SqliteEngine {
+                 object_data_model::Column::Key,
+                 object_data_model::Column::Data,
+             ])
+-            .and_where(query.and(Expr::col(object_data_model::Column::ObjectStoreId).is(store.id)));
++            .and_where(query.and(Expr::col(object_data_model::Column::ObjectStoreId).is(store.id)))
++            .order_by(
++                object_data_model::Column::Key,
++                if reverse { Order::Desc } else { Order::Asc },
++            );
+         if let Some(count) = count {
+             sql_query.limit(count as u64);
+         }
+@@ -209,7 +214,7 @@ impl SqliteEngine {
+         key_range: IndexedDBKeyRange,
+         count: Option<u32>,
+     ) -> Result<Vec<Vec<u8>>, Error> {
+-        Self::get_all(connection, store, key_range, count)
++        Self::get_all(connection, store, key_range, count, false)
+             .map(|models| models.into_iter().map(|m| m.key).collect())
+     }
+ 
+@@ -219,7 +224,7 @@ impl SqliteEngine {
+         key_range: IndexedDBKeyRange,
+         count: Option<u32>,
+     ) -> Result<Vec<Vec<u8>>, Error> {
+-        Self::get_all(connection, store, key_range, count)
++        Self::get_all(connection, store, key_range, count, false)
+             .map(|models| models.into_iter().map(|m| m.data).collect())
+     }
+ 
+@@ -228,9 +233,17 @@ impl SqliteEngine {
+         connection: &Connection,
+         store: object_store_model::Model,
+         key_range: IndexedDBKeyRange,
++        count: Option<u32>,
++        reverse: bool,
+     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+-        Self::get_all(connection, store, key_range, None)
+-            .map(|models| models.into_iter().map(|m| (m.key, m.data)).collect())
++        Self::get_all(connection, store, key_range, count, reverse).map(|models| {
++            let records = models.into_iter().map(|m| (m.key, m.data));
++            if reverse {
++                records.rev().collect()
++            } else {
++                records.collect()
++            }
++        })
+     }
+ 
+     fn put_item(
+@@ -651,10 +664,18 @@ impl KvsEngine for SqliteEngine {
+                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+                         callback,
+                         key_range,
++                        count,
++                        reverse,
+                     }) => {
+                         let _ = callback.send(
+-                            Self::get_all_records(&connection, object_store, key_range)
+-                                .map(|records| {
++                            Self::get_all_records(
++                                &connection,
++                                object_store,
++                                key_range,
++                                count,
++                                reverse,
++                            )
++                            .map(|records| {
+                                     records
+                                         .into_iter()
+                                         .map(|(key, data)| IndexedDBRecord {
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index b7f1ef81696..914b4a8209e 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -19,8 +19,8 @@ use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, Storage
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+     BackendError, BackendResult, ConnectionMsg, IndexedDBKeyRange, IndexedDBKeyType,
+-    IndexedDBObjectStore, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath, PutItemResult,
+-    SyncOperation, TxnCompleteMsg,
++    IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath,
++    PutItemResult, SyncOperation, TxnCompleteMsg,
+ };
+ use tempfile::TempDir;
+ use uuid::Uuid;
+@@ -489,6 +489,39 @@ fn get_all_keys_request(
+     receiver
+ }
+ 
++#[allow(clippy::too_many_arguments)]
++fn iterate_request(
++    ctx: &IndexedDbTestContext,
++    db_name: &str,
++    store_name: &str,
++    txn: u64,
++    key_range: IndexedDBKeyRange,
++    count: Option<u32>,
++    reverse: bool,
++    request_id: u64,
++) -> mpsc::Receiver<Option<BackendResult<Vec<IndexedDBRecord>>>> {
++    let (sender, receiver) = make_profile_callback();
++    GenericSend::send(
++        &ctx.private_threads,
++        IndexedDBThreadMsg::Async(
++            ctx.origin.clone(),
++            db_name.to_string(),
++            store_name.to_string(),
++            txn,
++            request_id,
++            IndexedDBTxnMode::Readonly,
++            AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
++                callback: sender,
++                key_range,
++                count,
++                reverse,
++            }),
++        ),
++    )
++    .unwrap();
++    receiver
++}
++
+ fn get_item(
+     ctx: &IndexedDbTestContext,
+     db_name: &str,
+@@ -1205,6 +1238,138 @@ fn test_indexeddb_cross_type_key_sort_order() {
+     ctx.shutdown();
+ }
+ 
++#[test]
++fn test_indexeddb_iterate_count_and_reverse() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-iterate";
++    let store_name = "items";
++    let connection_id =
++        expect_upgrade_and_initialize_database(&ctx, db_name, store_name, "by_author", None);
++
++    let txn = create_transaction(
++        &ctx,
++        db_name,
++        IndexedDBTxnMode::Readwrite,
++        vec![store_name.to_string()],
++    );
++    let mut receivers = Vec::new();
++    for request_id in 1..=5 {
++        let key = IndexedDBKeyType::Number(request_id as f64);
++        receivers.push((
++            request_id,
++            put_item_request(
++                &ctx,
++                db_name,
++                store_name,
++                txn,
++                request_id,
++                Some(key),
++                vec![request_id as u8],
++                true,
++            ),
++        ));
++    }
++    let commit_result = commit_transaction(&ctx, db_name, txn);
++    for (request_id, receiver) in receivers {
++        let result = recv_callback_timeout(&receiver, "iterate put reply");
++        assert!(result.is_ok(), "request {request_id} should succeed");
++        mark_request_handled(&ctx, db_name, txn, request_id);
++    }
++    let commit_msg = recv_callback_timeout(&commit_result, "iterate commit reply");
++    assert!(commit_msg.result.is_ok());
++    finish_transaction(&ctx, db_name, txn);
++
++    let number = |n: f64| IndexedDBKeyType::Number(n);
++    let cases = [
++        (
++            IndexedDBKeyRange::default(),
++            None,
++            false,
++            vec![1, 2, 3, 4, 5],
++        ),
++        (
++            IndexedDBKeyRange::default(),
++            None,
++            true,
++            vec![1, 2, 3, 4, 5],
++        ),
++        (
++            IndexedDBKeyRange::lower_bound(number(2.0), true),
++            Some(2),
++            false,
++            vec![3, 4],
++        ),
++        (
++            IndexedDBKeyRange::upper_bound(number(4.0), true),
++            Some(2),
++            true,
++            vec![2, 3],
++        ),
++        (
++            IndexedDBKeyRange::new(Some(number(2.0)), Some(number(4.0)), false, false),
++            Some(10),
++            true,
++            vec![2, 3, 4],
++        ),
++        (
++            IndexedDBKeyRange::lower_bound(number(5.0), true),
++            Some(1),
++            false,
++            vec![],
++        ),
++    ];
++
++    let txn = create_transaction(
++        &ctx,
++        db_name,
++        IndexedDBTxnMode::Readonly,
++        vec![store_name.to_string()],
++    );
++    let receivers: Vec<_> = cases
++        .iter()
++        .zip(1..)
++        .map(|((key_range, count, reverse, _), request_id)| {
++            iterate_request(
++                &ctx,
++                db_name,
++                store_name,
++                txn,
++                key_range.clone(),
++                *count,
++                *reverse,
++                request_id,
++            )
++        })
++        .collect();
++    let commit_result = commit_transaction(&ctx, db_name, txn);
++    for ((receiver, (key_range, count, reverse, expected)), request_id) in
++        receivers.iter().zip(&cases).zip(1..)
++    {
++        let records = recv_callback_timeout(receiver, "iterate reply").unwrap();
++        mark_request_handled(&ctx, db_name, txn, request_id);
++        let keys: Vec<_> = records.iter().map(|record| record.key.clone()).collect();
++        let values: Vec<_> = records.iter().map(|record| record.value.clone()).collect();
++        assert_eq!(
++            keys,
++            expected
++                .iter()
++                .map(|n| number(*n as f64))
++                .collect::<Vec<_>>(),
++            "{key_range:?} count {count:?} reverse {reverse}"
++        );
++        assert_eq!(
++            values,
++            expected.iter().map(|n| vec![*n as u8]).collect::<Vec<_>>()
++        );
++    }
++    let commit_msg = recv_callback_timeout(&commit_result, "iterate read commit reply");
++    assert!(commit_msg.result.is_ok());
++    finish_transaction(&ctx, db_name, txn);
++
++    close_database(&ctx, connection_id, db_name);
++    ctx.shutdown();
++}
++
+ #[test]
+ fn test_indexeddb_delete_item_range_respects_open_bounds() {
+     let ctx = IndexedDbTestContext::new();
