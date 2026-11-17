@@ -189,6 +189,19 @@ those scripts (they need network access). `check_stack.py` runs each with
 163. `indexeddb: Read the records of an index` — C · CI+device · watch: tests/wpt/tests/IndexedDB
 164. `indexeddb: Iterate cursors over indexes from their position in the index` — C · CI+device · watch: components/script_bindings/webidls/IDBCursor.webidl tests/wpt/tests/IndexedDB
 165. `docs: record patches 158 to 165 in the stack manifest` — B · none · watch: -
+166. `indexeddb: Get all keys, values and records with IDBGetAllOptions` — C · CI+device · watch: components/script_bindings/codegen/codegen.py tests/wpt/tests/IndexedDB
+167. `indexeddb: Read the key of an object store's record once` — A · CI+device · watch: -
+168. `indexeddb: Keep the object stores' rows in the database actor` — A · CI+device · watch: -
+169. `indexeddb: Check and store a put's index keys with one statement per table` — A · CI+device · watch: -
+170. `indexeddb: Write the key generator's current number once per transaction` — A · CI+device · watch: -
+171. `storage: Ask RDB whether a blob is NULL only when it is empty` — A · CI+device · watch: -
+172. `indexeddb: Prefetch the records of a cursor's next steps` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+173. `indexeddb: Return the same Array from keyPath on every read` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+174. `indexeddb: Throw from IDBObjectStore.index() once an abort has started` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+175. `indexeddb: Run no page code while computing keys from a clone` — C · CI+device · watch: components/script/dom/bindings/structuredclone.rs
+176. `script: Add a pref that exposes SharedArrayBuffer for testing` — B · CI+device · watch: components/script/dom/bindings/structuredclone.rs support/quickjs/cargo-config.toml
+177. `indexeddb: Convert SharedArrayBuffers and views on them to binary keys` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+178. `docs: record patches 166 to 178 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

@@ -1,0 +1,1566 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 08:02:41 +0000
+Subject: [PATCH] indexeddb: Prefetch the records of a cursor's next steps
+
+Design decision 10. Each cursor step was a round trip to the backend and
+a statement, about 1.1 ms on the DAYU200 even after the store rows were
+kept in the actor. A cursor's request to the backend now asks for more
+records than the one it finds: 1 at first, then twice as many as the
+cursor's last request, up to 64, as Gecko and Chromium prefetch; but 1
+after a write to its object store, for a step with a key, and always for
+"nextunique" over a non-unique index, whose later keys the backend finds
+only by reading every record of each key. The backend has returned the
+records that the next steps without a key find after the found one since
+the index cursors; it now returns them only while the stored bytes of
+all the records it returns (keys, primary keys and values) stay within
+1 MiB, leaving out the record that would cross it before reading its
+value. The found record comes back whatever its size.
+
+The cursor keeps those records and takes continue(), continue(key),
+continuePrimaryKey() and advance() steps from them (step 9 of "iterate a
+cursor" on the kept records) as long as they hold the record that the
+step finds and no request that writes to the cursor's object store (put,
+add, delete, clear, cursor update and delete) and no schema operation was
+made in the transaction since the request that returned them was made;
+writes to the transaction's other object stores leave them current.
+Writes are counted when they are made, so a write made after a cursor's
+request but before its result arrived counts too. Otherwise the cursor
+drops them and asks the backend. A step taken from them is still an
+entry of the transaction's request list, delivered in request order in
+its own task. A cursor keeps no records once its transaction can't take
+more steps, and the transaction drops the records of its cursors when it
+finishes.
+
+The fork test cursor-prefetch.any.js checks every step of cursors taking
+turns against a model of the spec's steps, with seeded random steps and
+writes through the store and the cursors, and the cases that a stale
+record would get wrong, also with writes to another store between the
+steps. The backend test test_cursor_steps_stop_at_the_bytes_limit pins
+the byte bound.
+
+Validation: Host: `cargo nextest run -p servo-storage -p servo-storage-traits` 144 passed, 1 skipped; WPT tests/wpt/tests/IndexedDB, 8 processes, SpiderMonkey 4,466 and 4,466, QuickJS 4,466 and 4,465 of 4,511 (P4.1 4,465 / 4,465; the differences are the known worker/sharedworker and origin-isolation flips, no unexpected results but QuickJS's idbversionchangeevent.any.worker open.blocked once); /_mozilla/IndexedDB/ with the interface lists 261 of 261 on SM, 259 of 261 on QuickJS (the interface lists, expected FAIL); cursor-prefetch.any.js 19 subtests pass with this build and with the P4.1 build, and fail with builds that ignore writes when taking kept records, stamp them when the reply arrives, or mis-handle continue(key) on them. DAYU200 (QuickJS + RDB, checked-release, 2 processes, idle host): WPT IndexedDB/ 4,448 of 4,511 (P4.1 4,441); interleaved-cursors-large passes in all three globals in 48.9-57.4 s (P4.1 TIMEOUT at 60 s), interleaved-cursors-small 21.7-24.3 s (26.3-29.0 s), idbcursor_iterating 1.8-2.2 s (3.8-4.4 s); the unexpected results are file_support (send_keys), idb-partitioned-coverage (testharness bookkeeping in its iframe, P4.2 report), idbversionchangeevent.any.worker, and createObjectStore-exception-order.any.sharedworker and rename-store.any.worker, which pass 3 of 3 alone; /_mozilla/IndexedDB/ 259 of 259; `./mach test-unit --ohos -p servo-storage` RDB only 145 passed / 3 skipped, SQLite and RDB 259 / 4. Probe page of 2,000 records, P4.1 vs this series: a store cursor step 1.73 -> 0.26 ms, an index cursor step 1.95 -> 0.29 ms, a key cursor step 1.53 -> 0.18 ms, two cursors taking turns 1.27 -> 0.23 ms, prevunique over 20 keys of 100 records 2.85 -> 1.45 ms, nextunique over 2 keys of 1,000 records 3.2 -> 2.5 ms. `./mach fmt`, `./mach test-tidy` (only the known libsqlite3-sys advisory), `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release` and `./mach check --ohos -- -p servo-storage --all-targets` with SQLite, RDB and both pass. P4 review fixes, folded in and checked at the end of the series (P4.3): the backend test test_cursor_steps_stop_at_the_bytes_limit passes on SQLite (host) and RDB (DAYU200) and fails with the former cap (it returned the record over the limit after the found one, and every large key of a key-only step); host nextest 145 passed / 1 skipped, DAYU200 RDB only 146 / 3, SQLite and RDB 261 / 4; cursor-prefetch.any.js 20 subtests (the new one writes to another store between the steps) pass on host SpiderMonkey, QuickJS and the board; board durations after the fixes: idbcursor_iterating 1.80-2.15 s, interleaved-cursors-small 21.9-23.7 s, interleaved-cursors-large 55.7-56.8 s (before them 1.94-2.23, 22.0-24.7 and 56.3-59.4 s).
+AI-assisted: Yes (agent session; implemented the prefetch and the fork test, checked the test against mutated builds, measured on host and board; folded in the P4 review fixes: the byte bound on a step's records, write counts per object store, kept records dropped when the transaction finishes)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbcursor.rs  | 231 ++++++--
+ .../script/dom/indexeddb/idbdatabase.rs       |   2 +
+ .../script/dom/indexeddb/idbobjectstore.rs    |   1 +
+ components/script/dom/indexeddb/idbrequest.rs |  29 +
+ .../script/dom/indexeddb/idbtransaction.rs    |  92 ++-
+ .../storage/indexeddb/backend/executor.rs     |   2 +
+ .../storage/indexeddb/backend/queries.rs      |  98 +++-
+ components/storage/indexeddb/backend/rdb.rs   |   4 +
+ .../storage/indexeddb/backend/sqlite.rs       |   7 +
+ components/storage/indexeddb/backend/tests.rs |  96 ++++
+ tests/wpt/mozilla/meta/MANIFEST.json          |  83 +++
+ .../tests/IndexedDB/cursor-prefetch.any.js    | 532 ++++++++++++++++++
+ 12 files changed, 1104 insertions(+), 73 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/cursor-prefetch.any.js
+
+diff --git a/components/script/dom/indexeddb/idbcursor.rs b/components/script/dom/indexeddb/idbcursor.rs
+index 3e5f0ba168a..ecad13233c1 100644
+--- a/components/script/dom/indexeddb/idbcursor.rs
++++ b/components/script/dom/indexeddb/idbcursor.rs
+@@ -5,6 +5,7 @@
+ #![cfg_attr(crown, allow(crown::jscontext_first_arg))]
+ 
+ use std::cell::Cell;
++use std::collections::VecDeque;
+ 
+ use dom_struct::dom_struct;
+ use js::context::JSContext;
+@@ -15,12 +16,13 @@ use script_bindings::cell::DomRefCell;
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, IndexedDBCursorDirection,
+-    IndexedDBCursorStep, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
++    IndexedDBCursorStep, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord, RequestOutput,
+ };
+ 
+ use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::{
+     IDBCursorDirection, IDBCursorMethods,
+ };
++use crate::dom::bindings::codegen::Bindings::IDBIndexBinding::IDBIndexMethods;
+ use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::IDBTransactionMode;
+ use crate::dom::bindings::codegen::UnionTypes::IDBObjectStoreOrIDBIndex;
+ use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
+@@ -46,6 +48,30 @@ pub(crate) fn backend_direction(direction: IDBCursorDirection) -> IndexedDBCurso
+     }
+ }
+ 
++/// The most records that a cursor asks the backend for in one step: the record the step finds,
++/// and those that the next steps without a key would find, which the cursor keeps.
++const MAX_PREFETCHED_RECORDS: u32 = 64;
++
++/// The records that a cursor's request to the backend returned after the record that the
++/// request moved the cursor to, as the next steps without a key would find them.
++#[derive(Default, MallocSizeOf)]
++struct Prefetched {
++    records: VecDeque<IndexedDBRecord>,
++    /// The writes count of the cursor's transaction for its effective object store when the
++    /// request was made; the records are current while it stays the same.
++    writes: u64,
++}
++
++/// A request of a cursor that the backend runs.
++#[derive(Clone, Copy, MallocSizeOf)]
++struct Fetch {
++    /// The most records that it asks for.
++    records: u32,
++    /// The writes count of the cursor's transaction for its effective object store when it was
++    /// made.
++    writes: u64,
++}
++
+ #[derive(JSTraceable, MallocSizeOf)]
+ #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+ pub(crate) enum ObjectStoreOrIndex {
+@@ -89,6 +115,14 @@ pub(crate) struct IDBCursor {
+ 
+     /// <https://w3c.github.io/IndexedDB/#cursor-request>
+     request: MutNullableDom<IDBRequest>,
++
++    /// The records that the next steps of the cursor can take without asking the backend.
++    #[no_trace]
++    prefetched: DomRefCell<Prefetched>,
++    /// The last request of the cursor that the backend runs, and whether its result is pending.
++    #[no_trace]
++    last_fetch: Cell<Option<Fetch>>,
++    fetch_pending: Cell<bool>,
+ }
+ 
+ impl IDBCursor {
+@@ -116,6 +150,9 @@ impl IDBCursor {
+             object_store_position: DomRefCell::new(None),
+             key_only,
+             request: Default::default(),
++            prefetched: Default::default(),
++            last_fetch: Cell::new(None),
++            fetch_pending: Cell::new(false),
+         }
+     }
+ 
+@@ -231,9 +268,31 @@ impl IDBCursor {
+         Ok(())
+     }
+ 
++    /// How many records the next request of the cursor to the backend asks for: twice as many
++    /// as the last request, up to [`MAX_PREFETCHED_RECORDS`], for a step without a key, as
++    /// Chromium and Gecko prefetch; one at first, after a write in the transaction, and for a
++    /// step with a key, which went beyond the records taken before.
++    ///
++    /// A "nextunique" cursor over an index that isn't unique asks for one record: to return the
++    /// keys after the first, the backend reads every record of each key, while a step reads only
++    /// the first record of its key.
++    fn next_fetch(&self, with_key: bool) -> Fetch {
++        let writes = self.transaction.writes(self.effective_object_store().id());
++        let unique_steps = self.direction == IDBCursorDirection::Nextunique &&
++            matches!(&self.source, ObjectStoreOrIndex::Index(index) if !index.Unique());
++        let records = match self.last_fetch.get() {
++            Some(last) if last.writes == writes && !with_key && !unique_steps => {
++                (last.records * 2).min(MAX_PREFETCHED_RECORDS)
++            },
++            _ => 1,
++        };
++        Fetch { records, writes }
++    }
++
+     /// The operation of <https://w3c.github.io/IndexedDB/#iterate-a-cursor> with this cursor,
+     /// `key`, `primary_key` and `count`: the backend finds the record from the cursor's position
+-    /// (step 9), which `iterate_cursor` then moves the cursor to.
++    /// (step 9), which `iterate_cursor` then moves the cursor to, and returns the records that the
++    /// next steps without a key would find after it, which the cursor keeps.
+     pub(crate) fn iterate_operation(
+         &self,
+         key: Option<IndexedDBKeyType>,
+@@ -253,6 +312,10 @@ impl IDBCursor {
+             ObjectStoreOrIndex::ObjectStore(_) => None,
+             ObjectStoreOrIndex::Index(index) => Some(index.id()),
+         };
++        let fetch = self.next_fetch(key.is_some());
++        self.last_fetch.set(Some(fetch));
++        self.fetch_pending.set(true);
++        self.prefetched.borrow_mut().records.clear();
+         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+             index,
+             key_range: self.range.clone(),
+@@ -264,10 +327,105 @@ impl IDBCursor {
+                 primary_key,
+                 count,
+             },
+-            records: 1,
++            records: fetch.records,
+             key_only: self.key_only,
+         })
+     }
++
++    /// Takes the record that <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9 finds
++    /// with `key`, `primary_key` and `count` from the prefetched records, with those before it, if
++    /// they are current and hold it; returns `None` and drops them otherwise.
++    ///
++    /// The prefetched records are the records that the steps without a key find one after the
++    /// other, from the cursor's position, as of the cursor's last request to the backend; no
++    /// write was made in the transaction since, so the records are still those. Step 9 with a key
++    /// (and a primary key) finds the first of them that meets its requirements for the key (and
++    /// primary key) as well, and with count n, the nth.
++    fn take_prefetched(
++        &self,
++        key: Option<&IndexedDBKeyType>,
++        primary_key: Option<&IndexedDBKeyType>,
++        count: u32,
++    ) -> Option<IndexedDBRecord> {
++        let mut prefetched = self.prefetched.borrow_mut();
++        if prefetched.writes != self.transaction.writes(self.effective_object_store().id()) {
++            prefetched.records.clear();
++            return None;
++        }
++        let reverse = matches!(
++            self.direction,
++            IDBCursorDirection::Prev | IDBCursorDirection::Prevunique
++        );
++        let beyond = |a: &IndexedDBKeyType, b: &IndexedDBKeyType| {
++            if reverse { a < b } else { a > b }
++        };
++        let found = match (key, primary_key) {
++            (None, _) => (count as usize).checked_sub(1),
++            // "If key is defined, the record’s key is greater than or equal to key", or less for
++            // "prev" and "prevunique".
++            (Some(key), None) => prefetched
++                .records
++                .iter()
++                .position(|record| record.key == *key || beyond(&record.key, key)),
++            // "If primaryKey is defined, the record’s key is equal to key and the record’s value
++            // is greater than or equal to primaryKey, or the record’s key is greater than key",
++            // or less for "prev".
++            (Some(key), Some(primary_key)) => prefetched.records.iter().position(|record| {
++                beyond(&record.key, key) ||
++                    (record.key == *key &&
++                        (record.primary_key == *primary_key ||
++                            beyond(&record.primary_key, primary_key)))
++            }),
++        };
++        match found.filter(|found| *found < prefetched.records.len()) {
++            Some(found) => {
++                prefetched.records.drain(..found);
++                prefetched.records.pop_front()
++            },
++            None => {
++                prefetched.records.clear();
++                None
++            },
++        }
++    }
++
++    /// Drops the records that the cursor keeps, which its transaction, once finished, can't use.
++    pub(crate) fn drop_prefetched_records(&self) {
++        self.prefetched.borrow_mut().records = VecDeque::new();
++    }
++
++    /// Runs <https://w3c.github.io/IndexedDB/#asynchronously-execute-a-request> with this
++    /// cursor's source, its request and the steps to iterate this cursor with `key`,
++    /// `primary_key` and `count`: with the record that the prefetched records give, or else
++    /// with the backend.
++    fn iterate(
++        &self,
++        cx: &mut JSContext,
++        key: Option<IndexedDBKeyType>,
++        primary_key: Option<IndexedDBKeyType>,
++        count: u32,
++    ) -> ErrorResult {
++        let request = self.Request();
++        let iteration_param = IterationParam {
++            cursor: Trusted::new(self),
++        };
++        if let Some(record) = self.take_prefetched(key.as_ref(), primary_key.as_ref(), count) {
++            return IDBRequest::execute_with_result(
++                self.request_source(),
++                Ok(RequestOutput::Records(vec![record])),
++                request,
++                iteration_param,
++            );
++        }
++        IDBRequest::execute_async(
++            cx,
++            self.request_source(),
++            self.iterate_operation(key, primary_key, count),
++            Some(request),
++            Some(iteration_param),
++        )?;
++        Ok(())
++    }
+ }
+ 
+ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+@@ -370,27 +528,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+         self.got_value.set(false);
+ 
+         // Step 8: Let request be the request created when this cursor was created.
+-        let request = self.Request();
+-
+         // Step 9: Unset the request's done flag on request.
+-        request.unset_done_flag();
++        self.Request().unset_done_flag();
+ 
+         // Step 10: Run the steps to asynchronously execute a request with the cursor's source as
+         // source, the steps to iterate a cursor as operation and request, using the current Realm
+         // as targetRealm, this cursor and count.
+-        let iteration_param = IterationParam {
+-            cursor: Trusted::new(self),
+-        };
+-
+-        IDBRequest::execute_async(
+-            cx,
+-            self.request_source(),
+-            self.iterate_operation(None, None, count),
+-            Some(request),
+-            Some(iteration_param),
+-        )?;
+-
+-        Ok(())
++        self.iterate(cx, None, None, count)
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-continue>
+@@ -452,27 +596,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+         self.got_value.set(false);
+ 
+         // Step 7: Let request be the request created when this cursor was created.
+-        let request = self.Request();
+-
+         // Step 8: Unset the request's done flag on request.
+-        request.unset_done_flag();
++        self.Request().unset_done_flag();
+ 
+         // Step 9: Run the steps to asynchronously execute a request with the cursor's source as
+         // source, the steps to iterate a cursor as operation and request, using the current Realm
+         // as targetRealm, this cursor and key (if given).
+-        let iteration_param = IterationParam {
+-            cursor: Trusted::new(self),
+-        };
+-
+-        IDBRequest::execute_async(
+-            cx,
+-            self.request_source(),
+-            self.iterate_operation(key, None, 1),
+-            Some(request),
+-            Some(iteration_param),
+-        )?;
+-
+-        Ok(())
++        self.iterate(cx, key, None, 1)
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-continueprimarykey>
+@@ -586,27 +716,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+         self.got_value.set(false);
+ 
+         // Step 18: Let request be the request created when this cursor was created.
+-        let request = self.Request();
+-
+         // Step 19: Unset the request's done flag on request.
+-        request.unset_done_flag();
++        self.Request().unset_done_flag();
+ 
+         // Step 20: Run the steps to asynchronously execute a request with the cursor's source as
+         // source, the steps to iterate a cursor as operation and request, using the current Realm
+         // as targetRealm, this cursor, key and primaryKey.
+-        let iteration_param = IterationParam {
+-            cursor: Trusted::new(self),
+-        };
+-
+-        IDBRequest::execute_async(
+-            cx,
+-            self.request_source(),
+-            self.iterate_operation(Some(key), Some(primary_key), 1),
+-            Some(request),
+-            Some(iteration_param),
+-        )?;
+-
+-        Ok(())
++        self.iterate(cx, Some(key), Some(primary_key), 1)
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-update>
+@@ -780,7 +896,18 @@ pub(crate) fn iterate_cursor(
+     let source = &cursor.source;
+ 
+     // Steps 2-9.1: the backend found the record, after count - 1 rounds of step 9.
+-    let Some(found_record) = records.into_iter().next() else {
++    let mut records = VecDeque::from(records);
++    let found_record = records.pop_front();
++    // The records after it are those that the next steps without a key find, as of the request.
++    // A transaction that is finishing or finished takes no more steps.
++    if cursor.fetch_pending.replace(false) && cursor.transaction.is_usable() {
++        let writes = cursor.last_fetch.get().map_or(0, |fetch| fetch.writes);
++        if !records.is_empty() {
++            cursor.transaction.note_prefetching_cursor(&cursor);
++        }
++        *cursor.prefetched.borrow_mut() = Prefetched { records, writes };
++    }
++    let Some(found_record) = found_record else {
+         // Step 9.2. If found record is not defined, then:
+         // Step 9.2.1. Set cursor’s key to undefined.
+         cursor.set_key(None);
+diff --git a/components/script/dom/indexeddb/idbdatabase.rs b/components/script/dom/indexeddb/idbdatabase.rs
+index af56265a871..018f77420e8 100644
+--- a/components/script/dom/indexeddb/idbdatabase.rs
++++ b/components/script/dom/indexeddb/idbdatabase.rs
+@@ -548,6 +548,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+             key_path,
+             auto_increment,
+         };
++        transaction.note_write(None);
+         if self
+             .get_idb_thread()
+             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
+@@ -608,6 +609,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+ 
+         // Step 7. Destroy store.
+         let operation = AsyncSchemaOperation::DeleteObjectStore;
++        transaction.note_write(None);
+         if self
+             .get_idb_thread()
+             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index 529f68146d6..b0e582297c5 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -627,6 +627,7 @@ impl IDBObjectStore {
+     /// Sends the schema operation `operation` of this handle's object store to the backend, in
+     /// the handle's transaction.
+     fn send_schema_operation(&self, operation: AsyncSchemaOperation) -> Fallible<()> {
++        self.transaction.note_write(None);
+         self.get_idb_thread()
+             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
+                 origin: self.global().origin().immutable().clone(),
+diff --git a/components/script/dom/indexeddb/idbrequest.rs b/components/script/dom/indexeddb/idbrequest.rs
+index 2b07c1fa01d..399f75dd6de 100644
+--- a/components/script/dom/indexeddb/idbrequest.rs
++++ b/components/script/dom/indexeddb/idbrequest.rs
+@@ -319,6 +319,10 @@ impl IDBRequest {
+             );
+         }
+ 
++        if matches!(operation, AsyncOperation::ReadWrite(_)) {
++            transaction.note_write(Some(object_store.id()));
++        }
++
+         let request_id = transaction.allocate_request_id();
+ 
+         // Step 3: If request was not given, let request be a new request with source as source.
+@@ -358,6 +362,31 @@ impl IDBRequest {
+         Ok(request)
+     }
+ 
++    /// <https://w3c.github.io/IndexedDB/#asynchronously-execute-a-request> for a cursor's
++    /// `request`, whose operation's `result` script knows from the records the cursor prefetched:
++    /// like [`Self::execute_async`], but the result is delivered without asking the backend.
++    pub(crate) fn execute_with_result(
++        source: RequestSource,
++        result: BackendResult<RequestOutput>,
++        request: DomRoot<IDBRequest>,
++        iteration_param: IterationParam,
++    ) -> ErrorResult {
++        // Step 1: Let transaction be the transaction associated with source.
++        let transaction = source.object_store().transaction();
++        // Step 2: Assert: transaction is active.
++        if !transaction.is_active() || !transaction.is_usable() {
++            return Err(Error::TransactionInactive(Some(
++                "Transaction is not active".to_owned(),
++            )));
++        }
++        // Step 4: Add request to the end of transaction’s request list.
++        // Step 5: Run these steps in parallel: [...] Let result be the result of performing
++        // operation.
++        let request_id = transaction.allocate_request_id();
++        transaction.add_request_with_result(&request, request_id, iteration_param, result);
++        Ok(())
++    }
++
+     /// <https://w3c.github.io/IndexedDB/#create-a-request-to-retrieve-multiple-items>, from an
+     /// object store or an index `source_handle`.
+     pub(crate) fn retrieve_multiple_items(
+diff --git a/components/script/dom/indexeddb/idbtransaction.rs b/components/script/dom/indexeddb/idbtransaction.rs
+index 32935afa41a..d9c531d65a8 100644
+--- a/components/script/dom/indexeddb/idbtransaction.rs
++++ b/components/script/dom/indexeddb/idbtransaction.rs
+@@ -34,7 +34,7 @@ use crate::dom::domstringlist::DOMStringList;
+ use crate::dom::event::{Event, EventBubbles, EventCancelable};
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::globalscope::GlobalScope;
+-use crate::dom::indexeddb::idbcursor::IterationParam;
++use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam};
+ use crate::dom::indexeddb::idbdatabase::IDBDatabase;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+ use crate::dom::indexeddb::idbrequest::IDBRequest;
+@@ -114,6 +114,14 @@ pub struct IDBTransaction {
+     cleanup_event_loop: Cell<Option<ScriptEventLoopId>>,
+     registered_in_global: Cell<bool>,
+     next_request_id: Cell<u64>,
++    /// The number of schema operations made in this transaction, and of the requests that write
++    /// to each object store, which tell cursors whether the records they prefetched are still
++    /// current.
++    schema_writes: Cell<u64>,
++    store_writes: DomRefCell<HashMap<IndexedDBObjectStoreId, u64>>,
++    /// The cursors of this transaction that keep prefetched records, which it drops when it
++    /// finishes.
++    prefetching_cursors: DomRefCell<Vec<Dom<IDBCursor>>>,
+ 
+     /// The id the backend knows this transaction by.
+     #[no_trace]
+@@ -155,6 +163,9 @@ impl IDBTransaction {
+             cleanup_event_loop: Cell::new(None),
+             registered_in_global: Cell::new(false),
+             next_request_id: Cell::new(0),
++            schema_writes: Cell::new(0),
++            store_writes: Default::default(),
++            prefetching_cursors: Default::default(),
+             id,
+         }
+     }
+@@ -412,6 +423,44 @@ impl IDBTransaction {
+         id
+     }
+ 
++    /// Notes that a request that writes to the object store `store`, or a schema operation if
++    /// `store` is `None`, was made in this transaction. The requests after it see its changes, so
++    /// the records that cursors over the store, or over any store, prefetched before are no
++    /// longer current.
++    pub(crate) fn note_write(&self, store: Option<IndexedDBObjectStoreId>) {
++        match store {
++            Some(store) => *self.store_writes.borrow_mut().entry(store).or_default() += 1,
++            None => self.schema_writes.set(self.schema_writes.get() + 1),
++        }
++    }
++
++    /// The number of schema operations, and of requests that write to the object store `store`,
++    /// made in this transaction.
++    pub(crate) fn writes(&self, store: IndexedDBObjectStoreId) -> u64 {
++        self.schema_writes.get() + self.store_writes.borrow().get(&store).copied().unwrap_or(0)
++    }
++
++    /// Notes that `cursor` keeps prefetched records, which the transaction drops when it
++    /// finishes.
++    pub(crate) fn note_prefetching_cursor(&self, cursor: &IDBCursor) {
++        let mut cursors = self.prefetching_cursors.borrow_mut();
++        if !cursors.iter().any(|kept| &**kept == cursor) {
++            cursors.push(Dom::from_ref(cursor));
++        }
++    }
++
++    fn drop_prefetched_records(&self) {
++        let cursors: Vec<DomRoot<IDBCursor>> = self
++            .prefetching_cursors
++            .borrow_mut()
++            .drain(..)
++            .map(|cursor| cursor.as_rooted())
++            .collect();
++        for cursor in cursors {
++            cursor.drop_prefetched_records();
++        }
++    }
++
+     /// <https://w3c.github.io/IndexedDB/#asynchronously-execute-a-request>
+     /// Step 4: Add request to the end of transaction’s request list.
+     pub(crate) fn add_request(
+@@ -428,6 +477,24 @@ impl IDBTransaction {
+         });
+     }
+ 
++    /// Adds `request` to the end of the request list with `result`, which script knows without
++    /// asking the backend, and delivers it in request order.
++    pub(crate) fn add_request_with_result(
++        &self,
++        request: &IDBRequest,
++        id: u64,
++        iteration_param: IterationParam,
++        result: BackendResult<RequestOutput>,
++    ) {
++        self.requests.borrow_mut().push_back(PendingRequest {
++            request: Some(Dom::from_ref(request)),
++            id,
++            iteration_param: Some(iteration_param),
++            result: Some(result),
++        });
++        self.queue_delivery();
++    }
++
+     /// Notes that this upgrade transaction created the object store `store`, which has no
+     /// records.
+     pub(crate) fn note_new_empty_store(&self, store: IndexedDBObjectStoreId) {
+@@ -662,16 +729,22 @@ impl IDBTransaction {
+             .front()
+             .is_some_and(|pending| pending.result.is_some())
+         {
+-            let this = Trusted::new(self);
+-            self.global()
+-                .task_manager()
+-                .database_access_task_source()
+-                .queue(task!(deliver_indexeddb_result: move |cx| {
+-                    this.root().deliver_next_result(cx);
+-                }));
++            self.queue_delivery();
+         }
+     }
+ 
++    /// Queues a task that delivers the result of the first request in the request list, if it
++    /// is there by then.
++    fn queue_delivery(&self) {
++        let this = Trusted::new(self);
++        self.global()
++            .task_manager()
++            .database_access_task_source()
++            .queue(task!(deliver_indexeddb_result: move |cx| {
++                this.root().deliver_next_result(cx);
++            }));
++    }
++
+     /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>, the steps after the backend
+     /// wrote the changes or failed to.
+     fn commit_result_arrived(&self, cx: &mut JSContext, result: BackendResult<()>) {
+@@ -807,6 +880,7 @@ impl IDBTransaction {
+         // https://w3c.github.io/IndexedDB/#transaction-lifetime
+         // Step 6: When a transaction is committed or aborted, its state is set to finished.
+         self.finished.set(true);
++        self.drop_prefetched_records();
+         self.version_change_old_version.set(None);
+         self.version_change_old_object_stores
+             .safe_borrow_mut(cx.no_gc())
+@@ -839,6 +913,7 @@ impl IDBTransaction {
+             return;
+         }
+         self.finished.set(true);
++        self.drop_prefetched_records();
+         self.requests.borrow_mut().clear();
+         self.index_populations.borrow_mut().clear();
+         self.send_abort_to_backend();
+@@ -873,6 +948,7 @@ impl IDBTransaction {
+         }
+         // Step 2.5.2: Set transaction’s state to finished.
+         self.finished.set(true);
++        self.drop_prefetched_records();
+         let global = self.global();
+         let event = Event::new(
+             cx,
+diff --git a/components/storage/indexeddb/backend/executor.rs b/components/storage/indexeddb/backend/executor.rs
+index c349299c4bc..ff46642b4af 100644
+--- a/components/storage/indexeddb/backend/executor.rs
++++ b/components/storage/indexeddb/backend/executor.rs
+@@ -37,6 +37,8 @@ pub(crate) trait SqlRow {
+     #[cfg(test)]
+     fn optional_text(&self, column: usize) -> Result<Option<String>, SqlError>;
+     fn optional_blob(&self, column: usize) -> Result<Option<Vec<u8>>, SqlError>;
++    /// The size in bytes of a BLOB or TEXT column, 0 for NULL, without reading its content.
++    fn size(&self, column: usize) -> Result<usize, SqlError>;
+ 
+     fn integer(&self, column: usize) -> Result<i64, SqlError> {
+         self.optional_integer(column)?
+diff --git a/components/storage/indexeddb/backend/queries.rs b/components/storage/indexeddb/backend/queries.rs
+index 3ae14cd839f..656c46eecbb 100644
+--- a/components/storage/indexeddb/backend/queries.rs
++++ b/components/storage/indexeddb/backend/queries.rs
+@@ -700,6 +700,19 @@ fn select<X: SqlExecutor, T>(
+     offset: u32,
+     map_row: impl Fn(&dyn SqlRow) -> Result<T, SqlError>,
+ ) -> Result<Vec<T>, SqlError> {
++    let (sql, params) = select_statement(source, columns, condition, reverse, count, offset);
++    query_rows(executor, &sql, &params, map_row)
++}
++
++/// The statement of [`select`], and its parameters.
++fn select_statement<'a>(
++    source: RecordSource,
++    columns: RecordColumns,
++    condition: &'a RangeCondition,
++    reverse: bool,
++    count: Option<u32>,
++    offset: u32,
++) -> (String, Vec<SqlParam<'a>>) {
+     let (table_and_condition, selected) = source.table_and_condition(columns, condition);
+     let mut sql = format!(
+         "SELECT {selected} FROM {table_and_condition} ORDER BY {}",
+@@ -714,7 +727,7 @@ fn select<X: SqlExecutor, T>(
+             params.push(SqlParam::Integer(offset.into()));
+         }
+     }
+-    query_rows(executor, &sql, &params, map_row)
++    (sql, params)
+ }
+ 
+ fn primary_key_of_row(row: &dyn SqlRow) -> Result<IndexedDBKeyType, SqlError> {
+@@ -1010,10 +1023,14 @@ impl StepBounds {
+     }
+ }
+ 
++/// The most bytes of keys, primary keys and values, as stored, that a cursor step returns with
++/// the records after the one it finds; that one comes back whatever its size.
++pub(crate) const CURSOR_RECORDS_BYTES: usize = 1 << 20;
++
+ /// <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9, for a cursor over the records of
+ /// `source` in `range`: the record that `step` moves the cursor to in `direction`, then the
+-/// records that further steps without a key would move it to, at most `records` records in all,
+-/// in the order of the steps. Without values if `key_only`.
++/// records that further steps without a key would move it to, at most `records` records in all
++/// and [`CURSOR_RECORDS_BYTES`] bytes, in the order of the steps. Without values if `key_only`.
+ #[allow(clippy::too_many_arguments)]
+ pub(crate) fn cursor_records<X: SqlExecutor>(
+     executor: &mut X,
+@@ -1097,16 +1114,71 @@ pub(crate) fn cursor_records<X: SqlExecutor>(
+     } else {
+         RecordColumns::Record
+     };
+-    select(
+-        executor,
+-        source,
+-        columns,
+-        &condition,
+-        reverse,
+-        Some(records),
+-        offset,
+-        |row| record_of_row(source, row, !key_only),
+-    )
++    let (sql, params) =
++        select_statement(source, columns, &condition, reverse, Some(records), offset);
++    let mut found = Vec::new();
++    let mut bytes = 0;
++    executor.query(&sql, &params, &mut |row| {
++        let limit = if found.is_empty() {
++            usize::MAX
++        } else {
++            CURSOR_RECORDS_BYTES - bytes
++        };
++        let Some((record, size)) = record_of_row_within(source, row, !key_only, limit)? else {
++            return Ok(ControlFlow::Break(()));
++        };
++        bytes += size;
++        found.push(record);
++        Ok(if bytes >= CURSOR_RECORDS_BYTES {
++            ControlFlow::Break(())
++        } else {
++            ControlFlow::Continue(())
++        })
++    })?;
++    Ok(found)
++}
++
++/// [`record_of_row`] and the bytes that its key, primary key and value take as stored, or `None`
++/// if they take more than `limit`, in which case the value isn't read.
++fn record_of_row_within(
++    source: RecordSource,
++    row: &dyn SqlRow,
++    with_value: bool,
++    limit: usize,
++) -> Result<Option<(IndexedDBRecord, usize)>, SqlError> {
++    let encoded_key = row.blob(0)?;
++    let (encoded_primary_key, value_column) = match source {
++        RecordSource::ObjectStore(_) => (None, 1),
++        RecordSource::Index(_) => (Some(row.blob(1)?), 2),
++    };
++    let mut size = encoded_key.len() +
++        encoded_primary_key
++            .as_ref()
++            .map_or(encoded_key.len(), Vec::len);
++    if with_value {
++        size += row.size(value_column)?;
++    }
++    if size > limit {
++        return Ok(None);
++    }
++    let key = decode_key(&encoded_key)?;
++    let primary_key = match encoded_primary_key {
++        Some(encoded_primary_key) => decode_key(&encoded_primary_key)?,
++        None => key.clone(),
++    };
++    let value = if with_value {
++        Some(row.blob(value_column)?)
++    } else {
++        None
++    };
++    Ok(Some((
++        IndexedDBRecord {
++            key,
++            primary_key,
++            value,
++        },
++        size,
++    )))
+ }
+ 
+ /// <https://w3c.github.io/IndexedDB/#count-the-records-in-a-range>
+diff --git a/components/storage/indexeddb/backend/rdb.rs b/components/storage/indexeddb/backend/rdb.rs
+index 8d09ff8c944..b5a33a435a2 100644
+--- a/components/storage/indexeddb/backend/rdb.rs
++++ b/components/storage/indexeddb/backend/rdb.rs
+@@ -139,6 +139,10 @@ impl SqlRow for RdbRow<'_, '_> {
+     fn optional_blob(&self, column: usize) -> Result<Option<Vec<u8>>, SqlError> {
+         Ok(self.0.blob(column)?)
+     }
++
++    fn size(&self, column: usize) -> Result<usize, SqlError> {
++        Ok(self.0.size(column)?)
++    }
+ }
+ 
+ impl SqlExecutor for RdbExecutor {
+diff --git a/components/storage/indexeddb/backend/sqlite.rs b/components/storage/indexeddb/backend/sqlite.rs
+index 5c77eeccd7e..224db2d6bdb 100644
+--- a/components/storage/indexeddb/backend/sqlite.rs
++++ b/components/storage/indexeddb/backend/sqlite.rs
+@@ -132,6 +132,13 @@ impl SqlRow for SqliteRow<'_, '_> {
+     fn optional_blob(&self, column: usize) -> Result<Option<Vec<u8>>, SqlError> {
+         Ok(self.0.get(column)?)
+     }
++
++    fn size(&self, column: usize) -> Result<usize, SqlError> {
++        Ok(match self.0.get_ref(column)? {
++            ValueRef::Blob(bytes) | ValueRef::Text(bytes) => bytes.len(),
++            _ => 0,
++        })
++    }
+ }
+ 
+ impl SqlExecutor for SqliteExecutor {
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index cc985ccc939..67a60fa24e1 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -143,6 +143,7 @@ executor_tests!(
+     test_cursor_steps_find_what_the_spec_finds,
+     test_cursor_steps_see_the_writes_between_them,
+     test_get_all_retrieves_what_a_cursor_visits,
++    test_cursor_steps_stop_at_the_bytes_limit,
+ );
+ 
+ const TIMEOUT: Duration = Duration::from_secs(10);
+@@ -6009,3 +6010,98 @@ fn pref_selects_the_executor() {
+         assert_eq!(matches!(executor, TwinExecutor::Rdb(_)), rdb_enabled);
+     }
+ }
++
++/// A cursor step returns the records after the one it finds only while their keys, primary keys
++/// and values fit in [`queries::CURSOR_RECORDS_BYTES`] as stored: the record that would cross it
++/// is left out, also when it has no value but large keys, and the found record comes back
++/// whatever its size.
++fn test_cursor_steps_stop_at_the_bytes_limit<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let values = create_store(&db, "values", None, false).unwrap();
++    let keys = create_store(&db, "keys", None, false).unwrap();
++    let limit = queries::CURSOR_RECORDS_BYTES;
++    let mut connection = db.connection();
++    let mut put = |store: i64, key: IndexedDBKeyType, value: &[u8]| {
++        let mut object_store = queries::object_store(&mut *connection, store)
++            .unwrap()
++            .unwrap();
++        queries::put_record(
++            &mut *connection,
++            &mut object_store,
++            Some(key),
++            value,
++            true,
++            vec![],
++        )
++        .unwrap();
++    };
++    for (key, size) in [(1.0, 10), (2.0, limit), (3.0, 10), (4.0, 10)] {
++        put(values, number(key), &vec![1; size]);
++    }
++    for n in 1..=4 {
++        put(keys, IndexedDBKeyType::Binary(vec![n; limit / 3]), &[n]);
++    }
++    for n in 5..=8 {
++        put(keys, IndexedDBKeyType::Binary(vec![n; 16]), &[n]);
++    }
++    let found = |connection: &mut X, store: i64, position: Option<IndexedDBKeyType>, key_only| {
++        let object_store = queries::object_store(connection, store).unwrap().unwrap();
++        let step = IndexedDBCursorStep {
++            position,
++            object_store_position: None,
++            key: None,
++            primary_key: None,
++            count: 1,
++        };
++        queries::cursor_records(
++            connection,
++            RecordSource::ObjectStore(&object_store),
++            &IndexedDBKeyRange::default(),
++            IndexedDBCursorDirection::Next,
++            &step,
++            64,
++            key_only,
++        )
++        .unwrap()
++        .into_iter()
++        .map(|record| record.primary_key)
++        .collect::<Vec<_>>()
++    };
++    let connection = &mut *connection;
++    assert_eq!(
++        found(connection, values, None, false),
++        [number(1.0)],
++        "the record over the limit after the found one is left out"
++    );
++    assert_eq!(
++        found(connection, values, Some(number(1.0)), false),
++        [number(2.0)],
++        "the found record comes back whatever its size, and nothing after it"
++    );
++    assert_eq!(
++        found(connection, values, Some(number(2.0)), false),
++        [number(3.0), number(4.0)]
++    );
++    assert_eq!(
++        found(connection, values, None, true),
++        [number(1.0), number(2.0), number(3.0), number(4.0)],
++        "a key-only step reads no values"
++    );
++    assert_eq!(
++        found(connection, keys, None, true),
++        [IndexedDBKeyType::Binary(vec![1; limit / 3])],
++        "a key-only step counts the keys"
++    );
++    assert_eq!(
++        found(
++            connection,
++            keys,
++            Some(IndexedDBKeyType::Binary(vec![4; limit / 3])),
++            true
++        )
++        .len(),
++        4,
++        "small keys fit"
++    );
++}
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index a9e1bf4b0bf..f53f37f0265 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11683,6 +11683,89 @@
+       }
+      ]
+     ],
++    "cursor-prefetch.any.js": [
++     "a387d66729d5358ea2a4f4e57b73519d5a2d4926",
++     [
++      "IndexedDB/cursor-prefetch.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: cursor steps see the records as they are when they run"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ],
++     [
++      "IndexedDB/cursor-prefetch.any.serviceworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: cursor steps see the records as they are when they run"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ],
++     [
++      "IndexedDB/cursor-prefetch.any.sharedworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: cursor steps see the records as they are when they run"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ],
++     [
++      "IndexedDB/cursor-prefetch.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: cursor steps see the records as they are when they run"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ]
++    ],
+     "generated-key-value-kinds.any.js": [
+      "93e646d1ad6073457e3aa79c4751b7ab82b16066",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/cursor-prefetch.any.js b/tests/wpt/mozilla/tests/IndexedDB/cursor-prefetch.any.js
+new file mode 100644
+index 00000000000..a387d66729d
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/cursor-prefetch.any.js
+@@ -0,0 +1,532 @@
++// META: global=window,worker
++// META: title=IndexedDB: cursor steps see the records as they are when they run
++// META: timeout=long
++
++// https://w3c.github.io/IndexedDB/#iterate-a-cursor: each step of a cursor finds its record
++// among the records as they are when the step runs, after every request made before it. Servo's
++// cursors take the records of later steps from what the backend returned with an earlier one,
++// as long as no request in the transaction has written since. These tests compare every step of
++// cursors over a store and an index, in every direction, with continue(), continue(key),
++// continuePrimaryKey() and advance(), and writes between and around the steps, with a model of
++// the spec's steps.
++
++'use strict';
++
++function openDatabase(t, upgrade) {
++  const name = 'cursor-prefetch-' + Math.random();
++  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open(name, 1);
++    request.onupgradeneeded = () => upgrade(request.result);
++    request.onsuccess = () => {
++      t.add_cleanup(() => { request.result.close(); });
++      resolve(request.result);
++    };
++    request.onerror = () => reject(request.error);
++  });
++}
++
++// The store 'items' with the records 1 to `count`, whose values {n, k} have the key in the index
++// 'k' as k.
++function createItems(count) {
++  return db => {
++    const store = db.createObjectStore('items');
++    store.createIndex('k', 'k');
++    for (let n = 1; n <= count; n++) {
++      store.put({n, k: n % 7}, n);
++    }
++  };
++}
++
++function seededRandom(seed) {
++  let state = seed;
++  return () => {
++    state ^= state << 13;
++    state ^= state >>> 17;
++    state ^= state << 5;
++    return (state >>> 0) / 4294967296;
++  };
++}
++
++const cmp = (a, b) => indexedDB.cmp(a, b);
++
++// The records of 'items' (`values`, primary key → value) and of its index 'k', as the requests
++// made so far leave them.
++class Model {
++  constructor(count) {
++    this.values = new Map();
++    for (let n = 1; n <= count; n++) {
++      this.values.set(n, {n, k: n % 7});
++    }
++    this.sorted = {};
++  }
++
++  put(key, value) {
++    this.values.set(key, value);
++    this.sorted = {};
++  }
++
++  delete(key) {
++    this.values.delete(key);
++    this.sorted = {};
++  }
++
++  // The records of `source`, 'store' or 'k', as [key, primary key], in the source's order.
++  records(source) {
++    if (!this.sorted[source]) {
++      const records = [];
++      for (const [key, value] of this.values) {
++        records.push(source == 'store' ? [key, key] : [value.k, key]);
++      }
++      records.sort((a, b) => cmp(a[0], b[0]) || cmp(a[1], b[1]));
++      this.sorted[source] = records;
++    }
++    return this.sorted[source];
++  }
++}
++
++// Step 9 of "iterate a cursor", for the cursor `state` ({source, direction, range, position,
++// objectStorePosition}): the record found, [key, primary key], or undefined, and the cursor
++// moved to it.
++function iterate(model, state, key, primaryKey, count) {
++  const records = model.records(state.source);
++  const index = state.source != 'store';
++  const inRange = record => state.range.includes(record[0]);
++  let found;
++  for (; count > 0; count--) {
++    const {position, objectStorePosition} = state;
++    const beyond = (record, sign) => {
++      if (position === undefined) return true;
++      const c = cmp(record[0], position) * sign;
++      if (!index || state.direction.endsWith('unique')) return c > 0;
++      return c > 0 || (c == 0 && cmp(record[1], objectStorePosition) * sign > 0);
++    };
++    const keyOk = (record, sign) => {
++      if (key === undefined) return true;
++      const c = cmp(record[0], key) * sign;
++      if (primaryKey === undefined) return c >= 0;
++      return c > 0 || (c == 0 && cmp(record[1], primaryKey) * sign >= 0);
++    };
++    switch (state.direction) {
++      case 'next':
++      case 'nextunique':
++        found = records.find(r => keyOk(r, 1) && beyond(r, 1) && inRange(r));
++        break;
++      case 'prev':
++        found = records.findLast(r => keyOk(r, -1) && beyond(r, -1) && inRange(r));
++        break;
++      case 'prevunique': {
++        const temp = records.findLast(r => keyOk(r, -1) && beyond(r, -1) && inRange(r));
++        found = temp && records.find(r => cmp(r[0], temp[0]) == 0);
++        break;
++      }
++    }
++    if (!found) return undefined;
++    state.position = found[0];
++    state.objectStorePosition = found[1];
++    key = primaryKey = undefined;
++  }
++  return found;
++}
++
++// Runs the cursors `specs` ({source, direction, range, keyOnly}) over 'items' in one transaction,
++// taking turns as their results arrive, for at most `steps` steps each. Before each step, a
++// random choice of continue(), continue(key), continuePrimaryKey() and advance() is made, and
++// with a probability of 1 / `writes`, a write through the store or the cursor before the step
++// and one through the store after it. Every record a cursor visits is checked against the model.
++function runCursors(t, db, {seed, count, specs, writes, steps}) {
++  const random = seededRandom(seed);
++  const pick = n => Math.floor(random() * n);
++  const model = new Model(count);
++  const transaction = db.transaction('items', writes ? 'readwrite' : 'readonly');
++  const store = transaction.objectStore('items');
++  let visits = 0;
++  const states = [];
++
++  // Writes a record just ahead of a random cursor, where it may have taken records already.
++  const write = (cursor, state) => {
++    const choice = pick(6);
++    const near = states[pick(states.length)];
++    const sign = near.direction.startsWith('prev') ? -1 : 1;
++    let key = 1 + pick(count + 40);
++    let k = pick(9);
++    if (near.position !== undefined && near.source == 'store') {
++      key = near.position + sign * (1 + pick(6)) + (pick(2) ? 0.5 : 0);
++    } else if (near.position !== undefined) {
++      k = near.position + sign * pick(2);
++    }
++    const value = {n: -key, k};
++    if (choice == 0) {
++      store.put(value, key);
++      model.put(key, value);
++    } else if (choice == 1) {
++      store.delete(key);
++      model.delete(key);
++    } else if (cursor && !state.keyOnly && choice == 2) {
++      const value = {n: -state.objectStorePosition, k};
++      cursor.update(value);
++      model.put(state.objectStorePosition, value);
++    } else if (cursor && !state.keyOnly && choice == 3) {
++      cursor.delete();
++      model.delete(state.objectStorePosition);
++    }
++  };
++
++  // Moves the cursor of `state` with a random step and returns the expected record, with the
++  // value it has when the step runs.
++  const move = (cursor, state) => {
++    const forward = !state.direction.startsWith('prev');
++    const ahead = (key, by) => (forward ? key + by : key - by);
++    const choice = pick(20);
++    let found;
++    if (choice < 14) {
++      cursor.continue();
++      found = iterate(model, state, undefined, undefined, 1);
++    } else if (choice < 16) {
++      const key = ahead(state.position, state.source == 'store' ? 1 + pick(8) : 1);
++      cursor.continue(key);
++      found = iterate(model, state, key, undefined, 1);
++    } else if (choice < 18 && state.source != 'store' && !state.direction.endsWith('unique')) {
++      const [key, primaryKey] = pick(4) ?
++          [state.position, ahead(state.objectStorePosition, 1 + pick(30))] :
++          [ahead(state.position, 1), 1 + pick(count)];
++      cursor.continuePrimaryKey(key, primaryKey);
++      found = iterate(model, state, key, primaryKey, 1);
++    } else {
++      const n = 1 + pick(choice < 19 ? 3 : 12);
++      cursor.advance(n);
++      found = iterate(model, state, undefined, undefined, n);
++    }
++    return found && [...found, {...model.values.get(found[1])}];
++  };
++
++  return new Promise((resolve, reject) => {
++    let running = specs.length;
++    transaction.onabort = () => reject(transaction.error);
++    transaction.oncomplete = () => resolve(visits);
++    for (const spec of specs) {
++      const state = {...spec, range: spec.range || IDBKeyRange.lowerBound(-Infinity)};
++      states.push(state);
++      const source = spec.source == 'store' ? store : store.index(spec.source);
++      const request = spec.keyOnly ?
++          source.openKeyCursor(state.range, spec.direction) :
++          source.openCursor(state.range, spec.direction);
++      let expected = iterate(model, state, undefined, undefined, 1);
++      expected = expected && [...expected, {...model.values.get(expected[1])}];
++      let taken = 0;
++      request.onerror = () => reject(request.error);
++      request.onsuccess = t.step_func(() => {
++        const cursor = request.result;
++        const label = `seed ${seed}, ${spec.source} ${spec.direction}, step ${taken}`;
++        if (!expected) {
++          assert_equals(cursor, null, `${label}: past the end`);
++          running--;
++          return;
++        }
++        assert_not_equals(cursor, null, `${label}: a record`);
++        assert_equals(cursor.key, expected[0], `${label}: key`);
++        assert_equals(cursor.primaryKey, expected[1], `${label}: primary key`);
++        if (!spec.keyOnly) {
++          assert_equals(cursor.value.n, expected[2].n, `${label}: value`);
++          assert_equals(cursor.value.k, expected[2].k, `${label}: value`);
++        }
++        visits++;
++        if (++taken == steps) {
++          running--;
++          return;
++        }
++        if (writes && pick(writes) == 0) write(cursor, state);
++        expected = move(cursor, state);
++        if (writes && pick(writes) == 0) write(null, state);
++      });
++    }
++  });
++}
++
++const CURSORS = [
++  {source: 'store', direction: 'next'},
++  {source: 'k', direction: 'prev'},
++  {source: 'k', direction: 'nextunique', range: IDBKeyRange.bound(1, 5)},
++  {source: 'store', direction: 'prev', range: IDBKeyRange.bound(10, 70, true, false)},
++  {source: 'k', direction: 'next', keyOnly: true},
++  {source: 'k', direction: 'prevunique'},
++];
++
++for (const seed of [1, 2]) {
++  promise_test(async t => {
++    const db = await openDatabase(t, createItems(80));
++    const visits = await runCursors(t, db, {seed, count: 80, specs: CURSORS, writes: 0,
++                                            steps: 200});
++    assert_greater_than(visits, 50);
++  }, `Cursors taking turns over the same records, without writes (seed ${seed})`);
++}
++
++// Writes are rare enough that cursors take records of later steps from earlier ones in between.
++for (const seed of [3, 4, 5, 6, 7, 8, 10, 11]) {
++  promise_test(async t => {
++    const db = await openDatabase(t, createItems(200));
++    const specs = [CURSORS[seed % 6], CURSORS[(seed + 1) % 6], CURSORS[(seed + 3) % 6]];
++    const visits = await runCursors(t, db, {seed, count: 200, specs, writes: 40, steps: 250});
++    assert_greater_than(visits, 20);
++  }, `Cursors taking turns, with writes now and then (seed ${seed})`);
++}
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems(80));
++  const visits = await runCursors(t, db, {seed: 9, count: 80, specs: CURSORS, writes: 3,
++                                          steps: 150});
++  assert_greater_than(visits, 50);
++}, 'Cursors taking turns, with writes through the store and the cursors at most steps');
++
++// Runs `onCursor` on each record that the cursor of `request` visits and continues the cursor,
++// unless `onCursor` returns 'moved' (it moved the cursor) or 'stop', until then or the end, and
++// resolves with the primary keys visited.
++function visit(request, onCursor) {
++  return new Promise((resolve, reject) => {
++    const visited = [];
++    request.onsuccess = () => {
++      const cursor = request.result;
++      if (!cursor) {
++        resolve(visited);
++        return;
++      }
++      visited.push(cursor.primaryKey);
++      try {
++        const next = onCursor(cursor, visited.length);
++        if (next == 'stop') {
++          resolve(visited);
++        } else if (next != 'moved') {
++          cursor.continue();
++        }
++      } catch (error) {
++        reject(error);
++      }
++    };
++    request.onerror = () => reject(request.error);
++  });
++}
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems(30));
++  const store = db.transaction('items', 'readwrite').objectStore('items');
++  const visited = await visit(store.openCursor(), (cursor, steps) => {
++    if (cursor.key == 4) {
++      store.put({n: 5.5, k: 0}, 5.5);
++      store.delete(6);
++      store.put({n: 70, k: 0}, 7);
++    }
++    if (cursor.key == 7) {
++      assert_equals(cursor.value.n, 70, 'the changed value');
++      // The step runs before the put, and the next one after it.
++      cursor.continue();
++      store.put({n: 8.5, k: 0}, 8.5);
++      return 'moved';
++    }
++  });
++  const expected = [1, 2, 3, 4, 5, 5.5, 7, 8, 8.5];
++  for (let n = 9; n <= 30; n++) expected.push(n);
++  assert_array_equals(visited, expected);
++}, 'Writes made before a step, and right after it, are seen by the steps after them');
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems(30));
++  const store = db.transaction('items', 'readwrite').objectStore('items');
++  const visited = await visit(store.index('k').openCursor(), cursor => {
++    if (cursor.primaryKey == 22) {
++      cursor.update({n: 22, k: 2});
++    }
++  });
++  // The keys are n % 7; the update moves 22 from key 1 to key 2, which the cursor visits next.
++  assert_array_equals(visited, [7, 14, 21, 28, 1, 8, 15, 22, 29, 2, 9, 16, 22, 23, 30, 3, 10, 17,
++                                24, 4, 11, 18, 25, 5, 12, 19, 26, 6, 13, 20, 27]);
++}, 'cursor.update() that moves the record ahead in the index is seen later');
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems(20));
++  const store = db.transaction('items', 'readwrite').objectStore('items');
++  const behind = store.openCursor();
++  const ahead = store.openCursor(IDBKeyRange.lowerBound(10));
++  const visited = {behind: [], ahead: []};
++  await new Promise((resolve, reject) => {
++    let ended = 0;
++    const end = () => ++ended == 2 && resolve();
++    behind.onsuccess = t.step_func(() => {
++      const cursor = behind.result;
++      if (!cursor) return end();
++      visited.behind.push(cursor.key);
++      if (cursor.key != 8) {
++        cursor.continue();
++        return;
++      }
++      // The cursor ahead deletes the records it visits, after this one took records ahead.
++      ahead.result.delete();
++      ahead.result.continue();
++    });
++    ahead.onsuccess = t.step_func(() => {
++      const cursor = ahead.result;
++      if (!cursor) {
++        behind.result.continue();
++        return end();
++      }
++      visited.ahead.push(cursor.key);
++      if (cursor.key == 10) return;
++      cursor.delete();
++      cursor.continue();
++    });
++    behind.onerror = ahead.onerror = () => reject(behind.error || ahead.error);
++  });
++  assert_array_equals(visited.ahead, [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
++  assert_array_equals(visited.behind, [1, 2, 3, 4, 5, 6, 7, 8, 9],
++                      'records deleted by the other cursor');
++}, 'cursor.delete() of one cursor is seen by another cursor over the same records');
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems(40));
++  const index = db.transaction('items').objectStore('items').index('k');
++  const moves = [
++    // Keys 0: 7, 14, 21, 28, 35; 1: 1, 8, 15, 22, 29, 36; 2: 2, 9, ...
++    [c => c.continue(), 14],
++    [c => c.continue(), 21],
++    [c => c.continue(), 28],
++    [c => c.continue(), 35],
++    [c => c.continue(), 1],
++    [c => c.continue(), 8],
++    // Within the records taken so far, and beyond them.
++    [c => c.continuePrimaryKey(1, 20), 22],
++    [c => c.continue(2), 2],
++    [c => c.advance(2), 16],
++    [c => c.continuePrimaryKey(5, 12), 12],
++    [c => c.continue(6), 6],
++    [c => c.advance(4), 34],
++    [c => c.advance(10), null],
++  ];
++  const request = index.openCursor();
++  await new Promise((resolve, reject) => {
++    let step = 0;
++    request.onsuccess = t.step_func(() => {
++      const cursor = request.result;
++      if (step == 0) {
++        assert_equals(cursor.primaryKey, 7);
++      } else {
++        const expected = moves[step - 1][1];
++        assert_equals(cursor && cursor.primaryKey, expected, `move ${step}`);
++      }
++      if (step == moves.length) return resolve();
++      moves[step++][0](cursor);
++      assert_equals(request.readyState, 'pending');
++    });
++    request.onerror = () => reject(request.error);
++  });
++}, 'continue(key), continuePrimaryKey() and advance() within and beyond the records taken');
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems(20));
++  const store = db.transaction('items').objectStore('items');
++  const order = [];
++  await visit(store.openCursor(), (cursor, steps) => {
++    order.push('cursor ' + cursor.key);
++    if (steps == 6) {
++      store.get(1).onsuccess = () => order.push('get');
++    }
++    if (steps == 7) {
++      cursor.continue();
++      store.count().onsuccess = () => order.push('count');
++      return 'moved';
++    }
++    if (steps == 9) return 'stop';
++  });
++  assert_array_equals(order, ['cursor 1', 'cursor 2', 'cursor 3', 'cursor 4', 'cursor 5',
++                              'cursor 6', 'get', 'cursor 7', 'cursor 8', 'count', 'cursor 9']);
++}, 'Steps taken from the records of an earlier step complete in request order');
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems(20));
++  const transaction = db.transaction('items', 'readwrite');
++  const store = transaction.objectStore('items');
++  let cursor;
++  await visit(store.openCursor(), (c, steps) => {
++    cursor = c;
++    if (steps == 6) return 'stop';
++  });
++  await new Promise(resolve => setTimeout(resolve, 0));
++  assert_throws_dom('TransactionInactiveError', () => cursor.continue(), 'in a later task');
++  assert_throws_dom('TransactionInactiveError', () => cursor.advance(1), 'in a later task');
++
++  const aborted = db.transaction('items', 'readwrite');
++  await visit(aborted.objectStore('items').openCursor(), (cursor, steps) => {
++    if (steps == 6) {
++      aborted.abort();
++      assert_throws_dom('TransactionInactiveError', () => cursor.continue(), 'after abort()');
++      return 'stop';
++    }
++  });
++}, 'Records taken from an earlier step do not make an inactive transaction usable');
++
++promise_test(async t => {
++  const db = await openDatabase(t, createItems(20));
++  const transaction = db.transaction('items', 'readwrite');
++  const store = transaction.objectStore('items');
++  const visited = await visit(store.openCursor(), cursor => {
++    if (cursor.key == 6) store.put({n: 6.5, k: 0}, 6.5);
++    if (cursor.key == 8) {
++      transaction.abort();
++      return 'stop';
++    }
++  });
++  assert_array_equals(visited, [1, 2, 3, 4, 5, 6, 6.5, 7, 8]);
++  await new Promise(resolve => transaction.onabort = resolve);
++  const after = await visit(db.transaction('items').objectStore('items').openCursor(), () => {});
++  assert_equals(after.length, 20, 'the aborted put is gone');
++  assert_false(after.includes(6.5));
++}, 'An aborted transaction leaves nothing that a later cursor sees');
++
++promise_test(async t => {
++  const size = 300 * 1024;
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('items');
++    for (let n = 1; n <= 24; n++) {
++      store.put(new Uint8Array(size).fill(n), n);
++    }
++  });
++  const store = db.transaction('items').objectStore('items');
++  const visited = await visit(store.openCursor(), cursor => {
++    assert_equals(cursor.value.length, size);
++    assert_equals(cursor.value[size - 1], cursor.key);
++  });
++  assert_array_equals(visited, Array.from({length: 24}, (_, i) => i + 1));
++}, 'A cursor over large values visits every record');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    createItems(60)(db);
++    db.createObjectStore('copies');
++  });
++  const transaction = db.transaction(['items', 'copies'], 'readwrite');
++  const items = transaction.objectStore('items');
++  const copies = transaction.objectStore('copies');
++  const visited = await visit(items.openCursor(), cursor => {
++    copies.put(cursor.value, cursor.key);
++    if (cursor.key == 20) {
++      items.put({n: 20.5, k: 0}, 20.5);
++      items.delete(22);
++    }
++    if (cursor.key == 40) copies.clear();
++  });
++  const expected = [];
++  for (let n = 1; n <= 60; n++) {
++    if (n != 22) expected.push(n);
++    if (n == 20) expected.push(20.5);
++  }
++  assert_array_equals(visited, expected);
++  const byIndex = await visit(items.index('k').openCursor(IDBKeyRange.only(1)), cursor => {
++    copies.put(cursor.value, -cursor.primaryKey);
++    if (cursor.primaryKey == 15) items.put({n: 16, k: 1}, 16);
++  });
++  assert_array_equals(byIndex, [1, 8, 15, 16, 29, 36, 43, 50, 57]);
++  const copied = await new Promise((resolve, reject) => {
++    const request = copies.getAllKeys();
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++  assert_equals(copied.length, 20 + byIndex.length, 'the copies made after clear()');
++}, 'Writes to another store between the steps of a cursor, and to its own store');

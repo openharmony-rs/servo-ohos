@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 08:38:20 +0000
+Subject: [PATCH] script: Add a pref that exposes SharedArrayBuffer for testing
+
+Servo creates every global without shared memory, so SharedArrayBuffer
+and Atomics don't exist; HTML exposes them only to cross-origin
+isolated globals, which Servo doesn't implement. The pref
+`js_shared_memory_enabled_for_testing` (default false) creates globals
+with shared memory and the SharedArrayBuffer constructor, isolated or
+not, so that the IndexedDB fork tests can check how IndexedDB handles
+shared memory. It is for those tests only: other Web APIs are not
+shared-memory aware (the bindings have no [AllowShared] checks), and a
+view of shared memory passed to one, such as TextDecoder.decode(),
+panics the script thread in mozjs's typed array wrappers. It sets both
+realm options: the QuickJS shim's realm options start zeroed, while
+SpiderMonkey's define the constructor by default. This replaces the
+TODO about js.shared_memory.enabled.
+
+Servo's structured serialization already refuses shared memory with
+both engines (SpiderMonkey's CloneDataPolicy, the QuickJS shim in every
+scope), as StructuredSerializeForStorage must. The fork test
+shared-array-buffer-values.any.js, which sets the pref, checks that
+IndexedDB's add(), put() and update() throw a DataCloneError for
+SharedArrayBuffers, views on them and values holding them, before the
+key is extracted, and that serializing stops at the buffer.
+
+Validation: Host SpiderMonkey release build of this commit: shared-array-buffer-values.any.js 4 of 4 subtests in window, dedicated and shared worker (the previous commit's build doesn't know the pref, and the test errors there); serialize-sharedarraybuffer-throws.https.html and sharedarraybuffer-key.https.html still FAIL as expected (crossOriginIsolated is undefined); structured-clone, idb_binary_key_conversion and index-keys-page-code unchanged. The pref is off by default, so nothing else changes. After the P4 review's rename to `js_shared_memory_enabled_for_testing`: the same results on host SpiderMonkey, QuickJS and the board.
+AI-assisted: Yes (agent session; added the pref, found the QuickJS shim's zeroed realm option, wrote the fork test; renamed the pref and documented it as test-only after the P4 review)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/config/prefs.rs                    |   6 +
+ components/script/runtime/script_runtime.rs   |   1 -
+ components/script_bindings/interface.rs       |   5 +-
+ .../shared-array-buffer-values.any.js.ini     |   1 +
+ tests/wpt/mozilla/meta/MANIFEST.json          |  48 +++++++
+ .../shared-array-buffer-values.any.js         | 120 ++++++++++++++++++
+ 6 files changed, 179 insertions(+), 2 deletions(-)
+ create mode 100644 tests/wpt/mozilla/meta/IndexedDB/shared-array-buffer-values.any.js.ini
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/shared-array-buffer-values.any.js
+
+diff --git a/components/config/prefs.rs b/components/config/prefs.rs
+index 1764abd92f3..3f20e0ec219 100644
+--- a/components/config/prefs.rs
++++ b/components/config/prefs.rs
+@@ -304,6 +304,11 @@ pub struct Preferences {
+     pub js_mem_max: i64,
+     pub js_native_regex_enabled: bool,
+     pub js_offthread_compilation_enabled: bool,
++    /// For the IndexedDB fork tests only: gives every global `SharedArrayBuffer` and `Atomics`,
++    /// whether or not it is cross-origin isolated, which Servo doesn't implement. Other Web APIs
++    /// are not shared-memory aware (the bindings have no `[AllowShared]` checks) and panic on a
++    /// view of shared memory.
++    pub js_shared_memory_enabled_for_testing: bool,
+     pub js_timers_minimum_duration: i64,
+     pub js_wasm_baseline_enabled: bool,
+     pub js_wasm_enabled: bool,
+@@ -597,6 +602,7 @@ impl Preferences {
+             js_mem_max: -1,
+             js_native_regex_enabled: true,
+             js_offthread_compilation_enabled: true,
++            js_shared_memory_enabled_for_testing: false,
+             js_timers_minimum_duration: 1000,
+             js_wasm_baseline_enabled: true,
+             js_wasm_enabled: true,
+diff --git a/components/script/runtime/script_runtime.rs b/components/script/runtime/script_runtime.rs
+index 4f0c1460483..d19318f8f8b 100644
+--- a/components/script/runtime/script_runtime.rs
++++ b/components/script/runtime/script_runtime.rs
+@@ -783,7 +783,6 @@ impl Runtime {
+             // TODO: handle js.asyncstack.enabled (needs new Spidermonkey)
+             // TODO: handle js.throw_on_debugee_would_run (needs new Spidermonkey)
+             // TODO: handle js.dump_stack_on_debugee_would_run (needs new Spidermonkey)
+-            // TODO: handle js.shared_memory.enabled
+             JS_SetGCParameter(
+                 cx,
+                 JSGCParamKey::JSGC_MAX_BYTES,
+diff --git a/components/script_bindings/interface.rs b/components/script_bindings/interface.rs
+index cfef7879196..7017bb7910f 100644
+--- a/components/script_bindings/interface.rs
++++ b/components/script_bindings/interface.rs
+@@ -31,6 +31,7 @@ use js::rust::{
+     HandleObject, HandleValue, MutableHandleObject, RealmOptions, define_methods,
+     define_properties, get_object_class, is_dom_class, maybe_wrap_object,
+ };
++use servo_config::pref;
+ use servo_url::MutableOrigin;
+ 
+ use crate::DomTypes;
+@@ -147,7 +148,9 @@ pub(crate) unsafe fn create_global_object<D: DomTypes>(
+ 
+     let mut options = RealmOptions::default();
+     options.creationOptions_.traceGlobal_ = Some(trace);
+-    options.creationOptions_.sharedMemoryAndAtomics_ = false;
++    let shared_memory = pref!(js_shared_memory_enabled_for_testing);
++    options.creationOptions_.sharedMemoryAndAtomics_ = shared_memory;
++    options.creationOptions_.defineSharedArrayBufferConstructor_ = shared_memory;
+     if use_system_compartment {
+         options.creationOptions_.compSpec_ = CompartmentSpecifier::NewCompartmentAndZone;
+         options.creationOptions_.__bindgen_anon_1.comp_ = std::ptr::null_mut();
+diff --git a/tests/wpt/mozilla/meta/IndexedDB/shared-array-buffer-values.any.js.ini b/tests/wpt/mozilla/meta/IndexedDB/shared-array-buffer-values.any.js.ini
+new file mode 100644
+index 00000000000..9faea0adb13
+--- /dev/null
++++ b/tests/wpt/mozilla/meta/IndexedDB/shared-array-buffer-values.any.js.ini
+@@ -0,0 +1 @@
++prefs: [js_shared_memory_enabled_for_testing:true]
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 9ae2d828c92..80d0c310481 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -12283,6 +12283,54 @@
+       }
+      ]
+     ],
++    "shared-array-buffer-values.any.js": [
++     "b2f83dd5e354cfa08f29737b723234e9754078b1",
++     [
++      "IndexedDB/shared-array-buffer-values.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,dedicatedworker,sharedworker"
++        ],
++        [
++         "title",
++         "IndexedDB: values holding shared memory can't be stored"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/shared-array-buffer-values.any.sharedworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,dedicatedworker,sharedworker"
++        ],
++        [
++         "title",
++         "IndexedDB: values holding shared memory can't be stored"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/shared-array-buffer-values.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,dedicatedworker,sharedworker"
++        ],
++        [
++         "title",
++         "IndexedDB: values holding shared memory can't be stored"
++        ]
++       ]
++      }
++     ]
++    ],
+     "string-keys-code-units.any.js": [
+      "4959920d8f31f40d5d0a879a598d0888c74a09f5",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/shared-array-buffer-values.any.js b/tests/wpt/mozilla/tests/IndexedDB/shared-array-buffer-values.any.js
+new file mode 100644
+index 00000000000..b2f83dd5e35
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/shared-array-buffer-values.any.js
+@@ -0,0 +1,120 @@
++// META: global=window,dedicatedworker,sharedworker
++// META: title=IndexedDB: values holding shared memory can't be stored
++
++// https://w3c.github.io/IndexedDB/#clone serializes values with StructuredSerializeForStorage, which
++// throws a DataCloneError for a SharedArrayBuffer, also inside a view or another value
++// (https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal). The
++// upstream tests (serialize-sharedarraybuffer-throws.https.html, html/.../serialization-via-idb)
++// also need cross-origin isolation, which Servo doesn't implement: this test's metadata sets the
++// pref js_shared_memory_enabled_for_testing, which gives every global a SharedArrayBuffer.
++
++'use strict';
++
++function openDatabase(t, upgrade) {
++  const name = 'shared-array-buffer-values-' + Math.random();
++  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open(name, 1);
++    request.onupgradeneeded = () => upgrade(request.result);
++    request.onsuccess = () => {
++      t.add_cleanup(() => { request.result.close(); });
++      resolve(request.result);
++    };
++    request.onerror = () => reject(request.error);
++  });
++}
++
++function result(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++function complete(transaction) {
++  return new Promise((resolve, reject) => {
++    transaction.oncomplete = resolve;
++    transaction.onabort = () => reject(transaction.error);
++  });
++}
++
++function sharedValues() {
++  const buffer = new SharedArrayBuffer(8);
++  return [
++    ['a SharedArrayBuffer', buffer],
++    ['a Uint8Array on a SharedArrayBuffer', new Uint8Array(buffer, 2, 4)],
++    ['a DataView on a SharedArrayBuffer', new DataView(buffer)],
++    ['an object holding a SharedArrayBuffer', {buffer}],
++    ['an Array holding a view on a SharedArrayBuffer', [1, new Int32Array(buffer)]],
++    ['a Map holding a SharedArrayBuffer', new Map([['buffer', buffer]])],
++  ];
++}
++
++test(() => {
++  assert_equals(typeof SharedArrayBuffer, 'function', 'the pref gives the global SharedArrayBuffer');
++}, 'SharedArrayBuffer is exposed with js_shared_memory_enabled_for_testing');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    db.createObjectStore('out-of-line');
++    db.createObjectStore('in-line', {keyPath: 'id'});
++  });
++  const tx = db.transaction(['out-of-line', 'in-line'], 'readwrite');
++  const done = complete(tx);
++  const outOfLine = tx.objectStore('out-of-line');
++  const inLine = tx.objectStore('in-line');
++  for (const [description, value] of sharedValues()) {
++    assert_throws_dom('DataCloneError', () => outOfLine.put(value, 1), `put() of ${description}`);
++    assert_throws_dom('DataCloneError', () => outOfLine.add(value, 1), `add() of ${description}`);
++    assert_throws_dom('DataCloneError', () => inLine.put({id: 1, value}),
++                      `put() of ${description} with an in-line key`);
++  }
++  assert_throws_dom('DataCloneError', () => inLine.put({value: new SharedArrayBuffer(1)}),
++                    'cloning comes before extracting the key, which would throw a DataError');
++  assert_equals(await result(outOfLine.put(new ArrayBuffer(8), 1)), 1,
++                'the transaction goes on after the exceptions');
++  assert_equals(await result(outOfLine.count()), 1);
++  assert_equals(await result(inLine.count()), 0);
++  await done;
++}, 'put() and add() throw a DataCloneError for values holding shared memory');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    db.createObjectStore('store');
++  });
++  const setup = db.transaction('store', 'readwrite');
++  setup.objectStore('store').put('old', 1);
++  await complete(setup);
++
++  const tx = db.transaction('store', 'readwrite');
++  const done = complete(tx);
++  const store = tx.objectStore('store');
++  const cursor = await result(store.openCursor());
++  for (const [description, value] of sharedValues()) {
++    assert_throws_dom('DataCloneError', () => cursor.update(value), `update() with ${description}`);
++  }
++  assert_equals(await result(store.get(1)), 'old');
++  await done;
++}, 'update() throws a DataCloneError for values holding shared memory');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    db.createObjectStore('store');
++  });
++  const tx = db.transaction('store', 'readwrite');
++  const done = complete(tx);
++  const store = tx.objectStore('store');
++  let before = false;
++  let after = false;
++  assert_throws_dom('DataCloneError', () => {
++    store.put([
++      {get x() { before = true; return 1; }},
++      new SharedArrayBuffer(4),
++      {get x() { after = true; return 2; }},
++    ], 1);
++  });
++  assert_true(before, 'the getter before the SharedArrayBuffer is called');
++  assert_false(after, 'the getter after the SharedArrayBuffer is not called');
++  assert_equals(await result(store.count()), 0);
++  await done;
++}, 'Serializing stops at the SharedArrayBuffer');

@@ -1,0 +1,688 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 08:36:11 +0000
+Subject: [PATCH] indexeddb: Run no page code while computing keys from a clone
+
+add(), put() and cursor update() clone the value into a user-agent
+defined realm and compute the keys from that clone, where no page code
+can run. Servo deserializes the clone in the page's realm, and two
+places still ran page code there, with the transaction active:
+
+- The multiEntry key conversion reads each index of an Array with Get,
+  so a hole reached a getter on the page's Array.prototype: its value
+  became an index key, and its requests went ahead of the request being
+  made (P3 review N1). P3 made the transaction inactive around the index
+  keys as a stopgap; put()'s primary key was left as it was.
+- The stored value was a second serialization of the clone, and
+  serializing an Error reads its "name", which reaches a getter on the
+  page's Error.prototype.
+
+The multiEntry conversion now reads only the Array's own elements: in a
+fresh realm a hole reads undefined, so the keys are the spec's. Key path
+evaluation and the other key conversions already read only own
+properties, and a clone has only data properties, so computing the
+primary key and the index keys, also while an index is populated, runs
+no page code, and the transaction-inactive toggle is gone. The record's
+value is now the serialization that the clone was made from: one
+serialization per put instead of two.
+
+A realm of its own for the clone would also do, but needs a second
+global per window and worker that can hold the DOM objects of a clone
+(Blob, File, ImageData, ...).
+
+The fork test index-keys-page-code.any.js now checks the spec's
+behaviour: put() and update() call no getter of Array.prototype or
+Object.prototype, a hole gives no index key, and a getter of
+Error.prototype.name runs once, while the value is serialized, with the
+transaction inactive. index-population.any.js's two subtests with a
+getter that a population reached become one that checks that it isn't
+reached.
+
+Validation: Host SpiderMonkey release build of this commit: /_mozilla/IndexedDB/ and the IndexedDB WPT tests on cloning, key paths and key injection (bindings-inject-*, clone-before-keypath-eval, idbcursor_update_*, idbindex-multientry, idbobjectstore_add/put/createIndex, key_valid, keypath-exceptions, nested-cloning-*, reading-autoincrement-*, structured-clone*, value*) 970 of 970 subtests in all globals but serviceworker; with the previous commit's build, index-keys-page-code.any.js fails all 4 subtests in each global (Array.prototype[1]'s getter called once per put and update; Error.prototype.name's getter called twice, the second time with the transaction active, where its put succeeded) and index-population.any.js's new subtest fails (the getter's value became a unique index key).
+AI-assisted: Yes (agent session; found the remaining page-code paths, chose own-property reads over a second realm, rewrote the fork tests)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbcursor.rs  |  10 +-
+ .../script/dom/indexeddb/idbobjectstore.rs    |  67 +++----
+ .../script/dom/indexeddb/idbtransaction.rs    |   7 +-
+ components/script/dom/indexeddb/key.rs        |  14 +-
+ python/tidy/error_message_exceptions.txt      |   2 +-
+ tests/wpt/mozilla/meta/MANIFEST.json          |  12 +-
+ .../IndexedDB/index-keys-page-code.any.js     | 178 +++++++++++-------
+ .../tests/IndexedDB/index-population.any.js   |  79 ++------
+ 8 files changed, 181 insertions(+), 188 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbcursor.rs b/components/script/dom/indexeddb/idbcursor.rs
+index ecad13233c1..99641764603 100644
+--- a/components/script/dom/indexeddb/idbcursor.rs
++++ b/components/script/dom/indexeddb/idbcursor.rs
+@@ -28,7 +28,6 @@ use crate::dom::bindings::codegen::UnionTypes::IDBObjectStoreOrIDBIndex;
+ use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
+ use crate::dom::bindings::refcounted::Trusted;
+ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+-use crate::dom::bindings::structuredclone;
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::indexeddb::idbindex::IDBIndex;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+@@ -760,7 +759,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+         // Step 8. Let clone be a clone of value in targetRealm during transaction. Rethrow any
+         // exceptions.
+         rooted!(&in(cx) let mut cloned_js_value = NullValue());
+-        effective_object_store.clone_value_in_target_realm(
++        let serialized_value = effective_object_store.clone_value_in_target_realm(
+             cx,
+             value,
+             cloned_js_value.handle_mut(),
+@@ -796,13 +795,6 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+             }
+         }
+ 
+-        let cloned_value = structuredclone::write(cx, cloned_js_value.handle(), None)?;
+-        let Ok(serialized_value) = postcard::to_stdvec(&cloned_value) else {
+-            return Err(Error::InvalidState(Some(
+-                "Failed to serialize cloned value".to_owned(),
+-            )));
+-        };
+-
+         // Step 10. Let operation be an algorithm to run store a record into an object store with
+         // this's effective object store, clone, this's effective key, and false.
+         let index_keys = effective_object_store.index_keys(cx, cloned_js_value.handle(), false);
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index 5d3c877ef70..4c096229119 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -225,13 +225,22 @@ impl IDBObjectStore {
+         self.global().storage_threads().sender()
+     }
+ 
+-    /// <https://www.w3.org/TR/IndexedDB-3/#clone>
++    /// <https://w3c.github.io/IndexedDB/#clone>: sets `clone` to a clone of `value` and returns
++    /// the serialized value, encoded as it is stored.
++    ///
++    /// targetRealm is the page's realm rather than a user-agent defined one. The key work on the
++    /// clone (the primary key and the index keys) reads only its own properties, which are data
++    /// properties, so no page code runs and a property that the page defines on a prototype reads
++    /// as it would in a fresh realm (see `convert_value_to_multientry_key`). The record's value is
++    /// the serialization that the clone came from: nothing changes the clone, and serializing it
++    /// again would run page code, such as a getter of `Error.prototype.name`, with the
++    /// transaction active.
+     pub(crate) fn clone_value_in_target_realm(
+         &self,
+         cx: &mut JSContext,
+         value: HandleValue,
+         clone: MutableHandleValue<'_>,
+-    ) -> Fallible<()> {
++    ) -> Fallible<Vec<u8>> {
+         // Step 1. Assert: transaction's state is active.
+         debug_assert!(self.transaction.is_active());
+ 
+@@ -244,11 +253,17 @@ impl IDBObjectStore {
+ 
+         let result = (|| {
+             // Step 3. Let serialized be ? StructuredSerializeForStorage(value).
++            // NOTE: `structuredclone::write` never serializes shared memory (its CloneDataPolicy
++            // doesn't allow it, and the QuickJS shim refuses it in every scope), and Servo has no
++            // [SameAgentCluster] interfaces, so it is StructuredSerializeForStorage as well.
+             let serialized = structuredclone::write(cx, value, None)?;
++            let stored = postcard::to_stdvec(&serialized).map_err(|_| {
++                Error::InvalidState(Some("Failed to encode a cloned value".to_owned()))
++            })?;
+ 
+             // Step 4. Let clone be ? StructuredDeserialize(serialized, targetRealm).
+             let _ = structuredclone::read(cx, &self.global(), serialized, clone)?;
+-            Ok(())
++            Ok(stored)
+         })();
+ 
+         // Step 5. Set transaction's state to active.
+@@ -258,17 +273,6 @@ impl IDBObjectStore {
+         result
+     }
+ 
+-    /// Runs `f` with the transaction inactive, as cloning a value does: computing index keys
+-    /// runs in the page's realm, where a getter reached through a hole of an array or a
+-    /// prototype could otherwise make requests that overtake the one being made.
+-    fn with_transaction_inactive<T>(&self, f: impl FnOnce() -> T) -> T {
+-        let active = self.transaction.is_active();
+-        self.transaction.set_active_flag(false);
+-        let result = f();
+-        self.transaction.set_active_flag(active);
+-        result
+-    }
+-
+     fn has_key_generator(&self) -> bool {
+         self.has_key_generator
+     }
+@@ -332,23 +336,21 @@ impl IDBObjectStore {
+             Some(KeyPath::String(key_path)) if key_is_generated => Some(key_path.str()),
+             _ => None,
+         };
+-        let indexes = self.transaction.get_db().indexes(self.id);
+-        self.with_transaction_inactive(|| {
+-            indexes
+-                .iter()
+-                .map(|index| IndexedDBIndexKeys {
+-                    index_id: index.id,
+-                    keys: index_keys(cx, value, index, generated_key_path.as_deref()),
+-                })
+-                .collect()
+-        })
++        self.transaction
++            .get_db()
++            .indexes(self.id)
++            .iter()
++            .map(|index| IndexedDBIndexKeys {
++                index_id: index.id,
++                keys: index_keys(cx, value, index, generated_key_path.as_deref()),
++            })
++            .collect()
+     }
+ 
+     /// The keys that the records `records` of this store get in `index`, which is being
+     /// populated: steps 5.1 and 5.2 of
+     /// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store> on each stored
+-    /// value, with its generated key injected. Records without keys are left out. Stops early if
+-    /// page code that computing the keys reached aborted the transaction.
++    /// value, with its generated key injected. Records without keys are left out.
+     pub(crate) fn index_keys_of_records(
+         &self,
+         cx: &mut JSContext,
+@@ -358,9 +360,6 @@ impl IDBObjectStore {
+         let mut keys_of_records = Vec::with_capacity(records.len());
+         rooted!(&in(cx) let mut value = UndefinedValue());
+         for record in records {
+-            if !self.transaction.is_usable() {
+-                break;
+-            }
+             if self
+                 .deserialize_value(cx, &record.primary_key, &record.value, value.handle_mut())
+                 .is_err()
+@@ -370,8 +369,7 @@ impl IDBObjectStore {
+                     "Failed to read a stored value to populate an index".to_owned(),
+                 ));
+             }
+-            let keys =
+-                self.with_transaction_inactive(|| index_keys(cx, value.handle(), index, None));
++            let keys = index_keys(cx, value.handle(), index, None);
+             if !keys.is_empty() {
+                 keys_of_records.push(IndexedDBRecordIndexKeys {
+                     primary_key: record.primary_key,
+@@ -490,7 +488,8 @@ impl IDBObjectStore {
+         // Step 10. Let clone be a clone of value in targetRealm during transaction.
+         // Rethrow any exceptions.
+         rooted!(&in(cx) let mut cloned_js_value = NullValue());
+-        self.clone_value_in_target_realm(cx, value, cloned_js_value.handle_mut())?;
++        let serialized_value =
++            self.clone_value_in_target_realm(cx, value, cloned_js_value.handle_mut())?;
+ 
+         // Step 11. If store uses in-line keys, then:
+         if let Some(key_path) = self.key_path.as_ref() {
+@@ -520,10 +519,6 @@ impl IDBObjectStore {
+                 },
+             }
+         }
+-        let cloned_value = structuredclone::write(cx, cloned_js_value.handle(), None)?;
+-        let Ok(serialized_value) = postcard::to_stdvec(&cloned_value) else {
+-            return Err(Error::InvalidState(None));
+-        };
+         // Step 12. Let operation be an algorithm to run store a record into an object store with
+         // store, clone, key, and no-overwrite flag.
+         // NOTE: The backend generates the key if none was given, and the value is stored without
+diff --git a/components/script/dom/indexeddb/idbtransaction.rs b/components/script/dom/indexeddb/idbtransaction.rs
+index 151f85d2ad7..1a27f4056af 100644
+--- a/components/script/dom/indexeddb/idbtransaction.rs
++++ b/components/script/dom/indexeddb/idbtransaction.rs
+@@ -584,12 +584,7 @@ impl IDBTransaction {
+         }
+         let mut realm = enter_auto_realm(cx, &*store);
+         let cx: &mut JSContext = &mut realm;
+-        let keys = store.index_keys_of_records(cx, &index, records);
+-        // Page code that computing the keys reached may have aborted the transaction.
+-        if self.finished.get() || self.abort_initiated.get() {
+-            return;
+-        }
+-        match keys {
++        match store.index_keys_of_records(cx, &index, records) {
+             Ok(records) => store.send_index_population_step(
+                 index_id,
+                 IndexPopulationStep::SetIndexKeys {
+diff --git a/components/script/dom/indexeddb/key.rs b/components/script/dom/indexeddb/key.rs
+index 5a071e346d4..47428bdb2b1 100644
+--- a/components/script/dom/indexeddb/key.rs
++++ b/components/script/dom/indexeddb/key.rs
+@@ -514,6 +514,10 @@ pub fn convert_value_to_key(
+ /// <https://w3c.github.io/IndexedDB/#convert-a-value-to-a-multientry-key>, except that the keys
+ /// of an array key are in key order rather than in the order of the array: each becomes a record
+ /// of a multiEntry index, so their order isn't observable.
++///
++/// `input` is part of a clone, which the spec makes in a user-agent defined realm, whose
++/// prototypes have no indexed properties. Servo clones into the page's realm, so an index that
++/// `input` doesn't have reads as undefined here instead of reaching the page's `Array.prototype`.
+ #[expect(unsafe_code)]
+ pub(crate) fn convert_value_to_multientry_key(
+     cx: &mut JSContext,
+@@ -547,9 +551,13 @@ pub(crate) fn convert_value_to_multientry_key(
+         // Step 1.5.1. Let entry be Get(input, index).
+         rooted!(&in(cx) let mut id: PropertyKey);
+         rooted!(&in(cx) let mut entry = UndefinedValue());
+-        // SAFETY: `id` is rooted.
+-        let got = unsafe { JS_IndexToId(cx, index, id.handle_mut()) } &&
+-            JS_GetPropertyById(cx, object.handle(), id.handle(), entry.handle_mut());
++        let mut own = false;
++        // SAFETY: `id` and `object` are rooted.
++        let got = unsafe {
++            JS_IndexToId(cx, index, id.handle_mut()) &&
++                JS_HasOwnPropertyById(cx, object.handle(), id.handle(), &mut own)
++        } && (!own ||
++            JS_GetPropertyById(cx, object.handle(), id.handle(), entry.handle_mut()));
+         // Step 1.5.2. If entry is not an abrupt completion, then:
+         if !got {
+             clear_pending_exception(cx);
+diff --git a/python/tidy/error_message_exceptions.txt b/python/tidy/error_message_exceptions.txt
+index 666c3be5d27..e11265c8d76 100644
+--- a/python/tidy/error_message_exceptions.txt
++++ b/python/tidy/error_message_exceptions.txt
+@@ -31,7 +31,7 @@
+ ./components/script/dom/indexeddb/idbdatabase.rs 13
+ ./components/script/dom/indexeddb/idbfactory.rs 5
+ ./components/script/dom/indexeddb/idbkeyrange.rs 1
+-./components/script/dom/indexeddb/idbobjectstore.rs 20
++./components/script/dom/indexeddb/idbobjectstore.rs 19
+ ./components/script/dom/indexeddb/idbopendbrequest.rs 3
+ ./components/script/dom/indexeddb/idbrequest.rs 5
+ ./components/script/dom/indexeddb/idbtransaction.rs 6
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index f53f37f0265..9ae2d828c92 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11956,7 +11956,7 @@
+      ]
+     ],
+     "index-keys-page-code.any.js": [
+-     "5a4fccd09b72cd07b55ce718e89055880f891ce9",
++     "eb81fd40192c8f2487c941b30f72c153f9ec28fe",
+      [
+       "IndexedDB/index-keys-page-code.any.html",
+       {
+@@ -11967,7 +11967,7 @@
+         ],
+         [
+          "title",
+-         "IndexedDB: page code reached while computing index keys can't make requests"
++         "IndexedDB: computing keys from a clone runs no page code"
+         ]
+        ]
+       }
+@@ -11982,7 +11982,7 @@
+         ],
+         [
+          "title",
+-         "IndexedDB: page code reached while computing index keys can't make requests"
++         "IndexedDB: computing keys from a clone runs no page code"
+         ]
+        ]
+       }
+@@ -11997,7 +11997,7 @@
+         ],
+         [
+          "title",
+-         "IndexedDB: page code reached while computing index keys can't make requests"
++         "IndexedDB: computing keys from a clone runs no page code"
+         ]
+        ]
+       }
+@@ -12012,14 +12012,14 @@
+         ],
+         [
+          "title",
+-         "IndexedDB: page code reached while computing index keys can't make requests"
++         "IndexedDB: computing keys from a clone runs no page code"
+         ]
+        ]
+       }
+      ]
+     ],
+     "index-population.any.js": [
+-     "669e877733e3cbeaa740d646ce2916b1a3b1831b",
++     "f80ed4274b8f8a49f357183a1fe46aa64ed922d1",
+      [
+       "IndexedDB/index-population.any.html",
+       {
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/index-keys-page-code.any.js b/tests/wpt/mozilla/tests/IndexedDB/index-keys-page-code.any.js
+index 5a4fccd09b7..eb81fd40192 100644
+--- a/tests/wpt/mozilla/tests/IndexedDB/index-keys-page-code.any.js
++++ b/tests/wpt/mozilla/tests/IndexedDB/index-keys-page-code.any.js
+@@ -1,12 +1,10 @@
+ // META: global=window,worker
+-// META: title=IndexedDB: page code reached while computing index keys can't make requests
++// META: title=IndexedDB: computing keys from a clone runs no page code
+ 
+-// https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store step 5 extracts the index
+-// keys from a clone in a user-agent defined realm, where no page code runs. Servo computes them in
+-// the page's realm when put(), add() or update() is called, where a getter on Array.prototype that
+-// a hole in a multiEntry array reaches does run. The transaction is inactive meanwhile, as it is
+-// while the value is cloned, so requests from such a getter throw a TransactionInactiveError
+-// instead of overtaking the request being made.
++// https://w3c.github.io/IndexedDB/#add-or-put and https://w3c.github.io/IndexedDB/#dom-idbcursor-update
++// clone the value into a user-agent defined realm and extract the keys from that clone, so no page
++// code runs while the keys are computed, and properties that the page defines on prototypes don't
++// reach the keys. Only serializing the value, while the transaction is inactive, runs page code.
+ 
+ 'use strict';
+ 
+@@ -40,84 +38,138 @@ function complete(transaction) {
+   });
+ }
+ 
+-// An array with a hole at index 1 that the getter below acts on; the mark survives cloning.
+-function tagsWithHole(first, last) {
+-  const tags = [first, , last];
+-  tags.hole = true;
+-  return tags;
+-}
+-
+-// Defines a getter of Array.prototype[1] that, for an array of `tagsWithHole`, tries the requests
+-// of `requests` against the transaction and returns the names of their exceptions, joined, through
+-// `errors()`, until the returned function removes it. Assignments to index 1 of other arrays still
+-// create their own property.
+-function arrayGetterMakingRequests(t, requests) {
+-  let names = '';
+-  Object.defineProperty(Array.prototype, 1, {
++// Defines `name` on `prototype` as a getter that counts its calls and returns `value`, until
++// `remove()` (or the end of the test). Assignments create an own property of the target. Returns
++// `{calls, remove}`, where `calls.count` is the number of calls.
++function prototypeGetter(t, prototype, name, value) {
++  const calls = {count: 0};
++  const previous = Object.getOwnPropertyDescriptor(prototype, name);
++  Object.defineProperty(prototype, name, {
+     configurable: true,
+     get() {
+-      if (this.hole !== true) {
+-        return undefined;
+-      }
+-      for (const request of requests) {
+-        try {
+-          request();
+-          names += ' none';
+-        } catch (e) {
+-          names += ' ' + e.name;
+-        }
+-      }
+-      return undefined;
++      calls.count++;
++      return value;
+     },
+-    set(value) {
+-      Object.defineProperty(this, 1, {value, writable: true, enumerable: true, configurable: true});
++    set(v) {
++      Object.defineProperty(this, name, {value: v, writable: true, enumerable: true, configurable: true});
+     },
+   });
+-  const remove = () => { delete Array.prototype[1]; };
++  const remove = () => {
++    if (previous) {
++      Object.defineProperty(prototype, name, previous);
++    } else {
++      delete prototype[name];
++    }
++  };
+   t.add_cleanup(remove);
+-  return [remove, () => names.trim()];
++  return {calls, remove};
++}
++
++// Defines the getters of `prototypeGetter` for `[prototype, name]` pairs, runs `f` and removes
++// them; returns `f`'s result and the call counts.
++function withPrototypeGetters(t, getters, f) {
++  const defined = getters.map(([prototype, name]) =>
++    prototypeGetter(t, prototype, name, 'from-prototype'));
++  let returned;
++  try {
++    returned = f();
++  } finally {
++    defined.forEach(getter => getter.remove());
++  }
++  return [returned, defined.map(getter => getter.calls.count)];
+ }
+ 
+-function createTagsStore(db) {
+-  db.createObjectStore('items').createIndex('tags', 'tags', {multiEntry: true});
++// A store `items` with in-line keys from `id` and a key generator, a multiEntry index on `tags` and
++// an index on `missing`, which no value has.
++function createItemsStore(db) {
++  const store = db.createObjectStore('items', {keyPath: 'id', autoIncrement: true});
++  store.createIndex('tags', 'tags', {multiEntry: true});
++  store.createIndex('missing', 'missing');
+ }
+ 
++async function indexKeys(store) {
++  return {
++    tags: await result(store.index('tags').getAllKeys()),
++    missing: await result(store.index('missing').count()),
++  };
++}
++
++const PROTOTYPE_GETTERS = [[Array.prototype, 1], [Object.prototype, 'id'], [Object.prototype, 'missing']];
++
+ promise_test(async t => {
+-  const db = await openDatabase(t, createTagsStore);
++  const db = await openDatabase(t, createItemsStore);
+   const tx = db.transaction('items', 'readwrite');
+   const done = complete(tx);
+   const store = tx.objectStore('items');
+-  const [remove, errors] = arrayGetterMakingRequests(t, [
+-    () => store.put({tags: ['inner']}, 'inner'),
+-    () => store.get('outer'),
+-    () => store.count(),
+-  ]);
+-  const put = store.put({tags: tagsWithHole('a', 'b')}, 'outer');
+-  remove();
+-  assert_equals(errors(), 'TransactionInactiveError TransactionInactiveError TransactionInactiveError');
+-  assert_equals(await result(put), 'outer');
+-  assert_array_equals(await result(store.getAllKeys()), ['outer']);
++  const [put, calls] =
++    withPrototypeGetters(t, PROTOTYPE_GETTERS, () => store.put({tags: ['a', , 'b']}));
++  assert_array_equals(calls, [0, 0, 0], 'no getter runs while put() computes the keys');
++  assert_equals(await result(put), 1, 'the key is generated, not read from Object.prototype');
++  const keys = await indexKeys(store);
++  assert_array_equals(keys.tags, [1, 1], 'the hole gives no index key');
++  assert_equals(keys.missing, 0, 'Object.prototype gives no index key');
+   await done;
+-}, 'Requests from a getter reached while put() computes index keys throw');
++}, 'put() reads neither the prototypes of Arrays nor those of Objects for keys');
+ 
+ promise_test(async t => {
+-  const db = await openDatabase(t, createTagsStore);
++  const db = await openDatabase(t, createItemsStore);
+   const setup = db.transaction('items', 'readwrite');
+-  setup.objectStore('items').put({tags: ['x']}, 'record');
++  setup.objectStore('items').put({tags: ['x']});
+   await complete(setup);
+ 
+   const tx = db.transaction('items', 'readwrite');
+   const done = complete(tx);
+   const store = tx.objectStore('items');
+   const cursor = await result(store.openCursor());
+-  const [remove, errors] = arrayGetterMakingRequests(t, [
+-    () => store.put({tags: ['inner']}, 'inner'),
+-    () => cursor.continue(),
+-  ]);
+-  const update = cursor.update({tags: tagsWithHole('c', 'd')});
+-  remove();
+-  assert_equals(errors(), 'TransactionInactiveError TransactionInactiveError');
+-  assert_equals(await result(update), 'record');
+-  assert_array_equals(await result(store.getAllKeys()), ['record']);
++  const [update, calls] =
++    withPrototypeGetters(t, PROTOTYPE_GETTERS, () => cursor.update({id: 1, tags: ['c', , 'd']}));
++  assert_array_equals(calls, [0, 0, 0], 'no getter runs while update() computes the keys');
++  assert_equals(await result(update), 1);
++  const keys = await indexKeys(store);
++  assert_array_equals(keys.tags, [1, 1], 'the hole gives no index key');
++  assert_equals(keys.missing, 0, 'Object.prototype gives no index key');
+   await done;
+-}, 'Requests from a getter reached while update() computes index keys throw');
++}, 'update() reads neither the prototypes of Arrays nor those of Objects for keys');
++
++for (const method of ['put', 'update']) {
++  promise_test(async t => {
++    const db = await openDatabase(t, db => {
++      db.createObjectStore('errors');
++    });
++    if (method === 'update') {
++      const setup = db.transaction('errors', 'readwrite');
++      setup.objectStore('errors').put('old', 'record');
++      await complete(setup);
++    }
++    const tx = db.transaction('errors', 'readwrite');
++    const done = complete(tx);
++    const store = tx.objectStore('errors');
++    const cursor = method === 'update' ? await result(store.openCursor()) : null;
++    const names = [];
++    const previous = Object.getOwnPropertyDescriptor(Error.prototype, 'name');
++    Object.defineProperty(Error.prototype, 'name', {
++      configurable: true,
++      get() {
++        try {
++          store.put('inner', 'inner');
++          names.push('none');
++        } catch (e) {
++          names.push(e.name);
++        }
++        return 'Error';
++      },
++    });
++    t.add_cleanup(() => { Object.defineProperty(Error.prototype, 'name', previous); });
++    const value = {error: new Error('message')};
++    const request = method === 'put' ? store.put(value, 'record') : cursor.update(value);
++    Object.defineProperty(Error.prototype, 'name', previous);
++    assert_array_equals(names, ['TransactionInactiveError'],
++                        'the getter runs once, while the value is serialized');
++    assert_equals(await result(request), 'record');
++    const stored = await result(store.get('record'));
++    assert_equals(stored.error.constructor, Error);
++    assert_equals(stored.error.message, 'message');
++    assert_array_equals(await result(store.getAllKeys()), ['record']);
++    await done;
++  }, `${method}() serializes the value once, with the transaction inactive`);
++}
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/index-population.any.js b/tests/wpt/mozilla/tests/IndexedDB/index-population.any.js
+index 669e877733e..f80ed4274b8 100644
+--- a/tests/wpt/mozilla/tests/IndexedDB/index-population.any.js
++++ b/tests/wpt/mozilla/tests/IndexedDB/index-population.any.js
+@@ -285,34 +285,32 @@ promise_test(async t => {
+   assert_equals(await generated, 3);
+ }, 'Records stored under generated keys are indexed with their values as they read back');
+ 
+-// More records than one step of a population reads, whose `tags` arrays have a hole at index 1,
+-// through which the multiEntry key conversion reaches Array.prototype[1].
++// More records than one step of a population reads, whose `tags` arrays have a hole at index 1.
++// The population reads the values in a user-agent defined realm in the spec, where the hole is
++// undefined, so a getter of Array.prototype[1] in the page's realm is never reached.
+ const WITH_HOLES = 600;
+ 
+ // A database at version 1 with the store `items` holding `WITH_HOLES` records
+-// `{tags: ['a<i>', , 'b<i>']}` under the keys 0 to WITH_HOLES - 1, whose arrays are marked with a
+-// `hole` property, which cloning keeps.
++// `{tags: ['a<i>', , 'b<i>']}` under the keys 0 to WITH_HOLES - 1.
+ async function databaseWithHoles(t) {
+   const db = await openDatabase(t, db => {
+     const store = db.createObjectStore('items');
+     for (let i = 0; i < WITH_HOLES; i++) {
+-      const tags = ['a' + i, , 'b' + i];
+-      tags.hole = true;
+-      store.add({tags}, i);
++      store.add({tags: ['a' + i, , 'b' + i]}, i);
+     }
+   });
+   db.close();
+   return db.name;
+ }
+ 
+-// Defines `get` as the getter of Array.prototype[1] for the marked arrays until the returned
+-// function removes it. Other arrays read undefined there, and assignments to index 1 create their
+-// own property.
+-function arrayGetter(t, get) {
++promise_test(async t => {
++  const name = await databaseWithHoles(t);
++  let calls = 0;
+   Object.defineProperty(Array.prototype, 1, {
+     configurable: true,
+     get() {
+-      return this.hole === true ? get() : undefined;
++      calls++;
++      return 'from-prototype';
+     },
+     set(value) {
+       Object.defineProperty(this, 1, {value, writable: true, enumerable: true, configurable: true});
+@@ -320,66 +318,19 @@ function arrayGetter(t, get) {
+   });
+   const remove = () => { delete Array.prototype[1]; };
+   t.add_cleanup(remove);
+-  return remove;
+-}
+-
+-promise_test(async t => {
+-  const name = await databaseWithHoles(t);
+-  let tx = null;
+-  const errors = new Set();
+-  const remove = arrayGetter(t, () => {
+-    try {
+-      tx.objectStore('items').put({tags: ['inner']}, 'inner');
+-      errors.add('none');
+-    } catch (e) {
+-      errors.add(e.name);
+-    }
+-    throw new Error('getter');
+-  });
+   let conflict, added;
+   const db = await reopen(name, 2, (db, transaction) => {
+-    tx = transaction;
+     const store = transaction.objectStore('items');
+     store.createIndex('tags', 'tags', {multiEntry: true, unique: true});
+     conflict = failure(store.add({tags: ['b' + (WITH_HOLES - 1)]}, 'conflict'));
+-    added = result(store.add({tags: ['new']}, 'new'));
++    added = result(store.add({tags: ['from-prototype']}, 'new'));
+   });
+   remove();
+   t.add_cleanup(() => { db.close(); });
+-  assert_array_equals([...errors], ['TransactionInactiveError']);
++  assert_equals(calls, 0, 'the population reaches no getter of Array.prototype');
+   assert_equals(await conflict, 'ConstraintError', 'the subkeys around the hole are indexed');
+-  assert_equals(await added, 'new');
++  assert_equals(await added, 'new', 'no record has the key from the prototype');
+   const store = db.transaction('items').objectStore('items');
+   assert_equals(await result(store.count()), WITH_HOLES + 1);
+-  assert_equals(await result(store.get('inner')), undefined);
+-}, 'A getter that a population reaches and that throws skips its subkey, and its requests throw');
+-
+-promise_test(async t => {
+-  const name = await databaseWithHoles(t);
+-  let tx = null;
+-  let calls = 0;
+-  const remove = arrayGetter(t, () => {
+-    calls++;
+-    if (tx) {
+-      const transaction = tx;
+-      tx = null;
+-      transaction.abort();
+-    }
+-    return undefined;
+-  });
+-  const events = await failedUpgrade(name, 2, (db, transaction) => {
+-    tx = transaction;
+-    transaction.objectStore('items').createIndex('tags', 'tags', {multiEntry: true});
+-  });
+-  remove();
+-  assert_array_equals(events, ['abort AbortError', 'open AbortError']);
+-  assert_less_than_equal(calls, 1, 'no more keys are computed after the abort');
+-
+-  const db = await reopen(name, 1, () => assert_unreached('no upgrade'));
+-  t.add_cleanup(() => { db.close(); });
+-  const tx2 = db.transaction('items', 'readwrite');
+-  const store = tx2.objectStore('items');
+-  assert_array_equals([...store.indexNames], []);
+-  await result(store.put({tags: ['z']}, 'z'));
+-  await complete(tx2);
+-}, 'A getter that a population reaches and that aborts the upgrade leaves the database as it was');
++  assert_equals(await result(store.index('tags').count()), 2 * WITH_HOLES + 1);
++}, 'A population skips holes without reaching the getters of Array.prototype');

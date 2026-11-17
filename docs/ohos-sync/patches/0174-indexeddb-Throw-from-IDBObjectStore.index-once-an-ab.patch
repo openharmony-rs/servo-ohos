@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 08:34:45 +0000
+Subject: [PATCH] indexeddb: Throw from IDBObjectStore.index() once an abort
+ has started
+
+"Abort a transaction" sets the transaction's state to finished in step
+4, but script sets its `finished` flag only in the task that fires the
+abort event, so index() right after abort() returned the index instead
+of throwing an InvalidStateError. `IDBTransaction::state_is_finished`
+(finished, or an abort initiated) is the spec's state; objectStore()
+already checks both flags.
+
+Validation: Host SpiderMonkey release build of this commit: idbobjectstore-index-finished passes in all three globals (failed before on both engines), idbobjectstore_index, idbtransaction_abort and idbtransaction_objectStoreNames unchanged (only the lone-surrogate "unusual names" subtests fail, as expected).
+AI-assisted: Yes (agent session; found the missing state check, ran the WPT test on both engines)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbobjectstore.rs  |  2 +-
+ components/script/dom/indexeddb/idbtransaction.rs  |  6 ++++++
+ .../idbobjectstore-index-finished.any.js.ini       | 14 --------------
+ 3 files changed, 7 insertions(+), 15 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index f52c737833b..5d3c877ef70 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -1127,7 +1127,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         self.verify_not_deleted()?;
+ 
+         // Step 4. If the transaction's state is finished, then throw an "InvalidStateError" DOMException.
+-        if self.transaction.is_finished() {
++        if self.transaction.state_is_finished() {
+             return Err(Error::InvalidState(None));
+         }
+ 
+diff --git a/components/script/dom/indexeddb/idbtransaction.rs b/components/script/dom/indexeddb/idbtransaction.rs
+index d9c531d65a8..151f85d2ad7 100644
+--- a/components/script/dom/indexeddb/idbtransaction.rs
++++ b/components/script/dom/indexeddb/idbtransaction.rs
+@@ -276,6 +276,12 @@ impl IDBTransaction {
+         self.finished.get()
+     }
+ 
++    /// Whether the transaction's state is finished in the spec's sense, which "abort a transaction"
++    /// sets in step 4, before the task that fires the abort event sets `finished`.
++    pub(crate) fn state_is_finished(&self) -> bool {
++        self.finished.get() || self.abort_initiated.get()
++    }
++
+     pub(crate) fn set_cleanup_event_loop(&self) {
+         // https://w3c.github.io/IndexedDB/#transaction-concept
+         // A transaction optionally has a cleanup event loop which is an event loop.
+diff --git a/tests/wpt/meta/IndexedDB/idbobjectstore-index-finished.any.js.ini b/tests/wpt/meta/IndexedDB/idbobjectstore-index-finished.any.js.ini
+index e2e9e26ca67..b7c3547e624 100644
+--- a/tests/wpt/meta/IndexedDB/idbobjectstore-index-finished.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbobjectstore-index-finished.any.js.ini
+@@ -1,16 +1,2 @@
+ [idbobjectstore-index-finished.any.serviceworker.html]
+   expected: ERROR
+-
+-[idbobjectstore-index-finished.any.worker.html]
+-  [IDBObjectStore index() behavior when transaction is finished]
+-    expected: FAIL
+-
+-
+-[idbobjectstore-index-finished.any.sharedworker.html]
+-  [IDBObjectStore index() behavior when transaction is finished]
+-    expected: FAIL
+-
+-
+-[idbobjectstore-index-finished.any.html]
+-  [IDBObjectStore index() behavior when transaction is finished]
+-    expected: FAIL
