@@ -1,0 +1,580 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 11:35:52 +0000
+Subject: [PATCH] indexeddb: Abort a global's unfinished transactions when it
+ goes away
+
+When a window or worker went away, its IndexedDB connections were
+closed, but its transactions were left alone. A readwrite transaction
+it left running kept its SQL transaction open on the database's only
+connection: every later writer of the database waited for it, and its
+writes were neither committed nor rolled back. Closing a connection
+with the forced flag aborts its transactions ("close a database
+connection", step 2), so the factory now aborts its unfinished
+transactions in the backend before it closes its connections, and
+reports them finished.
+
+For that, an abort no longer waits for a running batch of the
+transaction to finish: the engine already runs the rollback after the
+batch, and before any batch the scheduler hands over later. Waiting
+let a TransactionFinished that arrived first hand the next writer's
+batch to the engine ahead of the rollback. A transaction that finishes
+without a commit or an abort is now rolled back too, so that none
+leaves its SQL transaction open.
+
+An upgrade requested while a removed iframe still had its connection
+open waited for that connection's versionchange event, which the gone
+global never fires. A connection that closes now no longer owes its
+versionchange event; when its closing leaves no event to wait for
+while other connections are still open, the request gets its blocked
+event.
+
+Tests: an abort that arrives while a batch of the transaction runs,
+followed at once by the transaction's end, leaves nothing behind and
+lets the next writer run; a transaction that ends without a commit or
+an abort is rolled back; an upgrade waits for no versionchange event of
+a connection that closed, and gets its blocked event when the others
+stay open. A fork WPT test,
+tests/wpt/mozilla/tests/IndexedDB/removed-iframe-aborts-its-transactions.html,
+removes an iframe in the middle of a readwrite transaction and checks
+that its writes are gone, that writers of the same and of other stores
+run, and that an upgrade requested right away succeeds.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits` at this commit: 105 passed, 1 skipped (before: 102). The abort and finish tests fail 3 of 3 with the abort deferral restored or without the rollback on TransactionFinished, and the closed-connection test times out without the change to close_database. /_mozilla/IndexedDB/removed-iframe-aborts-its-transactions.html: the first subtest timed out before this change, the second still did without the close_database change; both pass 10 of 10 on host SpiderMonkey and QuickJS, and on the DAYU200. DAYU200 at the tip of the series, `./mach test-unit --ohos -p servo-storage -- [--no-default-features] --features ohos-rdb-backend --status-level all`: RDB only 106 passed, 3 skipped; both backends 182 passed, 4 skipped (the skips are the documented test_new_storage_threads_create_independent_groups and the ignored long tests). WPT IndexedDB/ at the tip of the series (with the P1 review fixes), passing subtests of 4,511: host SpiderMonkey 3,251 with no unexpected result, host QuickJS 3,253, DAYU200 in the board configuration (QuickJS + RDB) 3,247 (before the series 3,224, 3,229 and 3,222); no new failures: QuickJS idbversionchangeevent.any.sharedworker timed out once and passed 20 of 20 on both host engines, and the board's idbversionchangeevent.any.worker saw a blocked event from the sharedworker variant, which uses the same database name and whose connection deleteDatabase doesn't close yet; the other differences are known flips. idbtransaction-oncomplete, window and worker, `--repeat 30 --processes 4`, at the tip: 60 of 60.
+AI-assisted: Yes (agent session; the agent wrote the change and its tests from the P1 review's finding and reproducer, and ran them on the host and the DAYU200)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbfactory.rs |  14 ++
+ .../script/dom/indexeddb/idbtransaction.rs    |  21 ++
+ components/storage/indexeddb/mod.rs           |  67 ++++---
+ components/storage/tests/indexeddb.rs         | 180 ++++++++++++++++++
+ tests/wpt/mozilla/meta/MANIFEST.json          |  15 ++
+ ...emoved-iframe-aborts-its-transactions.html |  81 ++++++++
+ .../resources/removed-iframe-writer.html      |  20 ++
+ 7 files changed, 373 insertions(+), 25 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/removed-iframe-aborts-its-transactions.html
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/resources/removed-iframe-writer.html
+
+diff --git a/components/script/dom/indexeddb/idbfactory.rs b/components/script/dom/indexeddb/idbfactory.rs
+index dbdc403c358..8594bea04a2 100644
+--- a/components/script/dom/indexeddb/idbfactory.rs
++++ b/components/script/dom/indexeddb/idbfactory.rs
+@@ -492,6 +492,20 @@ impl IDBFactory {
+     }
+ 
+     pub(crate) fn abort_pending_upgrades_and_close_databases(&self) {
++        // https://w3c.github.io/IndexedDB/#closing-connection
++        // Step 2. If the forced flag is true, then for each transaction created using connection
++        // run abort a transaction with transaction and newly created "AbortError" DOMException.
++        let transactions: Vec<DomRoot<IDBTransaction>> = self
++            .indexeddb_transactions
++            .borrow()
++            .iter()
++            .flat_map(|(_, bucket)| bucket.iter())
++            .map(|transaction| DomRoot::from_ref(&**transaction))
++            .collect();
++        for transaction in transactions {
++            transaction.abort_when_global_goes_away();
++        }
++
+         let global = self.global();
+         let connections = self.connections.borrow();
+         let pending_upgrades = connections
+diff --git a/components/script/dom/indexeddb/idbtransaction.rs b/components/script/dom/indexeddb/idbtransaction.rs
+index 2d2d78f3213..029493b64d8 100644
+--- a/components/script/dom/indexeddb/idbtransaction.rs
++++ b/components/script/dom/indexeddb/idbtransaction.rs
+@@ -558,6 +558,27 @@ impl IDBTransaction {
+             .send(IndexedDBThreadMsg::Sync(operation));
+     }
+ 
++    /// Aborts the transaction in the backend when its global goes away, which then fires no
++    /// more events: the backend rolls back what it wrote, and the transaction holds back no
++    /// other transaction any more.
++    pub(crate) fn abort_when_global_goes_away(&self) {
++        if self.finished.get() {
++            return;
++        }
++        self.finished.set(true);
++        let callback = GenericCallback::new(|_: Result<TxnCompleteMsg, SendError>| {})
++            .expect("Could not create callback");
++        let _ = self
++            .get_idb_thread()
++            .send(IndexedDBThreadMsg::Sync(SyncOperation::Abort(
++                callback,
++                self.global().origin().immutable().clone(),
++                String::from(self.db.get_name()),
++                self.serial_number,
++            )));
++        self.notify_backend_transaction_finished();
++    }
++
+     fn notify_backend_transaction_finished(&self) {
+         let global = self.global();
+         let _ = self.get_idb_thread().send(IndexedDBThreadMsg::Sync(
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 29dfc679d06..fe3f6eefdf7 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -950,14 +950,11 @@ impl IndexedDBManager {
+                                 },
+                             }
+ 
+-                            if db.abort(&origin, &db_name, txn) {
+-                                return false;
+-                            }
+-
+                             // If more requests were queued while this batch was running,
+                             // schedule again now.
+                             db.schedule_transactions(origin.clone(), &db_name);
+-                            db.can_notify_txn_maybe_commit(txn)
++                            // An aborted transaction has nothing left to commit.
++                            mode.is_some() && db.can_notify_txn_maybe_commit(txn)
+                         });
+ 
+                     if should_notify {
+@@ -1517,12 +1514,10 @@ impl IndexedDBManager {
+                     "An request to open a connection should be in the queue."
+                 );
+             };
+-            debug_assert!(
+-                pending_versionchange.contains(&from_id),
+-                "The open request should be pending on the versionchange event for the connection sending the message."
+-            );
+-
+-            pending_versionchange.remove(&from_id);
++            // Note: a connection that closed first no longer counts, see `close_database`.
++            if !pending_versionchange.remove(&from_id) {
++                return;
++            }
+ 
+             // Step 10.3: Wait for all of the events to be fired.
+             if !pending_versionchange.is_empty() {
+@@ -1952,10 +1947,10 @@ impl IndexedDBManager {
+                 return;
+             };
+             if let OpenRequest::Open {
+-                sender: _,
++                sender,
+                 db_name: _,
+                 version,
+-                id: _,
++                id: request_id,
+                 processed: _,
+                 pending_upgrade,
+                 pending_versionchange,
+@@ -1964,6 +1959,33 @@ impl IndexedDBManager {
+             } = open_request
+             {
+                 pending_close.remove(&id);
++                // A closed connection fires no versionchange event, so the request stops waiting
++                // for it: the connection's global may be gone and never report the event.
++                if pending_versionchange.remove(&id) &&
++                    pending_versionchange.is_empty() &&
++                    !pending_close.is_empty() &&
++                    let Some(version) = *version
++                {
++                    // Step 10.4: If any of the connections in openConnections are still not
++                    // closed, queue a database task to fire a version change event named blocked
++                    // at request with db’s version and version.
++                    let old_version = self
++                        .databases
++                        .get(&key)
++                        .and_then(|db| db.version().ok())
++                        .unwrap_or_default();
++                    if sender
++                        .send(ConnectionMsg::Blocked {
++                            name: key.name.clone(),
++                            id: *request_id,
++                            version,
++                            old_version,
++                        })
++                        .is_err()
++                    {
++                        debug!("Script exit during indexeddb database open");
++                    }
++                }
+                 (
+                     // Note: need to exclude requests that have already started upgrading.
+                     pending_close.is_empty() &&
+@@ -2162,6 +2184,10 @@ impl IndexedDBManager {
+                 let maybe_commit_txns =
+                     if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
+                         db.finish_transaction(txn);
++                        // A no-op after a commit or an abort, but a transaction that finished
++                        // otherwise, such as one whose global went away, must not leave its SQL
++                        // transaction open.
++                        db.engine.rollback(txn, Box::new(|| {}));
+                         db.schedule_transactions(origin.clone(), &db_name);
+                         db.maybe_commit_candidates()
+                     } else {
+@@ -2219,9 +2245,9 @@ impl IndexedDBManager {
+         }
+     }
+ 
+-    /// Handling for the `Abort` message which will call [`Self::abort`] if the transaction
+-    /// being aborted is not ongoing. If the transaction is in process, abort is delayed until
+-    /// the batch finishes.
++    /// Handling for the `Abort` message, which calls [`IndexedDBEnvironment::abort`] at once,
++    /// also while a batch of the transaction runs: the engine runs the rollback after it, and
++    /// before any batch the scheduler hands over later.
+     fn handle_abort(
+         &mut self,
+         abort_callback: GenericCallback<TxnCompleteMsg>,
+@@ -2252,15 +2278,6 @@ impl IndexedDBManager {
+             .entry(transaction)
+             .or_default()
+             .push(abort_callback);
+-
+-        // If the transaction is running wait to abort until after it finishes to actually
+-        // abort.
+-        if database.running_readwrite == Some(transaction) ||
+-            database.running_readonly.contains(&transaction)
+-        {
+-            return;
+-        }
+-
+         database.abort(&origin, &database_name, transaction);
+     }
+ 
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index 8314d9dda5a..6cd7ca27527 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -69,6 +69,9 @@ backend_tests!(
+     test_indexeddb_batch_commit_failure_surfaces_an_error,
+     test_indexeddb_aborted_put_that_succeeded_leaves_no_record,
+     test_indexeddb_writers_with_disjoint_scopes_run_one_after_another,
++    test_indexeddb_abort_while_a_batch_runs_frees_the_next_writer,
++    test_indexeddb_finished_transaction_without_commit_is_rolled_back,
++    test_indexeddb_upgrade_waits_for_no_versionchange_of_a_closed_connection,
+ );
+ 
+ static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+@@ -1823,3 +1826,180 @@ fn test_indexeddb_writers_with_disjoint_scopes_run_one_after_another() {
+     close_database(&ctx, connection_id, db_name);
+     ctx.shutdown();
+ }
++
++/// Opens `db_name` at version 1 with the stores `a` and `b`.
++fn open_database_with_two_stores(ctx: &IndexedDbTestContext, db_name: &str) -> Uuid {
++    let receiver = open_database(ctx, db_name, Some(1));
++    loop {
++        match recv_callback_timeout(&receiver, "two stores open reply") {
++            ConnectionMsg::Upgrade { transaction, .. } => {
++                for store_name in ["a", "b"] {
++                    create_object_store(ctx, db_name, store_name, transaction, None, false);
++                }
++                commit_upgrade_transaction(ctx, db_name, transaction);
++            },
++            ConnectionMsg::Connection { id, .. } => break id,
++            other => panic!("unexpected two stores message: {other:?}"),
++        }
++    }
++}
++
++/// Runs a put into `store_name` in a new readwrite transaction and commits it.
++fn put_and_commit(ctx: &IndexedDbTestContext, db_name: &str, store_name: &str) {
++    let txn = create_transaction(
++        ctx,
++        db_name,
++        IndexedDBTxnMode::Readwrite,
++        vec![store_name.to_string()],
++    );
++    let put = put_item(
++        ctx,
++        db_name,
++        store_name,
++        txn,
++        IndexedDBKeyType::Number(1.0),
++        b"next".to_vec(),
++    );
++    assert!(
++        recv_callback_timeout(&put, "next writer put reply").is_ok(),
++        "The next writer's put must not meet the earlier writer's SQL transaction"
++    );
++    mark_request_handled(ctx, db_name, txn, 1);
++    let commit_result = commit_transaction(ctx, db_name, txn);
++    assert!(
++        recv_callback_timeout(&commit_result, "next writer commit reply")
++            .result
++            .is_ok()
++    );
++    finish_transaction(ctx, db_name, txn);
++}
++
++/// Sends `count` puts into `a` in the readwrite transaction `txn`, which keep the engine busy
++/// with a batch of them.
++fn send_puts(ctx: &IndexedDbTestContext, db_name: &str, txn: u64, count: u64) {
++    for key in 0..count {
++        let _ = put_item_request(
++            ctx,
++            db_name,
++            "a",
++            txn,
++            key,
++            Some(IndexedDBKeyType::Number(key as f64)),
++            vec![0; 1024],
++            true,
++        );
++    }
++}
++
++/// An abort that arrives while a batch of the transaction runs rolls the transaction back
++/// before the next writer runs, also when the transaction finishes right after the abort, as it
++/// does when its global goes away.
++fn test_indexeddb_abort_while_a_batch_runs_frees_the_next_writer() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-abort-running-batch";
++    let connection_id = open_database_with_two_stores(&ctx, db_name);
++
++    let txn = create_transaction(
++        &ctx,
++        db_name,
++        IndexedDBTxnMode::Readwrite,
++        vec!["a".to_string()],
++    );
++    send_puts(&ctx, db_name, txn, 2000);
++    let _abort_result = abort_transaction(&ctx, db_name, txn);
++    finish_transaction(&ctx, db_name, txn);
++
++    put_and_commit(&ctx, db_name, "b");
++    assert_eq!(
++        get_item_in_new_readonly_transaction(&ctx, db_name, "a", IndexedDBKeyType::Number(0.0)),
++        None
++    );
++
++    close_database(&ctx, connection_id, db_name);
++    ctx.shutdown();
++}
++
++/// A transaction that finishes without a commit or an abort, like one of a global that went
++/// away, is rolled back and holds back no other writer.
++fn test_indexeddb_finished_transaction_without_commit_is_rolled_back() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-finished-without-commit";
++    let connection_id = open_database_with_two_stores(&ctx, db_name);
++
++    let txn = create_transaction(
++        &ctx,
++        db_name,
++        IndexedDBTxnMode::Readwrite,
++        vec!["a".to_string()],
++    );
++    let put = put_item(
++        &ctx,
++        db_name,
++        "a",
++        txn,
++        IndexedDBKeyType::Number(0.0),
++        b"dead".to_vec(),
++    );
++    recv_callback_timeout(&put, "dead writer put reply").unwrap();
++    finish_transaction(&ctx, db_name, txn);
++
++    put_and_commit(&ctx, db_name, "b");
++    assert_eq!(
++        get_item_in_new_readonly_transaction(&ctx, db_name, "a", IndexedDBKeyType::Number(0.0)),
++        None
++    );
++
++    close_database(&ctx, connection_id, db_name);
++    ctx.shutdown();
++}
++
++/// A connection that closes before it reports its versionchange event, as one whose global went
++/// away does, holds back no upgrade; when its closing leaves no event to wait for while another
++/// connection stays open, the upgrade is blocked.
++fn test_indexeddb_upgrade_waits_for_no_versionchange_of_a_closed_connection() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-upgrade-closed-connection";
++    let gone = open_database_with_two_stores(&ctx, db_name);
++    let stays = match recv_callback_timeout(&open_database(&ctx, db_name, None), "second open") {
++        ConnectionMsg::Connection { id, .. } => id,
++        other => panic!("unexpected second open message: {other:?}"),
++    };
++
++    let upgrade = open_database(&ctx, db_name, Some(2));
++    GenericSend::send(
++        &ctx.private_threads,
++        IndexedDBThreadMsg::Sync(SyncOperation::NotifyEndOfVersionChange {
++            name: db_name.to_string(),
++            id: stays,
++            old_version: 1,
++            origin: ctx.origin.clone(),
++        }),
++    )
++    .unwrap();
++    close_database(&ctx, gone, db_name);
++    match recv_callback_timeout(&upgrade, "blocked event") {
++        ConnectionMsg::Blocked {
++            version,
++            old_version,
++            ..
++        } => assert_eq!((version, old_version), (2, 1)),
++        other => panic!("unexpected upgrade message: {other:?}"),
++    }
++
++    close_database(&ctx, stays, db_name);
++    let transaction = match recv_callback_timeout(&upgrade, "upgrade") {
++        ConnectionMsg::Upgrade { transaction, .. } => transaction,
++        other => panic!("unexpected upgrade message: {other:?}"),
++    };
++    commit_upgrade_transaction(&ctx, db_name, transaction);
++    let upgraded = match recv_callback_timeout(&upgrade, "upgraded connection") {
++        ConnectionMsg::Connection { id, version, .. } => {
++            assert_eq!(version, 2);
++            id
++        },
++        other => panic!("unexpected upgrade message: {other:?}"),
++    };
++
++    close_database(&ctx, upgraded, db_name);
++    ctx.shutdown();
++}
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index c40b29a9806..e2a73f3a08e 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -8565,6 +8565,14 @@
+     "b485d435a63ada28eabe976b49a8a580725e7508",
+     []
+    ],
++   "IndexedDB": {
++    "resources": {
++     "removed-iframe-writer.html": [
++      "728c70ad75c2804ca49320cd69afec1026e7fad8",
++      []
++     ]
++    }
++   },
+    "appearance": {
+     "document-selection-image-broken-ref.html": [
+      "d4d29943249a0ec2b78c79f88573d505742f7a56",
+@@ -11670,6 +11678,13 @@
+        ]
+       }
+      ]
++    ],
++    "removed-iframe-aborts-its-transactions.html": [
++     "4c72fe0190142520f2e483e292f0997bd6dc924b",
++     [
++      null,
++      {}
++     ]
+     ]
+    },
+    "accessibility-tree": {
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/removed-iframe-aborts-its-transactions.html b/tests/wpt/mozilla/tests/IndexedDB/removed-iframe-aborts-its-transactions.html
+new file mode 100644
+index 00000000000..4c72fe01901
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/removed-iframe-aborts-its-transactions.html
+@@ -0,0 +1,81 @@
++<!doctype html>
++<meta charset="utf-8">
++<title>IndexedDB: the transactions of a removed iframe are aborted</title>
++<link rel="help" href="https://w3c.github.io/IndexedDB/#closing-connection">
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script>
++// When the global of a connection goes away, the connection is closed with the forced flag,
++// which aborts its transactions: a readwrite transaction that a removed iframe left running
++// leaves no writes behind and holds back no later transaction, also of the same scope.
++
++function request(r) {
++  return new Promise((resolve, reject) => {
++    r.onsuccess = () => resolve(r.result);
++    r.onerror = () => reject(r.error);
++  });
++}
++
++function complete(tx) {
++  return new Promise((resolve, reject) => {
++    tx.oncomplete = resolve;
++    tx.onabort = () => reject(tx.error);
++  });
++}
++
++promise_test(async t => {
++  const name = 'removed-iframe-' + Math.random();
++  const setup = indexedDB.open(name, 1);
++  setup.onupgradeneeded = () => {
++    setup.result.createObjectStore('a');
++    setup.result.createObjectStore('b');
++  };
++  (await request(setup)).close();
++  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
++
++  const frame = document.createElement('iframe');
++  const writing = new Promise(resolve => window.onmessage = e => resolve(e.data));
++  frame.src = 'resources/removed-iframe-writer.html?' + encodeURIComponent(name);
++  document.body.appendChild(frame);
++  assert_equals(await writing, 'writing');
++  frame.remove();
++
++  const db = await request(indexedDB.open(name));
++  t.add_cleanup(() => { db.close(); });
++
++  let tx = db.transaction('b', 'readwrite');
++  tx.objectStore('b').put('parent', 0);
++  await complete(tx);
++
++  tx = db.transaction('a', 'readonly');
++  const written = request(tx.objectStore('a').count());
++  await complete(tx);
++  assert_equals(await written, 0, "the removed iframe's writes are rolled back");
++
++  tx = db.transaction('a', 'readwrite');
++  tx.objectStore('a').put('parent', 0);
++  await complete(tx);
++}, "The transactions of a removed iframe are aborted and hold back no one");
++
++promise_test(async t => {
++  const name = 'removed-iframe-upgrade-' + Math.random();
++  const setup = indexedDB.open(name, 1);
++  setup.onupgradeneeded = () => setup.result.createObjectStore('a');
++  (await request(setup)).close();
++  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
++
++  const frame = document.createElement('iframe');
++  const writing = new Promise(resolve => window.onmessage = e => resolve(e.data));
++  frame.src = 'resources/removed-iframe-writer.html?' + encodeURIComponent(name);
++  document.body.appendChild(frame);
++  assert_equals(await writing, 'writing');
++  frame.remove();
++
++  const upgrade = indexedDB.open(name, 2);
++  upgrade.onupgradeneeded = () => upgrade.result.createObjectStore('b');
++  const upgraded = await request(upgrade);
++  upgraded.close();
++  assert_equals(upgraded.version, 2);
++}, "An upgrade waits for no transaction or connection of a removed iframe");
++</script>
++<body></body>
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/resources/removed-iframe-writer.html b/tests/wpt/mozilla/tests/IndexedDB/resources/removed-iframe-writer.html
+new file mode 100644
+index 00000000000..728c70ad75c
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/resources/removed-iframe-writer.html
+@@ -0,0 +1,20 @@
++<!doctype html>
++<meta charset="utf-8">
++<script>
++// Keeps a readwrite transaction on the store `a` alive with chained puts, until the frame goes
++// away.
++const name = decodeURIComponent(location.search.slice(1));
++const request = indexedDB.open(name);
++request.onsuccess = () => {
++  const store = request.result.transaction('a', 'readwrite').objectStore('a');
++  let key = 0;
++  (function put() {
++    store.put('frame', key++).onsuccess = () => {
++      if (key === 1) {
++        parent.postMessage('writing', '*');
++      }
++      put();
++    };
++  })();
++};
++</script>

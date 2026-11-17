@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 09:22:21 +0000
+Subject: [PATCH] indexeddb: Abort a transaction whose commit failed with the
+ backend's error
+
+A failed commit aborted the transaction with an OperationError,
+whatever the backend reported. Now that the backend's commit result is
+the result of COMMIT itself, script aborts with the backend's error
+mapped as for other backend failures: QuotaExceededError when the disk
+or the database is full, OperationError otherwise, as step 2.4 of
+"commit a transaction" asks ("for example a QuotaExceededError or an
+UnknownError DOMException"; Servo has no UnknownError). The
+OperationError's message says that the commit failed, rather than the
+open-failed message of the mapping.
+
+idbtransaction.rs has one Error without a message fewer, so tidy's
+allowance for it in error_message_exceptions.txt goes down to 6.
+
+Validation: `./mach build --release` with SpiderMonkey and with `--js-engine quickjs`, and the DAYU200 board build, succeed at the tip of the series. WPT IndexedDB/ at the tip of the series (with the P1 review fixes), passing subtests of 4,511: host SpiderMonkey 3,251 with no unexpected result, host QuickJS 3,253, DAYU200 in the board configuration (QuickJS + RDB) 3,247 (before the series 3,224, 3,229 and 3,222). `./mach test-tidy` reports only the libsqlite3-sys advisory (deny.toml:434), as before the series. No WPT test makes COMMIT fail, so none depends on this change; the backend side, a failed COMMIT reaching the commit callback as an error, is covered by test_failed_commit_reports_the_error_and_rolls_back and test_commit_failure_rolls_back.
+AI-assisted: Yes (agent session; the agent wrote the change, checked it with the WPT runs of the series, and changed the error message for the P1 review)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../script/dom/indexeddb/idbtransaction.rs     | 18 +++++++++++++-----
+ python/tidy/error_message_exceptions.txt       |  2 +-
+ 2 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbtransaction.rs b/components/script/dom/indexeddb/idbtransaction.rs
+index 2204245f811..36e7736ffb8 100644
+--- a/components/script/dom/indexeddb/idbtransaction.rs
++++ b/components/script/dom/indexeddb/idbtransaction.rs
+@@ -332,15 +332,23 @@ impl IDBTransaction {
+                     Ok(()) => {
+                         this.finalize_commit();
+                     }
+-                    Err(_err) => {
+-                         // TODO: Map backend commit/rollback failure to an appropriate DOMException
+-                        this.initiate_abort(cx, Error::Operation(None));
++                    Err(err) => {
++                        // https://w3c.github.io/IndexedDB/#commit-a-transaction
++                        // Step 2.4. If an error occurs while writing the changes to the database,
++                        // then run abort a transaction with transaction and an appropriate type
++                        // for the error, for example a QuotaExceededError or an "UnknownError"
++                        // DOMException, and terminate these steps.
++                        let error = match err {
++                            BackendError::DbErr(details) => Error::Operation(Some(format!(
++                                "IndexedDB commit failed: {details}"
++                            ))),
++                            other => map_backend_error_to_dom_error(other),
++                        };
++                        this.initiate_abort(cx, error);
+ 
+                         this.finalize_abort();
+                     }
+                 }
+-                // TODO: https://w3c.github.io/IndexedDB/#commit-a-transaction
+-                // Backend commit/rollback is not yet atomic.
+             }));
+         })
+         .expect("Could not create callback");
+diff --git a/python/tidy/error_message_exceptions.txt b/python/tidy/error_message_exceptions.txt
+index 62d2a30d369..4b9b6fa97b5 100644
+--- a/python/tidy/error_message_exceptions.txt
++++ b/python/tidy/error_message_exceptions.txt
+@@ -35,7 +35,7 @@
+ ./components/script/dom/indexeddb/idbobjectstore.rs 26
+ ./components/script/dom/indexeddb/idbopendbrequest.rs 1
+ ./components/script/dom/indexeddb/idbrequest.rs 7
+-./components/script/dom/indexeddb/idbtransaction.rs 7
++./components/script/dom/indexeddb/idbtransaction.rs 6
+ ./components/script/dom/indexeddb/key.rs 2
+ ./components/script/dom/intersectionobserver/intersectionobserver.rs 2
+ ./components/script/dom/macros.rs 2

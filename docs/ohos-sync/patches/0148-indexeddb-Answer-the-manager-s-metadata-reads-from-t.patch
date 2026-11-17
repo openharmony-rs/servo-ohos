@@ -1,0 +1,566 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 11:45:06 +0000
+Subject: [PATCH] indexeddb: Answer the manager's metadata reads from the
+ committed metadata
+
+Since each database's work runs on its one connection, in order, the
+manager's synchronous metadata reads waited behind the work handed over
+before: the object store parameters of a transaction's first
+objectStore(), the version at open and in databases(). A readonly
+getAll over 50,000 records held the script thread that called
+objectStore(), and every IndexedDB request of the process, for about
+2 s on the DAYU200.
+
+The engine now keeps the version and the object stores (names, key
+paths, whether they have a key generator, indexes) as of the last
+commit. It loads them when it opens the database, and an upgrade
+transaction reloads them inside its SQL transaction right before
+COMMIT and publishes them once COMMIT has succeeded; if the reload
+fails, the commit fails. Only upgrade transactions change the
+metadata, and the manager only needs it as committed: script keeps
+the object stores that an upgrade creates or renames, and asks the
+backend only about stores the upgrade hasn't touched. The reads
+answer at once, and no longer run statements inside a writer's SQL
+transaction.
+
+databases() also filters by origin before it reads versions, and now
+reads committed versions, as the spec asks.
+
+Tests: the metadata reads answer while a job holds the connection; the
+version is the committed one after an upgrade without requests commits
+and after one aborts; inside an open upgrade transaction the SQL state
+has the upgrade's changes while the reads report the committed state,
+and both report the old state after the abort.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 105 passed, 1 skipped, as before (the manager-read test of the transaction model is replaced by one for the metadata reads). DAYU200 at the tip of the series, `./mach test-unit --ohos -p servo-storage -- [--no-default-features] --features ohos-rdb-backend --status-level all`: RDB only 106 passed, 3 skipped; both backends 182 passed, 4 skipped (the skips are the documented test_new_storage_threads_create_independent_groups and the ignored long tests). A temporary probe page (50,000 records of 100 bytes; during a readonly getAll, objectStore() on another store in the same task, and an open of an unrelated database), 3 runs each: on the DAYU200 (QuickJS + RDB) objectStore() took 1,932 to 2,019 ms and the open 1,936 to 2,022 ms before, 0 ms and 5 ms now, with the getAll at 2.7 s both times; host SpiderMonkey 5 ms and 7 to 8 ms before, 0 ms and 2 ms now. WPT IndexedDB/ at the tip of the series (with the P1 review fixes), passing subtests of 4,511: host SpiderMonkey 3,251 with no unexpected result, host QuickJS 3,253, DAYU200 in the board configuration (QuickJS + RDB) 3,247 (before the series 3,224, 3,229 and 3,222), and /_mozilla/IndexedDB/ 46 of 46 on all three; no new failures: QuickJS idbversionchangeevent.any.sharedworker timed out once and passed 20 of 20 on both host engines, and the board's idbversionchangeevent.any.worker saw a blocked event from the sharedworker variant, which uses the same database name and whose connection deleteDatabase doesn't close yet; the other differences are known flips. The SpiderMonkey runs used this tree with an earlier form of the databases() change, rewritten since with the same behaviour. `./mach check --ohos -- -p servo-storage --all-targets` warning-free with SQLite only, RDB only and both. CI-parity checks at this tree: `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`, the same OHOS build for the default and harmonyos flavors, each leaving a signed HAP, and `./mach test-unit --profile checked-release` (1,308 passed, 1 skipped) and `--doc` pass.
+AI-assisted: Yes (agent session; the agent wrote the change and its tests, and measured the stall on the host and the DAYU200, from the P1 review's finding)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../storage/indexeddb/backend/engine.rs       | 143 ++++++++++++++----
+ components/storage/indexeddb/backend/tests.rs |  74 +++++++--
+ components/storage/indexeddb/engines/mod.rs   |   3 +-
+ components/storage/indexeddb/mod.rs           |  39 ++---
+ 4 files changed, 202 insertions(+), 57 deletions(-)
+
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index 288a5300f6e..cd58e511ff4 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -33,8 +33,12 @@ use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction};
+ /// aborts. Readonly requests run without one, inside the open SQL transaction if there is one;
+ /// the manager never runs a readonly transaction alongside a writer with an overlapping scope, and
+ /// starts at most one writer at a time.
++///
++/// The manager's metadata reads answer from the metadata as of the last commit, without waiting
++/// for the work handed over before.
+ pub(crate) struct SqlEngine<X: SqlExecutor> {
+     actor: Arc<Actor<X>>,
++    metadata: Arc<Mutex<Metadata>>,
+     created_db_path: bool,
+ }
+ 
+@@ -45,7 +49,8 @@ impl<X: SqlExecutor> SqlEngine<X> {
+         db_info: &IndexedDBDescription,
+         pool: Arc<ThreadPool>,
+     ) -> Result<Self, SqlError> {
+-        let (executor, created_database) = schema::open_database::<X>(&path, db_info)?;
++        let (mut executor, created_database) = schema::open_database::<X>(&path, db_info)?;
++        let metadata = Arc::new(Mutex::new(Metadata::load(&mut executor)?));
+         Ok(Self {
+             actor: Arc::new(Actor {
+                 pool,
+@@ -57,9 +62,12 @@ impl<X: SqlExecutor> SqlEngine<X> {
+                     executor,
+                     writer: None,
+                     upgrade: None,
++                    versionchange: None,
++                    metadata: metadata.clone(),
+                     failed: FxHashMap::default(),
+                 })),
+             }),
++            metadata,
+             created_db_path: created || created_database,
+         })
+     }
+@@ -70,13 +78,20 @@ impl<X: SqlExecutor> SqlEngine<X> {
+         self.created_db_path
+     }
+ 
+-    /// Runs `read` on the connection after the work handed over before, and waits for it.
+-    fn read<T: Send + 'static>(
+-        &self,
+-        read: impl FnOnce(&mut X) -> Result<T, SqlError> + Send + 'static,
+-    ) -> Result<T, SqlError> {
++    /// The current number of the key generator of `store_name`, read on the connection after
++    /// the work handed over before, inside the open SQL transaction if there is one.
++    #[cfg(test)]
++    pub(crate) fn key_generator_current_number(&self, store_name: &str) -> Option<i64> {
++        let store_name = store_name.to_owned();
+         self.actor
+-            .call(move |database| read(&mut database.executor))?
++            .call(move |database| {
++                queries::key_generator_current_number(&mut database.executor, &store_name)
++            })
++            .and_then(|result| result)
++            .unwrap_or_else(|error| {
++                warn!("IndexedDB key generator lookup failed: {error:?}");
++                None
++            })
+     }
+ 
+     /// The connection, for tests to use while no work is handed over.
+@@ -85,6 +100,13 @@ impl<X: SqlExecutor> SqlEngine<X> {
+         TestConnection(lock(&self.actor.database))
+     }
+ 
++    /// Reloads the committed metadata, after a test changed the database through
++    /// [`Self::connection`].
++    #[cfg(test)]
++    pub(super) fn reload_metadata(&self) {
++        *lock(&self.metadata) = Metadata::load(&mut *self.connection()).unwrap();
++    }
++
+     /// Runs `job` on the connection after the work handed over before, without waiting for it.
+     #[cfg(test)]
+     pub(super) fn spawn_on_connection(&self, job: impl FnOnce(&mut X) + Send + 'static) {
+@@ -212,8 +234,8 @@ impl<X: SqlExecutor> Actor<X> {
+     }
+ 
+     /// Runs `job` after the work handed over before, and waits for its result. Runs it on this
+-    /// thread if the actor is idle, which saves the manager thread a round trip for its
+-    /// metadata reads.
++    /// thread if the actor is idle.
++    #[cfg(test)]
+     fn call<T: Send + 'static>(
+         self: &Arc<Self>,
+         job: impl FnOnce(&mut Database<X>) -> T + Send + 'static,
+@@ -256,6 +278,10 @@ pub(super) struct Database<X> {
+     writer: Option<u64>,
+     /// The upgrade transaction that hasn't begun yet, and the version it sets when it begins.
+     upgrade: Option<(u64, u64)>,
++    /// The upgrade transaction, whose commit changes the metadata.
++    versionchange: Option<u64>,
++    /// The metadata as of the last commit, which the [`SqlEngine`] reads.
++    metadata: Arc<Mutex<Metadata>>,
+     /// Transactions whose changes were rolled back by a failure, with the error that their later
+     /// requests and their commit report, until the transaction aborts.
+     failed: FxHashMap<u64, BackendError>,
+@@ -338,6 +364,10 @@ impl<X: SqlExecutor> Database<X> {
+ 
+     /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>
+     fn commit(&mut self, transaction: u64) -> BackendResult<()> {
++        let changes_metadata = self
++            .versionchange
++            .take_if(|versionchange| *versionchange == transaction)
++            .is_some();
+         if let Some(error) = self.failed.remove(&transaction) {
+             return Err(error);
+         }
+@@ -353,6 +383,17 @@ impl<X: SqlExecutor> Database<X> {
+         if self.writer != Some(transaction) {
+             return Ok(());
+         }
++        let metadata = if changes_metadata {
++            match Metadata::load(&mut self.executor) {
++                Ok(metadata) => Some(metadata),
++                Err(error) => {
++                    self.roll_back(transaction);
++                    return Err(error.to_backend_error());
++                },
++            }
++        } else {
++            None
++        };
+         self.writer = None;
+         // Step 2.3. Attempt to write any outstanding changes made by transaction to the database.
+         // Step 2.4. If an error occurs while writing the changes to the database, then run abort a
+@@ -361,7 +402,11 @@ impl<X: SqlExecutor> Database<X> {
+         self.executor.commit().map_err(|error| {
+             warn!("Failed to commit IndexedDB transaction {transaction}: {error:?}");
+             error.to_backend_error()
+-        })
++        })?;
++        if let Some(metadata) = metadata {
++            *lock(&self.metadata) = metadata;
++        }
++        Ok(())
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#abort-a-transaction>
+@@ -373,6 +418,9 @@ impl<X: SqlExecutor> Database<X> {
+         {
+             self.upgrade = None;
+         }
++        if self.versionchange == Some(transaction) {
++            self.versionchange = None;
++        }
+         // Step 2. All the changes made to the database by the transaction are reverted. For
+         // upgrade transactions this includes changes to the set of object stores and indexes, as
+         // well as the change to the version.
+@@ -425,6 +473,7 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
+     fn upgrade_version(&self, transaction: u64, version: u64) {
+         self.actor.spawn(move |database| {
+             database.upgrade = Some((transaction, version));
++            database.versionchange = Some(transaction);
+         });
+     }
+ 
+@@ -440,35 +489,75 @@ impl<X: SqlExecutor> KvsEngine for SqlEngine<X> {
+         });
+     }
+ 
+-    fn key_generator_current_number(&self, store_name: &str) -> Option<i64> {
+-        let store_name = store_name.to_owned();
+-        self.read(move |executor| queries::key_generator_current_number(executor, &store_name))
+-            .unwrap_or_else(|error| {
+-                warn!("IndexedDB key generator lookup failed: {error:?}");
+-                None
+-            })
++    fn has_key_generator(&self, store_name: &str) -> bool {
++        lock(&self.metadata)
++            .store(store_name)
++            .is_some_and(|store| store.has_key_generator)
+     }
+ 
+     fn key_path(&self, store_name: &str) -> Option<KeyPath> {
+-        let store_name = store_name.to_owned();
+-        self.read(move |executor| queries::key_path(executor, &store_name))
+-            .unwrap_or_else(|error| {
+-                warn!("IndexedDB key path lookup failed: {error:?}");
+-                None
+-            })
++        lock(&self.metadata)
++            .store(store_name)
++            .and_then(|store| store.key_path.clone())
+     }
+ 
+     fn object_store_names(&self) -> Result<Vec<String>, Self::Error> {
+-        self.read(queries::object_store_names)
++        Ok(lock(&self.metadata)
++            .stores
++            .iter()
++            .map(|store| store.name.clone())
++            .collect())
+     }
+ 
+     fn indexes(&self, store_name: &str) -> Result<Vec<IndexedDBIndex>, Self::Error> {
+-        let store_name = store_name.to_owned();
+-        self.read(move |executor| queries::indexes(executor, &store_name))
++        lock(&self.metadata)
++            .store(store_name)
++            .map(|store| store.indexes.clone())
++            .ok_or(SqlError::MissingRow("object store"))
+     }
+ 
+     fn version(&self) -> Result<u64, Self::Error> {
+-        self.read(queries::version)
++        Ok(lock(&self.metadata).version)
++    }
++}
++
++/// The version of a database and its object stores. Only upgrade transactions change them.
++struct Metadata {
++    version: u64,
++    /// In the order the stores were created.
++    stores: Vec<StoreMetadata>,
++}
++
++struct StoreMetadata {
++    name: String,
++    key_path: Option<KeyPath>,
++    has_key_generator: bool,
++    indexes: Vec<IndexedDBIndex>,
++}
++
++impl Metadata {
++    /// Reads the metadata on `executor`, inside its open SQL transaction if there is one.
++    fn load<X: SqlExecutor>(executor: &mut X) -> Result<Self, SqlError> {
++        let stores = queries::object_store_names(executor)?
++            .into_iter()
++            .map(|name| {
++                Ok(StoreMetadata {
++                    key_path: queries::key_path(executor, &name)?,
++                    has_key_generator: queries::key_generator_current_number(executor, &name)?
++                        .is_some(),
++                    indexes: queries::indexes(executor, &name)?,
++                    name,
++                })
++            })
++            .collect::<Result<_, SqlError>>()?;
++        Ok(Self {
++            version: queries::version(executor)?,
++            stores,
++        })
++    }
++
++    fn store(&self, name: &str) -> Option<&StoreMetadata> {
++        self.stores.iter().find(|store| store.name == name)
+     }
+ }
+ 
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index d54d80d134c..8902a54f653 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -104,7 +104,7 @@ executor_tests!(
+     test_commit_failure_rolls_back,
+     test_batches_reply_in_dispatch_order,
+     test_job_that_ends_the_sql_transaction_fails_the_writer,
+-    test_manager_read_that_ends_the_sql_transaction_fails_the_writer,
++    test_metadata_reads_do_not_wait_for_the_connection,
+     test_upgrade_without_requests_sets_the_version_at_commit,
+ );
+ 
+@@ -155,7 +155,9 @@ fn in_own_transaction<X: SqlExecutor, T>(
+     db: &SqlEngine<X>,
+     f: impl FnOnce(&mut X) -> Result<T, SqlError>,
+ ) -> Result<T, SqlError> {
+-    with_transaction(&mut *db.connection(), TransactionBehavior::Immediate, f)
++    let result = with_transaction(&mut *db.connection(), TransactionBehavior::Immediate, f);
++    db.reload_metadata();
++    result
+ }
+ 
+ fn create_store<X: SqlExecutor>(
+@@ -1165,6 +1167,18 @@ fn stored_keys<X: SqlExecutor>(db: &SqlEngine<X>, store_name: &str) -> Vec<Index
+     keys_of(&mut *db.connection(), store_name)
+ }
+ 
++/// The version and the object store names in the database, also inside its open SQL
++/// transaction, unlike the engine's metadata reads, which answer as of the last commit.
++pub(crate) fn stored_version_and_store_names<X: SqlExecutor>(
++    db: &SqlEngine<X>,
++) -> (u64, Vec<String>) {
++    let mut connection = db.connection();
++    (
++        queries::version(&mut *connection).unwrap(),
++        queries::object_store_names(&mut *connection).unwrap(),
++    )
++}
++
+ /// A write that fails in the database aborts the transaction: everything it wrote is rolled back,
+ /// and its later requests and its commit fail.
+ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
+@@ -1587,22 +1601,40 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+     );
+     assert!(schema_errors.try_recv().is_err());
+     let index_names = |db: &SqlEngine<X>| -> Vec<String> {
+-        db.indexes("kept")
++        queries::indexes(&mut *db.connection(), "kept")
+             .unwrap()
+             .into_iter()
+             .map(|index| index.name)
+             .collect()
+     };
+-    assert_eq!(db.version().unwrap(), 2);
+-    assert_eq!(db.object_store_names().unwrap(), vec!["kept", "created"]);
++    let before = (1, vec!["kept".to_owned(), "deleted".to_owned()]);
++    assert_eq!(
++        stored_version_and_store_names(&db),
++        (2, vec!["kept".to_owned(), "created".to_owned()])
++    );
+     assert_eq!(index_names(&db), vec!["by_c", "by_b"]);
+     assert_eq!(stored_keys(&db, "kept"), number_keys([1, 2]));
++    assert_eq!(
++        (db.version().unwrap(), db.object_store_names().unwrap()),
++        before
++    );
+ 
+     abort(&db, 2);
+ 
+-    assert_eq!(db.version().unwrap(), 1);
+-    assert_eq!(db.object_store_names().unwrap(), vec!["kept", "deleted"]);
++    assert_eq!(stored_version_and_store_names(&db), before);
++    assert_eq!(
++        (db.version().unwrap(), db.object_store_names().unwrap()),
++        before
++    );
+     assert_eq!(index_names(&db), vec!["by_a"]);
++    assert_eq!(
++        db.indexes("kept")
++            .unwrap()
++            .into_iter()
++            .map(|index| index.name)
++            .collect::<Vec<_>>(),
++        vec!["by_a"]
++    );
+     assert_eq!(stored_keys(&db, "kept"), number_keys([1]));
+     assert_eq!(stored_keys(&db, "deleted"), number_keys([1]));
+ }
+@@ -2222,11 +2254,29 @@ fn test_job_that_ends_the_sql_transaction_fails_the_writer<X: SqlExecutor>() {
+     });
+ }
+ 
+-/// The manager's metadata reads run on the connection between the writer's batches.
+-fn test_manager_read_that_ends_the_sql_transaction_fails_the_writer<X: SqlExecutor>() {
+-    check_writer_fails_after::<X>(|db| {
+-        let _ = db.key_path("test_store");
++/// The manager's metadata reads answer from the committed metadata, so they neither wait for
++/// the work handed over before nor run statements inside the writer's SQL transaction.
++fn test_metadata_reads_do_not_wait_for_the_connection<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let key_path = Some(KeyPath::String("id".to_owned()));
++    create_store(&db, "test_store", key_path.clone(), true).unwrap();
++    let (release, released) = mpsc::channel::<()>();
++    let (timed_out_sender, timed_out) = mpsc::channel();
++    db.spawn_on_connection(move |_| {
++        let _ = timed_out_sender.send(released.recv_timeout(TIMEOUT).is_err());
+     });
++
++    assert_eq!(db.version().unwrap(), 0);
++    assert_eq!(db.object_store_names().unwrap(), vec!["test_store"]);
++    assert_eq!(db.key_path("test_store"), key_path);
++    assert!(db.has_key_generator("test_store"));
++    assert!(db.indexes("test_store").unwrap().is_empty());
++    release.send(()).unwrap();
++    assert!(
++        !timed_out.recv().unwrap(),
++        "A metadata read waited for the busy connection"
++    );
+ }
+ 
+ /// An upgrade transaction without requests sets the version when it commits, and one that
+@@ -2237,9 +2287,11 @@ fn test_upgrade_without_requests_sets_the_version_at_commit<X: SqlExecutor>() {
+     db.upgrade_version(1, 2);
+     assert_eq!(commit(&db, 1), Ok(()));
+     assert_eq!(queries::version(&mut *db.connection()).unwrap(), 2);
++    assert_eq!(db.version().unwrap(), 2);
+ 
+     db.upgrade_version(2, 3);
+     abort(&db, 2);
++    assert_eq!(db.version().unwrap(), 2);
+     let mut connection = db.connection();
+     assert_eq!(queries::version(&mut *connection).unwrap(), 2);
+     assert!(!connection.in_transaction());
+diff --git a/components/storage/indexeddb/engines/mod.rs b/components/storage/indexeddb/engines/mod.rs
+index 2cd597bcb4d..68c7e2eb9c3 100644
+--- a/components/storage/indexeddb/engines/mod.rs
++++ b/components/storage/indexeddb/engines/mod.rs
+@@ -56,7 +56,8 @@ pub trait KvsEngine: MallocSizeOf {
+     /// `on_done` once it is undone.
+     fn rollback(&self, transaction: u64, on_done: Box<dyn FnOnce() + Send>);
+ 
+-    fn key_generator_current_number(&self, store_name: &str) -> Option<i64>;
++    // The metadata reads answer as of the last commit, without waiting for the work handed over.
++    fn has_key_generator(&self, store_name: &str) -> bool;
+     fn key_path(&self, store_name: &str) -> Option<KeyPath>;
+     fn object_store_names(&self) -> Result<Vec<String>, Self::Error>;
+     fn indexes(&self, store_name: &str) -> Result<Vec<IndexedDBIndex>, Self::Error>;
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index fe3f6eefdf7..4a9d73119a7 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -560,8 +560,8 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         );
+     }
+ 
+-    fn key_generator_current_number(&self, store_name: &str) -> Option<i64> {
+-        self.engine.key_generator_current_number(store_name)
++    fn has_key_generator(&self, store_name: &str) -> bool {
++        self.engine.has_key_generator(store_name)
+     }
+ 
+     fn key_path(&self, store_name: &str) -> Option<KeyPath> {
+@@ -2036,6 +2036,7 @@ impl IndexedDBManager {
+                 let info_list: Vec<DatabaseInfo> = self
+                     .databases
+                     .iter()
++                    .filter(|(description, _)| description.origin == origin)
+                     .filter_map(|(description, info)| {
+                         // Step 4.3: For each db of databases:
+                         if let Ok(version) = info.version() {
+@@ -2047,14 +2048,10 @@ impl IndexedDBManager {
+                                 // Step 4.3.6: Set info’s name dictionary member to db’s name.
+                                 // Step 4.3.7: Set info’s version dictionary member to db’s version.
+                                 // Step 4.3.8: Append info to result.
+-                                if description.origin == origin {
+-                                    Some(DatabaseInfo {
+-                                        name: description.name.clone(),
+-                                        version,
+-                                    })
+-                                } else {
+-                                    None
+-                                }
++                                Some(DatabaseInfo {
++                                    name: description.name.clone(),
++                                    version,
++                                })
+                             }
+                         } else {
+                             None
+@@ -2098,7 +2095,7 @@ impl IndexedDBManager {
+                     .get_database(origin, db_name)
+                     .map(|db| IndexedDBObjectStore {
+                         key_path: db.key_path(&store_name),
+-                        has_key_generator: db.key_generator_current_number(&store_name).is_some(),
++                        has_key_generator: db.has_key_generator(&store_name),
+                         indexes: db.indexes(&store_name).unwrap_or_default(),
+                         name: store_name,
+                     });
+@@ -2314,7 +2311,9 @@ mod tests {
+     use super::{IndexedDBDescription, IndexedDBEnvironment};
+     use crate::indexeddb::backend::SqlEngine;
+     use crate::indexeddb::backend::executor::SqlExecutor;
+-    use crate::indexeddb::backend::tests::{Faulty, executor_tests, faults_for};
++    use crate::indexeddb::backend::tests::{
++        Faulty, executor_tests, faults_for, stored_version_and_store_names,
++    };
+     use crate::indexeddb::engines::KvsEngine;
+ 
+     executor_tests!(
+@@ -2449,11 +2448,15 @@ mod tests {
+                 multi_entry: false,
+             }),
+         );
+-        assert_eq!(env.object_store_names().unwrap(), vec!["not_books"]);
+-        assert_eq!(env.version().unwrap(), 1);
++        assert_eq!(
++            stored_version_and_store_names(&env.engine),
++            (1, vec!["not_books".to_owned()])
++        );
++        assert!(env.object_store_names().unwrap().is_empty());
+ 
+         abort(&mut env, 1);
+ 
++        assert_eq!(stored_version_and_store_names(&env.engine), (0, vec![]));
+         assert_eq!(env.object_store_names().unwrap(), Vec::<String>::new());
+         assert_eq!(env.version().unwrap(), 0);
+     }
+@@ -2475,7 +2478,7 @@ mod tests {
+             create_store_operation(true),
+         );
+         commit(env, 1);
+-        assert_eq!(env.key_generator_current_number("books"), Some(1));
++        assert_eq!(env.engine.key_generator_current_number("books"), Some(1));
+ 
+         env.register_transaction(2, IndexedDBTxnMode::Readwrite, vec!["books".to_string()]);
+         run(
+@@ -2491,7 +2494,7 @@ mod tests {
+                 should_overwrite: false,
+             }),
+         );
+-        assert_eq!(env.key_generator_current_number("books"), Some(2));
++        assert_eq!(env.engine.key_generator_current_number("books"), Some(2));
+     }
+ 
+     fn test_abort_transaction_restores_readwrite_key_generator_current_number<X: SqlExecutor>() {
+@@ -2501,7 +2504,7 @@ mod tests {
+ 
+         abort(&mut env, 2);
+ 
+-        assert_eq!(env.key_generator_current_number("books"), Some(1));
++        assert_eq!(env.engine.key_generator_current_number("books"), Some(1));
+     }
+ 
+     fn test_failed_commit_reports_the_error_and_rolls_back<X: SqlExecutor>() {
+@@ -2517,7 +2520,7 @@ mod tests {
+ 
+         assert_eq!(message.txn, 2);
+         assert!(matches!(message.result, Err(BackendError::DbErr(_))));
+-        assert_eq!(env.key_generator_current_number("books"), Some(1));
++        assert_eq!(env.engine.key_generator_current_number("books"), Some(1));
+     }
+ 
+     fn register<X: SqlExecutor>(

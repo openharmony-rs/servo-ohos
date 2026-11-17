@@ -166,6 +166,13 @@ those scripts (they need network access). `check_stack.py` runs each with
 140. `indexeddb: End the executor's transaction after errors that may roll it back` — A · CI+device · watch: -
 141. `storage: Test the transaction and statement behaviour the executors rely on` — A · CI+device · watch: -
 142. `docs: record patches 136 to 142 in the stack manifest` — B · none · watch: -
+143. `indexeddb: Run each database's work on its one connection, in order` — A · CI+device · watch: components/storage/indexeddb/mod.rs components/storage/indexeddb/engines/mod.rs
+144. `indexeddb: Make each IndexedDB transaction one SQL transaction` — C · CI+device · watch: components/shared/storage/indexeddb.rs components/script/dom/indexeddb/idbtransaction.rs
+145. `indexeddb: Abort a transaction whose commit failed with the backend's error` — C · CI+device · watch: components/script/dom/indexeddb/key.rs
+146. `indexeddb: Move the key generator into the backend` — C · CI+device · watch: components/script/dom/bindings/structuredclone.rs tests/wpt/tests/IndexedDB
+147. `indexeddb: Abort a global's unfinished transactions when it goes away` — C · CI+device · watch: components/script/dom/window/window.rs components/script/dom/workers/workerglobalscope.rs components/shared/storage/indexeddb.rs
+148. `indexeddb: Answer the manager's metadata reads from the committed metadata` — C · CI+device · watch: components/script/dom/indexeddb/idbtransaction.rs components/script/dom/indexeddb/idbdatabase.rs
+149. `docs: record patches 143 to 149 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

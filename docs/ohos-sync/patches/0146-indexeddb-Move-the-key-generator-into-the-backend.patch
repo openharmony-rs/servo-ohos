@@ -1,0 +1,1798 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 10:17:24 +0000
+Subject: [PATCH] indexeddb: Move the key generator into the backend
+
+Script kept each store's key generator: every IDBObjectStore handle
+cached the current number when it was created, generated keys and
+applied "possibly update the key generator" itself, sent the new number
+along with each put, and restored its cached number when a transaction
+aborted. Two handles of one store, in different connections or
+transactions, could hand out the same key, and the arithmetic ran in
+f64, where 2^53 + 1 rounds to 2^53, so an explicit key of 2^53 or more
+didn't use the generator up and the overflow rules failed.
+
+Now the backend owns the key generator (design decision 4). The current
+number stays in the object_store row; put_record, the backend's "store
+a record into an object store", generates a key when the put has none
+(failing above 2^53 with the new PutItemResult::KeyGeneratorExhausted,
+which script reports as a ConstraintError) and otherwise runs "possibly
+update the key generator" in i64: the key clamped to 2^53, floored, and
+the current number moved past it if it is not below. The add check
+comes before any write, and the new current number is written after the
+record, in the transaction's SQL transaction, so a failed put changes
+nothing, the key generator included, as the spec's key generator
+section requires, and an abort's ROLLBACK reverts it. Script keeps the
+synchronous checks of add/put, including "check that a key could be
+injected into a value", and sends no key when the backend has to
+generate one; its key generator state, the abort snapshot of it, the
+field in PutItem and the current number in the object store metadata
+are gone.
+
+A store with a key generator and an in-line key path stores a value
+under a generated key without that key (design decision 5): script no
+longer knows the key before the put replies. GetItem and GetAllItems
+now reply with IndexedDBValue, the serialized value and its record's
+primary key (Iterate's records had it already), and
+IDBObjectStore::deserialize_value, which get, getAll and cursor values
+all use, injects the primary key with "inject a key into a value using
+a key path" when evaluating the key path on the deserialized value
+fails and the object the key would attach to, and every object before
+it on the key path, is an ordinary Object or an Array: the put
+evaluated the same path on an equivalent value, and storing keeps an
+injected property only on those, so that is exactly when the stored
+value lost a generated key. A Date, Map, Blob, typed array or other
+exotic object stored under a generated key comes back without it, as
+before this change and as the spec stores it. Values with the key
+already in them keep what they have, including explicit keys of a type
+that converting the key back would change (a typed array comes back as
+an ArrayBuffer), and so do the values stored before this change, which
+contain their generated key; the record format is unchanged, so the
+schema version stays.
+
+Tests on every executor: generated and explicit keys, including
+strings, dates, arrays, fractions and negative numbers; generation up
+to 2^53 and its failure after; explicit keys of 2^53 and more, up to
+Infinity, and large negative ones; an add of an existing key changes
+nothing and the transaction goes on; an abort reverts what generated
+and explicit keys did to the key generator. A fork WPT test,
+tests/wpt/mozilla/tests/IndexedDB/generated-key-value-kinds.any.js,
+checks which values come back with a generated key: plain objects and
+arrays, also nested, but not Dates, Maps, Sets, Blobs, Files,
+ArrayBuffers, typed arrays, RegExps, Boolean objects or a nested path
+through a Date.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits` at this commit: 102 passed, 1 skipped (the ignored long test; before: 97). DAYU200 at the tip of the series, `./mach test-unit --ohos -p servo-storage -- [--no-default-features] --features ohos-rdb-backend --status-level all`: RDB only 106 passed, 3 skipped; both backends 182 passed, 4 skipped (the skips are the documented test_new_storage_threads_create_independent_groups and the ignored long tests). WPT IndexedDB/ at the tip of the series (with the P1 review fixes), passing subtests of 4,511: host SpiderMonkey 3,251 with no unexpected result, host QuickJS 3,253, DAYU200 in the board configuration (QuickJS + RDB) 3,247 (before the series 3,224, 3,229 and 3,222). New passes in all three, when first measured: the 7 keygenerator.any.js subtests on explicit keys of 2^53 and more and on the overflow, in the window, worker and sharedworker globals, 10 of 10 repeats on both host engines. /_mozilla/IndexedDB/generated-key-value-kinds.any.js: 20 of its 22 window and worker subtests failed with injection for every object, 22 of 22 pass on both host engines, and the board passes all its globals. no new failures: QuickJS idbversionchangeevent.any.sharedworker timed out once and passed 20 of 20 on both host engines, and the board's idbversionchangeevent.any.worker saw a blocked event from the sharedworker variant, which uses the same database name and whose connection deleteDatabase doesn't close yet; the other differences are known flips. Values stored by the previous build: a database written by the P1.1 QuickJS build (generated keys in a single-segment and a nested key path, an explicit key) reads back the same through get, getAll and a cursor as with the old build, and a put stores the value without its key and reads it back with the key injected; checked before the review fixes, which change only exotic values.
+AI-assisted: Yes (agent session; the agent wrote the change and its tests, and ran the unit tests and WPT on the host and the DAYU200; another agent session restricted the injection to ordinary objects and Arrays and added the WPT test for the P1 review)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbcursor.rs  |  13 +-
+ .../script/dom/indexeddb/idbdatabase.rs       |   1 -
+ .../script/dom/indexeddb/idbobjectstore.rs    | 202 +++++--------
+ components/script/dom/indexeddb/idbrequest.rs |  50 ++--
+ .../script/dom/indexeddb/idbtransaction.rs    |  12 +-
+ components/script/dom/indexeddb/key.rs        |  52 +++-
+ components/shared/storage/indexeddb.rs        |  21 +-
+ .../storage/indexeddb/backend/engine.rs       |  38 +--
+ .../storage/indexeddb/backend/queries.rs      | 132 +++++++--
+ components/storage/indexeddb/backend/tests.rs | 274 ++++++++++++++++--
+ components/storage/indexeddb/mod.rs           |  13 +-
+ components/storage/tests/indexeddb.rs         |  25 +-
+ python/tidy/error_message_exceptions.txt      |   5 +-
+ .../meta/IndexedDB/keygenerator.any.js.ini    |  62 ----
+ tests/wpt/mozilla/meta/MANIFEST.json          |  65 +++++
+ .../generated-key-value-kinds.any.js          | 100 +++++++
+ 16 files changed, 740 insertions(+), 325 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/generated-key-value-kinds.any.js
+
+diff --git a/components/script/dom/indexeddb/idbcursor.rs b/components/script/dom/indexeddb/idbcursor.rs
+index d484e01e0ff..517f94de7df 100644
+--- a/components/script/dom/indexeddb/idbcursor.rs
++++ b/components/script/dom/indexeddb/idbcursor.rs
+@@ -711,7 +711,6 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+                     key: self.effective_key(),
+                     value: serialized_value,
+                     should_overwrite: true,
+-                    key_generator_current_number: None,
+                 })
+             },
+             None,
+@@ -791,7 +790,6 @@ pub(crate) struct IterationParam {
+ ///   "record’s value" means the primary key of the record, and
+ ///   "record’s referenced value" means the value of the record.
+ pub(crate) fn iterate_cursor(
+-    global: &GlobalScope,
+     cx: &mut JSContext,
+     param: &IterationParam,
+     records: Vec<IndexedDBRecord>,
+@@ -1063,11 +1061,12 @@ pub(crate) fn iterate_cursor(
+         // Step 13.1. Let serialized be found record’s referenced value.
+         // Step 13.2. Set cursor’s value to ! StructuredDeserialize(serialized, targetRealm)
+         rooted!(&in(cx) let mut new_cursor_value = UndefinedValue());
+-        postcard::from_bytes(&found_record.value)
+-            .map_err(|_| Error::Data(None))
+-            .and_then(|data| {
+-                structuredclone::read(cx, global, data, new_cursor_value.handle_mut())
+-            })?;
++        cursor.effective_object_store().deserialize_value(
++            cx,
++            &found_record.primary_key,
++            &found_record.value,
++            new_cursor_value.handle_mut(),
++        )?;
+         cursor.value.set(new_cursor_value.get());
+     }
+ 
+diff --git a/components/script/dom/indexeddb/idbdatabase.rs b/components/script/dom/indexeddb/idbdatabase.rs
+index 6106b2f23a1..9f0ce269f03 100644
+--- a/components/script/dom/indexeddb/idbdatabase.rs
++++ b/components/script/dom/indexeddb/idbdatabase.rs
+@@ -353,7 +353,6 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+             IDBObjectStoreAbortState {
+                 newly_created_during_transaction: true,
+                 rollback_indexes_on_abort: vec![],
+-                key_generator_current_number: if auto_increment { Some(1_i64) } else { None },
+             },
+             &transaction,
+         );
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index 549023b0d97..60303b75097 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -1,14 +1,13 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+-use std::cell::Cell;
+ use std::collections::HashMap;
+ 
+ use dom_struct::dom_struct;
+ use js::context::JSContext;
+ use js::conversions::ToJSValConvertible;
+ use js::gc::MutableHandleValue;
+-use js::jsval::NullValue;
++use js::jsval::{NullValue, UndefinedValue};
+ use js::rust::HandleValue;
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::codegen::GenericBindings::IDBObjectStoreBinding::IDBIndexParameters;
+@@ -44,8 +43,9 @@ use crate::dom::indexeddb::idbindex::IDBIndex;
+ use crate::dom::indexeddb::idbrequest::IDBRequest;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::key::{
+-    ExtractionResult, can_inject_key_into_value, convert_value_to_key, convert_value_to_key_range,
+-    extract_key, inject_key_into_value, is_valid_key_path,
++    EvaluationResult, ExtractionResult, can_inject_key_into_value, convert_value_to_key,
++    convert_value_to_key_range, evaluate_key_path_on_value, extract_key, inject_key_into_value,
++    injected_key_is_stored, is_valid_key_path,
+ };
+ 
+ #[derive(Clone, JSTraceable, MallocSizeOf)]
+@@ -91,7 +91,6 @@ struct IDBObjectStoreRollbackState {
+     rollback_name: Option<DOMString>,
+     #[no_trace]
+     rollback_indexes: Vec<indexeddb::IndexedDBIndex>,
+-    key_generator_current_number: Option<i64>,
+ }
+ 
+ #[dom_struct]
+@@ -103,7 +102,6 @@ pub struct IDBObjectStore {
+     abort_state_on_abort: DomRefCell<Option<IDBObjectStoreRollbackState>>,
+     transaction: Dom<IDBTransaction>,
+     has_key_generator: bool,
+-    key_generator_current_number: Cell<Option<i64>>,
+ 
+     // We store the db name in the object store to address backend operations
+     // that are keyed by (origin, database name, object store name).
+@@ -113,7 +111,6 @@ pub struct IDBObjectStore {
+ pub(crate) struct IDBObjectStoreAbortState {
+     pub(crate) newly_created_during_transaction: bool,
+     pub(crate) rollback_indexes_on_abort: Vec<indexeddb::IndexedDBIndex>,
+-    pub(crate) key_generator_current_number: Option<i64>,
+ }
+ 
+ impl IDBObjectStore {
+@@ -137,13 +134,7 @@ impl IDBObjectStore {
+         let IDBObjectStoreAbortState {
+             newly_created_during_transaction,
+             rollback_indexes_on_abort,
+-            key_generator_current_number,
+         } = abort_state;
+-        let key_generator_current_number = if has_key_generator {
+-            Some(key_generator_current_number.unwrap_or(1))
+-        } else {
+-            None
+-        };
+ 
+         IDBObjectStore {
+             reflector_: Reflector::new(),
+@@ -154,11 +145,9 @@ impl IDBObjectStore {
+                 newly_created_during_transaction,
+                 rollback_name: None,
+                 rollback_indexes: rollback_indexes_on_abort,
+-                key_generator_current_number,
+             })),
+             transaction: Dom::from_ref(transaction),
+             has_key_generator,
+-            key_generator_current_number: Cell::new(key_generator_current_number),
+             db_name: db_name.traced(),
+         }
+     }
+@@ -217,12 +206,6 @@ impl IDBObjectStore {
+                 index.key_path.clone().into(),
+             );
+         }
+-
+-        // Restore key generator state for existing object store handles.
+-        if self.has_key_generator && !abort_state.newly_created_during_transaction {
+-            self.key_generator_current_number
+-                .set(abort_state.key_generator_current_number);
+-        }
+     }
+ 
+     pub(crate) fn transaction(&self) -> DomRoot<IDBTransaction> {
+@@ -270,52 +253,48 @@ impl IDBObjectStore {
+         self.has_key_generator
+     }
+ 
+-    /// <https://w3c.github.io/IndexedDB/#generate-a-key>
+-    fn generate_key_for_put(&self) -> Fallible<(IndexedDBKeyType, i64)> {
+-        // Step 1. Let generator be store's key generator.
+-        let Some(current_number) = self.key_generator_current_number.get() else {
+-            return Err(Error::Data(None));
++    /// Deserializes `serialized`, a value of this store whose record has the key `primary_key`,
++    /// into `value`. A value stored under a generated key doesn't contain the key, so it is
++    /// injected here, as <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store>
++    /// step 1.1.3 does when storing, where step 4's serialization then keeps it only if it is a
++    /// property of ordinary objects and Arrays.
++    pub(crate) fn deserialize_value(
++        &self,
++        cx: &mut JSContext,
++        primary_key: &IndexedDBKeyType,
++        serialized: &[u8],
++        mut value: MutableHandleValue,
++    ) -> Fallible<()> {
++        let data = postcard::from_bytes(serialized)
++            .map_err(|_| Error::Data(Some("Failed to decode a stored value".to_owned())))?;
++        structuredclone::read(cx, &self.global(), data, value.reborrow())?;
++        let Some(key_path) = self.key_path.as_ref().filter(|_| self.has_key_generator) else {
++            return Ok(());
+         };
+-        // Step 2. Let key be generator's current number.
+-        let key = current_number as f64;
+-        // Step 3. If key is greater than 2^53 (9007199254740992), then return failure.
+-        if key > 9_007_199_254_740_992.0 {
+-            return Err(Error::Constraint(None));
++        // The key was generated if, and only if, the value had none at the key path when it was
++        // stored. Values stored with the key already in them, such as those from before the key
++        // generator moved to the backend, keep what they have.
++        rooted!(&in(cx) let mut stored_key = UndefinedValue());
++        if let EvaluationResult::Success =
++            evaluate_key_path_on_value(cx, value.handle(), key_path, stored_key.handle_mut())?
++        {
++            return Ok(());
+         }
+-        // Step 4. Increase generator's current number by 1.
+-        let next_current_number = current_number
+-            .checked_add(1)
+-            .ok_or(Error::Constraint(None))?;
+-        // Step 5. Return key.
+-        Ok((IndexedDBKeyType::Number(key), next_current_number))
+-    }
+-
+-    /// <https://w3c.github.io/IndexedDB/#possibly-update-the-key-generator>
+-    fn possibly_update_the_key_generator(&self, key: &IndexedDBKeyType) -> Option<i64> {
+-        // Step 1. If the type of key is not number, abort these steps.
+-        let IndexedDBKeyType::Number(number) = key else {
+-            return None;
++        let injected = match key_path {
++            KeyPath::String(key_path) => {
++                if !injected_key_is_stored(cx, value.handle(), key_path)? {
++                    return Ok(());
++                }
++                inject_key_into_value(cx, value.handle(), primary_key, key_path)?
++            },
++            KeyPath::StringSequence(_) => false,
+         };
+-
+-        // Step 2. Let value be the value of key.
+-        let mut value = *number;
+-        // Step 3. Set value to the minimum of value and 2^53 (9007199254740992).
+-        value = value.min(9_007_199_254_740_992.0);
+-        // Step 4. Set value to the largest integer not greater than value.
+-        value = value.floor();
+-        // Step 5. Let generator be store's key generator.
+-        let current_number = self.key_generator_current_number.get()?;
+-        // Step 6. If value is greater than or equal to generator's current number,
+-        // then set generator's current number to value + 1.
+-        if value < current_number as f64 {
+-            return None;
++        if !injected {
++            return Err(Error::Data(Some(
++                "Failed to inject the generated key into a stored value".to_owned(),
++            )));
+         }
+-
+-        let next = value + 1.0;
+-        if next > i64::MAX as f64 {
+-            return Some(i64::MAX);
+-        }
+-        Some(next as i64)
++        Ok(())
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#object-store-in-line-keys>
+@@ -397,7 +376,6 @@ impl IDBObjectStore {
+ 
+         // Step 8. If key was given, then:
+         let mut serialized_key = None;
+-        let mut key_generator_current_number_for_put = None;
+ 
+         if !key.is_undefined() {
+             // Step 8.1. Let r be the result of converting a value to a key with key.
+@@ -407,7 +385,6 @@ impl IDBObjectStore {
+             // "DataError" DOMException.
+             // Handled by `into_result()` above.
+             // Step 8.3. Let key be r.
+-            key_generator_current_number_for_put = self.possibly_update_the_key_generator(&key);
+             serialized_key = Some(key);
+         }
+ 
+@@ -418,62 +395,44 @@ impl IDBObjectStore {
+         self.clone_value_in_target_realm(cx, value, cloned_js_value.handle_mut())?;
+ 
+         // Step 11. If store uses in-line keys, then:
+-        let cloned_value = match self.key_path.as_ref() {
+-            Some(key_path) => {
+-                // Step 11.1. Let kpk be the result of extracting a key from a value using a key
+-                // path with clone and store’s key path. Rethrow any exceptions.
+-                match extract_key(cx, cloned_js_value.handle(), key_path, None)? {
+-                    // Step 11.2. If kpk is invalid, throw a "DataError" DOMException.
+-                    ExtractionResult::Invalid => return Err(Error::Data(None)),
+-                    // Step 11.3. If kpk is not failure, let key be kpk.
+-                    ExtractionResult::Key(kpk) => {
+-                        key_generator_current_number_for_put =
+-                            self.possibly_update_the_key_generator(&kpk);
+-                        serialized_key = Some(kpk);
+-                    },
+-                    // Step 11.4. Otherwise (kpk is failure):
+-                    ExtractionResult::Failure => {
+-                        // Step 11.4.1. If store does not have a key generator, throw a
+-                        // "DataError" DOMException.
+-                        if !self.has_key_generator() {
+-                            return Err(Error::Data(None));
+-                        }
+-                        let KeyPath::String(key_path) = key_path else {
+-                            return Err(Error::Data(None));
+-                        };
+-                        // Step 11.4.2. If check that a key could be injected into a value with
+-                        // clone and store’s key path return false, throw a "DataError"
+-                        // DOMException.
+-                        if !can_inject_key_into_value(cx, cloned_js_value.handle(), key_path)? {
+-                            return Err(Error::Data(None));
+-                        }
+-
+-                        // Prepares the generated key and injected clone here so Step 12 can
+-                        // pass the final key/value pair to the storage backend.
+-                        let (generated_key, next_current_number) = self.generate_key_for_put()?;
+-                        if !inject_key_into_value(
+-                            cx,
+-                            cloned_js_value.handle(),
+-                            &generated_key,
+-                            key_path,
+-                        )? {
+-                            return Err(Error::Data(None));
+-                        }
+-                        serialized_key = Some(generated_key);
+-                        key_generator_current_number_for_put = Some(next_current_number);
+-                    },
+-                }
+-
+-                structuredclone::write(cx, cloned_js_value.handle(), None)?
+-            },
+-            None => structuredclone::write(cx, cloned_js_value.handle(), None)?,
+-        };
++        if let Some(key_path) = self.key_path.as_ref() {
++            // Step 11.1. Let kpk be the result of extracting a key from a value using a key
++            // path with clone and store’s key path. Rethrow any exceptions.
++            match extract_key(cx, cloned_js_value.handle(), key_path, None)? {
++                // Step 11.2. If kpk is invalid, throw a "DataError" DOMException.
++                ExtractionResult::Invalid => return Err(Error::Data(None)),
++                // Step 11.3. If kpk is not failure, let key be kpk.
++                ExtractionResult::Key(kpk) => serialized_key = Some(kpk),
++                // Step 11.4. Otherwise (kpk is failure):
++                ExtractionResult::Failure => {
++                    // Step 11.4.1. If store does not have a key generator, throw a
++                    // "DataError" DOMException.
++                    if !self.has_key_generator() {
++                        return Err(Error::Data(None));
++                    }
++                    let KeyPath::String(key_path) = key_path else {
++                        return Err(Error::Data(None));
++                    };
++                    // Step 11.4.2. If check that a key could be injected into a value with
++                    // clone and store’s key path return false, throw a "DataError"
++                    // DOMException.
++                    if !can_inject_key_into_value(cx, cloned_js_value.handle(), key_path)? {
++                        return Err(Error::Data(None));
++                    }
++                },
++            }
++        }
++        let cloned_value = structuredclone::write(cx, cloned_js_value.handle(), None)?;
+         let Ok(serialized_value) = postcard::to_stdvec(&cloned_value) else {
+             return Err(Error::InvalidState(None));
+         };
+         // Step 12. Let operation be an algorithm to run store a record into an object store with
+         // store, clone, key, and no-overwrite flag.
+-        let request = IDBRequest::execute_async(
++        // NOTE: The backend generates the key if none was given, and the value is stored without
++        // it: reading the value injects the key, see `deserialize_value`.
++        // Step 13. Return the result (an IDBRequest) of running asynchronously execute a request
++        // with handle and operation.
++        IDBRequest::execute_async(
+             cx,
+             self,
+             |callback| {
+@@ -482,20 +441,11 @@ impl IDBObjectStore {
+                     key: serialized_key,
+                     value: serialized_value,
+                     should_overwrite: !no_overwrite,
+-                    key_generator_current_number: key_generator_current_number_for_put,
+                 })
+             },
+             None,
+             None,
+-        )?;
+-        // Keep the in-memory key generator in sync with the queued put request.
+-        if let Some(next_key_generator_current_number) = key_generator_current_number_for_put {
+-            self.key_generator_current_number
+-                .set(Some(next_key_generator_current_number));
+-        }
+-        // Step 13. Return the result (an IDBRequest) of running asynchronously execute a request
+-        // with handle and operation.
+-        Ok(request)
++        )
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-opencursor>
+diff --git a/components/script/dom/indexeddb/idbrequest.rs b/components/script/dom/indexeddb/idbrequest.rs
+index ec7de90e1cf..839b6f932bb 100644
+--- a/components/script/dom/indexeddb/idbrequest.rs
++++ b/components/script/dom/indexeddb/idbrequest.rs
+@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
+ use servo_base::generic_channel::{GenericSend, SendError};
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, BackendError, BackendResult, IndexedDBKeyType,
+-    IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, PutItemResult, SyncOperation,
++    IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, IndexedDBValue, PutItemResult,
++    SyncOperation,
+ };
+ use stylo_atoms::Atom;
+ 
+@@ -31,7 +32,6 @@ use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::refcounted::Trusted;
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+-use crate::dom::bindings::structuredclone;
+ use crate::dom::domexception::DOMException;
+ use crate::dom::event::{Event, EventBubbles, EventCancelable};
+ use crate::dom::eventtarget::EventTarget;
+@@ -53,8 +53,8 @@ struct RequestListener {
+ pub enum IdbResult {
+     Key(IndexedDBKeyType),
+     Keys(Vec<IndexedDBKeyType>),
+-    Value(Vec<u8>),
+-    Values(Vec<Vec<u8>>),
++    Value(IndexedDBValue),
++    Values(Vec<IndexedDBValue>),
+     Count(u64),
+     Iterate(Vec<IndexedDBRecord>),
+     Error(Error),
+@@ -73,14 +73,14 @@ impl From<Vec<IndexedDBKeyType>> for IdbResult {
+     }
+ }
+ 
+-impl From<Vec<u8>> for IdbResult {
+-    fn from(value: Vec<u8>) -> Self {
++impl From<IndexedDBValue> for IdbResult {
++    fn from(value: IndexedDBValue) -> Self {
+         IdbResult::Value(value)
+     }
+ }
+ 
+-impl From<Vec<Vec<u8>>> for IdbResult {
+-    fn from(value: Vec<Vec<u8>>) -> Self {
++impl From<Vec<IndexedDBValue>> for IdbResult {
++    fn from(value: Vec<IndexedDBValue>) -> Self {
+         IdbResult::Values(value)
+     }
+ }
+@@ -89,7 +89,9 @@ impl From<PutItemResult> for IdbResult {
+     fn from(value: PutItemResult) -> Self {
+         match value {
+             PutItemResult::Key(key) => Self::Key(key),
+-            PutItemResult::CannotOverwrite => Self::Error(Error::Constraint(None)),
++            PutItemResult::CannotOverwrite | PutItemResult::KeyGeneratorExhausted => {
++                Self::Error(Error::Constraint(None))
++            },
+         }
+     }
+ }
+@@ -176,12 +178,14 @@ impl RequestListener {
+                     }
+                     array.to_jsval(cx, answer.handle_mut());
+                 },
+-                IdbResult::Value(serialized_data) => {
+-                    let result = postcard::from_bytes(&serialized_data)
+-                        .map_err(|_| Error::Data(None))
+-                        .and_then(|data| {
+-                            structuredclone::read(cx, &global, data, answer.handle_mut())
+-                        });
++                IdbResult::Value(value) => {
++                    let store = request.source.get().expect("Value requests have a source");
++                    let result = store.deserialize_value(
++                        cx,
++                        &value.primary_key,
++                        &value.value,
++                        answer.handle_mut(),
++                    );
+                     if let Err(e) = result {
+                         warn!("Error reading structuredclone data");
+                         Self::handle_async_request_error(&global, cx, request, e, self.request_id);
+@@ -189,13 +193,15 @@ impl RequestListener {
+                     };
+                 },
+                 IdbResult::Values(serialized_values) => {
++                    let store = request.source.get().expect("Value requests have a source");
+                     rooted!(&in(cx) let mut values = vec![JSVal::default(); serialized_values.len()]);
+-                    for (i, serialized_data) in serialized_values.into_iter().enumerate() {
+-                        let result = postcard::from_bytes(&serialized_data)
+-                            .map_err(|_| Error::Data(None))
+-                            .and_then(|data| {
+-                                structuredclone::read(cx, &global, data, values.handle_mut_at(i))
+-                            });
++                    for (i, value) in serialized_values.into_iter().enumerate() {
++                        let result = store.deserialize_value(
++                            cx,
++                            &value.primary_key,
++                            &value.value,
++                            values.handle_mut_at(i),
++                        );
+                         if let Err(e) = result {
+                             warn!("Error reading structuredclone data");
+                             Self::handle_async_request_error(
+@@ -217,7 +223,7 @@ impl RequestListener {
+                     let param = self.iteration_param.as_ref().expect(
+                         "iteration_param must be provided by IDBRequest::execute_async for Iterate",
+                     );
+-                    let cursor = match iterate_cursor(&global, cx, param, records) {
++                    let cursor = match iterate_cursor(cx, param, records) {
+                         Ok(cursor) => cursor,
+                         Err(e) => {
+                             warn!("Error reading structuredclone data");
+diff --git a/components/script/dom/indexeddb/idbtransaction.rs b/components/script/dom/indexeddb/idbtransaction.rs
+index 36e7736ffb8..2d2d78f3213 100644
+--- a/components/script/dom/indexeddb/idbtransaction.rs
++++ b/components/script/dom/indexeddb/idbtransaction.rs
+@@ -702,7 +702,7 @@ impl IDBTransaction {
+     fn object_store_parameters(
+         &self,
+         object_store_name: &DOMString,
+-    ) -> Option<(IDBObjectStoreParameters, Vec<IndexedDBIndex>, Option<i64>)> {
++    ) -> Option<(IDBObjectStoreParameters, Vec<IndexedDBIndex>)> {
+         let global = self.global();
+         let idb_sender = global.storage_threads().sender();
+         let (sender, receiver) =
+@@ -734,7 +734,6 @@ impl IDBTransaction {
+                 keyPath: key_path,
+             },
+             object_store.indexes,
+-            object_store.key_generator_current_number,
+         ))
+     }
+ 
+@@ -802,24 +801,21 @@ impl IDBTransactionMethods<crate::DomTypeHolder> for IDBTransaction {
+             &self.global(),
+             self.db.get_name(),
+             name.clone(),
+-            parameters.as_ref().map(|(params, _, _)| params),
++            parameters.as_ref().map(|(params, _)| params),
+             IDBObjectStoreAbortState {
+                 newly_created_during_transaction: false,
+                 rollback_indexes_on_abort: if self.mode == IDBTransactionMode::Versionchange {
+                     parameters
+                         .as_ref()
+-                        .map(|(_, indexes, _)| indexes.clone())
++                        .map(|(_, indexes)| indexes.clone())
+                         .unwrap_or_default()
+                 } else {
+                     Vec::new()
+                 },
+-                key_generator_current_number: parameters
+-                    .as_ref()
+-                    .and_then(|(_, _, key_generator_current_number)| *key_generator_current_number),
+             },
+             self,
+         );
+-        if let Some(indexes) = parameters.map(|(_, indexes, _)| indexes) {
++        if let Some(indexes) = parameters.map(|(_, indexes)| indexes) {
+             for index in indexes {
+                 store.add_index(
+                     cx,
+diff --git a/components/script/dom/indexeddb/key.rs b/components/script/dom/indexeddb/key.rs
+index 788dff4f9a6..387bb90ee23 100644
+--- a/components/script/dom/indexeddb/key.rs
++++ b/components/script/dom/indexeddb/key.rs
+@@ -9,13 +9,14 @@ use itertools::Itertools;
+ use js::context::JSContext;
+ use js::conversions::{ToJSValConvertible, jsstr_to_string};
+ use js::jsapi::{
+-    ClippedTime, IsArrayBufferObject, IsDetachedArrayBufferObject, JS_GetArrayBufferViewBuffer,
+-    JS_GetStringLength, JS_IsArrayBufferViewObject, NewArrayObject1, PropertyKey,
++    ClippedTime, ESClass, IsArrayBufferObject, IsDetachedArrayBufferObject,
++    JS_GetArrayBufferViewBuffer, JS_GetStringLength, JS_IsArrayBufferViewObject, NewArrayObject1,
++    PropertyKey,
+ };
+ use js::jsval::{DoubleValue, ObjectValue, UndefinedValue};
+ use js::rust::wrappers2::{
+-    GetArrayLength, IsArrayObject, JS_HasOwnPropertyById, JS_IndexToId, JS_IsIdentifier,
+-    NewDateObject, ObjectIsDate, SameValue,
++    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_HasOwnPropertyById, JS_IndexToId,
++    JS_IsIdentifier, NewDateObject, ObjectIsDate, SameValue,
+ };
+ use js::rust::{HandleValue, MutableHandleValue};
+ use js::typedarray::{ArrayBuffer, ArrayBufferU8, ArrayBufferView};
+@@ -690,6 +691,49 @@ pub(crate) fn can_inject_key_into_value(
+     Ok(current_value.is_object())
+ }
+ 
++/// Whether a key that <https://w3c.github.io/IndexedDB/#inject-a-key-into-a-value-using-a-key-path>
++/// puts into `value` at `key_path` is stored with the value. StructuredSerializeForStorage keeps
++/// the own properties of ordinary objects and Arrays only, so a key that attaches to any other
++/// object, such as a Date, a Map, a Blob or a typed array, or to an object below one, is dropped.
++/// The objects that injecting creates are ordinary ones.
++#[expect(unsafe_code)]
++pub(crate) fn injected_key_is_stored(
++    cx: &mut JSContext,
++    value: HandleValue,
++    key_path: &DOMString,
++) -> Result<bool, Error> {
++    let key_path = key_path.str();
++    let mut identifiers = key_path.split('.').peekable();
++    rooted!(&in(cx) let mut current_value = *value);
++    while let Some(identifier) = identifiers.next() {
++        if !current_value.is_object() {
++            return Ok(false);
++        }
++        rooted!(&in(cx) let object = current_value.to_object());
++        let mut class = ESClass::Other;
++        if !unsafe { GetBuiltinClass(cx, object.handle(), &mut class) } {
++            return Err(Error::JSFailed);
++        }
++        if class != ESClass::Object && class != ESClass::Array {
++            return Ok(false);
++        }
++        if identifiers.peek().is_none() {
++            break;
++        }
++        let name = CString::new(identifier).expect("Failed to convert key path identifier");
++        if !has_own_property(cx, object.handle(), name.as_c_str()).map_err(|_| Error::JSFailed)? {
++            break;
++        }
++        get_property_jsval(
++            cx,
++            object.handle(),
++            name.as_c_str(),
++            current_value.handle_mut(),
++        )?;
++    }
++    Ok(true)
++}
++
+ /// <https://w3c.github.io/IndexedDB/#inject-a-key-into-a-value-using-a-key-path>
+ pub(crate) fn inject_key_into_value(
+     cx: &mut JSContext,
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 131252756a5..04639547d1e 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -275,6 +275,15 @@ impl IndexedDBKeyRange {
+     }
+ }
+ 
++/// A serialized value read from an object store, with the primary key of its record. A value
++/// stored under a generated key in a store with an in-line key path doesn't contain the key: script
++/// injects it into the deserialized value.
++#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
++pub struct IndexedDBValue {
++    pub primary_key: IndexedDBKeyType,
++    pub value: Vec<u8>,
++}
++
+ /// <https://w3c.github.io/IndexedDB/#record-snapshot>
+ #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+ pub struct IndexedDBRecord {
+@@ -296,7 +305,6 @@ pub struct IndexedDBObjectStore {
+     pub name: String,
+     pub key_path: Option<KeyPath>,
+     pub has_key_generator: bool,
+-    pub key_generator_current_number: Option<i64>,
+     pub indexes: Vec<IndexedDBIndex>,
+ }
+ 
+@@ -304,6 +312,8 @@ pub struct IndexedDBObjectStore {
+ pub enum PutItemResult {
+     Key(IndexedDBKeyType),
+     CannotOverwrite,
++    /// The store's key generator can't generate another key.
++    KeyGeneratorExhausted,
+ }
+ 
+ #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+@@ -314,7 +324,7 @@ pub enum AsyncReadOnlyOperation {
+         key_range: IndexedDBKeyRange,
+     },
+     GetItem {
+-        callback: GenericCallback<BackendResult<Option<Vec<u8>>>>,
++        callback: GenericCallback<BackendResult<Option<IndexedDBValue>>>,
+         key_range: IndexedDBKeyRange,
+     },
+ 
+@@ -324,7 +334,7 @@ pub enum AsyncReadOnlyOperation {
+         count: Option<u32>,
+     },
+     GetAllItems {
+-        callback: GenericCallback<BackendResult<Vec<Vec<u8>>>>,
++        callback: GenericCallback<BackendResult<Vec<IndexedDBValue>>>,
+         key_range: IndexedDBKeyRange,
+         count: Option<u32>,
+     },
+@@ -358,14 +368,13 @@ impl AsyncReadOnlyOperation {
+ 
+ #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+ pub enum AsyncReadWriteOperation {
+-    /// Sets the value of the given key in the associated idb data
++    /// Sets the value of the given key in the associated idb data, or of a key from the store's
++    /// key generator if `key` is `None`.
+     PutItem {
+         callback: GenericCallback<BackendResult<PutItemResult>>,
+         key: Option<IndexedDBKeyType>,
+         value: Vec<u8>,
+         should_overwrite: bool,
+-        /// New object store key generator current number to persist if the put succeeds.
+-        key_generator_current_number: Option<i64>,
+     },
+ 
+     /// Removes the key/value pair for the given key in the associated idb data
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index 33a1f739d48..288a5300f6e 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
+ use servo_base::threadpool::ThreadPool;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+-    BackendError, BackendResult, IndexedDBIndex, IndexedDBKeyType, IndexedDBTxnMode, KeyPath,
++    BackendError, BackendResult, IndexedDBIndex, IndexedDBTxnMode, KeyPath,
+ };
+ 
+ use super::executor::{SqlError, SqlExecutor, TransactionBehavior};
+@@ -638,37 +638,13 @@ fn run_read_write<X: SqlExecutor>(
+             key,
+             value,
+             should_overwrite,
+-            key_generator_current_number,
+         } => {
+-            let (key, key_generator_current_number) = match key {
+-                Some(key) => (key, key_generator_current_number),
+-                None => {
+-                    if store.auto_increment == 0 {
+-                        let error = BackendError::DbErr("Missing key for PutItem request".into());
+-                        let _ = callback.send(Err(error));
+-                        return None;
+-                    }
+-                    let Some(next_key_generator_current_number) =
+-                        store.auto_increment.checked_add(1)
+-                    else {
+-                        let error = BackendError::DbErr("Key generator overflow".into());
+-                        let _ = callback.send(Err(error));
+-                        return None;
+-                    };
+-                    (
+-                        IndexedDBKeyType::Number(store.auto_increment as f64),
+-                        Some(next_key_generator_current_number),
+-                    )
+-                },
+-            };
+-            let result = queries::put_record(
+-                executor,
+-                store,
+-                key,
+-                &value,
+-                should_overwrite,
+-                key_generator_current_number,
+-            );
++            if key.is_none() && store.auto_increment == 0 {
++                let error = BackendError::DbErr("Missing key for PutItem request".into());
++                let _ = callback.send(Err(error));
++                return None;
++            }
++            let result = queries::put_record(executor, store, key, &value, should_overwrite);
+             reply(&callback, result, Failure::Write)
+         },
+         AsyncReadWriteOperation::RemoveItem {
+diff --git a/components/storage/indexeddb/backend/queries.rs b/components/storage/indexeddb/backend/queries.rs
+index 802f4966bd9..fe93cb1bb9a 100644
+--- a/components/storage/indexeddb/backend/queries.rs
++++ b/components/storage/indexeddb/backend/queries.rs
+@@ -6,7 +6,7 @@
+ 
+ use storage_traits::indexeddb::{
+     CreateObjectResult, IndexedDBIndex, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
+-    KeyPath, PutItemResult,
++    IndexedDBValue, KeyPath, PutItemResult,
+ };
+ 
+ use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
+@@ -323,17 +323,28 @@ fn select_records<X: SqlExecutor, T>(
+     query_rows(executor, &sql, &params, map_row)
+ }
+ 
++fn value_of_row(row: &dyn SqlRow) -> Result<IndexedDBValue, SqlError> {
++    Ok(IndexedDBValue {
++        primary_key: decode_key(&row.blob(0)?)?,
++        value: row.blob(1)?,
++    })
++}
++
+ pub(crate) fn get_value<X: SqlExecutor>(
+     executor: &mut X,
+     store: &ObjectStore,
+     range: &IndexedDBKeyRange,
+-) -> Result<Option<Vec<u8>>, SqlError> {
+-    Ok(
+-        select_records(executor, "data", store, range, Some(1), false, |row| {
+-            row.blob(0)
+-        })?
+-        .pop(),
+-    )
++) -> Result<Option<IndexedDBValue>, SqlError> {
++    Ok(select_records(
++        executor,
++        "key, data",
++        store,
++        range,
++        Some(1),
++        false,
++        value_of_row,
++    )?
++    .pop())
+ }
+ 
+ pub(crate) fn get_key<X: SqlExecutor>(
+@@ -365,10 +376,16 @@ pub(crate) fn get_all_values<X: SqlExecutor>(
+     store: &ObjectStore,
+     range: &IndexedDBKeyRange,
+     count: Option<u32>,
+-) -> Result<Vec<Vec<u8>>, SqlError> {
+-    select_records(executor, "data", store, range, count, false, |row| {
+-        row.blob(0)
+-    })
++) -> Result<Vec<IndexedDBValue>, SqlError> {
++    select_records(
++        executor,
++        "key, data",
++        store,
++        range,
++        count,
++        false,
++        value_of_row,
++    )
+ }
+ 
+ /// The records of `store` in `range` in ascending key order: the first `count` of them, or the
+@@ -409,16 +426,80 @@ pub(crate) fn count<X: SqlExecutor>(
+     Ok(count as u64)
+ }
+ 
+-/// Stores `value` under `key`, unless a record with `key` exists and `overwrite` isn't set, and
+-/// then sets the store's key generator current number to `key_generator_current_number`, if any.
++/// 2^53, the largest key that a key generator generates.
++const MAX_GENERATED_KEY: i64 = 1 << 53;
++
++/// <https://w3c.github.io/IndexedDB/#generate-a-key>, without step 4: the caller increases the
++/// current number once the record is stored.
++fn generate_key(current_number: i64) -> Option<IndexedDBKeyType> {
++    // Step 1. Let generator be store’s key generator.
++    // Step 2. Let key be generator’s current number.
++    // Step 3. If key is greater than 2^53 (9007199254740992), then return failure.
++    if current_number > MAX_GENERATED_KEY {
++        return None;
++    }
++    // Step 5. Return key.
++    Some(IndexedDBKeyType::Number(current_number as f64))
++}
++
++/// <https://w3c.github.io/IndexedDB/#possibly-update-the-key-generator>: the new current number,
++/// if `key` changes it.
++fn possibly_update_the_key_generator(current_number: i64, key: &IndexedDBKeyType) -> Option<i64> {
++    // Step 1. If the type of key is not number, abort these steps.
++    let IndexedDBKeyType::Number(value) = key else {
++        return None;
++    };
++    // Step 2. Let value be the value of key.
++    // Step 3. Set value to the minimum of value and 2^53 (9007199254740992).
++    // Step 4. Set value to the largest integer not greater than value.
++    // The conversion is exact for integers up to 2^53, and saturates below i64::MIN, which is
++    // less than any current number.
++    let value = value.min(MAX_GENERATED_KEY as f64).floor() as i64;
++    // Step 5. Let generator be store’s key generator.
++    // Step 6. If value is greater than or equal to generator’s current number, then set
++    // generator’s current number to value + 1.
++    (value >= current_number).then_some(value + 1)
++}
++
++/// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store>: stores `value` under
++/// `key`, or under a key from the store's key generator if `key` is `None`, which requires that
++/// the store has one. A record that can't be stored changes nothing, not even the key generator.
+ pub(crate) fn put_record<X: SqlExecutor>(
+     executor: &mut X,
+     store: &ObjectStore,
+-    key: IndexedDBKeyType,
++    key: Option<IndexedDBKeyType>,
+     value: &[u8],
+     overwrite: bool,
+-    key_generator_current_number: Option<i64>,
+ ) -> Result<PutItemResult, SqlError> {
++    let has_key_generator = store.auto_increment != 0;
++    debug_assert!(key.is_some() || has_key_generator);
++    // Step 1. If store uses a key generator, then:
++    let (key, new_current_number) = match key {
++        // Step 1.1. If key is undefined, then:
++        None => {
++            // Step 1.1.1. Let key be the result of generating a key for store.
++            // Step 1.1.2. If key is failure, then this operation failed with a "ConstraintError"
++            // DOMException. Abort this algorithm without taking any further steps.
++            let Some(key) = generate_key(store.auto_increment) else {
++                return Ok(PutItemResult::KeyGeneratorExhausted);
++            };
++            // Step 1.1.3. If store also uses in-line keys, then run inject a key into a value
++            // using a key path with value, key and store’s key path.
++            // NOTE: The value is stored without the key; script injects it when it reads the
++            // value.
++            (key, Some(store.auto_increment + 1))
++        },
++        // Step 1.2. Otherwise, run possibly update the key generator for store with key.
++        Some(key) if has_key_generator => {
++            let new_current_number = possibly_update_the_key_generator(store.auto_increment, &key);
++            (key, new_current_number)
++        },
++        Some(key) => (key, None),
++    };
++
++    // Step 2. If the no-overwrite flag was given to these steps and is true, and a record already
++    // exists in store with its key equal to key, then this operation failed with a
++    // "ConstraintError" DOMException. Abort this algorithm without taking any further steps.
+     let encoded_key = encoding::serialize(&key);
+     let exists = query_row(
+         executor,
+@@ -427,12 +508,17 @@ pub(crate) fn put_record<X: SqlExecutor>(
+         |_| Ok(()),
+     )?
+     .is_some();
++    if exists && !overwrite {
++        return Ok(PutItemResult::CannotOverwrite);
++    }
++
++    // Step 3. If a record already exists in store with its key equal to key, then remove the
++    // record from store using delete records from an object store.
++    // Step 4. Store a record in store containing key as its key and !
++    // StructuredSerializeForStorage(value) as its value. The record is stored in the object
++    // store’s list of records such that the list is sorted according to the key of the records in
++    // ascending order.
+     if exists {
+-        if !overwrite {
+-            return Ok(PutItemResult::CannotOverwrite);
+-        }
+-        // Preserve `put()` semantics by replacing the stored value when the primary
+-        // key already exists.
+         executor.execute(
+             "UPDATE object_data SET data = ? WHERE object_store_id = ? AND key = ?",
+             &[
+@@ -451,7 +537,7 @@ pub(crate) fn put_record<X: SqlExecutor>(
+             ],
+         )?;
+     }
+-    if let Some(current_number) = key_generator_current_number {
++    if let Some(current_number) = new_current_number {
+         executor.execute(
+             "UPDATE object_store SET auto_increment = ? WHERE id = ?",
+             &[
+@@ -460,6 +546,8 @@ pub(crate) fn put_record<X: SqlExecutor>(
+             ],
+         )?;
+     }
++
++    // Step 6. Return key.
+     Ok(PutItemResult::Key(key))
+ }
+ 
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index f99e9fe535b..d54d80d134c 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -16,7 +16,7 @@ use servo_url::ImmutableOrigin;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+     BackendError, BackendResult, CreateObjectResult, IndexedDBKeyRange, IndexedDBKeyType,
+-    IndexedDBTxnMode, KeyPath, PutItemResult,
++    IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
+ };
+ use tempfile::TempDir;
+ use url::Host;
+@@ -88,6 +88,11 @@ executor_tests!(
+     test_delete_item_range_respects_open_bounds,
+     test_failed_write_fails_the_transaction,
+     test_missing_store_fails_only_its_request,
++    test_key_generator_follows_generated_and_explicit_keys,
++    test_key_generator_generates_up_to_2_pow_53,
++    test_large_explicit_keys_and_the_key_generator,
++    test_failed_add_changes_nothing,
++    test_abort_reverts_the_key_generator,
+     test_abort_rolls_back_data_schema_and_version,
+     test_transaction_spanning_batches_commits_atomically,
+     test_requests_run_in_order,
+@@ -775,10 +780,9 @@ fn test_delete_store_removes_store_records<X: SqlExecutor>() {
+         queries::put_record(
+             &mut *connection,
+             &object_store,
+-            IndexedDBKeyType::Number(1.0),
++            Some(IndexedDBKeyType::Number(1.0)),
+             &[1, 2, 3],
+             true,
+-            None,
+         )
+         .expect("Failed to insert item");
+         assert_eq!(record_count(&mut *connection, object_store.id), 1);
+@@ -826,11 +830,41 @@ fn put_request(
+             key: Some(key),
+             value,
+             should_overwrite,
+-            key_generator_current_number: None,
+         }),
+     )
+ }
+ 
++/// Runs `puts` (an explicit key or `None` for a generated one, and the value) in order as one
++/// batch of the readwrite `transaction` on `store_name`, and returns their replies.
++fn run_puts<X: SqlExecutor>(
++    db: &SqlEngine<X>,
++    transaction: u64,
++    store_name: &str,
++    puts: Vec<(Option<IndexedDBKeyType>, Vec<u8>)>,
++    should_overwrite: bool,
++) -> Vec<BackendResult<PutItemResult>> {
++    let (requests, receivers): (Vec<_>, Vec<_>) = puts
++        .into_iter()
++        .map(|(key, value)| {
++            let (callback, receiver) = get_callback();
++            let operation = AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
++                callback,
++                key,
++                value,
++                should_overwrite,
++            });
++            (request(store_name, operation), receiver)
++        })
++        .unzip();
++    run_batch(db, transaction, IndexedDBTxnMode::Readwrite, requests);
++    receivers.iter().map(recv).collect()
++}
++
++/// The reply to a put that stored its record under the number `key`.
++fn key_reply(key: f64) -> BackendResult<PutItemResult> {
++    Ok(PutItemResult::Key(IndexedDBKeyType::Number(key)))
++}
++
+ /// Runs a batch of `transaction` and waits until it has run.
+ fn run_batch<X: SqlExecutor>(
+     db: &SqlEngine<X>,
+@@ -897,6 +931,14 @@ fn number_keys(keys: impl IntoIterator<Item = i32>) -> Vec<IndexedDBKeyType> {
+         .collect()
+ }
+ 
++/// The reply to reading `value` stored under the number `key`.
++fn stored_value(key: f64, value: Vec<u8>) -> IndexedDBValue {
++    IndexedDBValue {
++        primary_key: IndexedDBKeyType::Number(key),
++        value,
++    }
++}
++
+ /// Receives the one reply of a request, and checks that no second one follows.
+ fn recv<T>(receiver: &mpsc::Receiver<T>) -> T {
+     let reply = receiver
+@@ -1022,15 +1064,24 @@ fn test_async_operations<X: SqlExecutor>() {
+         PutItemResult::Key(IndexedDBKeyType::Number(1.0))
+     );
+     let value = recv(&get_item_some.1).unwrap();
+-    assert_eq!(value, Some(vec![13, 14, 15]));
++    assert_eq!(value, Some(stored_value(1.0, vec![13, 14, 15])));
+     let value = recv(&get_item_none.1).unwrap();
+     assert_eq!(value, None);
+     let all_items = recv(&get_all_items.1).unwrap();
+     assert_eq!(all_items.len(), 3);
+     // Check that all three items are present
+-    assert!(all_items.contains(&vec![13, 14, 15]));
+-    assert!(all_items.contains(&vec![4, 5, 6]));
+-    assert!(all_items.contains(&vec![7, 8, 9]));
++    assert!(all_items.contains(&stored_value(1.0, vec![13, 14, 15])));
++    assert!(all_items.contains(&IndexedDBValue {
++        primary_key: IndexedDBKeyType::String("2.0".to_string()),
++        value: vec![4, 5, 6],
++    }));
++    assert!(all_items.contains(&IndexedDBValue {
++        primary_key: IndexedDBKeyType::Array(vec![
++            IndexedDBKeyType::String("3".to_string()),
++            IndexedDBKeyType::Number(0.0),
++        ]),
++        value: vec![7, 8, 9],
++    }));
+     let amount = recv(&count.1).unwrap();
+     assert_eq!(amount, 1);
+     recv(&remove.1).unwrap();
+@@ -1058,10 +1109,9 @@ fn test_delete_item_range_respects_open_bounds<X: SqlExecutor>() {
+             queries::put_record(
+                 &mut *connection,
+                 &store,
+-                IndexedDBKeyType::Number(key as f64),
++                Some(IndexedDBKeyType::Number(key as f64)),
+                 &[key as u8],
+                 false,
+-                None,
+             )
+             .expect("Failed to seed object store");
+         }
+@@ -1240,6 +1290,197 @@ fn test_missing_store_fails_only_its_request<X: SqlExecutor>() {
+     assert_eq!(stored_keys(&db, store_name), number_keys([2]));
+ }
+ 
++/// <https://w3c.github.io/IndexedDB/#key-generator-construct>: generated keys start at 1 and
++/// count up; explicit number keys at or above the current number move it past their integer part,
++/// other keys leave it alone.
++fn test_key_generator_follows_generated_and_explicit_keys<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    create_store(&db, "test_store", None, true).unwrap();
++    let number = |key: f64| Some(IndexedDBKeyType::Number(key));
++
++    let replies = run_puts(
++        &db,
++        1,
++        "test_store",
++        vec![
++            (None, vec![1]),
++            (None, vec![2]),
++            (number(1000.0), vec![3]),
++            (None, vec![4]),
++            (Some(IndexedDBKeyType::String("9999".to_owned())), vec![5]),
++            (Some(IndexedDBKeyType::Date(9999.0)), vec![6]),
++            (
++                Some(IndexedDBKeyType::Array(vec![IndexedDBKeyType::Number(
++                    9999.0,
++                )])),
++                vec![7],
++            ),
++            (None, vec![8]),
++            (number(1002.5), vec![9]),
++            (number(-5.0), vec![10]),
++            (None, vec![11]),
++            (number(1004.7), vec![12]),
++            (None, vec![13]),
++        ],
++        false,
++    );
++    assert_eq!(replies[0], key_reply(1.0));
++    assert_eq!(replies[1], key_reply(2.0));
++    assert_eq!(replies[3], key_reply(1001.0));
++    assert_eq!(replies[7], key_reply(1002.0));
++    assert_eq!(replies[10], key_reply(1003.0));
++    assert_eq!(replies[12], key_reply(1005.0));
++    assert!(
++        replies
++            .iter()
++            .all(|reply| matches!(reply, Ok(PutItemResult::Key(_))))
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++    assert_eq!(db.key_generator_current_number("test_store"), Some(1006));
++}
++
++/// A key generator whose current number is above 2^53 fails to generate keys, which fails only
++/// that request, stores nothing and leaves the current number as it is.
++fn test_key_generator_generates_up_to_2_pow_53<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    create_store(&db, "test_store", None, true).unwrap();
++    let max = 9_007_199_254_740_992.0;
++
++    let replies = run_puts(
++        &db,
++        1,
++        "test_store",
++        vec![
++            (Some(IndexedDBKeyType::Number(max - 1.0)), vec![1]),
++            (None, vec![2]),
++            (None, vec![3]),
++            (Some(IndexedDBKeyType::Number(2.0)), vec![4]),
++            (None, vec![5]),
++        ],
++        false,
++    );
++    assert_eq!(replies[1], key_reply(max));
++    assert_eq!(replies[2], Ok(PutItemResult::KeyGeneratorExhausted));
++    assert_eq!(replies[3], key_reply(2.0));
++    assert_eq!(replies[4], Ok(PutItemResult::KeyGeneratorExhausted));
++    assert_eq!(commit(&db, 1), Ok(()));
++    assert_eq!(
++        stored_keys(&db, "test_store"),
++        vec![
++            IndexedDBKeyType::Number(2.0),
++            IndexedDBKeyType::Number(max - 1.0),
++            IndexedDBKeyType::Number(max),
++        ]
++    );
++    assert_eq!(
++        db.key_generator_current_number("test_store"),
++        Some((1 << 53) + 1)
++    );
++}
++
++/// An explicit key of 2^53 or more uses up the key generator; a key below every current number
++/// leaves it alone.
++fn test_large_explicit_keys_and_the_key_generator<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let keys = [
++        9_007_199_254_740_992.0,
++        2f64.powi(60),
++        2f64.powi(63),
++        2f64.powi(64),
++        2f64.powi(70),
++        f64::INFINITY,
++        -2f64.powi(60),
++        -2f64.powi(64),
++        -2f64.powi(70),
++        f64::NEG_INFINITY,
++    ];
++    for (transaction, key) in (1..).zip(keys) {
++        let store_name = format!("store {key}");
++        create_store(&db, &store_name, None, true).unwrap();
++        let replies = run_puts(
++            &db,
++            transaction,
++            &store_name,
++            vec![
++                (Some(IndexedDBKeyType::Number(key)), vec![1]),
++                (None, vec![2]),
++            ],
++            false,
++        );
++        assert_eq!(replies[0], key_reply(key));
++        if key > 0.0 {
++            assert_eq!(replies[1], Ok(PutItemResult::KeyGeneratorExhausted));
++        } else {
++            assert_eq!(replies[1], key_reply(1.0));
++        }
++        assert_eq!(commit(&db, transaction), Ok(()));
++    }
++}
++
++/// An `add` of an existing key fails without changing anything, and the transaction goes on.
++fn test_failed_add_changes_nothing<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    create_store(&db, "test_store", None, true).unwrap();
++    let replies = run_puts(&db, 1, "test_store", vec![(None, vec![1])], false);
++    assert_eq!(replies[0], key_reply(1.0));
++
++    let replies = run_puts(
++        &db,
++        1,
++        "test_store",
++        vec![
++            (Some(IndexedDBKeyType::Number(1.0)), vec![2]),
++            (None, vec![3]),
++        ],
++        false,
++    );
++    assert_eq!(replies[0], Ok(PutItemResult::CannotOverwrite));
++    assert_eq!(replies[1], key_reply(2.0));
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    let get = get_callback();
++    run_batch(
++        &db,
++        2,
++        IndexedDBTxnMode::Readonly,
++        vec![get_request(get.0, 1.0)],
++    );
++    assert_eq!(recv(&get.1), Ok(Some(stored_value(1.0, vec![1]))));
++    assert_eq!(db.key_generator_current_number("test_store"), Some(3));
++}
++
++/// Aborting a transaction reverts what its generated and its explicit keys did to the key
++/// generator.
++fn test_abort_reverts_the_key_generator<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    create_store(&db, "test_store", None, true).unwrap();
++
++    let replies = run_puts(
++        &db,
++        1,
++        "test_store",
++        vec![
++            (None, vec![1]),
++            (Some(IndexedDBKeyType::Number(10.0)), vec![2]),
++            (None, vec![3]),
++        ],
++        false,
++    );
++    assert_eq!(replies[2], key_reply(11.0));
++    abort(&db, 1);
++    assert_eq!(db.key_generator_current_number("test_store"), Some(1));
++
++    let replies = run_puts(&db, 2, "test_store", vec![(None, vec![4])], true);
++    assert_eq!(replies[0], key_reply(1.0));
++    assert_eq!(commit(&db, 2), Ok(()));
++    assert_eq!(db.key_generator_current_number("test_store"), Some(2));
++}
++
+ /// Aborting a transaction rolls back everything it did in all its batches, and for an upgrade
+ /// transaction also its schema changes and the version.
+ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+@@ -1336,7 +1577,6 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+                 key: None,
+                 value: vec![3],
+                 should_overwrite: false,
+-                key_generator_current_number: None,
+             }),
+         )],
+     );
+@@ -1516,7 +1756,7 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
+             }),
+         )],
+     );
+-    assert_eq!(recv(&value.1), Ok(Some(vec![9])));
++    assert_eq!(recv(&value.1), Ok(Some(stored_value(1.0, vec![9]))));
+ }
+ 
+ /// Each database has its own actor: one whose connection is busy, with a write transaction
+@@ -1568,7 +1808,7 @@ fn test_two_databases_progress_independently<X: SqlExecutor>() {
+     );
+ 
+     release.send(()).unwrap();
+-    assert_eq!(recv(&get.1), Ok(Some(vec![1])));
++    assert_eq!(recv(&get.1), Ok(Some(stored_value(1.0, vec![1]))));
+     assert_eq!(commit(&busy, 1), Ok(()));
+     assert_eq!(stored_keys(&busy, "test_store"), number_keys([1]));
+ }
+@@ -1753,7 +1993,7 @@ fn open_faulty_engine<X: SqlExecutor>(dir: &TempDir) -> SqlEngine<Faulty<X>> {
+ }
+ 
+ fn get_request(
+-    callback: GenericCallback<BackendResult<Option<Vec<u8>>>>,
++    callback: GenericCallback<BackendResult<Option<IndexedDBValue>>>,
+     key: f64,
+ ) -> KvsOperation {
+     request(
+@@ -1844,9 +2084,9 @@ fn test_statement_failure_that_ends_the_transaction_fails_it<X: SqlExecutor>() {
+             .map(|get| get_request(get.0.clone(), 1.0))
+             .collect(),
+     );
+-    assert_eq!(recv(&gets[0].1), Ok(Some(vec![1])));
++    assert_eq!(recv(&gets[0].1), Ok(Some(stored_value(1.0, vec![1]))));
+     assert!(recv(&gets[1].1).is_err());
+-    assert_eq!(recv(&gets[2].1), Ok(Some(vec![1])));
++    assert_eq!(recv(&gets[2].1), Ok(Some(stored_value(1.0, vec![1]))));
+     assert_eq!(commit(&db, 2), Ok(()));
+ }
+ 
+@@ -1907,7 +2147,7 @@ fn test_commit_failure_rolls_back<X: SqlExecutor>() {
+         IndexedDBTxnMode::Readonly,
+         vec![get_request(get.0, 1.0)],
+     );
+-    assert_eq!(recv(&get.1), Ok(Some(vec![1])));
++    assert_eq!(recv(&get.1), Ok(Some(stored_value(1.0, vec![1]))));
+     assert_eq!(commit(&db, 2), Ok(()));
+ 
+     faults_for(dir.path()).lock().unwrap().commit = false;
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 0925482e921..29dfc679d06 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -2072,16 +2072,14 @@ impl IndexedDBManager {
+             },
+             SyncOperation::GetObjectStore(sender, origin, db_name, store_name) => {
+                 // FIXME:(arihant2math) Should we error out more aggressively here?
+-                let result = self.get_database(origin, db_name).map(|db| {
+-                    let key_generator_current_number = db.key_generator_current_number(&store_name);
+-                    IndexedDBObjectStore {
++                let result = self
++                    .get_database(origin, db_name)
++                    .map(|db| IndexedDBObjectStore {
+                         key_path: db.key_path(&store_name),
+-                        has_key_generator: key_generator_current_number.is_some(),
+-                        key_generator_current_number,
++                        has_key_generator: db.key_generator_current_number(&store_name).is_some(),
+                         indexes: db.indexes(&store_name).unwrap_or_default(),
+                         name: store_name,
+-                    }
+-                });
++                    });
+                 let _ = sender.send(result.ok_or(BackendError::DbNotFound));
+             },
+             SyncOperation::Commit(callback, origin, db_name, txn) => {
+@@ -2474,7 +2472,6 @@ mod tests {
+                 key: None,
+                 value: vec![1],
+                 should_overwrite: false,
+-                key_generator_current_number: None,
+             }),
+         );
+         assert_eq!(env.key_generator_current_number("books"), Some(2));
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index b908eba2a1c..8314d9dda5a 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -20,8 +20,8 @@ use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, Storage
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+     BackendError, BackendResult, ConnectionMsg, IndexedDBKeyRange, IndexedDBKeyType,
+-    IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath,
+-    PutItemResult, SyncOperation, TxnCompleteMsg,
++    IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, IndexedDBValue,
++    KeyPath, PutItemResult, SyncOperation, TxnCompleteMsg,
+ };
+ use tempfile::TempDir;
+ use uuid::Uuid;
+@@ -503,7 +503,6 @@ fn put_item_request(
+                 key,
+                 value,
+                 should_overwrite,
+-                key_generator_current_number: None,
+             }),
+         ),
+     )
+@@ -579,7 +578,7 @@ fn get_item(
+     store_name: &str,
+     txn: u64,
+     key: IndexedDBKeyType,
+-) -> mpsc::Receiver<Option<BackendResult<Option<Vec<u8>>>>> {
++) -> mpsc::Receiver<Option<BackendResult<Option<IndexedDBValue>>>> {
+     let request_id = 1;
+     let (sender, receiver) = make_profile_callback();
+     GenericSend::send(
+@@ -759,7 +758,6 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
+     assert_eq!(store.name, store_name);
+     assert_eq!(store.key_path, Some(KeyPath::String("id".to_string())));
+     assert_eq!(store.has_key_generator, false);
+-    assert_eq!(store.key_generator_current_number, None);
+     assert_eq!(store.indexes.len(), 1);
+     assert_eq!(store.indexes[0].name, index_name);
+     assert_eq!(
+@@ -811,7 +809,13 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
+     let roundtrip_msg = recv_callback_timeout(&roundtrip, "get item reply").unwrap();
+     mark_request_handled(&ctx, db_name, txn, 1);
+     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
+-    assert_eq!(roundtrip_msg, Some(b"Moby Dick".to_vec()));
++    assert_eq!(
++        roundtrip_msg,
++        Some(IndexedDBValue {
++            primary_key: IndexedDBKeyType::String("book-1".to_string()),
++            value: b"Moby Dick".to_vec(),
++        })
++    );
+     assert!(commit_msg.result.is_ok());
+     finish_transaction(&ctx, db_name, txn);
+ 
+@@ -1192,7 +1196,10 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
+     let lookup_msg = recv_callback_timeout(&lookup, "get preserved item reply").unwrap();
+     mark_request_handled(&ctx, db_name, txn, 1);
+     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
+-    assert_eq!(lookup_msg, Some(b"Moby Dick".to_vec()));
++    assert_eq!(
++        lookup_msg.map(|value| value.value),
++        Some(b"Moby Dick".to_vec())
++    );
+     assert!(commit_msg.result.is_ok());
+     finish_transaction(&ctx, db_name, txn);
+ 
+@@ -1682,7 +1689,9 @@ fn get_item_in_new_readonly_transaction(
+     );
+     let lookup = get_item(ctx, db_name, store_name, txn, key);
+     let commit_result = commit_transaction(ctx, db_name, txn);
+-    let value = recv_callback_timeout(&lookup, "get item reply").unwrap();
++    let value = recv_callback_timeout(&lookup, "get item reply")
++        .unwrap()
++        .map(|value| value.value);
+     mark_request_handled(ctx, db_name, txn, 1);
+     assert!(
+         recv_callback_timeout(&commit_result, "readonly commit reply")
+diff --git a/python/tidy/error_message_exceptions.txt b/python/tidy/error_message_exceptions.txt
+index 4b9b6fa97b5..de9136044a6 100644
+--- a/python/tidy/error_message_exceptions.txt
++++ b/python/tidy/error_message_exceptions.txt
+@@ -28,13 +28,12 @@
+ ./components/script/dom/gamepad/gamepadhapticactuator.rs 3
+ ./components/script/dom/geometry/dommatrixreadonly.rs 3
+ ./components/script/dom/globalscope/messageport.rs 2
+-./components/script/dom/indexeddb/idbcursor.rs 1
+ ./components/script/dom/indexeddb/idbdatabase.rs 13
+ ./components/script/dom/indexeddb/idbfactory.rs 9
+ ./components/script/dom/indexeddb/idbkeyrange.rs 1
+-./components/script/dom/indexeddb/idbobjectstore.rs 26
++./components/script/dom/indexeddb/idbobjectstore.rs 22
+ ./components/script/dom/indexeddb/idbopendbrequest.rs 1
+-./components/script/dom/indexeddb/idbrequest.rs 7
++./components/script/dom/indexeddb/idbrequest.rs 5
+ ./components/script/dom/indexeddb/idbtransaction.rs 6
+ ./components/script/dom/indexeddb/key.rs 2
+ ./components/script/dom/intersectionobserver/intersectionobserver.rs 2
+diff --git a/tests/wpt/meta/IndexedDB/keygenerator.any.js.ini b/tests/wpt/meta/IndexedDB/keygenerator.any.js.ini
+index 68ebbdeaaaa..2d7841cd2a6 100644
+--- a/tests/wpt/meta/IndexedDB/keygenerator.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/keygenerator.any.js.ini
+@@ -1,70 +1,8 @@
+ [keygenerator.any.html]
+-  [Key generator vs. explicit key 53 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key greater than 53 bits, less than 64 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key 63 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key 64 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key greater than 64 bits, but still finite]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key equal to Infinity]
+-    expected: FAIL
+-
+-  [Keygenerator overflow]
+-    expected: FAIL
+-
+ 
+ [keygenerator.any.serviceworker.html]
+   expected: ERROR
+ 
+ [keygenerator.any.sharedworker.html]
+-  [Key generator vs. explicit key 53 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key greater than 53 bits, less than 64 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key 63 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key 64 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key greater than 64 bits, but still finite]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key equal to Infinity]
+-    expected: FAIL
+-
+-  [Keygenerator overflow]
+-    expected: FAIL
+-
+ 
+ [keygenerator.any.worker.html]
+-  [Key generator vs. explicit key 53 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key greater than 53 bits, less than 64 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key 63 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key 64 bits]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key greater than 64 bits, but still finite]
+-    expected: FAIL
+-
+-  [Key generator vs. explicit key equal to Infinity]
+-    expected: FAIL
+-
+-  [Keygenerator overflow]
+-    expected: FAIL
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 06e70bc5376..c40b29a9806 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11607,6 +11607,71 @@
+    }
+   },
+   "testharness": {
++   "IndexedDB": {
++    "generated-key-value-kinds.any.js": [
++     "93e646d1ad6073457e3aa79c4751b7ab82b16066",
++     [
++      "IndexedDB/generated-key-value-kinds.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/generated-key-value-kinds.any.serviceworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/generated-key-value-kinds.any.sharedworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/generated-key-value-kinds.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
++        ]
++       ]
++      }
++     ]
++    ]
++   },
+    "accessibility-tree": {
+     "accessibility-update-basic-mutation.html": [
+      "f86426901b096137876adf6fcbb272e5bca47658",
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/generated-key-value-kinds.any.js b/tests/wpt/mozilla/tests/IndexedDB/generated-key-value-kinds.any.js
+new file mode 100644
+index 00000000000..93e646d1ad6
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/generated-key-value-kinds.any.js
+@@ -0,0 +1,100 @@
++// META: global=window,worker
++// META: title=IndexedDB: a generated in-line key is part of the value only where storing keeps it
++
++// https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store injects a generated key
++// into the value (step 1.1.3) before StructuredSerializeForStorage (step 4), which keeps the own
++// properties of ordinary objects and Arrays only. So a value of another kind, or with such an
++// object where the key would attach, reads back without the key.
++
++'use strict';
++
++function openDatabase(t, upgrade) {
++  const name = 'generated-key-value-kinds-' + Math.random();
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open(name, 1);
++    request.onupgradeneeded = () => upgrade(request.result);
++    request.onsuccess = () => {
++      t.add_cleanup(() => {
++        request.result.close();
++        indexedDB.deleteDatabase(name);
++      });
++      resolve(request.result);
++    };
++    request.onerror = () => reject(request.error);
++  });
++}
++
++function result(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++// Puts `value` into `storeName` under a generated key, and reads it back with get() and with a
++// cursor.
++async function putAndRead(db, storeName, value) {
++  const tx = db.transaction(storeName, 'readwrite');
++  const store = tx.objectStore(storeName);
++  const key = await result(store.put(value));
++  const got = await result(store.get(key));
++  const cursor = await result(store.openCursor(key));
++  return {key, got, fromCursor: cursor.value};
++}
++
++const exotic = {
++  Date: [() => new Date(0), v => v instanceof Date],
++  Map: [() => new Map([[1, 2]]), v => v instanceof Map],
++  Set: [() => new Set([1]), v => v instanceof Set],
++  Blob: [() => new Blob(['x']), v => v instanceof Blob],
++  File: [() => new File(['x'], 'x.txt'), v => v instanceof File],
++  ArrayBuffer: [() => new ArrayBuffer(4), v => v instanceof ArrayBuffer],
++  Uint8Array: [() => new Uint8Array(2), v => v instanceof Uint8Array],
++  RegExp: [() => /x/, v => v instanceof RegExp],
++  'Boolean object': [() => new Boolean(true), v => v instanceof Boolean],
++};
++
++for (const [kind, [make, isKind]] of Object.entries(exotic)) {
++  promise_test(async t => {
++    const db = await openDatabase(t, db => {
++      db.createObjectStore('store', {keyPath: 'id', autoIncrement: true});
++    });
++    const {got, fromCursor} = await putAndRead(db, 'store', make());
++    for (const value of [got, fromCursor]) {
++      assert_true(isKind(value), 'the value keeps its kind');
++      assert_false(Object.prototype.hasOwnProperty.call(value, 'id'),
++                   'the generated key is not part of the value');
++    }
++  }, `A ${kind} value doesn't get its generated key`);
++}
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    db.createObjectStore('store', {keyPath: 'id', autoIncrement: true});
++  });
++  for (const make of [() => ({}), () => [1, 2]]) {
++    const {key, got, fromCursor} = await putAndRead(db, 'store', make());
++    assert_equals(got.id, key, 'get() returns the value with its key');
++    assert_equals(fromCursor.id, key, 'a cursor returns the value with its key');
++  }
++}, 'Ordinary objects and Arrays get their generated key');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    db.createObjectStore('store', {keyPath: 'a.id', autoIncrement: true});
++  });
++  let {got} = await putAndRead(db, 'store', {a: new Date(0)});
++  assert_true(got.a instanceof Date, 'the nested value keeps its kind');
++  assert_false(Object.prototype.hasOwnProperty.call(got.a, 'id'),
++               'the generated key is not part of a nested Date');
++
++  let key;
++  ({key, got} = await putAndRead(db, 'store', {a: {}}));
++  assert_equals(got.a.id, key, 'a nested ordinary object gets the key');
++
++  ({key, got} = await putAndRead(db, 'store', {}));
++  assert_equals(got.a.id, key, 'the objects on the key path are created');
++
++  ({key, got} = await putAndRead(db, 'store', {a: [1]}));
++  assert_equals(got.a.id, key, 'a nested Array gets the key');
++}, 'A generated key in a nested key path attaches to ordinary objects and Arrays only');
