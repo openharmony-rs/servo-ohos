@@ -186,6 +186,7 @@ mod from_script {
                 Self::SetFinalUrl(..) => target!("SetFinalUrl"),
                 Self::LogEntry(..) => target!("LogEntry"),
                 Self::DiscardDocument => target!("DiscardDocument"),
+                Self::EvictFromBackForwardCache => target!("EvictFromBackForwardCache"),
                 Self::DiscardTopLevelBrowsingContext => target!("DiscardTopLevelBrowsingContext"),
                 Self::PipelineExited => target!("PipelineExited"),
                 Self::ForwardDOMMessage(..) => target!("ForwardDOMMessage"),

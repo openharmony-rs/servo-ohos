@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 07:34:02 +0000
+Subject: [PATCH] storage: Ask RDB whether a blob is NULL only when it is empty
+
+Reading a blob cost three NDK calls (OH_Cursor IsNull, GetSize and
+GetBlob), each a lookup behind a mutex in RDB. A NULL has the size 0 in
+RDB (SqliteStatement::GetSize returns sqlite3_column_bytes), so the
+cursor asks for the size first and for the NULL flag only when the size
+is 0.
+
+Validation: `./mach check --ohos -- -p servo-storage --all-targets` with RDB only and with SQLite and RDB: no warnings; the device unit tests (`./mach test-unit --ohos -p servo-storage`, RDB only and both backends) read every kind of stored value through it, see the last commit of the series (P4.2). DAYU200 (QuickJS + RDB, checked-release), 50,000 records with a 100-byte string each, one run per build: getAllKeys 1,025 -> 892 ms, getAll 3,804 -> 3,610 ms, a store's getAllRecords 4,760 -> 4,554 ms, an index's 8,094 -> 7,737 ms.
+AI-assisted: Yes (agent session; read RDB's GetSize in the relational_store source, changed the read order, measured large reads on the board)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/storage/ohos_rdb/cursor.rs | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/components/storage/ohos_rdb/cursor.rs b/components/storage/ohos_rdb/cursor.rs
+index 3cea6d4b3bd..928fcd85b40 100644
+--- a/components/storage/ohos_rdb/cursor.rs
++++ b/components/storage/ohos_rdb/cursor.rs
+@@ -165,13 +165,11 @@ impl<'trans> OhosRdbCursor<'trans> {
+     }
+ 
+     pub(crate) fn blob(&self, index: usize) -> Result<Option<Vec<u8>>> {
+-        if self.is_null(index)? {
+-            return Ok(None);
+-        }
+-
++        // A NULL has the size 0, so only an empty value needs the NULL check, which costs
++        // another call per value.
+         let size = self.size(index)?;
+         if size == 0 {
+-            return Ok(Some(Vec::new()));
++            return Ok((!self.is_null(index)?).then(Vec::new));
+         }
+ 
+         let mut buffer = vec![0u8; size];

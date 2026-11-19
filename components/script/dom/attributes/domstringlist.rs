@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use itertools::Itertools;
 use js::context::JSContext;
 use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
@@ -36,25 +35,6 @@ impl DOMStringList {
         strings: Vec<DOMString>,
     ) -> DomRoot<DOMStringList> {
         reflect_dom_object(cx, Box::new(DOMStringList::new_inherited(strings)), global)
-    }
-
-    /// <https://www.w3.org/TR/IndexedDB-3/#sorted-name-list>
-    pub(crate) fn new_sorted<'a>(
-        cx: &mut JSContext,
-        global: &GlobalScope,
-        strings: impl IntoIterator<Item = &'a TracedDOMString>,
-    ) -> DomRoot<DOMStringList> {
-        let sorted = strings
-            .into_iter()
-            .map(|dom_string| dom_string.str().encode_utf16().collect::<Vec<u16>>())
-            .sorted_unstable()
-            .map(|utf16_str| {
-                String::from_utf16(utf16_str.as_slice())
-                    .expect("can't convert object store name from utf16 back to utf8")
-                    .into()
-            })
-            .collect();
-        Self::new(cx, global, sorted)
     }
 }
 

@@ -1,0 +1,228 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 14 Nov 2026 21:28:11 +0000
+Subject: [PATCH] storage: Run the IndexedDB integration tests on every backend
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+tests/indexeddb.rs drives the storage threads the way script does, so it
+tested whichever IndexedDB executor the build ran on: SQLite on the host,
+and on a device with both backends only RDB, which the
+storage_ohos_rdb_backend_enabled pref selects by default.
+
+Each test is now a plain function, and `backend_tests!` defines a
+`#[test]` for it per backend compiled in, in a module named after the
+backend (`indexeddb::sqlite::…`, `indexeddb::rdb::…`). The wrapper
+takes the test lock and sets the pref before the test opens its
+databases, so with both backends compiled in each test runs once on
+SQLite and once on RDB; with one backend the pref has no effect.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 71 passed, the 11 integration tests as `indexeddb::sqlite::…`. DAYU200 with both backends (`./mach test-unit --ohos -p servo-storage -- --features ohos-rdb-backend --status-level all`): 111 passed, each integration test once as `indexeddb::sqlite::…` and once as `indexeddb::rdb::…`; RDB only: 69 passed; one documented skip in each.
+AI-assisted: Yes (agent session; written and run on the host and the DAYU200 by the agent, and run again by a later agent session after review fixes to the previous commit)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/storage/tests/indexeddb.rs | 72 ++++++++++++++++++++-------
+ 1 file changed, 55 insertions(+), 17 deletions(-)
+
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index 914b4a8209e..4503a6c5286 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -3,7 +3,7 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use std::cell::Cell;
+-use std::sync::{Mutex, MutexGuard, OnceLock, mpsc};
++use std::sync::{Mutex, OnceLock, mpsc};
+ use std::time::Duration;
+ 
+ use profile::mem as profile_mem;
+@@ -12,6 +12,7 @@ use servo_base::generic_channel::{self, GenericSend};
+ use servo_base::id::{
+     PIPELINE_NAMESPACE, PipelineNamespace, PipelineNamespaceId, TEST_PAINTER_ID, WebViewId,
+ };
++use servo_config::prefs;
+ use servo_url::{ImmutableOrigin, ServoUrl};
+ use storage::ClientStorageThreadFactory;
+ use storage_traits::StorageThreads;
+@@ -27,12 +28,65 @@ use uuid::Uuid;
+ 
+ const TIMEOUT: Duration = Duration::from_secs(5);
+ 
++/// Defines a `#[test]` for each of the given functions and each storage backend compiled in, in
++/// a module named after the backend. With both compiled in, the
++/// `storage_ohos_rdb_backend_enabled` pref chooses one per database.
++macro_rules! backend_tests {
++    ($($test:ident),* $(,)?) => {
++        #[cfg(feature = "sqlite-backend")]
++        mod sqlite {
++            $(
++                #[test]
++                fn $test() {
++                    super::run_test(false, super::$test);
++                }
++            )*
++        }
++
++        #[cfg(ohos_rdb)]
++        mod rdb {
++            $(
++                #[test]
++                fn $test() {
++                    super::run_test(true, super::$test);
++                }
++            )*
++        }
++    };
++}
++
++backend_tests!(
++    test_indexeddb_roundtrip_and_metadata_persist,
++    test_indexeddb_store_names_support_nul_bytes,
++    test_indexeddb_version_upgrade_persists_metadata,
++    test_indexeddb_duplicate_store_is_not_an_error,
++    test_indexeddb_aborted_transaction_restores_pre_transaction_state,
++    test_indexeddb_aborted_upgrade_reverts_version_and_stores,
++    test_indexeddb_cross_type_key_sort_order,
++    test_indexeddb_iterate_count_and_reverse,
++    test_indexeddb_delete_item_range_respects_open_bounds,
++    test_indexeddb_auto_increment_assigns_sequential_keys,
++    test_indexeddb_batch_commit_failure_surfaces_an_error,
++);
++
+ static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+ 
+ fn indexeddb_test_lock() -> &'static Mutex<()> {
+     INDEXEDDB_TEST_LOCK.get_or_init(|| Mutex::new(()))
+ }
+ 
++/// Runs `test` on the RDB backend if `rdb_backend` is set and on SQLite otherwise, while no other
++/// IndexedDB test runs.
++fn run_test(rdb_backend: bool, test: fn()) {
++    let _test_lock = indexeddb_test_lock()
++        .lock()
++        .unwrap_or_else(|poisoned| poisoned.into_inner());
++    let mut preferences = prefs::get().clone();
++    preferences.storage_ohos_rdb_backend_enabled = rdb_backend;
++    prefs::set(preferences);
++    test();
++}
++
+ fn install_test_namespace() {
+     if PIPELINE_NAMESPACE.get().is_none() {
+         PipelineNamespace::install(PipelineNamespaceId(1));
+@@ -73,7 +127,6 @@ fn shutdown_storage_group(threads: &StorageThreads) {
+ 
+ struct IndexedDbTestContext {
+     _client_handle: storage_traits::client_storage::ClientStorageThreadHandle,
+-    _test_lock: MutexGuard<'static, ()>,
+     _temp_dir: TempDir,
+     private_threads: StorageThreads,
+     public_threads: StorageThreads,
+@@ -85,9 +138,6 @@ struct IndexedDbTestContext {
+ impl IndexedDbTestContext {
+     fn new() -> Self {
+         install_test_namespace();
+-        let test_lock = indexeddb_test_lock()
+-            .lock()
+-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+         let temp_dir = tempfile::tempdir().unwrap();
+         let config_dir = temp_dir.path().to_path_buf();
+         let client_handle: storage_traits::client_storage::ClientStorageThreadHandle =
+@@ -109,7 +159,6 @@ impl IndexedDbTestContext {
+ 
+         Self {
+             _client_handle: client_handle,
+-            _test_lock: test_lock,
+             _temp_dir: temp_dir,
+             private_threads,
+             public_threads,
+@@ -690,7 +739,6 @@ fn reopen_database(ctx: &IndexedDbTestContext, db_name: &str, store_name: &str)
+     }
+ }
+ 
+-#[test]
+ fn test_indexeddb_roundtrip_and_metadata_persist() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-roundtrip";
+@@ -817,7 +865,6 @@ fn test_indexeddb_roundtrip_and_metadata_persist() {
+     ctx.shutdown();
+ }
+ 
+-#[test]
+ fn test_indexeddb_store_names_support_nul_bytes() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-nul";
+@@ -843,7 +890,6 @@ fn test_indexeddb_store_names_support_nul_bytes() {
+     ctx.shutdown();
+ }
+ 
+-#[test]
+ fn test_indexeddb_version_upgrade_persists_metadata() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-upgrade";
+@@ -899,7 +945,6 @@ fn test_indexeddb_version_upgrade_persists_metadata() {
+ /// Recreating an existing store is not a backend error: the engine reports
+ /// `AlreadyExists` and leaves the schema alone. Script rejects the duplicate
+ /// before it gets here, so this pins the engine's own behaviour.
+-#[test]
+ fn test_indexeddb_duplicate_store_is_not_an_error() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-duplicate-store";
+@@ -969,7 +1014,6 @@ fn abort_transaction(
+     receiver
+ }
+ 
+-#[test]
+ fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-abort-txn";
+@@ -1049,7 +1093,6 @@ fn test_indexeddb_aborted_transaction_restores_pre_transaction_state() {
+     ctx.shutdown();
+ }
+ 
+-#[test]
+ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-abort-upgrade";
+@@ -1148,7 +1191,6 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
+     ctx.shutdown();
+ }
+ 
+-#[test]
+ fn test_indexeddb_cross_type_key_sort_order() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-sort-order";
+@@ -1238,7 +1280,6 @@ fn test_indexeddb_cross_type_key_sort_order() {
+     ctx.shutdown();
+ }
+ 
+-#[test]
+ fn test_indexeddb_iterate_count_and_reverse() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-iterate";
+@@ -1370,7 +1411,6 @@ fn test_indexeddb_iterate_count_and_reverse() {
+     ctx.shutdown();
+ }
+ 
+-#[test]
+ fn test_indexeddb_delete_item_range_respects_open_bounds() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-open-bounds";
+@@ -1495,7 +1535,6 @@ fn test_indexeddb_delete_item_range_respects_open_bounds() {
+     ctx.shutdown();
+ }
+ 
+-#[test]
+ fn test_indexeddb_auto_increment_assigns_sequential_keys() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-auto-increment";
+@@ -1586,7 +1625,6 @@ fn test_indexeddb_auto_increment_assigns_sequential_keys() {
+     ctx.shutdown();
+ }
+ 
+-#[test]
+ fn test_indexeddb_batch_commit_failure_surfaces_an_error() {
+     let ctx = IndexedDbTestContext::new();
+     let db_name = "indexeddb-batch-failure";

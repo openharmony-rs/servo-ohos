@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 17 Nov 2026 20:53:23 +0000
+Subject: [PATCH] docs: record patches 136 to 142 in the stack manifest
+
+Phase P0 of the IndexedDB redesign: the cherry-picked cursor fix, the
+executor layer with its tests on every backend, the schema version, the
+executor's handling of errors that end a transaction, and the tests of
+the RDB behaviour the executors rely on. Patches that edit upstream
+files are tier C, those that only add or change fork files tier A; this
+bookkeeping entry is B, like the earlier ones.
+
+Validation: `uv run docs/ohos-sync/check_stack.py base/2026-11-09` passes.
+AI-assisted: Yes (agent session; written by the agent, and regenerated after the review fixes to the P0 commits)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 753cf7695a5..a5443457049 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -159,6 +159,13 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 133. `backport: deny: Allow chrono in cargo deny (#50002)` — B · CI · watch: -
+ 134. `wpt: Let fetch-cannot-overwhelm-system wait for its requests to a small file` — B · CI · watch: -
+ 135. `docs: record patches 131 to 135 in the stack manifest` — B · none · watch: -
++136. `indexeddb: Read only the records a cursor step needs` — C · CI+device · watch: components/script/dom/indexeddb components/shared/storage/indexeddb.rs tests/wpt/tests/IndexedDB
++137. `indexeddb: Run the SQLite and RDB backends as executors of one engine` — C · CI+device · watch: components/storage/indexeddb components/shared/storage/indexeddb.rs components/storage/client_storage.rs
++138. `storage: Run the IndexedDB integration tests on every backend` — A · CI+device · watch: components/shared/storage/indexeddb.rs components/storage/indexeddb/mod.rs
++139. `indexeddb: Reset databases stored with another schema version` — A · CI+device · watch: components/storage/indexeddb/mod.rs components/storage/client_storage.rs
++140. `indexeddb: End the executor's transaction after errors that may roll it back` — A · CI+device · watch: -
++141. `storage: Test the transaction and statement behaviour the executors rely on` — A · CI+device · watch: -
++142. `docs: record patches 136 to 142 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 

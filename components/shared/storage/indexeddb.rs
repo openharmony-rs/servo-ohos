@@ -6,16 +6,18 @@ use std::cmp::{Ordering, PartialEq, PartialOrd};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
+use std::path::PathBuf;
 
 use malloc_size_of_derive::MallocSizeOf;
 use profile_traits::generic_callback::GenericCallback;
 use profile_traits::mem::ReportsChan;
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::GenericSender;
+use servo_base::id::{PipelineId, WebViewId};
 use servo_url::origin::ImmutableOrigin;
 use uuid::Uuid;
 
-use crate::client_storage::StorageProxyMap;
+use crate::client_storage::{ClientStorageThreadHandle, StorageProxyMap};
 
 // TODO Box<dyn Error> is not serializable, fix needs to be found
 pub type DbError = String;
@@ -34,6 +36,14 @@ pub enum BackendError {
     QuotaExceeded,
     /// The transaction was aborted
     Abort,
+    /// A constraint failed: a unique index got the same key for two records while it was
+    /// populated, which aborts the upgrade transaction, or a statement violated a constraint of
+    /// the database's tables. Reported as a "ConstraintError" DOMException.
+    Constraint,
+    /// The database can't be used any more, for example because its file is corrupt: the
+    /// transaction fails, and the backend closes every connection to the database with the
+    /// forced flag (<https://w3c.github.io/IndexedDB/#close-a-database-connection>).
+    Unusable(DbError),
 
     DbErr(DbError),
 }
@@ -51,6 +61,8 @@ impl Display for BackendError {
             BackendError::StoreNotFound => write!(f, "StoreNotFound"),
             BackendError::QuotaExceeded => write!(f, "QuotaExceeded"),
             BackendError::Abort => write!(f, "Abort"),
+            BackendError::Constraint => write!(f, "Constraint"),
+            BackendError::Unusable(err) => write!(f, "Unusable database: {err}"),
             BackendError::DbErr(err) => write!(f, "{err}"),
         }
     }
@@ -60,10 +72,122 @@ impl Error for BackendError {}
 
 pub type BackendResult<T> = Result<T, BackendError>;
 
+/// A DOMString as its UTF-16 code units, which may include unpaired surrogates
+/// (<https://webidl.spec.whatwg.org/#idl-DOMString>). String keys and the names of databases,
+/// object stores and indexes take this form, so that any JavaScript string survives unchanged,
+/// and it orders by code units, as IndexedDB compares keys and sorts names.
+#[derive(
+    Clone, Default, Deserialize, Eq, Hash, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct Utf16String(Vec<u16>);
+
+impl Utf16String {
+    pub fn from_units(units: Vec<u16>) -> Self {
+        Self(units)
+    }
+
+    pub fn units(&self) -> &[u16] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The string, unless it has an unpaired surrogate.
+    pub fn to_utf8(&self) -> Option<String> {
+        String::from_utf16(&self.0).ok()
+    }
+
+    /// The string with each unpaired surrogate replaced by U+FFFD.
+    pub fn to_string_lossy(&self) -> String {
+        String::from_utf16_lossy(&self.0)
+    }
+
+    /// The code units in big-endian byte order, which sorts like the code units.
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        self.0.iter().flat_map(|unit| unit.to_be_bytes()).collect()
+    }
+
+    /// The string of [`Utf16String::to_be_bytes`], or `None` for an odd number of bytes.
+    pub fn from_be_bytes(bytes: &[u8]) -> Option<Self> {
+        let (pairs, remainder) = bytes.as_chunks::<2>();
+        if !remainder.is_empty() {
+            return None;
+        }
+        Some(Self(
+            pairs.iter().map(|pair| u16::from_be_bytes(*pair)).collect(),
+        ))
+    }
+}
+
+impl From<&str> for Utf16String {
+    fn from(string: &str) -> Self {
+        Self(string.encode_utf16().collect())
+    }
+}
+
+impl From<String> for Utf16String {
+    fn from(string: String) -> Self {
+        Self::from(string.as_str())
+    }
+}
+
+impl PartialEq<&str> for Utf16String {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.iter().copied().eq(other.encode_utf16())
+    }
+}
+
+impl Debug for Utf16String {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"")?;
+        for unit in char::decode_utf16(self.0.iter().copied()) {
+            match unit {
+                Ok(character) => write!(f, "{}", character.escape_debug())?,
+                Err(error) => write!(f, "\\u{{{:x}}}", error.unpaired_surrogate())?,
+            }
+        }
+        f.write_str("\"")
+    }
+}
+
+impl Display for Utf16String {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_string_lossy())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, MallocSizeOf, Serialize)]
 pub enum KeyPath {
     String(String),
     Sequence(Vec<String>),
+}
+
+/// A transaction: its connection, and a serial number that is unique among the transactions of
+/// the connection. The backend numbers the upgrade transaction of an open request 0
+/// ([`IndexedDBTxnId::upgrade`]); script numbers the transactions it creates from 1.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
+pub struct IndexedDBTxnId {
+    /// The id of the connection, which is also the id of the request that opened it.
+    pub connection: Uuid,
+    pub serial: u64,
+}
+
+impl IndexedDBTxnId {
+    /// The upgrade transaction of the connection `connection`.
+    pub fn upgrade(connection: Uuid) -> Self {
+        Self {
+            connection,
+            serial: 0,
+        }
+    }
+}
+
+impl Display for IndexedDBTxnId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.connection, self.serial)
+    }
 }
 
 // https://www.w3.org/TR/IndexedDB-3/#enumdef-idbtransactionmode
@@ -78,7 +202,7 @@ pub enum IndexedDBTxnMode {
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum IndexedDBKeyType {
     Number(f64),
-    String(String),
+    String(Utf16String),
     Binary(Vec<u8>),
     Date(f64),
     Array(Vec<IndexedDBKeyType>),
@@ -139,7 +263,8 @@ impl PartialOrd for IndexedDBKeyType {
             // Step 11 skipped
             // TODO: Likely a tiny bit wrong (use js number comparison)
             (IndexedDBKeyType::Number(a), IndexedDBKeyType::Number(b)) => a.partial_cmp(b),
-            // TODO: Likely a tiny bit wrong (use js string comparison)
+            // Step 11. string: If va is code unit less than vb, then return -1. If vb is code
+            // unit less than va, then return 1. Return 0.
             (IndexedDBKeyType::String(a), IndexedDBKeyType::String(b)) => a.partial_cmp(b),
             // TODO: Likely a little wrong (use js binary comparison)
             (IndexedDBKeyType::Binary(a), IndexedDBKeyType::Binary(b)) => a.partial_cmp(b),
@@ -249,163 +374,324 @@ impl IndexedDBKeyRange {
         }
         None
     }
+
+    /// Raises the lower bound to `key` (excluded if `open`), unless the current one is tighter.
+    pub fn restrict_lower(&mut self, key: IndexedDBKeyType, open: bool) {
+        let tighter = self
+            .lower
+            .as_ref()
+            .is_none_or(|lower| &key > lower || (&key == lower && open && !self.lower_open));
+        if tighter {
+            self.lower = Some(key);
+            self.lower_open = open;
+        }
+    }
+
+    /// Lowers the upper bound to `key` (excluded if `open`), unless the current one is tighter.
+    pub fn restrict_upper(&mut self, key: IndexedDBKeyType, open: bool) {
+        let tighter = self
+            .upper
+            .as_ref()
+            .is_none_or(|upper| &key < upper || (&key == upper && open && !self.upper_open));
+        if tighter {
+            self.upper = Some(key);
+            self.upper_open = open;
+        }
+    }
 }
 
-/// <https://w3c.github.io/IndexedDB/#record-snapshot>
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
-pub struct IndexedDBRecord {
-    pub key: IndexedDBKeyType,
+/// A serialized value read from an object store, with the primary key of its record. A value
+/// stored under a generated key in a store with an in-line key path doesn't contain the key: script
+/// injects it into the deserialized value.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct IndexedDBValue {
     pub primary_key: IndexedDBKeyType,
     pub value: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+/// <https://w3c.github.io/IndexedDB/#record-snapshot>: the key, the primary key (the key for a
+/// record of an object store) and the (referenced) value, which is `None` if the request read
+/// keys only.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct IndexedDBRecord {
+    pub key: IndexedDBKeyType,
+    pub primary_key: IndexedDBKeyType,
+    pub value: Option<Vec<u8>>,
+}
+
+/// <https://w3c.github.io/IndexedDB/#cursor-direction>
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum IndexedDBCursorDirection {
+    Next,
+    NextUnique,
+    Prev,
+    PrevUnique,
+}
+
+/// A step of a cursor: the cursor's position and the arguments of
+/// <https://w3c.github.io/IndexedDB/#iterate-a-cursor>.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct IndexedDBCursorStep {
+    /// The cursor's position, undefined before its first step.
+    pub position: Option<IndexedDBKeyType>,
+    /// The cursor's object store position, for a cursor over an index.
+    pub object_store_position: Option<IndexedDBKeyType>,
+    /// The key given to continue() or continuePrimaryKey().
+    pub key: Option<IndexedDBKeyType>,
+    /// The primary key given to continuePrimaryKey().
+    pub primary_key: Option<IndexedDBKeyType>,
+    /// The count given to advance(), 1 otherwise.
+    pub count: u32,
+}
+
+/// The id of an object store, unique in its database. An upgrade transaction in script gives a
+/// store it creates one more than the largest id its connection has seen in the transaction, and
+/// the backend checks that it is larger than the id of every store in the database. The id of a
+/// store deleted in an earlier transaction can be given again, so nothing that outlives a store's
+/// rows may be keyed by its id.
+pub type IndexedDBObjectStoreId = i64;
+
+/// The id of an index, unique in its database, given like an [`IndexedDBObjectStoreId`], and
+/// reused like it.
+pub type IndexedDBIndexId = i64;
+
+/// <https://w3c.github.io/IndexedDB/#index-construct>
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub struct IndexedDBIndex {
-    pub name: String,
+    pub id: IndexedDBIndexId,
+    pub name: Utf16String,
     pub key_path: KeyPath,
     pub multi_entry: bool,
     pub unique: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+/// <https://w3c.github.io/IndexedDB/#object-store-construct>, without its records: what a
+/// connection knows about an object store.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub struct IndexedDBObjectStore {
-    pub name: String,
+    pub id: IndexedDBObjectStoreId,
+    pub name: Utf16String,
     pub key_path: Option<KeyPath>,
     pub has_key_generator: bool,
-    pub key_generator_current_number: Option<i64>,
     pub indexes: Vec<IndexedDBIndex>,
+}
+
+/// The key of an index record for a value that script stores, as script computes it
+/// (<https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store> step 5.1). When the
+/// backend generates the record's key and step 1.1.3 injects it into the value, script doesn't
+/// know the parts of the index key that come from it: where the index's key path, or an item of
+/// a sequence key path, is the store's key path. Those parts are
+/// [`IndexedDBIndexKey::PrimaryKey`], which the backend replaces with the record's key.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum IndexedDBIndexKey {
+    Key(IndexedDBKeyType),
+    /// The primary key of the record.
+    PrimaryKey,
+    /// An array key of these items.
+    Array(Vec<IndexedDBIndexKey>),
+}
+
+impl IndexedDBIndexKey {
+    /// The key, with each [`IndexedDBIndexKey::PrimaryKey`] replaced by `primary_key`.
+    pub fn with_primary_key(self, primary_key: &IndexedDBKeyType) -> IndexedDBKeyType {
+        match self {
+            Self::Key(key) => key,
+            Self::PrimaryKey => primary_key.clone(),
+            Self::Array(items) => IndexedDBKeyType::Array(
+                items
+                    .into_iter()
+                    .map(|item| item.with_primary_key(primary_key))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// The keys of the records that the index `index_id` gets for a value that script stores: none
+/// if extracting a key from the value failed or gave an invalid key, the subkeys of an array key
+/// for a multiEntry index, and the key otherwise. Script removes duplicates.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct IndexedDBIndexKeys {
+    pub index_id: IndexedDBIndexId,
+    pub keys: Vec<IndexedDBIndexKey>,
+}
+
+/// The keys that script computed for an index that it populates, from the value of the record
+/// with the key `primary_key`, as [`IndexedDBIndexKeys`] has them.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct IndexedDBRecordIndexKeys {
+    pub primary_key: IndexedDBKeyType,
+    pub keys: Vec<IndexedDBIndexKey>,
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum PutItemResult {
     Key(IndexedDBKeyType),
     CannotOverwrite,
+    /// The store's key generator can't generate another key.
+    KeyGeneratorExhausted,
+    /// The unique index `0` has one of the value's keys for another record.
+    UniqueIndexKeyExists(IndexedDBIndexId),
 }
 
+/// The reads of the records of the object store that [`IndexedDBThreadMsg::Async`] names, or,
+/// with `index`, of the records of that index of the store: in (index key, primary key) order,
+/// with the index key as the key of each record and the primary key as its value, which refers
+/// to the store's record and its value.
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum AsyncReadOnlyOperation {
-    /// Gets the value associated with the given key in the associated idb data
+    /// The primary key of the first record in `key_range`:
+    /// <https://w3c.github.io/IndexedDB/#retrieve-a-key-from-an-object-store> and
+    /// <https://w3c.github.io/IndexedDB/#retrieve-a-value-from-an-index>.
     GetKey {
-        callback: GenericCallback<BackendResult<Option<IndexedDBKeyType>>>,
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
     },
+    /// The (referenced) value of the first record in `key_range`:
+    /// <https://w3c.github.io/IndexedDB/#retrieve-a-value-from-an-object-store> and
+    /// <https://w3c.github.io/IndexedDB/#retrieve-a-referenced-value-from-an-index>.
     GetItem {
-        callback: GenericCallback<BackendResult<Option<Vec<u8>>>>,
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
     },
 
+    /// The primary keys of the first `count` records in `key_range` in `direction`, or of all
+    /// of them if `count` is `None` or 0:
+    /// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-object-store> and
+    /// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-index> with kind "key".
+    /// The unique directions take the record with the lowest primary key of each index key.
     GetAllKeys {
-        callback: GenericCallback<BackendResult<Vec<IndexedDBKeyType>>>,
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
+        direction: IndexedDBCursorDirection,
     },
+    /// The (referenced) values of the records that [`AsyncReadOnlyOperation::GetAllKeys`] gets
+    /// the keys of: kind "value".
     GetAllItems {
-        callback: GenericCallback<BackendResult<Vec<Vec<u8>>>>,
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
         count: Option<u32>,
+        direction: IndexedDBCursorDirection,
+    },
+    /// The records that [`AsyncReadOnlyOperation::GetAllKeys`] gets the keys of, with their
+    /// keys, primary keys and (referenced) values: kind "record".
+    GetAllRecords {
+        index: Option<IndexedDBIndexId>,
+        key_range: IndexedDBKeyRange,
+        count: Option<u32>,
+        direction: IndexedDBCursorDirection,
     },
 
+    /// <https://w3c.github.io/IndexedDB/#count-the-records-in-a-range>
     Count {
-        callback: GenericCallback<BackendResult<u64>>,
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
     },
+    /// <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9 for a cursor over the records in
+    /// `key_range`: the record that `step` moves the cursor to in `direction`, none if it moves
+    /// past the end. Then the records that further steps without a key would move it to, up to
+    /// `records` records in all, in the order of the steps. With `key_only`, without values.
     Iterate {
-        callback: GenericCallback<BackendResult<Vec<IndexedDBRecord>>>,
+        index: Option<IndexedDBIndexId>,
         key_range: IndexedDBKeyRange,
+        direction: IndexedDBCursorDirection,
+        step: IndexedDBCursorStep,
+        records: u32,
+        key_only: bool,
     },
-}
-
-impl AsyncReadOnlyOperation {
-    fn notify_error(&self, error: BackendError) {
-        let _ = match self {
-            Self::GetKey { callback, .. } => callback.send(Err(error)),
-            Self::GetItem { callback, .. } => callback.send(Err(error)),
-            Self::GetAllKeys { callback, .. } => callback.send(Err(error)),
-            Self::GetAllItems { callback, .. } => callback.send(Err(error)),
-            Self::Count { callback, .. } => callback.send(Err(error)),
-            Self::Iterate { callback, .. } => callback.send(Err(error)),
-        };
-    }
 }
 
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum AsyncReadWriteOperation {
-    /// Sets the value of the given key in the associated idb data
+    /// Sets the value of the given key in the associated idb data, or of a key from the store's
+    /// key generator if `key` is `None`.
     PutItem {
-        callback: GenericCallback<BackendResult<PutItemResult>>,
         key: Option<IndexedDBKeyType>,
         value: Vec<u8>,
         should_overwrite: bool,
-        /// New object store key generator current number to persist if the put succeeds.
-        key_generator_current_number: Option<i64>,
+        /// The keys of the record in each index of the store, one entry per index.
+        index_keys: Vec<IndexedDBIndexKeys>,
     },
 
     /// Removes the key/value pair for the given key in the associated idb data
-    RemoveItem {
-        callback: GenericCallback<BackendResult<()>>,
-        key_range: IndexedDBKeyRange,
-    },
+    RemoveItem { key_range: IndexedDBKeyRange },
     /// Clears all key/value pairs in the associated idb data
-    Clear(GenericCallback<BackendResult<()>>),
+    Clear,
 }
 
-impl AsyncReadWriteOperation {
-    fn notify_error(&self, error: BackendError) {
-        let _ = match self {
-            Self::PutItem { callback, .. } => callback.send(Err(error)),
-            Self::RemoveItem { callback, .. } => callback.send(Err(error)),
-            Self::Clear(callback) => callback.send(Err(error)),
-        };
-    }
-}
-
+/// A change to the object stores and indexes in an upgrade transaction, of the object store that
+/// [`IndexedDBThreadMsg::AsyncSchemaOperation`] names. Script doesn't wait for it: only a failure
+/// is reported, as [`TransactionEvent::SchemaChangeFailed`], and it fails the transaction.
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum AsyncSchemaOperation {
-    /// Creates a new index for the database
-    CreateIndex {
-        callback: GenericCallback<BackendError>,
-        index_name: String,
-        key_path: KeyPath,
-        unique: bool,
-        multi_entry: bool,
-    },
-    /// Rename an index
-    RenameIndex {
-        callback: GenericCallback<BackendError>,
-        index_name: String,
-        new_name: String,
-    },
-    /// Delete an index
-    DeleteIndex {
-        callback: GenericCallback<BackendError>,
-        index_name: String,
-    },
-    /// Creates a new store for the database
+    /// Creates the object store, with its id from script.
     CreateObjectStore {
-        callback: GenericCallback<BackendError>,
+        name: Utf16String,
         key_path: Option<KeyPath>,
         auto_increment: bool,
     },
-    /// Delete an existing object store in the database
-    DeleteObjectStore {
-        callback: GenericCallback<BackendError>,
+    /// Deletes the object store and its records and indexes.
+    DeleteObjectStore,
+    /// Renames the object store, which keeps its records and indexes.
+    RenameObjectStore { new_name: Utf16String },
+    /// Creates an index of the object store, with its id from script. With `populate`, the store
+    /// may have records, and script populates the index from them: the backend reports the first
+    /// records as [`IndexPopulationEvent::Records`], script answers with
+    /// [`AsyncSchemaOperation::PopulateIndex`] steps, and the transaction's later requests and
+    /// schema operations wait until the population is done, so that they see the whole index.
+    CreateIndex {
+        index_id: IndexedDBIndexId,
+        name: Utf16String,
+        key_path: KeyPath,
+        unique: bool,
+        multi_entry: bool,
+        populate: bool,
+    },
+    /// Renames an index of the object store.
+    RenameIndex {
+        index_id: IndexedDBIndexId,
+        new_name: Utf16String,
+    },
+    /// Deletes an index of the object store.
+    DeleteIndex { index_id: IndexedDBIndexId },
+    /// A step of populating the index `index_id` of the object store, which runs ahead of the
+    /// requests that wait for the population.
+    PopulateIndex {
+        index_id: IndexedDBIndexId,
+        step: IndexPopulationStep,
     },
 }
 
-impl AsyncSchemaOperation {
-    pub fn notify_error(&self, error: BackendError) {
-        match self {
-            AsyncSchemaOperation::CreateIndex { .. } |
-            AsyncSchemaOperation::RenameIndex { .. } |
-            AsyncSchemaOperation::DeleteIndex { .. } => {},
-            AsyncSchemaOperation::CreateObjectStore { callback, .. } => {
-                let _ = callback.send(error);
-            },
-            AsyncSchemaOperation::DeleteObjectStore { callback, .. } => {
-                let _ = callback.send(error);
-            },
-        };
-    }
+/// A step of populating an index that
+/// <https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex> created on an object store
+/// with records.
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum IndexPopulationStep {
+    /// Reads the records after the one with the key `after`, reported as
+    /// [`IndexPopulationEvent::Records`].
+    ReadRecords { after: IndexedDBKeyType },
+    /// Stores the index records of `records`. With `done`, no records follow, and the backend
+    /// reports [`IndexPopulationEvent::Done`].
+    SetIndexKeys {
+        records: Vec<IndexedDBRecordIndexKeys>,
+        done: bool,
+    },
+}
+
+/// What the backend reports about the population of an index.
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum IndexPopulationEvent {
+    /// The next records of the object store in key order, a batch of limited size, and whether
+    /// they are the last.
+    Records {
+        records: Vec<IndexedDBValue>,
+        last: bool,
+    },
+    /// The population ended: every record has its index records, or the population failed with
+    /// the error, which failed the transaction. [`BackendError::Constraint`] means that a unique
+    /// index got the same key for two records.
+    Done(BackendResult<()>),
 }
 
 /// Operations that are not executed instantly, but rather added to a
@@ -417,88 +703,150 @@ pub enum AsyncOperation {
     Schema(AsyncSchemaOperation),
 }
 
-impl AsyncOperation {
-    pub fn notify_error(&self, error: BackendError) {
-        match self {
-            Self::ReadOnly(operation) => operation.notify_error(error),
-            Self::ReadWrite(operation) => operation.notify_error(error),
-            Self::Schema(operation) => operation.notify_error(error),
-        }
-    }
+/// The result of a request that the backend ran, by kind of operation.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum RequestOutput {
+    /// Of [`AsyncReadOnlyOperation::GetKey`].
+    Key(Option<IndexedDBKeyType>),
+    /// Of [`AsyncReadOnlyOperation::GetItem`].
+    Value(Option<IndexedDBValue>),
+    /// Of [`AsyncReadOnlyOperation::GetAllKeys`].
+    Keys(Vec<IndexedDBKeyType>),
+    /// Of [`AsyncReadOnlyOperation::GetAllItems`].
+    Values(Vec<IndexedDBValue>),
+    /// Of [`AsyncReadOnlyOperation::Count`].
+    Count(u64),
+    /// Of [`AsyncReadOnlyOperation::Iterate`].
+    Records(Vec<IndexedDBRecord>),
+    /// Of [`AsyncReadOnlyOperation::GetAllRecords`], each with its value.
+    AllRecords(Vec<IndexedDBRecord>),
+    /// Of [`AsyncReadWriteOperation::PutItem`].
+    Put(PutItemResult),
+    /// Of [`AsyncReadWriteOperation::RemoveItem`] and [`AsyncReadWriteOperation::Clear`].
+    Done,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
-pub enum CreateObjectResult {
-    Created,
-    AlreadyExists,
+/// What the backend reports about a transaction to its connection.
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum TransactionEvent {
+    /// The result of the request `request_id` of the transaction.
+    Request {
+        request_id: u64,
+        result: BackendResult<RequestOutput>,
+    },
+    /// A schema operation failed, which fails the transaction.
+    SchemaChangeFailed(BackendError),
+    /// About the population of the index `index_id`.
+    IndexPopulation {
+        index_id: IndexedDBIndexId,
+        event: IndexPopulationEvent,
+    },
+    /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>: the changes of the transaction
+    /// were written, or writing them failed and they were rolled back.
+    Committed(BackendResult<()>),
+}
+
+/// A message on the result channel of a connection, which script creates for each open request
+/// and which the backend uses for everything it reports about the open request and, once it
+/// opened, the connection. The backend sends the messages in the order the work ran, and the
+/// channel keeps that order, so the results of a transaction's requests reach script in request
+/// order, and the open request's outcome comes before the connection's events.
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum ConnectionEvent {
+    /// About the open request: its outcome, or that it is blocked.
+    Open(ConnectionMsg),
+    /// Something happened to the transaction of the connection with the serial number `serial`.
+    Transaction {
+        serial: u64,
+        event: TransactionEvent,
+    },
+    /// <https://w3c.github.io/IndexedDB/#eventdef-idbdatabase-versionchange>: the open or delete
+    /// request `request` waits for this connection to close, to open the database with
+    /// `new_version`, or to delete it if that is `None`. Script reports with
+    /// [`SyncOperation::NotifyEndOfVersionChange`] once the event was fired.
+    VersionChange {
+        old_version: u64,
+        new_version: Option<u64>,
+        request: Uuid,
+    },
+    /// <https://w3c.github.io/IndexedDB/#close-a-database-connection> with the forced flag: the
+    /// backend can't use the database any more and has set the connection's close pending flag.
+    /// Script aborts the connection's transactions and fires close once they have finished.
+    ForcedClose,
+    /// Another request or transaction waits for this connection: for its transaction, for it to
+    /// close, or for the upgrade that its open request runs. Script evicts the connection's
+    /// document from the back/forward cache if it isn't fully active, as a cached document's
+    /// tasks are held back and it would never finish, and ignores the event otherwise. This is
+    /// Chromium's DisallowInactiveClient; the IndexedDB specification doesn't cover it.
+    EvictIfInactive,
+}
+
+/// What the backend reports about a request to delete a database
+/// (<https://w3c.github.io/IndexedDB/#delete-a-database>).
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum DeleteDatabaseEvent {
+    /// Step 8: connections to the database are still open after their versionchange events, so
+    /// a blocked event is fired at the request.
+    Blocked { old_version: u64 },
+    /// The request's result: the version the deleted database had, or 0 if there was none.
+    Done(BackendResult<u64>),
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 /// Messaging used in the context of connection lifecycle management.
 pub enum ConnectionMsg {
     /// Error if a DB is opened for a version lower than the current db version.
-    VersionError { name: String, id: Uuid },
+    VersionError { name: Utf16String, id: Uuid },
     /// Opening a connection was aborted.
-    AbortError { name: String, id: Uuid },
+    AbortError { name: Utf16String, id: Uuid },
     /// A newly created connection with a version,
     /// updgraded or not.
     Connection {
-        name: String,
+        name: Utf16String,
         id: Uuid,
         version: u64,
         upgraded: bool,
-        // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps
-        // Step 3. Set transaction’s scope to connection’s object store set.
-        object_store_names: Vec<String>,
+        /// <https://w3c.github.io/IndexedDB/#connection-object-store-set>, as committed.
+        object_stores: Vec<IndexedDBObjectStore>,
     },
     /// An upgrade transaction for a version started.
     Upgrade {
-        name: String,
+        name: Utf16String,
         id: Uuid,
         version: u64,
         old_version: u64,
-        transaction: u64,
-        // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps
-        // Step 3. Set transaction’s scope to connection’s object store set.
-        object_store_names: Vec<String>,
-    },
-    /// A `versionchange` event should be fired for a connection.
-    VersionChange {
-        /// The id of the connection.
-        id: Uuid,
-        /// The name of the connection.
-        name: String,
-        version: u64,
-        old_version: u64,
+        transaction: IndexedDBTxnId,
+        /// <https://w3c.github.io/IndexedDB/#connection-object-store-set>, as committed, which
+        /// is also the scope of the upgrade transaction.
+        object_stores: Vec<IndexedDBObjectStore>,
     },
     /// A `blocked` event should be fired for a connection.
     Blocked {
-        name: String,
+        name: Utf16String,
         id: Uuid,
         version: u64,
         old_version: u64,
     },
     /// A backend error related to the database occurred.
     DatabaseError {
-        name: String,
+        name: Utf16String,
         id: Uuid,
         error: BackendError,
     },
-    /// Ask script to recheck whether a transaction can commit now.
-    TxnMaybeCommit { db_name: String, txn: u64 },
 }
 
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
-pub struct TxnCompleteMsg {
-    pub origin: ImmutableOrigin,
-    pub db_name: String,
-    pub txn: u64,
-    pub result: BackendResult<()>,
+/// What the IndexedDB manager needs to obtain a global's local storage bottle map
+/// (<https://storage.spec.whatwg.org/#obtain-a-local-storage-bottle-map>), so that script doesn't
+/// wait for it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StorageBottleSource {
+    pub client_storage: ClientStorageThreadHandle,
+    pub webview: Option<WebViewId>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DatabaseInfo {
-    pub name: String,
+    pub name: Utf16String,
     pub version: u64,
 }
 
@@ -508,126 +856,100 @@ pub enum SyncOperation {
     GetDatabases(
         GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
         ImmutableOrigin,
+        StorageBottleSource,
     ),
-    /// Upgrades the version of the database
-    UpgradeVersion(
-        /// Sender to send new version as the result of the operation
-        GenericSender<BackendResult<u64>>,
-        ImmutableOrigin,
-        String, // Database
-        u64,    // Serial number for the transaction
-        u64,    // Version to upgrade to
-    ),
-    /// Get object store info
-    GetObjectStore(
-        GenericSender<BackendResult<IndexedDBObjectStore>>,
-        ImmutableOrigin,
-        String, // Database
-        String, // Store
-    ),
-    /// Commits changes of a transaction to the database
-    Commit(
-        GenericCallback<TxnCompleteMsg>,
-        ImmutableOrigin,
-        String, // Database
-        u64,    // Transaction serial number
-    ),
-    /// Aborts a transaction in the backend
-    Abort(
-        GenericCallback<TxnCompleteMsg>,
-        ImmutableOrigin,
-        String, // Database
-        u64,    // Transaction serial number
-    ),
+    /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>: commits the transaction once its
+    /// requests have run, and reports [`TransactionEvent::Committed`]. Script sends it once the
+    /// results of all the transaction's requests have been delivered.
+    Commit {
+        origin: ImmutableOrigin,
+        db_name: Utf16String,
+        txn: IndexedDBTxnId,
+    },
+    /// <https://w3c.github.io/IndexedDB/#abort-a-transaction>: rolls the transaction back, after
+    /// the work handed over before. Nothing is reported: script has aborted the transaction
+    /// already, and results that arrive after this are discarded.
+    Abort {
+        origin: ImmutableOrigin,
+        db_name: Utf16String,
+        txn: IndexedDBTxnId,
+    },
     /// Upgrade transaction finished after its event was fired in script.
     UpgradeTransactionFinished {
         origin: ImmutableOrigin,
-        db_name: String,
-        txn: u64,
+        db_name: Utf16String,
+        txn: IndexedDBTxnId,
         committed: bool,
     },
-    /// <https://w3c.github.io/IndexedDB/#transaction-lifetime
-    /// Step 3:
-    /// When each request associated with a transaction is processed,
-    /// a success or error event will be fired. While the event is
-    /// being dispatched, the transaction state is set to active, allowing
-    /// additional requests to be made against the transaction. Once the
-    /// event dispatch is complete, the transaction’s state is set to inactive again.
-    RequestHandled {
-        origin: ImmutableOrigin,
-        db_name: String,
-        txn: u64,
-        request_id: u64,
-    },
+    /// <https://w3c.github.io/IndexedDB/#dom-idbdatabase-transaction>: a transaction was created
+    /// with the id script gave it. Transactions are created before each other in the order in
+    /// which their messages reach the backend, see
+    /// <https://w3c.github.io/IndexedDB/#transaction-scheduling>.
     CreateTransaction {
-        sender: GenericSender<BackendResult<u64>>,
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
+        txn: IndexedDBTxnId,
         mode: IndexedDBTxnMode,
-        scope: Vec<String>,
-    },
-    /// Request script to recheck transaction commit eligibility.
-    TxnMaybeCommit {
-        origin: ImmutableOrigin,
-        db_name: String,
-        txn: u64,
+        scope: Vec<IndexedDBObjectStoreId>,
     },
     TransactionFinished {
         origin: ImmutableOrigin,
-        db_name: String,
-        txn: u64,
+        db_name: Utf16String,
+        txn: IndexedDBTxnId,
     },
 
     CloseDatabase(
         ImmutableOrigin,
         Uuid,
-        String, // Database
+        Utf16String, // Database
     ),
 
     OpenDatabase(
-        // Callback for the result.
-        GenericCallback<ConnectionMsg>,
         // Origin of the request.
         ImmutableOrigin,
         // Name of the database.
-        String,
+        Utf16String,
         // Requested db version(optional).
         Option<u64>,
         // The id of the request.
         Uuid,
-        // The Storage proxy map.
-        StorageProxyMap,
+        // Where to obtain the storage proxy map.
+        StorageBottleSource,
+        // The result channel of the open request and of the connection, if it opens.
+        GenericCallback<ConnectionEvent>,
+        // The pipeline of the window that makes the request; `None` for a worker.
+        Option<PipelineId>,
     ),
 
     /// Deletes the database
     DeleteDatabase(
-        GenericCallback<BackendResult<u64>>,
+        GenericCallback<DeleteDatabaseEvent>,
         ImmutableOrigin,
         // Database name.
-        String,
-        // The Storage proxy map.
-        StorageProxyMap,
+        Utf16String,
+        // Where to obtain the storage proxy map.
+        StorageBottleSource,
         Uuid,
-    ),
-
-    /// Returns the version of the database
-    Version(
-        GenericSender<BackendResult<u64>>,
-        ImmutableOrigin,
-        String, // Database
     ),
 
     /// Abort pending database upgrades
     AbortPendingUpgrades {
-        pending_upgrades: HashMap<String, HashSet<Uuid>>,
+        pending_upgrades: HashMap<Utf16String, HashSet<Uuid>>,
         origin: ImmutableOrigin,
-        proxy_map: StorageProxyMap,
     },
 
+    /// The windows of these pipelines went away without their IndexedDB teardown, as their
+    /// script thread or content process died: their open requests end and their connections
+    /// close, as with [`SyncOperation::AbortPendingUpgrades`], and their transactions are rolled
+    /// back.
+    CloseConnectionsOfPipelines(Vec<PipelineId>),
+
+    /// The versionchange event that the open or delete request `request` fired at the connection
+    /// `id` was dispatched, or skipped as the connection's close is pending.
     NotifyEndOfVersionChange {
         id: Uuid,
-        name: String,
-        old_version: u64,
+        name: Utf16String,
+        request: Uuid,
         origin: ImmutableOrigin,
     },
 
@@ -640,24 +962,49 @@ pub enum IndexedDBThreadMsg {
     Sync(SyncOperation),
     Async(
         ImmutableOrigin,
-        String, // Database
-        String, // ObjectStore
-        u64,    // Serial number of the transaction that requests this operation
-        u64,    // Monotonic request id in the transaction
+        Utf16String, // Database
+        IndexedDBObjectStoreId,
+        IndexedDBTxnId,
+        u64, // Monotonic request id in the transaction
         IndexedDBTxnMode,
         AsyncOperation,
     ),
     AsyncSchemaOperation {
         origin: ImmutableOrigin,
-        database_name: String,
-        store_name: String,
+        database_name: Utf16String,
+        store_id: IndexedDBObjectStoreId,
         operation: AsyncSchemaOperation,
-        transaction_serial_number: u64,
+        transaction: IndexedDBTxnId,
     },
     EngineTxnBatchComplete {
         origin: ImmutableOrigin,
-        db_name: String,
-        txn: u64,
+        db_name: Utf16String,
+        txn: IndexedDBTxnId,
+    },
+    /// The storage proxy map of the queued open or delete request `request` was obtained, which
+    /// the manager does in parallel.
+    StorageProxyMapObtained {
+        origin: ImmutableOrigin,
+        db_name: Utf16String,
+        request: Uuid,
+        result: BackendResult<StorageProxyMap>,
+    },
+    /// The open or delete request `request` at the front of its connection queue looked its
+    /// database up in the client storage registry, which the manager does in parallel: the
+    /// database's directory and, for an open, which creates a database that doesn't exist,
+    /// whether it was created; `None` if a delete found no database.
+    DatabaseLocated {
+        origin: ImmutableOrigin,
+        db_name: Utf16String,
+        request: Uuid,
+        result: BackendResult<Option<(PathBuf, bool)>>,
+    },
+    /// The databases in the storage bottle of `origin` were listed in the client storage
+    /// registry, each with its directory, for the databases() call that `sender` answers.
+    DatabasesListed {
+        origin: ImmutableOrigin,
+        sender: GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
+        result: BackendResult<Vec<(Utf16String, PathBuf)>>,
     },
 
     /// Measure memory used by this thread and send the report over the provided channel.
@@ -681,5 +1028,38 @@ mod test {
         let full_range = IndexedDBKeyRange::new(None, None, false, false);
         assert!(!full_range.is_singleton());
         assert!(full_range.as_singleton().is_none());
+    }
+
+    #[test]
+    fn test_restrict_bounds() {
+        let one = IndexedDBKeyType::Number(1.0);
+        let two = IndexedDBKeyType::Number(2.0);
+        let three = IndexedDBKeyType::Number(3.0);
+
+        let mut range =
+            IndexedDBKeyRange::new(Some(two.clone()), Some(three.clone()), false, false);
+        range.restrict_lower(one.clone(), true);
+        assert_eq!(range.lower, Some(two.clone()));
+        assert!(!range.lower_open);
+        range.restrict_lower(two.clone(), false);
+        assert!(!range.lower_open);
+        range.restrict_lower(two.clone(), true);
+        assert!(range.lower_open);
+        range.restrict_lower(three.clone(), false);
+        assert_eq!(range.lower, Some(three.clone()));
+        assert!(!range.lower_open);
+
+        let mut range = IndexedDBKeyRange::default();
+        range.restrict_upper(two.clone(), true);
+        assert_eq!(range.upper, Some(two.clone()));
+        assert!(range.upper_open);
+        range.restrict_upper(two.clone(), false);
+        assert!(range.upper_open);
+        range.restrict_upper(three, true);
+        assert_eq!(range.upper, Some(two));
+        range.restrict_upper(one.clone(), false);
+        assert_eq!(range.upper, Some(one));
+        assert!(!range.upper_open);
+        assert!(range.lower.is_none());
     }
 }

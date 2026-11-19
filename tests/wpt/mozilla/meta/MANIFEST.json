@@ -8565,6 +8565,30 @@
     "b485d435a63ada28eabe976b49a8a580725e7508",
     []
    ],
+   "IndexedDB": {
+    "resources": {
+     "connection-holder.html": [
+      "1d7d4bf2b54269b1567797b3aec069002d0c10c5",
+      []
+     ],
+     "connection-holder.js": [
+      "cb8eab6592c3acf547b9194a1a6a5fcbf92952c1",
+      []
+     ],
+     "removed-iframe-writer.html": [
+      "728c70ad75c2804ca49320cd69afec1026e7fad8",
+      []
+     ],
+     "shared-worker-connection-frame.html": [
+      "4bebc8581a9020d53b1c6f82a9370e45a4fa0161",
+      []
+     ],
+     "upgrade-frame.html": [
+      "3e3e64899775946887e3efbfcc6d5e6bf5d3de24",
+      []
+     ]
+    }
+   },
    "appearance": {
     "document-selection-image-broken-ref.html": [
      "d4d29943249a0ec2b78c79f88573d505742f7a56",
@@ -11342,6 +11366,14 @@
      "worker-success.js": [
       "327986f34b9b20476b6a7b1189c732a9ea8b9f68",
       []
+     ],
+     "worker-terminate-idle-inner.js": [
+      "9f09be5800f061537fd41adf3bf4b82d0190a04b",
+      []
+     ],
+     "worker-terminate-idle-outer.js": [
+      "2682a6b67b775117a4fb39822fc1be0442335ca0",
+      []
      ]
     },
     "restyle-out-of-document-ref.html": [
@@ -11607,6 +11639,1202 @@
    }
   },
   "testharness": {
+   "IndexedDB": {
+    "back-forward-cache-held-back.window.js": [
+     "1d953d7479412a537bfe7c1ef6016f342ca7bdb6",
+     [
+      "IndexedDB/back-forward-cache-held-back.window.html",
+      {
+       "script_metadata": [
+        [
+         "title",
+         "IndexedDB: a cached page that holds back another page's request or transaction is evicted"
+        ],
+        [
+         "script",
+         "/common/dispatcher/dispatcher.js"
+        ],
+        [
+         "script",
+         "/common/utils.js"
+        ],
+        [
+         "script",
+         "/IndexedDB/resources/support.js"
+        ],
+        [
+         "script",
+         "/html/browsers/browsing-the-web/back-forward-cache/resources/rc-helper.js"
+        ],
+        [
+         "script",
+         "/html/browsers/browsing-the-web/remote-context-helper/resources/remote-context-helper.js"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
+    "back-forward-cache-versionchange.window.js": [
+     "2a30ff98ff0f8105c0d67766a5a158a5137e95f8",
+     [
+      "IndexedDB/back-forward-cache-versionchange.window.html",
+      {
+       "script_metadata": [
+        [
+         "title",
+         "IndexedDB: versionchange at a connection in the back/forward cache evicts its page"
+        ],
+        [
+         "script",
+         "/common/dispatcher/dispatcher.js"
+        ],
+        [
+         "script",
+         "/common/utils.js"
+        ],
+        [
+         "script",
+         "/common/get-host-info.sub.js"
+        ],
+        [
+         "script",
+         "/IndexedDB/resources/support.js"
+        ],
+        [
+         "script",
+         "/html/browsers/browsing-the-web/back-forward-cache/resources/rc-helper.js"
+        ],
+        [
+         "script",
+         "/html/browsers/browsing-the-web/remote-context-helper/resources/remote-context-helper.js"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
+    "connection-after-aborted-upgrade.any.js": [
+     "8b7e54ee97d9c2a1a5702ae531acf242328bab25",
+     [
+      "IndexedDB/connection-after-aborted-upgrade.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the connection of an aborted upgrade is closed"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/connection-after-aborted-upgrade.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the connection of an aborted upgrade is closed"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/connection-after-aborted-upgrade.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the connection of an aborted upgrade is closed"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/connection-after-aborted-upgrade.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the connection of an aborted upgrade is closed"
+        ]
+       ]
+      }
+     ]
+    ],
+    "connection-queue-globals.html": [
+     "90a2a65a21d4fdd3bae6c41602b2526dd1463272",
+     [
+      null,
+      {
+       "timeout": "long"
+      }
+     ]
+    ],
+    "connection-queue.any.js": [
+     "bb994aef8f3c32ce8d6d1e858b9c5266b4e55df3",
+     [
+      "IndexedDB/connection-queue.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: connection queues, versionchange, blocked and close pending"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/connection-queue.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: connection queues, versionchange, blocked and close pending"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/connection-queue.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: connection queues, versionchange, blocked and close pending"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
+    "cursor-prefetch.any.js": [
+     "a387d66729d5358ea2a4f4e57b73519d5a2d4926",
+     [
+      "IndexedDB/cursor-prefetch.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursor steps see the records as they are when they run"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/cursor-prefetch.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursor steps see the records as they are when they run"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/cursor-prefetch.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursor steps see the records as they are when they run"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/cursor-prefetch.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursor steps see the records as they are when they run"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
+    "generated-key-value-kinds.any.js": [
+     "93e646d1ad6073457e3aa79c4751b7ab82b16066",
+     [
+      "IndexedDB/generated-key-value-kinds.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/generated-key-value-kinds.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/generated-key-value-kinds.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/generated-key-value-kinds.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: a generated in-line key is part of the value only where storing keeps it"
+        ]
+       ]
+      }
+     ]
+    ],
+    "get-all-options.any.js": [
+     "2db8edc497af355f9909687059f9c3ce8fb3626c",
+     [
+      "IndexedDB/get-all-options.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: getAll(), getAllKeys() and getAllRecords() with IDBGetAllOptions"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/get-all-options.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: getAll(), getAllKeys() and getAllRecords() with IDBGetAllOptions"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/get-all-options.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: getAll(), getAllKeys() and getAllRecords() with IDBGetAllOptions"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
+    "index-cursors.any.js": [
+     "d1c7658343402c0a2f3945385f88145a319dd867",
+     [
+      "IndexedDB/index-cursors.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursors over the records of an index"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-cursors.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursors over the records of an index"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-cursors.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursors over the records of an index"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-cursors.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: cursors over the records of an index"
+        ]
+       ]
+      }
+     ]
+    ],
+    "index-keys-page-code.any.js": [
+     "eb81fd40192c8f2487c941b30f72c153f9ec28fe",
+     [
+      "IndexedDB/index-keys-page-code.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: computing keys from a clone runs no page code"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-keys-page-code.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: computing keys from a clone runs no page code"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-keys-page-code.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: computing keys from a clone runs no page code"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/index-keys-page-code.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: computing keys from a clone runs no page code"
+        ]
+       ]
+      }
+     ]
+    ],
+    "index-population.any.js": [
+     "f80ed4274b8f8a49f357183a1fe46aa64ed922d1",
+     [
+      "IndexedDB/index-population.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: an index created on an object store with records is populated from them"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/index-population.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: an index created on an object store with records is populated from them"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/index-population.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: an index created on an object store with records is populated from them"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/index-population.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: an index created on an object store with records is populated from them"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
+    "index-reads.any.js": [
+     "4696a5efe9e4378fdb089143407ff7c8100172cd",
+     [
+      "IndexedDB/index-reads.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: reading the records of an index"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/index-reads.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: reading the records of an index"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/index-reads.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: reading the records of an index"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/index-reads.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: reading the records of an index"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
+    "removed-iframe-aborts-its-transactions.html": [
+     "4c72fe0190142520f2e483e292f0997bd6dc924b",
+     [
+      null,
+      {}
+     ]
+    ],
+    "removed-iframe-during-upgrade.html": [
+     "faeb433113f2502f2f3141ded3cdf4c2afb3934a",
+     [
+      null,
+      {
+       "timeout": "long"
+      }
+     ]
+    ],
+    "request-result-order.any.js": [
+     "0d1ffcde775dfce11401ffeff8241639595d00d8",
+     [
+      "IndexedDB/request-result-order.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: request results are delivered in request order"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/request-result-order.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: request results are delivered in request order"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/request-result-order.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: request results are delivered in request order"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/request-result-order.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: request results are delivered in request order"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ],
+    "shared-array-buffer-keys.any.js": [
+     "6b2ed1767083155b9561f81d150943ec2549bec5",
+     [
+      "IndexedDB/shared-array-buffer-keys.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: SharedArrayBuffers and views on them as keys"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/shared-array-buffer-keys.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: SharedArrayBuffers and views on them as keys"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/shared-array-buffer-keys.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: SharedArrayBuffers and views on them as keys"
+        ]
+       ]
+      }
+     ]
+    ],
+    "shared-array-buffer-values.any.js": [
+     "b2f83dd5e354cfa08f29737b723234e9754078b1",
+     [
+      "IndexedDB/shared-array-buffer-values.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: values holding shared memory can't be stored"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/shared-array-buffer-values.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: values holding shared memory can't be stored"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/shared-array-buffer-values.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker,sharedworker"
+        ],
+        [
+         "title",
+         "IndexedDB: values holding shared memory can't be stored"
+        ]
+       ]
+      }
+     ]
+    ],
+    "shared-worker-owners.html": [
+     "b13748d238e4413c2085d52207c9e977c52a55ba",
+     [
+      null,
+      {
+       "timeout": "long"
+      }
+     ]
+    ],
+    "string-keys-code-units.any.js": [
+     "4959920d8f31f40d5d0a879a598d0888c74a09f5",
+     [
+      "IndexedDB/string-keys-code-units.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: string keys are their code units, unpaired surrogates included"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/string-keys-code-units.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: string keys are their code units, unpaired surrogates included"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/string-keys-code-units.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: string keys are their code units, unpaired surrogates included"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/string-keys-code-units.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: string keys are their code units, unpaired surrogates included"
+        ]
+       ]
+      }
+     ]
+    ],
+    "unique-index-keys.any.js": [
+     "da058697baaf17203097f408822472199a02b144",
+     [
+      "IndexedDB/unique-index-keys.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/unique-index-keys.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/unique-index-keys.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/unique-index-keys.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
+        ]
+       ]
+      }
+     ]
+    ],
+    "upgrade-metadata-by-id.any.js": [
+     "8da07ef7c26414dfc154868aa33032afd3af6d52",
+     [
+      "IndexedDB/upgrade-metadata-by-id.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: object stores and indexes keep their identity through renames and deletes"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/upgrade-metadata-by-id.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: object stores and indexes keep their identity through renames and deletes"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/upgrade-metadata-by-id.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: object stores and indexes keep their identity through renames and deletes"
+        ]
+       ]
+      }
+     ],
+     [
+      "IndexedDB/upgrade-metadata-by-id.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: object stores and indexes keep their identity through renames and deletes"
+        ]
+       ]
+      }
+     ]
+    ],
+    "versionchange-after-open-success.any.js": [
+     "6905bbd212edc40a0be1b7514e27d9840c5206b4",
+     [
+      "IndexedDB/versionchange-after-open-success.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: versionchange comes after the success of the connection's open request"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/versionchange-after-open-success.any.serviceworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: versionchange comes after the success of the connection's open request"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/versionchange-after-open-success.any.sharedworker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: versionchange comes after the success of the connection's open request"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ],
+     [
+      "IndexedDB/versionchange-after-open-success.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,worker"
+        ],
+        [
+         "title",
+         "IndexedDB: versionchange comes after the success of the connection's open request"
+        ],
+        [
+         "timeout",
+         "long"
+        ]
+       ],
+       "timeout": "long"
+      }
+     ]
+    ]
+   },
    "accessibility-tree": {
     "accessibility-update-basic-mutation.html": [
      "f86426901b096137876adf6fcbb272e5bca47658",
@@ -14869,14 +16097,14 @@
      ]
     ],
     "interfaces.https.html": [
-     "6b86f9d8491d53915833b10c5c921a356fe8c7f1",
+     "b2b6a89c1568b30fe7fd1191241e5e0126b38653",
      [
       null,
       {}
      ]
     ],
     "interfaces.worker.js": [
-     "5acb874e8d8467ac450fb9569ee1a51c8cf7a7b1",
+     "db65d4a14b061f35e86f16f0976d39193d06267b",
      [
       "mozilla/interfaces.worker.html",
       {}
@@ -15762,6 +16990,13 @@
     ],
     "windowproxy.html": [
      "d5c75899eb546d7243d65b6f55e876c5008c6292",
+     [
+      null,
+      {}
+     ]
+    ],
+    "worker-terminate-idle.html": [
+     "e938e5d87d2eed8295674c787409af96ecf73f5d",
      [
       null,
       {}

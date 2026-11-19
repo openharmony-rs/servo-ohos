@@ -1,0 +1,2622 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 21:29:16 +0000
+Subject: [PATCH] indexeddb: Store index records with the records they index
+
+https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store step 5 gives each index of the
+store a record per key of the value: the key extracted with the index's key path, or each subkey for
+a multiEntry index, and none if extracting fails, throws or gives an invalid key. Deleting records
+and clearing the store delete their index records, and a key that a unique index has for another
+record fails the put with a ConstraintError and no effects. Until now no index had records, unique
+indexes accepted anything, and a multiEntry key path panicked in extract_key.
+
+Script computes the keys, as Gecko, Chromium and WebKit do, so the storage thread never runs JS:
+for put()/add() and cursor.update(), IDBObjectStore::index_keys extracts them from the clone for
+every index of the connection's metadata (key.rs index_keys; convert_value_to_multientry_key skips
+subkeys that are invalid or throw and removes duplicates). PutItem carries them as
+`index_keys: Vec<IndexedDBIndexKeys { index_id, keys }>`, one entry per index. When the backend
+generates the key, step 1.1.3 injects it into the value before step 5, which script can't do: the
+parts of an index key that come from it are `IndexedDBIndexKey::PrimaryKey` placeholders, for a key
+path equal to the store's and for such items of a sequence key path; an item below the store's key
+path fails (the key is a number), and any other item gives what it gives on the value without the
+key. The backend fills the placeholders with the record's key (Chromium and WebKit do the same).
+
+The backend (queries.rs) keeps a unique index's records in unique_index_data and any other's in
+index_data, Gecko's tables, read in (key, primary key) order. `ObjectStore` now lists the store's
+indexes with their unique flag (one LEFT JOIN in object_store()). put_record checks that the keys are
+for exactly the store's indexes (else the transaction fails: script's metadata isn't the database's),
+encodes them without duplicates, and checks every unique key against other records before writing
+anything, so a conflict (`PutItemResult::UniqueIndexKeyExists(index)`, a ConstraintError in script)
+changes neither the record it would replace, nor other indexes, nor the key generator, and the
+transaction goes on; the unique table's primary key is the backstop that fails the transaction.
+Then it deletes the replaced record's index records, writes the record and inserts the new ones.
+delete_records and clear delete the index records of the deleted records first. New indexes on
+(object_store_id, object_data_key) of both tables find a record's index records and serve the host
+SQLite's foreign keys; SCHEMA_VERSION 3, which resets existing databases (owner rule).
+
+Script computes the keys with the transaction inactive, as it is while the value is cloned: the
+spec extracts them from a clone in a user-agent defined realm, where no page code runs, but Servo
+extracts them in the page's realm, where a getter that a hole of a multiEntry array or a missing
+property reaches on a prototype does run. Requests from such a getter throw a
+TransactionInactiveError instead of going before the one being made.
+
+createIndex doesn't populate an index from existing records yet (P3.2), and indexes aren't read yet
+(P3.3, P3.4). A sequence key path still evaluates to an ordinary object, so it gives no keys; the
+next commit fixes that.
+
+Validation: `cargo nextest run -p servo-storage -p servo-storage-traits` (host SQLite): 122 passed, 1 skipped (P2 tip 115/1); new backend tests on every executor: index records after puts and overwrites, deletes of keys and ranges and clear, deleteIndex/deleteObjectStore and a reused index id, unique conflicts without any effect (record, other indexes, key generator, multiEntry, a record replaced with its own keys), placeholders filled with generated keys, abort, mismatched index keys. Host WPT tests/wpt/tests/IndexedDB with SpiderMonkey and this commit's binary: 3,298 of 4,511 (P2 tip 3,289), new passes idbobjectstore_add and idbobjectstore_put "unique:true" and idbobjectstore-put-unique-index-constraint-is-atomic in window, worker and sharedworker; the other two changes are known whole-test flips (idbfactory-origin-isolation passes, idbversionchangeevent.any.sharedworker timed out; 5 of 5 alone). New fork test tests/wpt/mozilla/tests/IndexedDB/unique-index-keys.any.js: 7 subtests in 4 globals pass with SM, QuickJS and --multiprocess, 20 of 28 fail with the P2 binary; /_mozilla/IndexedDB/ 134 of 134. A page probe read back from the SQLite file gives the spec's records for multiEntry, placeholders and cursor.update on SM and QuickJS alike. `./mach check --ohos -- -p servo-storage --all-targets` with SQLite, RDB and both: no warnings; `./mach clippy --locked -- -- --deny warnings` passes. With the P3 review fixes folded in (the keys computed with the transaction inactive): `./mach check` without warnings and nextest 122 passed, 1 skipped at this commit; the new fork test tests/wpt/mozilla/tests/IndexedDB/index-keys-page-code.any.js (2 subtests in 4 globals: requests from an Array.prototype getter that put() or cursor.update() reach throw a TransactionInactiveError, and only the outer record is stored) passes at the branch tip on SM, QuickJS and the DAYU200, and the P3.3 binary fails all 8.
+AI-assisted: Yes (agent session; designed and wrote the index key computation, the placeholder rules, the backend index maintenance and the tests, and ran the checks; after the P3 review, computed the keys with the transaction inactive and wrote the page-code fork test)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbcursor.rs  |   2 +
+ .../script/dom/indexeddb/idbdatabase.rs       |  10 +
+ .../script/dom/indexeddb/idbobjectstore.rs    |  49 +-
+ components/script/dom/indexeddb/idbrequest.rs |   3 +
+ components/script/dom/indexeddb/key.rs        | 230 +++++-
+ components/shared/storage/indexeddb.rs        |  44 ++
+ .../storage/indexeddb/backend/engine.rs       |   3 +-
+ .../storage/indexeddb/backend/queries.rs      | 285 ++++++-
+ .../storage/indexeddb/backend/schema.rs       |  15 +-
+ components/storage/indexeddb/backend/tests.rs | 734 +++++++++++++++++-
+ components/storage/indexeddb/mod.rs           |   1 +
+ components/storage/tests/indexeddb.rs         |  57 +-
+ ...ique-index-constraint-is-atomic.any.js.ini |   8 -
+ .../IndexedDB/idbobjectstore_add.any.js.ini   |   8 -
+ .../IndexedDB/idbobjectstore_put.any.js.ini   |   8 -
+ tests/wpt/mozilla/meta/MANIFEST.json          | 126 +++
+ .../IndexedDB/index-keys-page-code.any.js     | 123 +++
+ .../tests/IndexedDB/unique-index-keys.any.js  | 229 ++++++
+ 18 files changed, 1826 insertions(+), 109 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/index-keys-page-code.any.js
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/unique-index-keys.any.js
+
+diff --git a/components/script/dom/indexeddb/idbcursor.rs b/components/script/dom/indexeddb/idbcursor.rs
+index c0c7bbc3119..f38fe6d1619 100644
+--- a/components/script/dom/indexeddb/idbcursor.rs
++++ b/components/script/dom/indexeddb/idbcursor.rs
+@@ -697,6 +697,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+ 
+         // Step 10. Let operation be an algorithm to run store a record into an object store with
+         // this's effective object store, clone, this's effective key, and false.
++        let index_keys = effective_object_store.index_keys(cx, cloned_js_value.handle(), false);
+         // Step 11. Return the result (an IDBRequest) of running asynchronously execute a request
+         // with this and operation.
+         IDBRequest::execute_async(
+@@ -706,6 +707,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+                 key: self.effective_key(),
+                 value: serialized_value,
+                 should_overwrite: true,
++                index_keys,
+             }),
+             None,
+             None,
+diff --git a/components/script/dom/indexeddb/idbdatabase.rs b/components/script/dom/indexeddb/idbdatabase.rs
+index 9c637d90f6a..8b1c3d95a3f 100644
+--- a/components/script/dom/indexeddb/idbdatabase.rs
++++ b/components/script/dom/indexeddb/idbdatabase.rs
+@@ -244,6 +244,16 @@ impl IDBDatabase {
+         })
+     }
+ 
++    /// The indexes of the object store `store`, in the order they were created.
++    pub(crate) fn indexes(&self, store: IndexedDBObjectStoreId) -> Vec<IndexedDBIndex> {
++        self.object_stores
++            .borrow()
++            .iter()
++            .find(|object_store| object_store.id == store)
++            .map(|object_store| object_store.indexes.clone())
++            .unwrap_or_default()
++    }
++
+     pub(crate) fn object_stores_snapshot(&self) -> Vec<IndexedDBObjectStore> {
+         self.object_stores.borrow().clone()
+     }
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index 187d5c56b5a..03db108dae6 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -17,7 +17,7 @@ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use servo_base::generic_channel::{GenericSend, GenericSender};
+ use storage_traits::indexeddb::{
+     self, AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+-    IndexedDBIndex, IndexedDBIndexId, IndexedDBKeyType, IndexedDBObjectStore,
++    IndexedDBIndex, IndexedDBIndexId, IndexedDBIndexKeys, IndexedDBKeyType, IndexedDBObjectStore,
+     IndexedDBObjectStoreId, IndexedDBThreadMsg, Utf16String,
+ };
+ 
+@@ -43,8 +43,8 @@ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::key::{
+     EvaluationResult, ExtractionResult, can_inject_key_into_value, convert_value_to_key,
+     convert_value_to_key_range, dom_string_from_name, evaluate_key_path_on_value, extract_key,
+-    inject_key_into_value, injected_key_is_stored, is_valid_key_path, name_from_dom_string,
+-    sorted_name_list,
++    index_keys, inject_key_into_value, injected_key_is_stored, is_valid_key_path,
++    name_from_dom_string, sorted_name_list,
+ };
+ 
+ #[derive(Clone, JSTraceable, MallocSizeOf)]
+@@ -229,6 +229,17 @@ impl IDBObjectStore {
+         result
+     }
+ 
++    /// Runs `f` with the transaction inactive, as cloning a value does: computing index keys
++    /// runs in the page's realm, where a getter reached through a hole of an array or a
++    /// prototype could otherwise make requests that overtake the one being made.
++    fn with_transaction_inactive<T>(&self, f: impl FnOnce() -> T) -> T {
++        let active = self.transaction.is_active();
++        self.transaction.set_active_flag(false);
++        let result = f();
++        self.transaction.set_active_flag(active);
++        result
++    }
++
+     fn has_key_generator(&self) -> bool {
+         self.has_key_generator
+     }
+@@ -277,6 +288,33 @@ impl IDBObjectStore {
+         Ok(())
+     }
+ 
++    /// The keys of the records that storing `value`, a clone, gives in each index of the store,
++    /// for the backend to store with the record: steps 5.1 and 5.2 of
++    /// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store>. If
++    /// `key_is_generated`, the backend generates the record's key, and the parts of the index
++    /// keys that come from the key are placeholders.
++    pub(crate) fn index_keys(
++        &self,
++        cx: &mut JSContext,
++        value: HandleValue,
++        key_is_generated: bool,
++    ) -> Vec<IndexedDBIndexKeys> {
++        let generated_key_path = match &self.key_path {
++            Some(KeyPath::String(key_path)) if key_is_generated => Some(key_path.str()),
++            _ => None,
++        };
++        let indexes = self.transaction.get_db().indexes(self.id);
++        self.with_transaction_inactive(|| {
++            indexes
++                .iter()
++                .map(|index| IndexedDBIndexKeys {
++                    index_id: index.id,
++                    keys: index_keys(cx, value, index, generated_key_path.as_deref()),
++                })
++                .collect()
++        })
++    }
++
+     /// <https://www.w3.org/TR/IndexedDB-3/#object-store-in-line-keys>
+     pub(crate) fn uses_inline_keys(&self) -> bool {
+         self.key_path.is_some()
+@@ -408,7 +446,9 @@ impl IDBObjectStore {
+         // Step 12. Let operation be an algorithm to run store a record into an object store with
+         // store, clone, key, and no-overwrite flag.
+         // NOTE: The backend generates the key if none was given, and the value is stored without
+-        // it: reading the value injects the key, see `deserialize_value`.
++        // it: reading the value injects the key, see `deserialize_value`. The index keys that the
++        // operation's step 5 extracts from the clone are computed here.
++        let index_keys = self.index_keys(cx, cloned_js_value.handle(), serialized_key.is_none());
+         // Step 13. Return the result (an IDBRequest) of running asynchronously execute a request
+         // with handle and operation.
+         IDBRequest::execute_async(
+@@ -418,6 +458,7 @@ impl IDBObjectStore {
+                 key: serialized_key,
+                 value: serialized_value,
+                 should_overwrite: !no_overwrite,
++                index_keys,
+             }),
+             None,
+             None,
+diff --git a/components/script/dom/indexeddb/idbrequest.rs b/components/script/dom/indexeddb/idbrequest.rs
+index 16301922eb8..7067fb3643e 100644
+--- a/components/script/dom/indexeddb/idbrequest.rs
++++ b/components/script/dom/indexeddb/idbrequest.rs
+@@ -81,6 +81,9 @@ impl From<PutItemResult> for IdbResult {
+             PutItemResult::CannotOverwrite | PutItemResult::KeyGeneratorExhausted => {
+                 Self::Error(Error::Constraint(None))
+             },
++            PutItemResult::UniqueIndexKeyExists(_) => Self::Error(Error::Constraint(Some(
++                "A unique index already has one of the value's keys for another record".to_owned(),
++            ))),
+         }
+     }
+ }
+diff --git a/components/script/dom/indexeddb/key.rs b/components/script/dom/indexeddb/key.rs
+index a53006a9918..ce3910682b2 100644
+--- a/components/script/dom/indexeddb/key.rs
++++ b/components/script/dom/indexeddb/key.rs
+@@ -2,6 +2,7 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
++use std::cmp::Ordering;
+ use std::ffi::CString;
+ use std::{ptr, slice};
+ 
+@@ -15,15 +16,18 @@ use js::jsapi::{
+ };
+ use js::jsval::{DoubleValue, ObjectValue, StringValue, UndefinedValue};
+ use js::rust::wrappers2::{
+-    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_AtomizeUCStringN, JS_DefinePropertyById2,
+-    JS_GetLatin1StringCharsAndLength, JS_GetTwoByteStringCharsAndLength, JS_HasOwnPropertyById,
+-    JS_IndexToId, JS_IsIdentifier, JS_NewUCStringCopyN, JS_StringToId, NewDateObject, ObjectIsDate,
+-    SameValue,
++    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_AtomizeUCStringN, JS_ClearPendingException,
++    JS_DefinePropertyById2, JS_GetLatin1StringCharsAndLength, JS_GetTwoByteStringCharsAndLength,
++    JS_HasOwnPropertyById, JS_IndexToId, JS_IsIdentifier, JS_NewUCStringCopyN, JS_StringToId,
++    NewDateObject, ObjectIsDate, SameValue,
+ };
+ use js::rust::{HandleId, HandleObject, HandleValue, MutableHandleId, MutableHandleValue};
+ use js::typedarray::{ArrayBuffer, ArrayBufferU8, ArrayBufferView};
+-use script_bindings::js::{JS_GetPropertyById, JS_NewObject, PropertyFlags};
+-use storage_traits::indexeddb::{BackendError, IndexedDBKeyRange, IndexedDBKeyType, Utf16String};
++use script_bindings::js::{JS_GetPropertyById, JS_IsExceptionPending, JS_NewObject, PropertyFlags};
++use storage_traits::indexeddb::{
++    BackendError, IndexedDBIndex, IndexedDBIndexKey, IndexedDBKeyRange, IndexedDBKeyType,
++    Utf16String,
++};
+ 
+ use crate::dom::bindings::buffer_source::create_buffer_source;
+ use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
+@@ -507,6 +511,78 @@ pub fn convert_value_to_key(
+     Ok(ConversionResult::Invalid)
+ }
+ 
++/// <https://w3c.github.io/IndexedDB/#convert-a-value-to-a-multientry-key>, except that the keys
++/// of an array key are in key order rather than in the order of the array: each becomes a record
++/// of a multiEntry index, so their order isn't observable.
++#[expect(unsafe_code)]
++pub(crate) fn convert_value_to_multientry_key(
++    cx: &mut JSContext,
++    input: HandleValue,
++) -> Result<ConversionResult, Error> {
++    // Step 1. If input is an Array exotic object, then:
++    let mut is_array = false;
++    // SAFETY: `input` is rooted.
++    if !unsafe { IsArrayObject(cx, input, &mut is_array) } {
++        return Err(Error::JSFailed);
++    }
++    if !is_array {
++        // Step 2. Otherwise, return the result of converting a value to a key with argument
++        // input. Rethrow any exceptions.
++        return convert_value_to_key(cx, input, None);
++    }
++    rooted!(&in(cx) let object = input.to_object());
++
++    // Step 1.1. Let len be ? ToLength( ? Get(input, "length")).
++    let mut len = 0;
++    // SAFETY: `object` is rooted.
++    if !unsafe { GetArrayLength(cx, object.handle(), &mut len) } {
++        return Err(Error::JSFailed);
++    }
++    // Step 1.2. Let seen be a new set containing only input.
++    // Step 1.3. Let keys be a new empty list.
++    let mut keys = vec![];
++    // Step 1.4. Let index be 0.
++    // Step 1.5. While index is less than len:
++    for index in 0..len {
++        // Step 1.5.1. Let entry be Get(input, index).
++        rooted!(&in(cx) let mut id: PropertyKey);
++        rooted!(&in(cx) let mut entry = UndefinedValue());
++        // SAFETY: `id` is rooted.
++        let got = unsafe { JS_IndexToId(cx, index, id.handle_mut()) } &&
++            JS_GetPropertyById(cx, object.handle(), id.handle(), entry.handle_mut());
++        // Step 1.5.2. If entry is not an abrupt completion, then:
++        if !got {
++            clear_pending_exception(cx);
++            continue;
++        }
++        // Step 1.5.2.1. Let key be the result of converting a value to a key with arguments entry
++        // and seen.
++        // Step 1.5.2.2. If key is not "invalid value" or "invalid type" or an abrupt completion,
++        // and there is no item in keys equal to key, then append key to keys.
++        match convert_value_to_key(cx, entry.handle(), Some(vec![input])) {
++            Ok(ConversionResult::Valid(key)) => keys.push(key),
++            Ok(ConversionResult::Invalid) => {},
++            Err(_) => clear_pending_exception(cx),
++        }
++        // Step 1.5.3. Increase index by 1.
++    }
++    // NOTE: Removing the duplicates after sorting takes O(n log n) comparisons rather than the
++    // spec's O(n²). Valid keys never compare as unordered.
++    keys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
++    keys.dedup();
++    // Step 1.6. Return a new array key with value set to keys.
++    Ok(ConversionResult::Valid(IndexedDBKeyType::Array(keys)))
++}
++
++/// Clears the exception of a failed JavaScript operation whose failure is ignored.
++#[expect(unsafe_code)]
++fn clear_pending_exception(cx: &mut JSContext) {
++    if JS_IsExceptionPending(cx) {
++        // SAFETY: `cx` is the context the exception is pending on.
++        unsafe { JS_ClearPendingException(cx) };
++    }
++}
++
+ /// <https://www.w3.org/TR/IndexedDB-3/#convert-a-value-to-a-key-range>
+ pub fn convert_value_to_key_range(
+     cx: &mut JSContext,
+@@ -959,17 +1035,141 @@ pub(crate) fn extract_key(
+     // multiEntry flag is unset, and the result of running the steps to convert a value to a
+     // multiEntry key with r otherwise. Rethrow any exceptions.
+     let key = match multi_entry {
+-        Some(true) => {
+-            // TODO: implement convert_value_to_multientry_key
+-            unimplemented!("multiEntry keys are not yet supported");
++        Some(true) => convert_value_to_multientry_key(cx, r.handle())?,
++        _ => convert_value_to_key(cx, r.handle(), None)?,
++    };
++    match key {
++        // Step 4. If key is "invalid value" or "invalid type", return invalid.
++        ConversionResult::Invalid => Ok(ExtractionResult::Invalid),
++        // Step 5. Return key.
++        ConversionResult::Valid(key) => Ok(ExtractionResult::Key(key)),
++    }
++}
++
++/// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store> steps 5.1 and 5.2 for
++/// `index`, where `value` is the clone being stored: the keys of the records that `index` gets,
++/// without duplicates.
++///
++/// `generated_key_path` is the store's key path when the backend generates the record's key, which
++/// step 1.1.3 injects into the value at that key path before step 5. Script doesn't know the key,
++/// so the parts of the index key that come from it are placeholders, and the keys are those that
++/// the key path gives on the value with the key injected.
++pub(crate) fn index_keys(
++    cx: &mut JSContext,
++    value: HandleValue,
++    index: &IndexedDBIndex,
++    generated_key_path: Option<&str>,
++) -> Vec<IndexedDBIndexKey> {
++    // Step 5.1. Let index key be the result of extracting a key from a value using a key path
++    // with value, index’s key path, and index’s multiEntry flag.
++    let key_path = KeyPath::from(index.key_path.clone());
++    let index_key = match generated_key_path {
++        Some(store_key_path) => {
++            index_key_with_generated_key(cx, value, &key_path, index.multi_entry, store_key_path)
+         },
+-        _ => match convert_value_to_key(cx, r.handle(), None)? {
+-            ConversionResult::Valid(key) => key,
+-            // Step 4. If key is invalid, return invalid.
+-            ConversionResult::Invalid => return Ok(ExtractionResult::Invalid),
++        None => extracted_index_key(cx, value, &key_path, index.multi_entry),
++    };
++    // Step 5.2. If index key is an exception, or invalid, or failure, take no further actions for
++    // index, and continue these steps for the next index.
++    // NOTE: An exception thrown in this step is not rethrown.
++    let index_key = match index_key {
++        Ok(Some(index_key)) => index_key,
++        Ok(None) => return vec![],
++        Err(_) => {
++            clear_pending_exception(cx);
++            return vec![];
+         },
+     };
++    // Step 5.5 and 5.6: a multiEntry index gets a record for each subkey of an array key, any
++    // other index one for the key.
++    match index_key {
++        IndexedDBIndexKey::Key(IndexedDBKeyType::Array(subkeys)) if index.multi_entry => {
++            subkeys.into_iter().map(IndexedDBIndexKey::Key).collect()
++        },
++        index_key => vec![index_key],
++    }
++}
++
++/// The index key that extracting a key from `value` with `key_path` gives, `None` for invalid or
++/// failure.
++fn extracted_index_key(
++    cx: &mut JSContext,
++    value: HandleValue,
++    key_path: &KeyPath,
++    multi_entry: bool,
++) -> Result<Option<IndexedDBIndexKey>, Error> {
++    Ok(match extract_key(cx, value, key_path, Some(multi_entry))? {
++        ExtractionResult::Key(key) => Some(IndexedDBIndexKey::Key(key)),
++        ExtractionResult::Invalid | ExtractionResult::Failure => None,
++    })
++}
+ 
+-    // Step 5. Return key.
+-    Ok(ExtractionResult::Key(key))
++/// What evaluating a key path item gives on a value into which a generated key was injected at
++/// the store's key path.
++enum OnInjectedKey {
++    /// The key.
++    Key,
++    /// Failure: the item goes below the key, which is a number.
++    Failure,
++    /// The same index key as on the value without the key, or likewise none. The injection only
++    /// adds the key's property and possibly ordinary objects on the way to it: an item that
++    /// reaches such an object gets an invalid key instead of failure, and an existing object
++    /// converts to the same key with the added property.
++    Unchanged,
++}
++
++fn on_injected_key(item: &str, store_key_path: &str) -> OnInjectedKey {
++    match item.strip_prefix(store_key_path) {
++        Some("") => OnInjectedKey::Key,
++        Some(rest) if rest.starts_with('.') => OnInjectedKey::Failure,
++        _ => OnInjectedKey::Unchanged,
++    }
++}
++
++/// The index key that extracting a key with `key_path` gives on `value` once a generated key is
++/// injected into it at `store_key_path`, with the key as a placeholder.
++fn index_key_with_generated_key(
++    cx: &mut JSContext,
++    value: HandleValue,
++    key_path: &KeyPath,
++    multi_entry: bool,
++    store_key_path: &str,
++) -> Result<Option<IndexedDBIndexKey>, Error> {
++    match key_path {
++        KeyPath::String(path) => match on_injected_key(&path.str(), store_key_path) {
++            // The key is a number, which a multiEntry index also gets as it is.
++            OnInjectedKey::Key => Ok(Some(IndexedDBIndexKey::PrimaryKey)),
++            OnInjectedKey::Failure => Ok(None),
++            OnInjectedKey::Unchanged => extracted_index_key(cx, value, key_path, multi_entry),
++        },
++        KeyPath::StringSequence(items) => {
++            let on_key: Vec<OnInjectedKey> = items
++                .iter()
++                .map(|item| on_injected_key(&item.str(), store_key_path))
++                .collect();
++            if on_key
++                .iter()
++                .all(|on_key| matches!(on_key, OnInjectedKey::Unchanged))
++            {
++                return extracted_index_key(cx, value, key_path, multi_entry);
++            }
++            // Evaluating a sequence fails if an item fails, and converting the array of the items'
++            // values gives invalid if one of them is invalid.
++            let mut parts = Vec::with_capacity(items.len());
++            for (item, on_key) in items.iter().zip(on_key) {
++                match on_key {
++                    OnInjectedKey::Key => parts.push(IndexedDBIndexKey::PrimaryKey),
++                    OnInjectedKey::Failure => return Ok(None),
++                    OnInjectedKey::Unchanged => {
++                        let item = KeyPath::String(item.clone());
++                        match extracted_index_key(cx, value, &item, false)? {
++                            Some(part) => parts.push(part),
++                            None => return Ok(None),
++                        }
++                    },
++                }
++            }
++            Ok(Some(IndexedDBIndexKey::Array(parts)))
++        },
++    }
+ }
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 555327c89e2..99578837bf2 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -438,12 +438,54 @@ pub struct IndexedDBObjectStore {
+     pub indexes: Vec<IndexedDBIndex>,
+ }
+ 
++/// The key of an index record for a value that script stores, as script computes it
++/// (<https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store> step 5.1). When the
++/// backend generates the record's key and step 1.1.3 injects it into the value, script doesn't
++/// know the parts of the index key that come from it: where the index's key path, or an item of
++/// a sequence key path, is the store's key path. Those parts are
++/// [`IndexedDBIndexKey::PrimaryKey`], which the backend replaces with the record's key.
++#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
++pub enum IndexedDBIndexKey {
++    Key(IndexedDBKeyType),
++    /// The primary key of the record.
++    PrimaryKey,
++    /// An array key of these items.
++    Array(Vec<IndexedDBIndexKey>),
++}
++
++impl IndexedDBIndexKey {
++    /// The key, with each [`IndexedDBIndexKey::PrimaryKey`] replaced by `primary_key`.
++    pub fn with_primary_key(self, primary_key: &IndexedDBKeyType) -> IndexedDBKeyType {
++        match self {
++            Self::Key(key) => key,
++            Self::PrimaryKey => primary_key.clone(),
++            Self::Array(items) => IndexedDBKeyType::Array(
++                items
++                    .into_iter()
++                    .map(|item| item.with_primary_key(primary_key))
++                    .collect(),
++            ),
++        }
++    }
++}
++
++/// The keys of the records that the index `index_id` gets for a value that script stores: none
++/// if extracting a key from the value failed or gave an invalid key, the subkeys of an array key
++/// for a multiEntry index, and the key otherwise. Script removes duplicates.
++#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
++pub struct IndexedDBIndexKeys {
++    pub index_id: IndexedDBIndexId,
++    pub keys: Vec<IndexedDBIndexKey>,
++}
++
+ #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+ pub enum PutItemResult {
+     Key(IndexedDBKeyType),
+     CannotOverwrite,
+     /// The store's key generator can't generate another key.
+     KeyGeneratorExhausted,
++    /// The unique index `0` has one of the value's keys for another record.
++    UniqueIndexKeyExists(IndexedDBIndexId),
+ }
+ 
+ #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+@@ -485,6 +527,8 @@ pub enum AsyncReadWriteOperation {
+         key: Option<IndexedDBKeyType>,
+         value: Vec<u8>,
+         should_overwrite: bool,
++        /// The keys of the record in each index of the store, one entry per index.
++        index_keys: Vec<IndexedDBIndexKeys>,
+     },
+ 
+     /// Removes the key/value pair for the given key in the associated idb data
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index 31fee95737d..6b0621f42c0 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -664,13 +664,14 @@ fn run_read_write<X: SqlExecutor>(
+             key,
+             value,
+             should_overwrite,
++            index_keys,
+         } => {
+             if key.is_none() && store.auto_increment == 0 {
+                 let error = BackendError::DbErr("Missing key for PutItem request".into());
+                 return (Err(error), None);
+             }
+             outcome(
+-                queries::put_record(executor, store, key, &value, should_overwrite),
++                queries::put_record(executor, store, key, &value, should_overwrite, index_keys),
+                 RequestOutput::Put,
+                 Failure::Write,
+             )
+diff --git a/components/storage/indexeddb/backend/queries.rs b/components/storage/indexeddb/backend/queries.rs
+index 6122ad8ee08..f8f9b58511a 100644
+--- a/components/storage/indexeddb/backend/queries.rs
++++ b/components/storage/indexeddb/backend/queries.rs
+@@ -4,20 +4,72 @@
+ 
+ //! The IndexedDB operations on the tables of `schema.rs`.
+ 
++use std::collections::BTreeSet;
++
+ use storage_traits::indexeddb::{
+-    IndexedDBIndex, IndexedDBIndexId, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore,
+-    IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBValue, KeyPath, PutItemResult, Utf16String,
++    IndexedDBIndex, IndexedDBIndexId, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
++    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBValue, KeyPath,
++    PutItemResult, Utf16String,
+ };
+ 
+ use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
+ use crate::indexeddb::engines::encoding;
+ 
+-/// A row of `object_store`.
++/// A row of `object_store`, with the indexes of the store.
+ #[derive(Clone, Debug)]
+ pub(crate) struct ObjectStore {
+     pub(crate) id: i64,
+     /// The key generator's current number, or 0 for a store without a key generator.
+     pub(crate) auto_increment: i64,
++    /// In the order of their ids.
++    pub(crate) indexes: Vec<StoreIndex>,
++}
++
++impl ObjectStore {
++    pub(crate) fn index(&self, id: IndexedDBIndexId) -> Option<StoreIndex> {
++        self.indexes.iter().copied().find(|index| index.id == id)
++    }
++
++    /// The tables that hold the records of the store's indexes.
++    fn index_tables(&self) -> impl Iterator<Item = &'static str> {
++        let has = |unique| self.indexes.iter().any(|index| index.unique == unique);
++        [(has(false), "index_data"), (has(true), "unique_index_data")]
++            .into_iter()
++            .filter_map(|(has, table)| has.then_some(table))
++    }
++}
++
++/// An index of an object store, as reading and writing its records needs it.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct StoreIndex {
++    pub(crate) id: IndexedDBIndexId,
++    pub(crate) unique: bool,
++}
++
++impl StoreIndex {
++    /// The table of the index's records, `(index_id, value, object_data_key, object_store_id)`,
++    /// where `value` is the encoded index key and `object_data_key` the encoded primary key of
++    /// the record in the store. `unique_index_data`'s primary key `(index_id, value)` allows one
++    /// record per key; `index_data`'s is `(index_id, value, object_data_key)`. Both read in
++    /// (key, primary key) order.
++    #[cfg_attr(not(test), expect(dead_code))]
++    pub(crate) fn table(&self) -> &'static str {
++        if self.unique {
++            "unique_index_data"
++        } else {
++            "index_data"
++        }
++    }
++
++    fn insert_statement(&self) -> &'static str {
++        if self.unique {
++            "INSERT INTO unique_index_data (index_id, value, object_data_key, object_store_id) \
++             VALUES (?, ?, ?, ?)"
++        } else {
++            "INSERT INTO index_data (index_id, value, object_data_key, object_store_id) \
++             VALUES (?, ?, ?, ?)"
++        }
++    }
+ }
+ 
+ pub(crate) fn encode_key_path(key_path: &KeyPath) -> Result<Vec<u8>, SqlError> {
+@@ -48,17 +100,33 @@ pub(crate) fn object_store<X: SqlExecutor>(
+     executor: &mut X,
+     store_id: IndexedDBObjectStoreId,
+ ) -> Result<Option<ObjectStore>, SqlError> {
+-    query_row(
++    let rows = query_rows(
+         executor,
+-        "SELECT id, auto_increment FROM object_store WHERE id = ?",
++        "SELECT s.id, s.auto_increment, i.id, i.unique_index FROM object_store AS s \
++         LEFT JOIN object_store_index AS i ON i.object_store_id = s.id \
++         WHERE s.id = ? ORDER BY i.id",
+         &[SqlParam::Integer(store_id)],
+         |row| {
+-            Ok(ObjectStore {
+-                id: row.integer(0)?,
+-                auto_increment: row.integer(1)?,
+-            })
++            let index = row
++                .optional_integer(2)?
++                .map(|id| {
++                    Ok::<_, SqlError>(StoreIndex {
++                        id,
++                        unique: row.integer(3)? != 0,
++                    })
++                })
++                .transpose()?;
++            Ok((row.integer(0)?, row.integer(1)?, index))
+         },
+-    )
++    )?;
++    let Some(&(id, auto_increment, _)) = rows.first() else {
++        return Ok(None);
++    };
++    Ok(Some(ObjectStore {
++        id,
++        auto_increment,
++        indexes: rows.into_iter().filter_map(|(_, _, index)| index).collect(),
++    }))
+ }
+ 
+ fn required_object_store<X: SqlExecutor>(
+@@ -334,10 +402,11 @@ pub(crate) fn set_version<X: SqlExecutor>(executor: &mut X, version: u64) -> Res
+     Ok(())
+ }
+ 
+-/// The `key` conditions for a key range, to append to a `WHERE` clause, and the encoded bounds
+-/// to bind for their placeholders, in order.
++/// The conditions of a key range on an encoded key column, to append to a `WHERE` clause, and
++/// the encoded bounds to bind for their placeholders, in order.
+ #[derive(Default)]
+ struct RangeCondition {
++    /// The conditions, with `{}` for the column.
+     sql: String,
+     bounds: Vec<Vec<u8>>,
+ }
+@@ -348,6 +417,19 @@ impl RangeCondition {
+         self.bounds.push(encoding::serialize(bound));
+     }
+ 
++    /// The range of the one encoded key `key`.
++    fn only(key: Vec<u8>) -> Self {
++        Self {
++            sql: " AND {} = ?".to_owned(),
++            bounds: vec![key],
++        }
++    }
++
++    /// The conditions on the column `column`.
++    fn on(&self, column: &str) -> String {
++        self.sql.replace("{}", column)
++    }
++
+     /// The parameters for `object_store_id = ?` followed by this condition.
+     fn params(&self, store: &ObjectStore) -> Vec<SqlParam<'_>> {
+         std::iter::once(SqlParam::Integer(store.id))
+@@ -359,22 +441,22 @@ impl RangeCondition {
+ fn range_condition(range: &IndexedDBKeyRange) -> RangeCondition {
+     let mut condition = RangeCondition::default();
+     if let Some(singleton) = range.as_singleton() {
+-        condition.push(" AND key = ?", singleton);
++        condition.push(" AND {} = ?", singleton);
+         return condition;
+     }
+     if let Some(lower) = range.lower.as_ref() {
+         let sql = if range.lower_open {
+-            " AND key > ?"
++            " AND {} > ?"
+         } else {
+-            " AND key >= ?"
++            " AND {} >= ?"
+         };
+         condition.push(sql, lower);
+     }
+     if let Some(upper) = range.upper.as_ref() {
+         let sql = if range.upper_open {
+-            " AND key < ?"
++            " AND {} < ?"
+         } else {
+-            " AND key <= ?"
++            " AND {} <= ?"
+         };
+         condition.push(sql, upper);
+     }
+@@ -395,7 +477,7 @@ fn select_records<X: SqlExecutor, T>(
+     let condition = range_condition(range);
+     let mut sql = format!(
+         "SELECT {columns} FROM object_data WHERE object_store_id = ?{} ORDER BY key {}",
+-        condition.sql,
++        condition.on("key"),
+         if reverse { "DESC" } else { "ASC" }
+     );
+     let mut params = condition.params(store);
+@@ -502,7 +584,7 @@ pub(crate) fn count<X: SqlExecutor>(
+     let condition = range_condition(range);
+     let sql = format!(
+         "SELECT COUNT(*) FROM object_data WHERE object_store_id = ?{}",
+-        condition.sql
++        condition.on("key")
+     );
+     let params = condition.params(store);
+     let count = query_row(executor, &sql, &params, |row| row.integer(0))?.unwrap_or_default();
+@@ -544,15 +626,124 @@ fn possibly_update_the_key_generator(current_number: i64, key: &IndexedDBKeyType
+     (value >= current_number).then_some(value + 1)
+ }
+ 
++/// The encoded keys of the records that an index gets for a record, without duplicates.
++pub(crate) struct IndexRecords {
++    pub(crate) index: StoreIndex,
++    pub(crate) keys: BTreeSet<Vec<u8>>,
++}
++
++/// The index records of the record with the key `primary_key` in `store`, from the keys that
++/// script computed for each index of the store, with `primary_key` in place of each placeholder.
++/// Keys for other indexes than exactly the store's mean that script's metadata isn't the
++/// database's.
++pub(crate) fn index_records(
++    store: &ObjectStore,
++    primary_key: &IndexedDBKeyType,
++    index_keys: Vec<IndexedDBIndexKeys>,
++) -> Result<Vec<IndexRecords>, SqlError> {
++    let mut records: Vec<IndexRecords> = Vec::with_capacity(index_keys.len());
++    for IndexedDBIndexKeys { index_id, keys } in index_keys {
++        let index = store.index(index_id).ok_or(SqlError::InvalidMetadata(
++            "index keys for an index the store doesn't have",
++        ))?;
++        if records.iter().any(|records| records.index == index) {
++            return Err(SqlError::InvalidMetadata("index keys given twice"));
++        }
++        let keys = keys
++            .into_iter()
++            .map(|key| encoding::serialize(&key.with_primary_key(primary_key)))
++            .collect();
++        records.push(IndexRecords { index, keys });
++    }
++    if records.len() != store.indexes.len() {
++        return Err(SqlError::InvalidMetadata("index keys missing for an index"));
++    }
++    Ok(records)
++}
++
++/// The first of the unique indexes in `records` that has one of its keys for another record
++/// than the one with the encoded key `primary_key`.
++pub(crate) fn unique_index_conflict<X: SqlExecutor>(
++    executor: &mut X,
++    records: &[IndexRecords],
++    primary_key: &[u8],
++) -> Result<Option<IndexedDBIndexId>, SqlError> {
++    for records in records.iter().filter(|records| records.index.unique) {
++        for key in &records.keys {
++            let taken = query_row(
++                executor,
++                "SELECT 1 FROM unique_index_data \
++                 WHERE index_id = ? AND value = ? AND object_data_key != ?",
++                &[
++                    SqlParam::Integer(records.index.id),
++                    SqlParam::Blob(key),
++                    SqlParam::Blob(primary_key),
++                ],
++                |_| Ok(()),
++            )?
++            .is_some();
++            if taken {
++                return Ok(Some(records.index.id));
++            }
++        }
++    }
++    Ok(None)
++}
++
++/// Stores `records`, the index records of the record of `store` with the encoded key
++/// `primary_key`. The record must be stored already. A unique index's primary key rejects a key
++/// that another record has: callers check with [`unique_index_conflict`] first, and the failed
++/// statement fails the transaction.
++pub(crate) fn insert_index_records<X: SqlExecutor>(
++    executor: &mut X,
++    store: &ObjectStore,
++    primary_key: &[u8],
++    records: &[IndexRecords],
++) -> Result<(), SqlError> {
++    for records in records {
++        for key in &records.keys {
++            executor.execute(
++                records.index.insert_statement(),
++                &[
++                    SqlParam::Integer(records.index.id),
++                    SqlParam::Blob(key),
++                    SqlParam::Blob(primary_key),
++                    SqlParam::Integer(store.id),
++                ],
++            )?;
++        }
++    }
++    Ok(())
++}
++
++/// Deletes the index records of the records of `store` whose keys meet `condition`.
++fn delete_index_records<X: SqlExecutor>(
++    executor: &mut X,
++    store: &ObjectStore,
++    condition: &RangeCondition,
++) -> Result<(), SqlError> {
++    let params = condition.params(store);
++    for table in store.index_tables() {
++        let sql = format!(
++            "DELETE FROM {table} WHERE object_store_id = ?{}",
++            condition.on("object_data_key")
++        );
++        executor.execute(&sql, &params)?;
++    }
++    Ok(())
++}
++
+ /// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store>: stores `value` under
+ /// `key`, or under a key from the store's key generator if `key` is `None`, which requires that
+-/// the store has one. A record that can't be stored changes nothing, not even the key generator.
++/// the store has one, with `index_keys`, the keys script computed for each index of the store. A
++/// record that can't be stored changes nothing, not even the key generator.
+ pub(crate) fn put_record<X: SqlExecutor>(
+     executor: &mut X,
+     store: &ObjectStore,
+     key: Option<IndexedDBKeyType>,
+     value: &[u8],
+     overwrite: bool,
++    index_keys: Vec<IndexedDBIndexKeys>,
+ ) -> Result<PutItemResult, SqlError> {
+     let has_key_generator = store.auto_increment != 0;
+     debug_assert!(key.is_some() || has_key_generator);
+@@ -569,7 +760,7 @@ pub(crate) fn put_record<X: SqlExecutor>(
+             // Step 1.1.3. If store also uses in-line keys, then run inject a key into a value
+             // using a key path with value, key and store’s key path.
+             // NOTE: The value is stored without the key; script injects it when it reads the
+-            // value.
++            // value. The index keys that come from the key are placeholders.
+             (key, Some(store.auto_increment + 1))
+         },
+         // Step 1.2. Otherwise, run possibly update the key generator for store with key.
+@@ -595,6 +786,27 @@ pub(crate) fn put_record<X: SqlExecutor>(
+         return Ok(PutItemResult::CannotOverwrite);
+     }
+ 
++    // Step 5. For each index which references store:
++    // Step 5.1. Let index key be the result of extracting a key from a value using a key path
++    // with value, index’s key path, and index’s multiEntry flag.
++    // Step 5.2. If index key is an exception, or invalid, or failure, take no further actions for
++    // index, and continue these steps for the next index.
++    // NOTE: Script ran these steps.
++    let index_records = index_records(store, &key, index_keys)?;
++    // Step 5.3. If index’s multiEntry flag is false, or if index key is not an array key, and if
++    // index already contains a record with key equal to index key, and index’s unique flag is
++    // true, then this operation failed with a "ConstraintError" DOMException. Abort this
++    // algorithm without taking any further steps.
++    // Step 5.4. If index’s multiEntry flag is true and index key is an array key, and if index
++    // already contains a record with key equal to any of the subkeys of index key, and index’s
++    // unique flag is true, then this operation failed with a "ConstraintError" DOMException.
++    // Abort this algorithm without taking any further steps.
++    // NOTE: These checks run before anything is written, so that a failed request has no effects.
++    // Step 3 removes the index records of the record that is replaced, so they don't count.
++    if let Some(index) = unique_index_conflict(executor, &index_records, &encoded_key)? {
++        return Ok(PutItemResult::UniqueIndexKeyExists(index));
++    }
++
+     // Step 3. If a record already exists in store with its key equal to key, then remove the
+     // record from store using delete records from an object store.
+     // Step 4. Store a record in store containing key as its key and !
+@@ -602,6 +814,7 @@ pub(crate) fn put_record<X: SqlExecutor>(
+     // store’s list of records such that the list is sorted according to the key of the records in
+     // ascending order.
+     if exists {
++        delete_index_records(executor, store, &RangeCondition::only(encoded_key.clone()))?;
+         executor.execute(
+             "UPDATE object_data SET data = ? WHERE object_store_id = ? AND key = ?",
+             &[
+@@ -620,6 +833,18 @@ pub(crate) fn put_record<X: SqlExecutor>(
+             ],
+         )?;
+     }
++
++    // Step 5.5. If index’s multiEntry flag is false, or if index key is not an array key then
++    // store a record in index containing index key as its key and key as its value. The record is
++    // stored in index’s list of records such that the list is sorted primarily on the records keys,
++    // and secondarily on the records values, in ascending order.
++    // Step 5.6. If index’s multiEntry flag is true and index key is an array key, then for each
++    // subkey of the subkeys of index key store a record in index containing subkey as its key and
++    // key as its value. The records are stored in index’s list of records such that the list is
++    // sorted primarily on the records keys, and secondarily on the records values, in ascending
++    // order.
++    insert_index_records(executor, store, &encoded_key, &index_records)?;
++
+     if let Some(current_number) = new_current_number {
+         executor.execute(
+             "UPDATE object_store SET auto_increment = ? WHERE id = ?",
+@@ -634,25 +859,37 @@ pub(crate) fn put_record<X: SqlExecutor>(
+     Ok(PutItemResult::Key(key))
+ }
+ 
++/// <https://w3c.github.io/IndexedDB/#delete-records-from-an-object-store>
+ pub(crate) fn delete_records<X: SqlExecutor>(
+     executor: &mut X,
+     store: &ObjectStore,
+     range: &IndexedDBKeyRange,
+ ) -> Result<(), SqlError> {
+     let condition = range_condition(range);
++    // Step 2. For each index which references store, remove every record from index’s list of
++    // records whose value is in range, if any such records exist.
++    // NOTE: Before step 1, as index records refer to the store's records.
++    delete_index_records(executor, store, &condition)?;
++    // Step 1. Remove all records, if any, from store’s list of records with key in range.
+     let sql = format!(
+         "DELETE FROM object_data WHERE object_store_id = ?{}",
+-        condition.sql
++        condition.on("key")
+     );
+-    let params = condition.params(store);
+-    executor.execute(&sql, &params)?;
++    executor.execute(&sql, &condition.params(store))?;
++    // Step 3. Return undefined.
+     Ok(())
+ }
+ 
++/// <https://w3c.github.io/IndexedDB/#clear-an-object-store>
+ pub(crate) fn clear<X: SqlExecutor>(executor: &mut X, store: &ObjectStore) -> Result<(), SqlError> {
++    // Step 2. In all indexes which reference store, remove all records.
++    // NOTE: Before step 1, as index records refer to the store's records.
++    delete_index_records(executor, store, &RangeCondition::default())?;
++    // Step 1. Remove all records from store.
+     executor.execute(
+         "DELETE FROM object_data WHERE object_store_id = ?",
+         &[SqlParam::Integer(store.id)],
+     )?;
++    // Step 3. Return undefined.
+     Ok(())
+ }
+diff --git a/components/storage/indexeddb/backend/schema.rs b/components/storage/indexeddb/backend/schema.rs
+index fc85cb8a0eb..2b187ee7232 100644
+--- a/components/storage/indexeddb/backend/schema.rs
++++ b/components/storage/indexeddb/backend/schema.rs
+@@ -15,13 +15,16 @@ use crate::shared::DB_INIT_PRAGMAS;
+ /// The version of the tables below and of how records are stored in them, kept in the database
+ /// file's `user_version`. Bump it with every change to either: a database stored with another
+ /// version is deleted and created anew when it is opened, as there are no migrations.
+-pub(crate) const SCHEMA_VERSION: i64 = 2;
++pub(crate) const SCHEMA_VERSION: i64 = 3;
+ 
+ // Adapted from:
+ // https://github.com/mozilla-firefox/firefox/blob/ee102e926521b3e460293b0aea6b54b1a03f6f74/dom/indexedDB/DBSchema.cpp#L78
+ // Names are BLOBs of UTF-16 code units (`Utf16String::to_be_bytes`), which, unlike text, hold
+-// any DOMString.
+-const CREATE_TABLES: [&str; 6] = [
++// any DOMString. A unique index keeps its records in `unique_index_data`, whose primary key allows
++// one record per key, any other index in `index_data`; both are read in (key, primary key) order.
++// Their indexes on the record's key find the index records of the records a write replaces or
++// deletes.
++const CREATE_TABLES: [&str; 8] = [
+     r#"
+ CREATE TABLE IF NOT EXISTS database (
+     name    blob             not null
+@@ -83,6 +86,12 @@ CREATE TABLE IF NOT EXISTS unique_index_data (
+     FOREIGN KEY (object_store_id, object_data_key)
+     REFERENCES object_data(object_store_id, key)
+ ) WITHOUT ROWID;"#,
++    r#"
++CREATE INDEX IF NOT EXISTS index_data_object_data_key_index
++    ON index_data (object_store_id, object_data_key);"#,
++    r#"
++CREATE INDEX IF NOT EXISTS unique_index_data_object_data_key_index
++    ON unique_index_data (object_store_id, object_data_key);"#,
+ ];
+ 
+ /// Opens the database in `directory`, creating its tables if it is new. A database stored with
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index 85c827726b1..5bd770cf50d 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -16,9 +16,10 @@ use servo_base::threadpool::ThreadPool;
+ use servo_url::ImmutableOrigin;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+-    BackendError, BackendResult, ConnectionEvent, IndexedDBIndex, IndexedDBKeyRange,
+-    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBTxnId, IndexedDBTxnMode,
+-    IndexedDBValue, KeyPath, PutItemResult, RequestOutput, TransactionEvent, Utf16String,
++    BackendError, BackendResult, ConnectionEvent, IndexedDBIndex, IndexedDBIndexKey,
++    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord,
++    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput,
++    TransactionEvent, Utf16String,
+ };
+ use tempfile::TempDir;
+ use url::Host;
+@@ -114,6 +115,13 @@ executor_tests!(
+     test_job_that_ends_the_sql_transaction_fails_the_writer,
+     test_metadata_reads_do_not_wait_for_the_connection,
+     test_upgrade_without_requests_sets_the_version_at_commit,
++    test_index_records_follow_puts_and_overwrites,
++    test_deleted_records_take_their_index_records_along,
++    test_deleted_indexes_take_their_records_along,
++    test_unique_index_conflict_changes_nothing,
++    test_placeholders_become_the_record_key,
++    test_abort_reverts_index_records,
++    test_index_keys_for_other_indexes_fail_the_transaction,
+ );
+ 
+ const TIMEOUT: Duration = Duration::from_secs(10);
+@@ -842,9 +850,17 @@ fn test_unpaired_surrogates_in_names_and_keys<X: SqlExecutor>() {
+         units(&[0xDC00, 0xD800]),
+     ]
+     .into_iter()
+-    .map(|key| (Some(IndexedDBKeyType::String(key)), vec![]))
++    .map(|key| {
++        let key = IndexedDBKeyType::String(key);
++        let index_keys = vec![index_keys(1, [key.clone()]), index_keys(2, [])];
++        (Some(key), vec![], index_keys)
++    })
+     .collect();
+-    assert!(run_puts(&db, 1, 1, puts, false).iter().all(Result::is_ok));
++    assert!(
++        run_indexed_puts(&db, 1, 1, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
+     assert!(commit(&db, 1).is_ok());
+     let sorted: Vec<_> = [
+         &[0x61, 0xDFFF][..],
+@@ -859,6 +875,11 @@ fn test_unpaired_surrogates_in_names_and_keys<X: SqlExecutor>() {
+     .collect();
+     assert!(sorted.is_sorted_by(|a, b| a < b));
+     assert_eq!(stored_keys(&db, 1), sorted);
++    let by_trail: Vec<_> = sorted
++        .iter()
++        .map(|key| (key.clone(), key.clone()))
++        .collect();
++    assert_eq!(index_records_of(&db, 1, 1), by_trail);
+     let range = IndexedDBKeyRange::new(
+         Some(IndexedDBKeyType::String(lead.clone())),
+         Some(IndexedDBKeyType::String(trail.clone())),
+@@ -996,17 +1017,11 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
+ 
+     in_own_transaction(&db, |executor| {
+         let store = queries::object_store(executor, books)?.unwrap();
+-        queries::put_record(executor, &store, None, &[7], false)?;
+-        executor.execute(
+-            "INSERT INTO index_data (index_id, value, object_data_key, object_store_id) \
+-             VALUES (?, ?, ?, ?)",
+-            &[
+-                SqlParam::Integer(by_author),
+-                SqlParam::Blob(&[1]),
+-                SqlParam::Blob(&encoding::serialize(&IndexedDBKeyType::Number(1.0))),
+-                SqlParam::Integer(books),
+-            ],
+-        )?;
++        let index_keys = vec![
++            index_keys(by_title, []),
++            index_keys(by_author, [IndexedDBKeyType::Number(1.0)]),
++        ];
++        queries::put_record(executor, &store, None, &[7], false, index_keys)?;
+         Ok(())
+     })
+     .unwrap();
+@@ -1136,6 +1151,7 @@ fn test_delete_store_removes_store_records<X: SqlExecutor>() {
+             Some(IndexedDBKeyType::Number(1.0)),
+             &[1, 2, 3],
+             true,
++            vec![],
+         )
+         .expect("Failed to insert item");
+         assert_eq!(record_count(&mut *connection, object_store.id), 1);
+@@ -1270,43 +1286,90 @@ fn schema(store: i64, operation: AsyncSchemaOperation) -> KvsOperation {
+     }
+ }
+ 
++/// A put into a store without indexes.
+ fn put_request(
+     store: i64,
+     request_id: ReplyId<PutReply>,
+     key: IndexedDBKeyType,
+     value: Vec<u8>,
+     should_overwrite: bool,
++) -> KvsOperation {
++    indexed_put_request(
++        store,
++        request_id,
++        Some(key),
++        value,
++        should_overwrite,
++        vec![],
++    )
++}
++
++/// A put under `key`, or under a generated key if it is `None`, with the record's keys in the
++/// store's indexes.
++fn indexed_put_request(
++    store: i64,
++    request_id: ReplyId<PutReply>,
++    key: Option<IndexedDBKeyType>,
++    value: Vec<u8>,
++    should_overwrite: bool,
++    index_keys: Vec<IndexedDBIndexKeys>,
+ ) -> KvsOperation {
+     request(
+         store,
+         request_id,
+         AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
+-            key: Some(key),
++            key,
+             value,
+             should_overwrite,
++            index_keys,
+         }),
+     )
+ }
+ 
++/// The keys `keys` of a record in the index `index`.
++fn index_keys(index: i64, keys: impl IntoIterator<Item = IndexedDBKeyType>) -> IndexedDBIndexKeys {
++    IndexedDBIndexKeys {
++        index_id: index,
++        keys: keys.into_iter().map(IndexedDBIndexKey::Key).collect(),
++    }
++}
++
++/// No keys in each of the indexes `indexes`.
++fn no_index_keys(indexes: &[i64]) -> Vec<IndexedDBIndexKeys> {
++    indexes.iter().map(|index| index_keys(*index, [])).collect()
++}
++
+ /// Runs `puts` (an explicit key or `None` for a generated one, and the value) in order as one
+-/// batch of the readwrite `transaction` on `store`, and returns their replies.
++/// batch of the readwrite `transaction` on `store`, which has no indexes, and returns their
++/// replies.
+ fn run_puts<X: SqlExecutor>(
+     db: &SqlEngine<X>,
+     transaction: u64,
+     store: i64,
+     puts: Vec<(Option<IndexedDBKeyType>, Vec<u8>)>,
+     should_overwrite: bool,
++) -> Vec<BackendResult<PutItemResult>> {
++    let puts = puts
++        .into_iter()
++        .map(|(key, value)| (key, value, vec![]))
++        .collect();
++    run_indexed_puts(db, transaction, store, puts, should_overwrite)
++}
++
++/// Like [`run_puts`], with the keys of each record in the store's indexes.
++fn run_indexed_puts<X: SqlExecutor>(
++    db: &SqlEngine<X>,
++    transaction: u64,
++    store: i64,
++    puts: Vec<(Option<IndexedDBKeyType>, Vec<u8>, Vec<IndexedDBIndexKeys>)>,
++    should_overwrite: bool,
+ ) -> Vec<BackendResult<PutItemResult>> {
+     let (requests, receivers): (Vec<_>, Vec<_>) = puts
+         .into_iter()
+-        .map(|(key, value)| {
++        .map(|(key, value, index_keys)| {
+             let (id, receiver) = get_callback();
+-            let operation = AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
+-                key,
+-                value,
+-                should_overwrite,
+-            });
+-            (request(store, id, operation), receiver)
++            let put = indexed_put_request(store, id, key, value, should_overwrite, index_keys);
++            (put, receiver)
+         })
+         .unzip();
+     run_batch(db, transaction, IndexedDBTxnMode::Readwrite, requests);
+@@ -1567,6 +1630,7 @@ fn test_delete_item_range_respects_open_bounds<X: SqlExecutor>() {
+                 Some(IndexedDBKeyType::Number(key as f64)),
+                 &[key as u8],
+                 false,
++                vec![],
+             )
+             .expect("Failed to seed object store");
+         }
+@@ -1664,12 +1728,13 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
+         1,
+         IndexedDBTxnMode::Versionchange,
+         vec![
+-            put_request(
++            indexed_put_request(
+                 store_id,
+                 put.0,
+-                IndexedDBKeyType::Number(1.0),
++                Some(IndexedDBKeyType::Number(1.0)),
+                 vec![1],
+                 false,
++                no_index_keys(&index_ids),
+             ),
+             // Index names are unique per store, so this fails in the database.
+             schema(
+@@ -1679,12 +1744,13 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
+                     new_name: "b".into(),
+                 },
+             ),
+-            put_request(
++            indexed_put_request(
+                 store_id,
+                 put_after.0,
+-                IndexedDBKeyType::Number(2.0),
++                Some(IndexedDBKeyType::Number(2.0)),
+                 vec![2],
+                 false,
++                no_index_keys(&index_ids),
+             ),
+         ],
+     );
+@@ -1700,12 +1766,13 @@ fn test_failed_write_fails_the_transaction<X: SqlExecutor>() {
+         &db,
+         1,
+         IndexedDBTxnMode::Versionchange,
+-        vec![put_request(
++        vec![indexed_put_request(
+             store_id,
+             put_later.0,
+-            IndexedDBKeyType::Number(3.0),
++            Some(IndexedDBKeyType::Number(3.0)),
+             vec![3],
+             false,
++            no_index_keys(&index_ids),
+         )],
+     );
+     assert!(recv(&put_later.1).is_err());
+@@ -1975,7 +2042,13 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+             .into_iter()
+             .zip(&seeds)
+             .map(|(store, seed)| {
+-                put_request(store, seed.0, IndexedDBKeyType::Number(1.0), vec![1], false)
++                let index_keys = if store == kept {
++                    no_index_keys(&[by_a])
++                } else {
++                    vec![]
++                };
++                let key = Some(IndexedDBKeyType::Number(1.0));
++                indexed_put_request(store, seed.0, key, vec![1], false, index_keys)
+             })
+             .collect(),
+     );
+@@ -1989,7 +2062,14 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+         2,
+         IndexedDBTxnMode::Versionchange,
+         vec![
+-            put_request(kept, put.0, IndexedDBKeyType::Number(2.0), vec![2], false),
++            indexed_put_request(
++                kept,
++                put.0,
++                Some(IndexedDBKeyType::Number(2.0)),
++                vec![2],
++                false,
++                no_index_keys(&[by_a]),
++            ),
+             schema(
+                 created,
+                 AsyncSchemaOperation::CreateObjectStore {
+@@ -2036,6 +2116,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+                 key: None,
+                 value: vec![3],
+                 should_overwrite: false,
++                index_keys: vec![],
+             }),
+         )],
+     );
+@@ -2905,6 +2986,593 @@ fn key_path_decode_rejects_invalid_bytes() {
+     assert!(queries::decode_key_path(&[0xff]).is_err());
+ }
+ 
++/// A string key.
++fn string(string: &str) -> IndexedDBKeyType {
++    IndexedDBKeyType::String(string.into())
++}
++
++fn number(number: f64) -> IndexedDBKeyType {
++    IndexedDBKeyType::Number(number)
++}
++
++/// The records of the index `index` of `store`, as (key, primary key), in the index's order.
++fn index_records_of<X: SqlExecutor>(
++    db: &SqlEngine<X>,
++    store: i64,
++    index: i64,
++) -> Vec<(IndexedDBKeyType, IndexedDBKeyType)> {
++    let mut connection = db.connection();
++    let index = queries::object_store(&mut *connection, store)
++        .unwrap()
++        .unwrap()
++        .index(index)
++        .unwrap();
++    let sql = format!(
++        "SELECT value, object_data_key FROM {} WHERE index_id = ? \
++         ORDER BY value, object_data_key",
++        index.table()
++    );
++    query_rows(
++        &mut *connection,
++        &sql,
++        &[SqlParam::Integer(index.id)],
++        |row| {
++            Ok((
++                encoding::deserialize(&row.blob(0)?).unwrap(),
++                encoding::deserialize(&row.blob(1)?).unwrap(),
++            ))
++        },
++    )
++    .unwrap()
++}
++
++/// The number of records of the index `index` in both index tables.
++fn index_record_count<X: SqlExecutor>(db: &SqlEngine<X>, index: i64) -> i64 {
++    query_row(
++        &mut *db.connection(),
++        "SELECT (SELECT COUNT(*) FROM index_data WHERE index_id = ?) + \
++         (SELECT COUNT(*) FROM unique_index_data WHERE index_id = ?)",
++        &[SqlParam::Integer(index), SqlParam::Integer(index)],
++        |row| row.integer(0),
++    )
++    .unwrap()
++    .unwrap()
++}
++
++/// The number of index records whose record isn't in the store. The host's SQLite rejects them
++/// with its foreign keys; RDB doesn't check them in transactions.
++fn dangling_index_records<X: SqlExecutor>(db: &SqlEngine<X>) -> i64 {
++    query_row(
++        &mut *db.connection(),
++        "SELECT \
++         (SELECT COUNT(*) FROM index_data AS i WHERE NOT EXISTS (SELECT 1 FROM object_data AS o \
++         WHERE o.object_store_id = i.object_store_id AND o.key = i.object_data_key)) + \
++         (SELECT COUNT(*) FROM unique_index_data AS i WHERE NOT EXISTS (SELECT 1 FROM object_data \
++         AS o WHERE o.object_store_id = i.object_store_id AND o.key = i.object_data_key))",
++        &[],
++        |row| row.integer(0),
++    )
++    .unwrap()
++    .unwrap()
++}
++
++/// `(key, primary key)` index records with string keys and number primary keys.
++fn string_records(records: &[(&str, f64)]) -> Vec<(IndexedDBKeyType, IndexedDBKeyType)> {
++    records
++        .iter()
++        .map(|(key, primary_key)| (string(key), number(*primary_key)))
++        .collect()
++}
++
++fn remove_request(
++    store: i64,
++    request_id: ReplyId<BackendResult<()>>,
++    key_range: IndexedDBKeyRange,
++) -> KvsOperation {
++    request(
++        store,
++        request_id,
++        AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem { key_range }),
++    )
++}
++
++/// A put stores a record in each index for each of the record's keys there, a put that replaces a
++/// record replaces its index records, and an index without keys for the record gets none.
++fn test_index_records_follow_puts_and_overwrites<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "people", None, false).unwrap();
++    let index = |name: &str, unique, multi_entry| {
++        let key_path = KeyPath::String(name.to_owned());
++        create_index(&db, store, name.to_owned(), key_path, unique, multi_entry).unwrap()
++    };
++    let (by_name, by_email, by_tag) = (
++        index("name", false, false),
++        index("email", true, false),
++        index("tag", false, true),
++    );
++    let keys = |name: Option<&str>, email: &str, tags: &[&str]| {
++        vec![
++            index_keys(by_name, name.map(string)),
++            index_keys(by_email, [string(email)]),
++            index_keys(by_tag, tags.iter().map(|tag| string(tag))),
++        ]
++    };
++    let puts = vec![
++        (
++            Some(number(1.0)),
++            vec![1],
++            keys(Some("ann"), "a@x", &["red", "blue"]),
++        ),
++        (
++            Some(number(2.0)),
++            vec![2],
++            keys(Some("ann"), "b@x", &["blue"]),
++        ),
++        (Some(number(3.0)), vec![3], keys(None, "c@x", &[])),
++    ];
++    assert_eq!(
++        run_indexed_puts(&db, 1, store, puts, true),
++        vec![key_reply(1.0), key_reply(2.0), key_reply(3.0)]
++    );
++    let emails = string_records(&[("a@x", 1.0), ("b@x", 2.0), ("c@x", 3.0)]);
++    assert_eq!(
++        index_records_of(&db, store, by_name),
++        string_records(&[("ann", 1.0), ("ann", 2.0)])
++    );
++    assert_eq!(index_records_of(&db, store, by_email), emails);
++    assert_eq!(
++        index_records_of(&db, store, by_tag),
++        string_records(&[("blue", 1.0), ("blue", 2.0), ("red", 1.0)])
++    );
++
++    // Record 1 gets another name, keeps its own email, and loses its tags.
++    let puts = vec![(Some(number(1.0)), vec![4], keys(Some("bea"), "a@x", &[]))];
++    assert_eq!(
++        run_indexed_puts(&db, 1, store, puts, true),
++        vec![key_reply(1.0)]
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++    assert_eq!(
++        index_records_of(&db, store, by_name),
++        string_records(&[("ann", 2.0), ("bea", 1.0)])
++    );
++    assert_eq!(index_records_of(&db, store, by_email), emails);
++    assert_eq!(
++        index_records_of(&db, store, by_tag),
++        string_records(&[("blue", 2.0)])
++    );
++    // A unique index's records are only in `unique_index_data`.
++    assert_eq!(index_record_count(&db, by_email), 3);
++    assert_eq!(dangling_index_records(&db), 0);
++}
++
++/// Deleting a record, a range of records or all of them deletes their index records, and only
++/// theirs.
++fn test_deleted_records_take_their_index_records_along<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let other = create_store(&db, "other", None, false).unwrap();
++    let index = |store, name: &str, unique| {
++        let key_path = KeyPath::String(name.to_owned());
++        create_index(&db, store, name.to_owned(), key_path, unique, false).unwrap()
++    };
++    let (by_parity, by_tenfold, by_other) = (
++        index(store, "parity", false),
++        index(store, "tenfold", true),
++        index(other, "parity", false),
++    );
++    let puts = (1..=6)
++        .map(|key| {
++            let key = f64::from(key);
++            let index_keys = vec![
++                index_keys(by_parity, [number(key % 2.0)]),
++                index_keys(by_tenfold, [number(key * 10.0)]),
++            ];
++            (Some(number(key)), vec![], index_keys)
++        })
++        .collect();
++    assert!(
++        run_indexed_puts(&db, 1, store, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    let puts = vec![(
++        Some(number(2.0)),
++        vec![],
++        vec![index_keys(by_other, [number(0.0)])],
++    )];
++    assert_eq!(
++        run_indexed_puts(&db, 1, other, puts, false),
++        vec![key_reply(2.0)]
++    );
++
++    let removals: Vec<_> = (0..2).map(|_| get_callback()).collect();
++    let lower_open = IndexedDBKeyRange::new(Some(number(3.0)), Some(number(5.0)), true, false);
++    run_batch(
++        &db,
++        1,
++        IndexedDBTxnMode::Readwrite,
++        vec![
++            remove_request(store, removals[0].0, IndexedDBKeyRange::only(number(2.0))),
++            remove_request(store, removals[1].0, lower_open),
++        ],
++    );
++    assert!(removals.iter().all(|removal| recv(&removal.1).is_ok()));
++    assert_eq!(stored_keys(&db, store), number_keys([1, 3, 6]));
++    let records = |pairs: &[(f64, f64)]| -> Vec<_> {
++        pairs
++            .iter()
++            .map(|(key, primary_key)| (number(*key), number(*primary_key)))
++            .collect()
++    };
++    assert_eq!(
++        index_records_of(&db, store, by_parity),
++        records(&[(0.0, 6.0), (1.0, 1.0), (1.0, 3.0)])
++    );
++    assert_eq!(
++        index_records_of(&db, store, by_tenfold),
++        records(&[(10.0, 1.0), (30.0, 3.0), (60.0, 6.0)])
++    );
++
++    let clear = get_callback::<BackendResult<()>>();
++    run_batch(
++        &db,
++        1,
++        IndexedDBTxnMode::Readwrite,
++        vec![request(
++            store,
++            clear.0,
++            AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear),
++        )],
++    );
++    assert_eq!(recv(&clear.1), Ok(()));
++    assert_eq!(commit(&db, 1), Ok(()));
++    assert_eq!(index_record_count(&db, by_parity), 0);
++    assert_eq!(index_record_count(&db, by_tenfold), 0);
++    assert_eq!(
++        index_records_of(&db, other, by_other),
++        records(&[(0.0, 2.0)])
++    );
++    assert_eq!(dangling_index_records(&db), 0);
++}
++
++/// Deleting an index deletes its records, and deleting a store those of all its indexes, so an
++/// index that gets the id of a deleted one in a later transaction starts empty.
++fn test_deleted_indexes_take_their_records_along<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    set_version(&db, 1).unwrap();
++    let kept = create_store(&db, "kept", None, false).unwrap();
++    let deleted = create_store(&db, "deleted", None, false).unwrap();
++    let key_path = KeyPath::String("a".to_owned());
++    let index = |store, name: &str, unique| {
++        create_index(&db, store, name.to_owned(), key_path.clone(), unique, false).unwrap()
++    };
++    let (stays, goes, goes_with_store) = (
++        index(kept, "stays", false),
++        index(kept, "goes", true),
++        index(deleted, "goes_with_store", false),
++    );
++    let puts = vec![(
++        Some(number(1.0)),
++        vec![],
++        vec![
++            index_keys(stays, [string("a")]),
++            index_keys(goes, [string("a")]),
++        ],
++    )];
++    assert!(run_indexed_puts(&db, 1, kept, puts, false)[0].is_ok());
++    let puts = vec![(
++        Some(number(1.0)),
++        vec![],
++        vec![index_keys(goes_with_store, [string("a")])],
++    )];
++    assert!(run_indexed_puts(&db, 1, deleted, puts, false)[0].is_ok());
++    assert_eq!(commit(&db, 1), Ok(()));
++    assert_eq!(
++        [stays, goes, goes_with_store].map(|index| index_record_count(&db, index)),
++        [1, 1, 1]
++    );
++
++    db.upgrade_version(txn(2), 2);
++    let failures = run_batch(
++        &db,
++        2,
++        IndexedDBTxnMode::Versionchange,
++        vec![
++            schema(kept, AsyncSchemaOperation::DeleteIndex { index_id: goes }),
++            schema(deleted, AsyncSchemaOperation::DeleteObjectStore),
++        ],
++    );
++    assert_eq!(failures, vec![]);
++    assert_eq!(commit(&db, 2), Ok(()));
++    assert_eq!(
++        [stays, goes, goes_with_store].map(|index| index_record_count(&db, index)),
++        [1, 0, 0]
++    );
++
++    // The largest index id is `stays`'s now, so the ids of the deleted indexes come back.
++    db.upgrade_version(txn(3), 3);
++    let failures = run_batch(
++        &db,
++        3,
++        IndexedDBTxnMode::Versionchange,
++        vec![schema(
++            kept,
++            AsyncSchemaOperation::CreateIndex {
++                index_id: goes,
++                name: "comes".into(),
++                key_path: key_path.clone(),
++                unique: false,
++                multi_entry: false,
++            },
++        )],
++    );
++    assert_eq!(failures, vec![]);
++    assert_eq!(commit(&db, 3), Ok(()));
++    assert_eq!(index_records_of(&db, kept, goes), vec![]);
++    assert_eq!(index_record_count(&db, goes), 0);
++    assert_eq!(dangling_index_records(&db), 0);
++}
++
++/// A put with a key that a unique index has for another record fails without any effect: not on
++/// the record it would replace, on the other indexes or on the key generator, and the transaction
++/// goes on. A replaced record doesn't conflict with its own keys, and each key of a multiEntry
++/// unique index must be unique.
++fn test_unique_index_conflict_changes_nothing<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "users", None, true).unwrap();
++    let index = |name: &str, unique, multi_entry| {
++        let key_path = KeyPath::String(name.to_owned());
++        create_index(&db, store, name.to_owned(), key_path, unique, multi_entry).unwrap()
++    };
++    let (by_email, by_name, by_tag) = (
++        index("email", true, false),
++        index("name", false, false),
++        index("tag", true, true),
++    );
++    let put = |key: Option<f64>, value: u8, email: &str, name: &str, tags: &[&str]| {
++        let index_keys = vec![
++            index_keys(by_email, [string(email)]),
++            index_keys(by_name, [string(name)]),
++            index_keys(by_tag, tags.iter().map(|tag| string(tag))),
++        ];
++        (key.map(number), vec![value], index_keys)
++    };
++    let conflict = |index| Ok(PutItemResult::UniqueIndexKeyExists(index));
++    let replies = run_indexed_puts(
++        &db,
++        1,
++        store,
++        vec![
++            put(None, 1, "a", "ann", &["t1", "t2"]),
++            put(None, 2, "b", "bob", &["t3"]),
++            put(None, 3, "a", "cat", &[]),
++            put(Some(10.0), 4, "x", "cat", &["t5", "t2"]),
++            put(Some(1.0), 5, "b", "cat", &[]),
++            put(Some(1.0), 6, "a", "ann", &["t2", "t1"]),
++            put(None, 7, "c", "dan", &["t4", "t4"]),
++        ],
++        true,
++    );
++    assert_eq!(
++        replies,
++        vec![
++            key_reply(1.0),
++            key_reply(2.0),
++            conflict(by_email),
++            conflict(by_tag),
++            conflict(by_email),
++            key_reply(1.0),
++            key_reply(3.0),
++        ]
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++    assert_eq!(db.key_generator_current_number(store), Some(4));
++    assert_eq!(stored_keys(&db, store), number_keys([1, 2, 3]));
++    let get = get_callback::<GetReply>();
++    run_batch(
++        &db,
++        2,
++        IndexedDBTxnMode::Readonly,
++        vec![request(
++            store,
++            get.0,
++            AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
++                key_range: IndexedDBKeyRange::only(number(1.0)),
++            }),
++        )],
++    );
++    assert_eq!(recv(&get.1), Ok(Some(stored_value(1.0, vec![6]))));
++    assert_eq!(
++        index_records_of(&db, store, by_email),
++        string_records(&[("a", 1.0), ("b", 2.0), ("c", 3.0)])
++    );
++    assert_eq!(
++        index_records_of(&db, store, by_name),
++        string_records(&[("ann", 1.0), ("bob", 2.0), ("dan", 3.0)])
++    );
++    assert_eq!(
++        index_records_of(&db, store, by_tag),
++        string_records(&[("t1", 1.0), ("t2", 1.0), ("t3", 2.0), ("t4", 3.0)])
++    );
++    assert_eq!(dangling_index_records(&db), 0);
++}
++
++/// The parts of index keys that come from a generated key become the record's key, as a whole
++/// key and inside an array key.
++fn test_placeholders_become_the_record_key<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let id = KeyPath::String("id".to_owned());
++    let store = create_store(&db, "items", Some(id.clone()), true).unwrap();
++    let pair = KeyPath::Sequence(vec!["x".to_owned(), "id".to_owned()]);
++    let by_id = create_index(&db, store, "by_id".to_owned(), id.clone(), true, false).unwrap();
++    let by_ids = create_index(&db, store, "by_ids".to_owned(), id, false, true).unwrap();
++    let by_pair = create_index(&db, store, "by_pair".to_owned(), pair, true, false).unwrap();
++    let placeholders = |x: f64| {
++        vec![
++            IndexedDBIndexKeys {
++                index_id: by_id,
++                keys: vec![IndexedDBIndexKey::PrimaryKey],
++            },
++            IndexedDBIndexKeys {
++                index_id: by_ids,
++                keys: vec![IndexedDBIndexKey::PrimaryKey],
++            },
++            IndexedDBIndexKeys {
++                index_id: by_pair,
++                keys: vec![IndexedDBIndexKey::Array(vec![
++                    IndexedDBIndexKey::Key(number(x)),
++                    IndexedDBIndexKey::PrimaryKey,
++                ])],
++            },
++        ]
++    };
++    let explicit = vec![
++        index_keys(by_id, [number(5.0)]),
++        index_keys(by_ids, [number(5.0)]),
++        index_keys(
++            by_pair,
++            [IndexedDBKeyType::Array(vec![number(0.0), number(5.0)])],
++        ),
++    ];
++    let replies = run_indexed_puts(
++        &db,
++        1,
++        store,
++        vec![
++            (None, vec![1], placeholders(0.0)),
++            (None, vec![2], placeholders(0.0)),
++            (Some(number(5.0)), vec![3], explicit),
++            (None, vec![4], placeholders(1.0)),
++        ],
++        false,
++    );
++    assert_eq!(
++        replies,
++        vec![
++            key_reply(1.0),
++            key_reply(2.0),
++            key_reply(5.0),
++            key_reply(6.0)
++        ]
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++    let same: Vec<_> = [1.0, 2.0, 5.0, 6.0]
++        .into_iter()
++        .map(|key| (number(key), number(key)))
++        .collect();
++    assert_eq!(index_records_of(&db, store, by_id), same);
++    assert_eq!(index_records_of(&db, store, by_ids), same);
++    let pairs: Vec<_> = [(0.0, 1.0), (0.0, 2.0), (0.0, 5.0), (1.0, 6.0)]
++        .into_iter()
++        .map(|(x, key)| {
++            (
++                IndexedDBKeyType::Array(vec![number(x), number(key)]),
++                number(key),
++            )
++        })
++        .collect();
++    assert_eq!(index_records_of(&db, store, by_pair), pairs);
++}
++
++/// Aborting a transaction reverts what it did to index records, in both index tables.
++fn test_abort_reverts_index_records<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let key_path = KeyPath::String("a".to_owned());
++    let plain = create_index(
++        &db,
++        store,
++        "plain".to_owned(),
++        key_path.clone(),
++        false,
++        false,
++    )
++    .unwrap();
++    let unique = create_index(&db, store, "unique".to_owned(), key_path, true, false).unwrap();
++    let put = |key: f64, index_key: &str| {
++        let index_keys = vec![
++            index_keys(plain, [string(index_key)]),
++            index_keys(unique, [string(index_key)]),
++        ];
++        (Some(number(key)), vec![], index_keys)
++    };
++    assert!(run_indexed_puts(&db, 1, store, vec![put(1.0, "a")], true)[0].is_ok());
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    let replies = run_indexed_puts(&db, 2, store, vec![put(1.0, "b"), put(2.0, "c")], true);
++    assert!(replies.iter().all(Result::is_ok));
++    let removal = get_callback();
++    run_batch(
++        &db,
++        2,
++        IndexedDBTxnMode::Readwrite,
++        vec![remove_request(
++            store,
++            removal.0,
++            IndexedDBKeyRange::only(number(1.0)),
++        )],
++    );
++    assert_eq!(recv(&removal.1), Ok(()));
++    assert_eq!(
++        index_records_of(&db, store, unique),
++        string_records(&[("c", 2.0)])
++    );
++    abort(&db, 2);
++
++    let before = string_records(&[("a", 1.0)]);
++    assert_eq!(index_records_of(&db, store, plain), before);
++    assert_eq!(index_records_of(&db, store, unique), before);
++    // The aborted put's unique key is free again.
++    assert_eq!(
++        run_indexed_puts(&db, 3, store, vec![put(2.0, "b")], true),
++        vec![key_reply(2.0)]
++    );
++    assert_eq!(commit(&db, 3), Ok(()));
++}
++
++/// Index keys for other indexes than exactly the store's mean that script's metadata isn't the
++/// database's, so the put fails its transaction, which rolls back.
++fn test_index_keys_for_other_indexes_fail_the_transaction<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let other = create_store(&db, "other", None, false).unwrap();
++    let key_path = KeyPath::String("a".to_owned());
++    let index = create_index(&db, store, "a".to_owned(), key_path.clone(), false, false).unwrap();
++    let other_index = create_index(&db, other, "a".to_owned(), key_path, false, false).unwrap();
++    let mismatches = [
++        vec![],
++        no_index_keys(&[index, index]),
++        no_index_keys(&[index, other_index]),
++        no_index_keys(&[other_index]),
++    ];
++    for (transaction, index_keys) in (1..).zip(mismatches) {
++        let replies = run_indexed_puts(
++            &db,
++            transaction,
++            store,
++            vec![
++                (Some(number(1.0)), vec![], no_index_keys(&[index])),
++                (Some(number(2.0)), vec![], index_keys),
++                (Some(number(3.0)), vec![], no_index_keys(&[index])),
++            ],
++            false,
++        );
++        assert_eq!(replies[0], key_reply(1.0));
++        assert!(matches!(replies[1], Err(BackendError::DbErr(_))));
++        assert!(replies[2].is_err());
++        assert!(commit(&db, transaction).is_err());
++        assert_eq!(stored_keys(&db, store), vec![]);
++    }
++}
++
+ #[test]
+ fn has_enospc_detects_enospc_and_nothing_else() {
+     use crate::shared::has_enospc;
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 9e0be7f718e..1ee0ab8eeac 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -2497,6 +2497,7 @@ mod tests {
+                 key: None,
+                 value: vec![1],
+                 should_overwrite: false,
++                index_keys: vec![],
+             }),
+         );
+         assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(2));
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index 8d90d349918..319c0412a6f 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -2,7 +2,7 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use std::cell::Cell;
++use std::cell::{Cell, RefCell};
+ use std::collections::HashMap;
+ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{LazyLock, Mutex, OnceLock, mpsc};
+@@ -20,10 +20,10 @@ use storage::ClientStorageThreadFactory;
+ use storage_traits::StorageThreads;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+-    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBKeyRange,
+-    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnId,
+-    IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput, StorageBottleSource,
+-    SyncOperation, TransactionEvent,
++    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBIndexKeys,
++    IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg,
++    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput,
++    StorageBottleSource, SyncOperation, TransactionEvent,
+ };
+ use tempfile::TempDir;
+ use uuid::Uuid;
+@@ -146,6 +146,9 @@ struct IndexedDbTestContext {
+     bottle_source: StorageBottleSource,
+     origin: ImmutableOrigin,
+     shutdown: Cell<bool>,
++    /// The indexes that [`create_index`] created, by database and store, for which puts send
++    /// index keys, as script's metadata has them.
++    indexes: RefCell<HashMap<(String, i64), Vec<i64>>>,
+ }
+ 
+ impl IndexedDbTestContext {
+@@ -172,6 +175,7 @@ impl IndexedDbTestContext {
+             bottle_source,
+             origin,
+             shutdown: Cell::new(false),
++            indexes: Default::default(),
+         }
+     }
+ 
+@@ -446,6 +450,11 @@ fn create_index(
+     unique: bool,
+     multi_entry: bool,
+ ) -> mpsc::Receiver<Option<BackendError>> {
++    ctx.indexes
++        .borrow_mut()
++        .entry((db_name.to_owned(), store))
++        .or_default()
++        .push(index_id);
+     send_schema_operation(
+         ctx,
+         db_name,
+@@ -629,6 +638,43 @@ fn put_item_request(
+     key: Option<IndexedDBKeyType>,
+     value: Vec<u8>,
+     should_overwrite: bool,
++) -> mpsc::Receiver<Option<BackendResult<PutItemResult>>> {
++    let index_keys = ctx
++        .indexes
++        .borrow()
++        .get(&(db_name.to_owned(), store))
++        .into_iter()
++        .flatten()
++        .map(|&index_id| IndexedDBIndexKeys {
++            index_id,
++            keys: vec![],
++        })
++        .collect();
++    indexed_put_request(
++        ctx,
++        db_name,
++        store,
++        txn,
++        request_id,
++        key,
++        value,
++        should_overwrite,
++        index_keys,
++    )
++}
++
++/// A put with the record's keys in the store's indexes.
++#[allow(clippy::too_many_arguments)]
++fn indexed_put_request(
++    ctx: &IndexedDbTestContext,
++    db_name: &str,
++    store: i64,
++    txn: IndexedDBTxnId,
++    request_id: u64,
++    key: Option<IndexedDBKeyType>,
++    value: Vec<u8>,
++    should_overwrite: bool,
++    index_keys: Vec<IndexedDBIndexKeys>,
+ ) -> mpsc::Receiver<Option<BackendResult<PutItemResult>>> {
+     send_request(
+         ctx,
+@@ -641,6 +687,7 @@ fn put_item_request(
+             key,
+             value,
+             should_overwrite,
++            index_keys,
+         }),
+     )
+ }
+diff --git a/tests/wpt/meta/IndexedDB/idbobjectstore-put-unique-index-constraint-is-atomic.any.js.ini b/tests/wpt/meta/IndexedDB/idbobjectstore-put-unique-index-constraint-is-atomic.any.js.ini
+index 97dc20d4298..00e1430194e 100644
+--- a/tests/wpt/meta/IndexedDB/idbobjectstore-put-unique-index-constraint-is-atomic.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbobjectstore-put-unique-index-constraint-is-atomic.any.js.ini
+@@ -2,15 +2,7 @@
+   expected: ERROR
+ 
+ [idbobjectstore-put-unique-index-constraint-is-atomic.any.sharedworker.html]
+-  [A put() that fails a unique index constraint must not delete the record it would have overwritten]
+-    expected: FAIL
+-
+ 
+ [idbobjectstore-put-unique-index-constraint-is-atomic.any.html]
+-  [A put() that fails a unique index constraint must not delete the record it would have overwritten]
+-    expected: FAIL
+-
+ 
+ [idbobjectstore-put-unique-index-constraint-is-atomic.any.worker.html]
+-  [A put() that fails a unique index constraint must not delete the record it would have overwritten]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbobjectstore_add.any.js.ini b/tests/wpt/meta/IndexedDB/idbobjectstore_add.any.js.ini
+index a6537185d62..152cfbd5d72 100644
+--- a/tests/wpt/meta/IndexedDB/idbobjectstore_add.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbobjectstore_add.any.js.ini
+@@ -1,16 +1,8 @@
+ [idbobjectstore_add.any.sharedworker.html]
+-  [add() where an index has unique:true specified]
+-    expected: FAIL
+-
+ 
+ [idbobjectstore_add.any.worker.html]
+-  [add() where an index has unique:true specified]
+-    expected: FAIL
+-
+ 
+ [idbobjectstore_add.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbobjectstore_add.any.html]
+-  [add() where an index has unique:true specified]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbobjectstore_put.any.js.ini b/tests/wpt/meta/IndexedDB/idbobjectstore_put.any.js.ini
+index 7b30da87093..f7cac785c59 100644
+--- a/tests/wpt/meta/IndexedDB/idbobjectstore_put.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbobjectstore_put.any.js.ini
+@@ -1,16 +1,8 @@
+ [idbobjectstore_put.any.sharedworker.html]
+-  [put() where an index has unique:true specified]
+-    expected: FAIL
+-
+ 
+ [idbobjectstore_put.any.worker.html]
+-  [put() where an index has unique:true specified]
+-    expected: FAIL
+-
+ 
+ [idbobjectstore_put.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbobjectstore_put.any.html]
+-  [put() where an index has unique:true specified]
+-    expected: FAIL
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 958b8ed1f60..1b0e2a69c7a 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11742,6 +11742,69 @@
+       }
+      ]
+     ],
++    "index-keys-page-code.any.js": [
++     "5a4fccd09b72cd07b55ce718e89055880f891ce9",
++     [
++      "IndexedDB/index-keys-page-code.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: page code reached while computing index keys can't make requests"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/index-keys-page-code.any.serviceworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: page code reached while computing index keys can't make requests"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/index-keys-page-code.any.sharedworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: page code reached while computing index keys can't make requests"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/index-keys-page-code.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: page code reached while computing index keys can't make requests"
++        ]
++       ]
++      }
++     ]
++    ],
+     "removed-iframe-aborts-its-transactions.html": [
+      "4c72fe0190142520f2e483e292f0997bd6dc924b",
+      [
+@@ -11895,6 +11958,69 @@
+       }
+      ]
+     ],
++    "unique-index-keys.any.js": [
++     "da058697baaf17203097f408822472199a02b144",
++     [
++      "IndexedDB/unique-index-keys.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/unique-index-keys.any.serviceworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/unique-index-keys.any.sharedworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/unique-index-keys.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: the keys a put gives unique indexes, and what a failed put leaves"
++        ]
++       ]
++      }
++     ]
++    ],
+     "upgrade-metadata-by-id.any.js": [
+      "8da07ef7c26414dfc154868aa33032afd3af6d52",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/index-keys-page-code.any.js b/tests/wpt/mozilla/tests/IndexedDB/index-keys-page-code.any.js
+new file mode 100644
+index 00000000000..5a4fccd09b7
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/index-keys-page-code.any.js
+@@ -0,0 +1,123 @@
++// META: global=window,worker
++// META: title=IndexedDB: page code reached while computing index keys can't make requests
++
++// https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store step 5 extracts the index
++// keys from a clone in a user-agent defined realm, where no page code runs. Servo computes them in
++// the page's realm when put(), add() or update() is called, where a getter on Array.prototype that
++// a hole in a multiEntry array reaches does run. The transaction is inactive meanwhile, as it is
++// while the value is cloned, so requests from such a getter throw a TransactionInactiveError
++// instead of overtaking the request being made.
++
++'use strict';
++
++function openDatabase(t, upgrade) {
++  const name = 'index-keys-page-code-' + Math.random();
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open(name, 1);
++    request.onupgradeneeded = () => upgrade(request.result);
++    request.onsuccess = () => {
++      t.add_cleanup(() => {
++        request.result.close();
++        indexedDB.deleteDatabase(name);
++      });
++      resolve(request.result);
++    };
++    request.onerror = () => reject(request.error);
++  });
++}
++
++function result(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++function complete(transaction) {
++  return new Promise((resolve, reject) => {
++    transaction.oncomplete = resolve;
++    transaction.onabort = () => reject(transaction.error);
++  });
++}
++
++// An array with a hole at index 1 that the getter below acts on; the mark survives cloning.
++function tagsWithHole(first, last) {
++  const tags = [first, , last];
++  tags.hole = true;
++  return tags;
++}
++
++// Defines a getter of Array.prototype[1] that, for an array of `tagsWithHole`, tries the requests
++// of `requests` against the transaction and returns the names of their exceptions, joined, through
++// `errors()`, until the returned function removes it. Assignments to index 1 of other arrays still
++// create their own property.
++function arrayGetterMakingRequests(t, requests) {
++  let names = '';
++  Object.defineProperty(Array.prototype, 1, {
++    configurable: true,
++    get() {
++      if (this.hole !== true) {
++        return undefined;
++      }
++      for (const request of requests) {
++        try {
++          request();
++          names += ' none';
++        } catch (e) {
++          names += ' ' + e.name;
++        }
++      }
++      return undefined;
++    },
++    set(value) {
++      Object.defineProperty(this, 1, {value, writable: true, enumerable: true, configurable: true});
++    },
++  });
++  const remove = () => { delete Array.prototype[1]; };
++  t.add_cleanup(remove);
++  return [remove, () => names.trim()];
++}
++
++function createTagsStore(db) {
++  db.createObjectStore('items').createIndex('tags', 'tags', {multiEntry: true});
++}
++
++promise_test(async t => {
++  const db = await openDatabase(t, createTagsStore);
++  const tx = db.transaction('items', 'readwrite');
++  const done = complete(tx);
++  const store = tx.objectStore('items');
++  const [remove, errors] = arrayGetterMakingRequests(t, [
++    () => store.put({tags: ['inner']}, 'inner'),
++    () => store.get('outer'),
++    () => store.count(),
++  ]);
++  const put = store.put({tags: tagsWithHole('a', 'b')}, 'outer');
++  remove();
++  assert_equals(errors(), 'TransactionInactiveError TransactionInactiveError TransactionInactiveError');
++  assert_equals(await result(put), 'outer');
++  assert_array_equals(await result(store.getAllKeys()), ['outer']);
++  await done;
++}, 'Requests from a getter reached while put() computes index keys throw');
++
++promise_test(async t => {
++  const db = await openDatabase(t, createTagsStore);
++  const setup = db.transaction('items', 'readwrite');
++  setup.objectStore('items').put({tags: ['x']}, 'record');
++  await complete(setup);
++
++  const tx = db.transaction('items', 'readwrite');
++  const done = complete(tx);
++  const store = tx.objectStore('items');
++  const cursor = await result(store.openCursor());
++  const [remove, errors] = arrayGetterMakingRequests(t, [
++    () => store.put({tags: ['inner']}, 'inner'),
++    () => cursor.continue(),
++  ]);
++  const update = cursor.update({tags: tagsWithHole('c', 'd')});
++  remove();
++  assert_equals(errors(), 'TransactionInactiveError TransactionInactiveError');
++  assert_equals(await result(update), 'record');
++  assert_array_equals(await result(store.getAllKeys()), ['record']);
++  await done;
++}, 'Requests from a getter reached while update() computes index keys throw');
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/unique-index-keys.any.js b/tests/wpt/mozilla/tests/IndexedDB/unique-index-keys.any.js
+new file mode 100644
+index 00000000000..da058697baa
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/unique-index-keys.any.js
+@@ -0,0 +1,229 @@
++// META: global=window,worker
++// META: title=IndexedDB: the keys a put gives unique indexes, and what a failed put leaves
++
++// https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store step 5: each index gets the
++// keys extracted from the value, none if extracting fails or gives an invalid key, and each valid
++// subkey of an array for a multiEntry index. A key that a unique index has for another record
++// fails the put with a ConstraintError, and a failed request reverts all its changes
++// (https://w3c.github.io/IndexedDB/#asynchronously-execute-a-request). Index reads aren't
++// implemented yet, so these tests observe the index records through unique conflicts.
++
++'use strict';
++
++function openDatabase(t, upgrade) {
++  const name = 'unique-index-keys-' + Math.random();
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open(name, 1);
++    request.onupgradeneeded = () => upgrade(request.result, request.transaction);
++    request.onsuccess = () => {
++      t.add_cleanup(() => {
++        request.result.close();
++        indexedDB.deleteDatabase(name);
++      });
++      resolve(request.result);
++    };
++    request.onerror = () => reject(request.error);
++  });
++}
++
++function result(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++// The name of the request's error, which is prevented, so that the transaction goes on.
++function failure(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => reject(new Error('The request should fail'));
++    request.onerror = event => {
++      event.preventDefault();
++      resolve(request.error.name);
++    };
++  });
++}
++
++function complete(transaction) {
++  return new Promise((resolve, reject) => {
++    transaction.oncomplete = resolve;
++    transaction.onabort = () => reject(transaction.error);
++  });
++}
++
++function usersStore(db, options) {
++  const store = db.createObjectStore('users', options);
++  store.createIndex('email', 'email', {unique: true});
++  store.createIndex('nick', 'nick', {unique: true});
++  store.createIndex('name', 'name');
++  return store;
++}
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => usersStore(db, {autoIncrement: true}));
++  const tx = db.transaction('users', 'readwrite');
++  const store = tx.objectStore('users');
++  assert_equals(await result(store.add({email: 'a', nick: 'x'})), 1);
++  assert_equals(await failure(store.add({email: 'a', nick: 'y'})), 'ConstraintError');
++  assert_equals(await failure(store.put({email: 'a', nick: 'y'}, 7)), 'ConstraintError');
++  // Neither the record nor the other unique index's key nor the key generator changed.
++  assert_equals(await result(store.count()), 1);
++  assert_equals(await result(store.add({email: 'b', nick: 'y'})), 2);
++  await complete(tx);
++}, 'A put that a unique index rejects stores nothing, also not in other indexes or the key ' +
++   'generator');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => usersStore(db, {keyPath: 'id'}));
++  const tx = db.transaction('users', 'readwrite');
++  const store = tx.objectStore('users');
++  await result(store.put({id: 1, email: 'a', nick: 'x'}));
++  await result(store.put({id: 2, email: 'b', nick: 'y'}));
++  assert_equals(await failure(store.put({id: 1, email: 'b', nick: 'z'})), 'ConstraintError');
++  assert_equals((await result(store.get(1))).email, 'a', 'the record is unchanged');
++  // Record 1 still has its keys, and replacing it with its own keys is no conflict.
++  assert_equals(await failure(store.put({id: 3, email: 'c', nick: 'x'})), 'ConstraintError');
++  await result(store.put({id: 1, email: 'a', nick: 'x', name: 'ann'}));
++  // Record 1 gives up 'x', which is free for another record then.
++  await result(store.put({id: 1, email: 'a', nick: 'w'}));
++  await result(store.put({id: 3, email: 'c', nick: 'x'}));
++  await complete(tx);
++}, 'A record that a put replaces keeps its index keys if the put fails, and gives them up if ' +
++   'it succeeds');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    db.createObjectStore('store', {autoIncrement: true})
++        .createIndex('tags', 'tags', {unique: true, multiEntry: true});
++  });
++  const tx = db.transaction('store', 'readwrite');
++  const store = tx.objectStore('store');
++  await result(store.put({tags: [1, 2]}));
++  assert_equals(await failure(store.put({tags: [3, 2]})), 'ConstraintError');
++  // The failed put stored no key 3, and a key repeated in one value is no conflict.
++  await result(store.put({tags: [3, 3]}));
++  // Subkeys that aren't valid keys are skipped, the others are kept.
++  await result(store.put({tags: [4, {}, null, undefined, [5, {}], 4]}));
++  assert_equals(await failure(store.put({tags: [4]})), 'ConstraintError');
++  await result(store.put({tags: [[5]]}));
++  // An empty array gives no records, and a non-array value gives one.
++  await result(store.put({tags: []}));
++  await result(store.put({tags: []}));
++  await result(store.put({tags: 6}));
++  assert_equals(await failure(store.put({tags: [6]})), 'ConstraintError');
++  await complete(tx);
++}, 'Each key of a multiEntry unique index must be unique, and invalid subkeys are skipped');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    db.createObjectStore('store', {autoIncrement: true})
++        .createIndex('k', 'k', {unique: true});
++  });
++  const tx = db.transaction('store', 'readwrite');
++  const store = tx.objectStore('store');
++  for (const value of [{}, {k: {}}, {k: [1, {}]}, {k: NaN}, {k: null}, {k: undefined},
++                       {k: true}]) {
++    await result(store.put(value));
++    await result(store.put(value));
++  }
++  assert_equals(await result(store.count()), 14);
++  await complete(tx);
++}, 'A value without a valid key at the key path gives a unique index no record');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => usersStore(db, {keyPath: 'id'}));
++  let tx = db.transaction('users', 'readwrite');
++  let store = tx.objectStore('users');
++  for (let id = 1; id <= 6; id++) {
++    await result(store.put({id, email: 'e' + id, nick: 'n' + id}));
++  }
++  await complete(tx);
++
++  tx = db.transaction('users', 'readwrite');
++  store = tx.objectStore('users');
++  await result(store.put({id: 7, email: 'e7'}));
++  const aborted = new Promise(resolve => tx.onabort = resolve);
++  tx.abort();
++  await aborted;
++
++  tx = db.transaction('users', 'readwrite');
++  store = tx.objectStore('users');
++  // The aborted put's key is free.
++  await result(store.put({id: 8, email: 'e7'}));
++  await result(store.delete(1));
++  await result(store.delete(IDBKeyRange.bound(2, 4, true, false)));
++  // Deleting a record frees its keys.
++  for (const id of [1, 3, 4]) {
++    await result(store.put({id: 10 + id, email: 'e' + id}));
++  }
++  assert_equals(await failure(store.put({id: 12, email: 'e2'})), 'ConstraintError');
++  const cursor = await result(store.openCursor(5));
++  await result(cursor.update({id: 5, email: 'z', nick: 'n5'}));
++  await result(store.put({id: 15, email: 'e5'}));
++  assert_equals(await failure(store.put({id: 16, email: 'z'})), 'ConstraintError');
++  const cursorToDelete = await result(store.openCursor(6));
++  await result(cursorToDelete.delete());
++  await result(store.put({id: 16, email: 'e6', nick: 'n6'}));
++  await result(store.clear());
++  await result(store.put({id: 17, email: 'z', nick: 'n5'}));
++  await complete(tx);
++}, 'Aborting, deleting, clearing and cursor updates and deletes free unique keys');
++
++promise_test(async t => {
++  const name = 'unique-index-keys-reused-' + Math.random();
++  let db;
++  t.add_cleanup(() => {
++    db.close();
++    indexedDB.deleteDatabase(name);
++  });
++  const open = (version, upgrade) => new Promise((resolve, reject) => {
++    const request = indexedDB.open(name, version);
++    request.onupgradeneeded = () => upgrade(request.result, request.transaction);
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++  db = await open(1, db => {
++    const store = db.createObjectStore('store', {keyPath: 'id'});
++    store.createIndex('a', 'a', {unique: true});
++    store.put({id: 1, a: 'x'});
++    const other = db.createObjectStore('other', {keyPath: 'id'});
++    other.createIndex('b', 'b', {unique: true});
++    other.put({id: 1, b: 'x'});
++  });
++  db.close();
++  db = await open(2, (db, tx) => {
++    tx.objectStore('store').deleteIndex('a');
++    db.deleteObjectStore('other');
++  });
++  db.close();
++  // The new indexes get the ids of the deleted ones, but none of their records.
++  db = await open(3, (db, tx) => {
++    tx.objectStore('store').createIndex('c', 'c', {unique: true});
++    db.createObjectStore('other', {keyPath: 'id'}).createIndex('d', 'd', {unique: true});
++  });
++  const tx = db.transaction(['store', 'other'], 'readwrite');
++  await result(tx.objectStore('store').put({id: 2, c: 'x'}));
++  await result(tx.objectStore('other').put({id: 2, d: 'x'}));
++  await complete(tx);
++}, 'Indexes created after others were deleted start without records');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('store', {keyPath: 'id', autoIncrement: true});
++    store.createIndex('id', 'id', {unique: true});
++    store.createIndex('ids', 'id', {unique: true, multiEntry: true});
++    store.createIndex('pair', ['x', 'id'], {unique: true});
++    store.createIndex('below', 'id.sub', {unique: true});
++    store.createIndex('x', 'x', {unique: true});
++  });
++  const tx = db.transaction('store', 'readwrite');
++  const store = tx.objectStore('store');
++  assert_equals(await result(store.put({x: 1})), 1);
++  assert_equals(await result(store.put({x: 2})), 2);
++  assert_equals(await failure(store.put({x: 2})), 'ConstraintError');
++  assert_equals(await result(store.put({x: 3})), 3, 'the failed put used no key');
++  // A record replaced with its own keys doesn't conflict with them.
++  assert_equals(await result(store.put({id: 1, x: 1})), 1);
++  assert_equals(await result(store.put({id: 2, x: 2, sub: 1})), 2);
++  await complete(tx);
++}, 'Index keys that depend on a generated key cause no conflicts among records');

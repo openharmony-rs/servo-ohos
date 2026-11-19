@@ -1,0 +1,316 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 08:40:13 +0000
+Subject: [PATCH] indexeddb: Convert SharedArrayBuffers and views on them to
+ binary keys
+
+"Convert a value to a key" takes any buffer source, a SharedArrayBuffer
+included, and copies its bytes into a binary key. Script only checked
+for ArrayBuffers and views, and the mozjs typed array wrappers assert
+that the memory isn't shared, so a view on a SharedArrayBuffer would
+have panicked once shared memory exists. Shared buffers and views on
+them are now copied with relaxed atomic loads, since other agents may
+write shared memory meanwhile, and "is a potentially valid key range"
+accepts a SharedArrayBuffer as well.
+
+The fork test shared-array-buffer-keys.any.js, which sets the pref
+`js_shared_memory_enabled_for_testing`, checks keys from
+SharedArrayBuffers, views on them with offsets and Arrays of them, that
+later writes to the buffer don't change them, and their use in queries,
+key ranges and cmp(). The upstream sharedarraybuffer-key.https.html
+stays expected FAIL: it asserts crossOriginIsolated.
+
+Validation: Host SpiderMonkey release build of this commit: shared-array-buffer-keys.any.js 2 of 2 subtests in window, dedicated and shared worker (with the previous commit's build the first put() throws a DataError, and a probe with a view on a SharedArrayBuffer hit the `assert!(!shared)` of mozjs's typed array wrapper, a panic of the script thread); /_mozilla/IndexedDB/ and the key WPT tests (idb_binary_key_*, idb-binary-key-*, key_valid, key_invalid, idbfactory_cmp, idbkeyrange*, getAll-options, key-conversion-exceptions) 836 of 840, as expected (the four failures are sharedarraybuffer-key.https.html and serialize-sharedarraybuffer-throws.https.html, which assert crossOriginIsolated). Series P4.3 (this and the four commits before it), at this commit: host WPT tests/wpt/tests/IndexedDB, 8 processes, SpiderMonkey 4,473 and 4,473, QuickJS 4,473 and 4,473 of 4,511 (P4.2 4,466 / 4,466; +7: keyPath 4, index() after abort() 3; no unexpected results but one SpiderMonkey idbindex-rename.any.sharedworker lone-surrogate TIMEOUT, the known worker/sharedworker flip); /_mozilla/IndexedDB/ with the interface lists 282 of 282 on SpiderMonkey, 280 of 282 on QuickJS (the interface lists, expected FAIL); `./mach update-wpt` from both engines' logs changes nothing but that flip. DAYU200 (QuickJS + RDB, checked-release, 2 processes, idle host): IndexedDB/ 4,452 of 4,511 (P4.2 4,448), unexpected only file_support (send_keys), idb-partitioned-coverage (testharness bookkeeping in its iframe), idbfactory-origin-isolation and idbdatabase-createObjectStore-exception-order.any.sharedworker (TIMEOUT; 3 of 3 OK alone); /_mozilla/IndexedDB/ 280 of 280. Unit tests: host `cargo nextest run -p servo-storage -p servo-storage-traits` 144 passed, 1 skipped (one of two runs timed out webstorage::clear_data_for_sites_local, which passes 20 of 20 alone), DAYU200 RDB only 145 / 3 skipped, SQLite and RDB 259 / 4. `./mach fmt`, `./mach test-tidy` (only the known libsqlite3-sys advisory), `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`, `RUSTFLAGS="-D warnings" ./mach build --locked --ohos --profile checked-release` with the default and harmonyos flavors (signed HAPs), `./mach test-unit --profile checked-release` (1,347 passed, 1 skipped) and `--doc` pass. After the P4 review fixes (folded into 172, 176 and here), at this commit: host WPT IndexedDB/ SpiderMonkey 4,458 and 4,472 (unexpected only idbfactory-origin-isolation TIMEOUT in both runs, each time after idbcursor-continuePrimaryKey-exception-order.any.worker in the same browser, the known flip, and in the first run idbfactory_open.any.html, which ran next in that browser and passes 5 of 5 alone), QuickJS 4,473 (no unexpected results); /_mozilla/IndexedDB/ with the interface lists 285 of 285 SpiderMonkey, 283 of 285 QuickJS; DAYU200 IndexedDB/ 4,456 (unexpected only the known flips: file_support, idb-partitioned-coverage, createObjectStore-exception-order and rename-store sharedworker, idbversionchangeevent worker), /_mozilla/IndexedDB/ 283 of 283; unit tests host 145 / 1 skipped, DAYU200 RDB 146 / 3, SQLite and RDB 261 / 4; `./mach check --ohos -- -p servo-storage --all-targets` with SQLite, RDB and both without warnings; fmt, tidy (only the known advisory), clippy, crown, both OHOS flavors (signed HAPs), test-unit checked-release (1,348 passed, 1 skipped) and --doc pass.
+AI-assisted: Yes (agent session; added shared memory to the key conversion, wrote the fork test, ran the P4 gate)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/key.rs        |  55 +++++++--
+ .../shared-array-buffer-keys.any.js.ini       |   1 +
+ tests/wpt/mozilla/meta/MANIFEST.json          |  48 ++++++++
+ .../IndexedDB/shared-array-buffer-keys.any.js | 106 ++++++++++++++++++
+ 4 files changed, 203 insertions(+), 7 deletions(-)
+ create mode 100644 tests/wpt/mozilla/meta/IndexedDB/shared-array-buffer-keys.any.js.ini
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/shared-array-buffer-keys.any.js
+
+diff --git a/components/script/dom/indexeddb/key.rs b/components/script/dom/indexeddb/key.rs
+index 47428bdb2b1..9c9ecd816fb 100644
+--- a/components/script/dom/indexeddb/key.rs
++++ b/components/script/dom/indexeddb/key.rs
+@@ -4,15 +4,17 @@
+ 
+ use std::cmp::Ordering;
+ use std::ffi::CString;
++use std::sync::atomic::{self, AtomicU8};
+ use std::{ptr, slice};
+ 
+ use itertools::Itertools;
+ use js::context::JSContext;
+ use js::conversions::ToJSValConvertible;
+ use js::jsapi::{
+-    ClippedTime, ESClass, IsArrayBufferObject, IsDetachedArrayBufferObject,
++    ClippedTime, ESClass, GetArrayBufferMaybeSharedLengthAndData, GetArrayBufferViewLengthAndData,
++    IsArrayBufferObject, IsDetachedArrayBufferObject, IsSharedArrayBufferObject,
+     JS_DeprecatedStringHasLatin1Chars, JS_GetArrayBufferViewBuffer, JS_GetStringLength,
+-    JS_IsArrayBufferViewObject, JSString, NewArrayObject1, PropertyKey,
++    JS_IsArrayBufferViewObject, JSObject, JSString, NewArrayObject1, PropertyKey,
+ };
+ use js::jsval::{DoubleValue, ObjectValue, StringValue, UndefinedValue};
+ use js::rust::wrappers2::{
+@@ -414,12 +416,17 @@ pub fn convert_value_to_key(
+             }
+ 
+             // If input is a buffer source type:
+-            if IsArrayBufferObject(*object) || JS_IsArrayBufferViewObject(*object) {
++            let is_shared_array_buffer = IsSharedArrayBufferObject(*object);
++            if IsArrayBufferObject(*object) ||
++                is_shared_array_buffer ||
++                JS_IsArrayBufferViewObject(*object)
++            {
++                let mut is_shared = is_shared_array_buffer;
+                 let is_detached = if IsArrayBufferObject(*object) {
+                     IsDetachedArrayBufferObject(*object)
++                } else if is_shared_array_buffer {
++                    false
+                 } else {
+-                    // Shared ArrayBuffers are not supported here, so this stays false.
+-                    let mut is_shared = false;
+                     rooted!(
+                         in (cx.raw_cx()) let view_buffer =
+                             JS_GetArrayBufferViewBuffer(
+@@ -436,7 +443,9 @@ pub fn convert_value_to_key(
+                 }
+                 // 3.2. Let bytes be the result of getting a copy of the bytes held
+                 // by the buffer source input.
+-                let bytes = if IsArrayBufferObject(*object) {
++                let bytes = if is_shared {
++                    Some(shared_memory_bytes(*object))
++                } else if IsArrayBufferObject(*object) {
+                     let array_buffer = ArrayBuffer::from(*object).map_err(|()| Error::JSFailed)?;
+                     array_buffer.to_vec()
+                 } else {
+@@ -511,6 +520,32 @@ pub fn convert_value_to_key(
+     Ok(ConversionResult::Invalid)
+ }
+ 
++/// A copy of the bytes of `object`, a SharedArrayBuffer or a view on one. Shared memory may change
++/// at any time, so the bytes are read as atomics.
++#[expect(unsafe_code)]
++fn shared_memory_bytes(object: *mut JSObject) -> Vec<u8> {
++    let mut length = 0;
++    let mut is_shared = false;
++    let mut data = ptr::null_mut();
++    // SAFETY: `object` is a live SharedArrayBuffer or view, and the out-parameters are valid.
++    unsafe {
++        if JS_IsArrayBufferViewObject(object) {
++            GetArrayBufferViewLengthAndData(object, &mut length, &mut is_shared, &mut data);
++        } else {
++            GetArrayBufferMaybeSharedLengthAndData(object, &mut length, &mut is_shared, &mut data);
++        }
++    }
++    if data.is_null() {
++        return Vec::new();
++    }
++    (0..length)
++        // SAFETY: `data` points to `length` bytes of the buffer, which no JavaScript code runs to
++        // detach or shrink (a SharedArrayBuffer can only grow) while they are read, and a u8 is
++        // always aligned for AtomicU8.
++        .map(|i| unsafe { AtomicU8::from_ptr(data.add(i)) }.load(atomic::Ordering::Relaxed))
++        .collect()
++}
++
+ /// <https://w3c.github.io/IndexedDB/#convert-a-value-to-a-multientry-key>, except that the keys
+ /// of an array key are in key order rather than in the order of the array: each becomes a record
+ /// of a multiEntry index, so their order isn't observable.
+@@ -658,7 +693,13 @@ pub(crate) fn is_potentially_valid_key_range(
+         return Err(Error::JSFailed);
+     }
+     // SAFETY: `object` is a live object.
+-    if is_date || unsafe { IsArrayBufferObject(*object) || JS_IsArrayBufferViewObject(*object) } {
++    if is_date ||
++        unsafe {
++            IsArrayBufferObject(*object) ||
++                IsSharedArrayBufferObject(*object) ||
++                JS_IsArrayBufferViewObject(*object)
++        }
++    {
+         return Ok(true);
+     }
+     let mut is_array = false;
+diff --git a/tests/wpt/mozilla/meta/IndexedDB/shared-array-buffer-keys.any.js.ini b/tests/wpt/mozilla/meta/IndexedDB/shared-array-buffer-keys.any.js.ini
+new file mode 100644
+index 00000000000..9faea0adb13
+--- /dev/null
++++ b/tests/wpt/mozilla/meta/IndexedDB/shared-array-buffer-keys.any.js.ini
+@@ -0,0 +1 @@
++prefs: [js_shared_memory_enabled_for_testing:true]
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 80d0c310481..aeec96d237f 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -12283,6 +12283,54 @@
+       }
+      ]
+     ],
++    "shared-array-buffer-keys.any.js": [
++     "6b2ed1767083155b9561f81d150943ec2549bec5",
++     [
++      "IndexedDB/shared-array-buffer-keys.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,dedicatedworker,sharedworker"
++        ],
++        [
++         "title",
++         "IndexedDB: SharedArrayBuffers and views on them as keys"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/shared-array-buffer-keys.any.sharedworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,dedicatedworker,sharedworker"
++        ],
++        [
++         "title",
++         "IndexedDB: SharedArrayBuffers and views on them as keys"
++        ]
++       ]
++      }
++     ],
++     [
++      "IndexedDB/shared-array-buffer-keys.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,dedicatedworker,sharedworker"
++        ],
++        [
++         "title",
++         "IndexedDB: SharedArrayBuffers and views on them as keys"
++        ]
++       ]
++      }
++     ]
++    ],
+     "shared-array-buffer-values.any.js": [
+      "b2f83dd5e354cfa08f29737b723234e9754078b1",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/shared-array-buffer-keys.any.js b/tests/wpt/mozilla/tests/IndexedDB/shared-array-buffer-keys.any.js
+new file mode 100644
+index 00000000000..6b2ed176708
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/shared-array-buffer-keys.any.js
+@@ -0,0 +1,106 @@
++// META: global=window,dedicatedworker,sharedworker
++// META: title=IndexedDB: SharedArrayBuffers and views on them as keys
++
++// https://w3c.github.io/IndexedDB/#convert-a-value-to-a-key: a buffer source, including a
++// SharedArrayBuffer and a view on one, converts to a binary key with a copy of its bytes. The
++// upstream test (sharedarraybuffer-key.https.html) also needs cross-origin isolation, which Servo
++// doesn't implement: this test's metadata sets the pref js_shared_memory_enabled_for_testing,
++// which gives every global a SharedArrayBuffer.
++
++'use strict';
++
++function openDatabase(t, upgrade) {
++  const name = 'shared-array-buffer-keys-' + Math.random();
++  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open(name, 1);
++    request.onupgradeneeded = () => upgrade(request.result);
++    request.onsuccess = () => {
++      t.add_cleanup(() => { request.result.close(); });
++      resolve(request.result);
++    };
++    request.onerror = () => reject(request.error);
++  });
++}
++
++function result(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++function complete(transaction) {
++  return new Promise((resolve, reject) => {
++    transaction.oncomplete = resolve;
++    transaction.onabort = () => reject(transaction.error);
++  });
++}
++
++// A SharedArrayBuffer of `bytes.length + 2` bytes with `bytes` at offset 1.
++function sharedBuffer(bytes) {
++  const buffer = new SharedArrayBuffer(bytes.length + 2);
++  new Uint8Array(buffer).set(bytes, 1);
++  return buffer;
++}
++
++function bytesOf(arrayBuffer) {
++  assert_true(arrayBuffer instanceof ArrayBuffer, 'a binary key reads back as an ArrayBuffer');
++  return [...new Uint8Array(arrayBuffer)];
++}
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    db.createObjectStore('store');
++  });
++  const tx = db.transaction('store', 'readwrite');
++  const done = complete(tx);
++  const store = tx.objectStore('store');
++
++  const whole = sharedBuffer([1, 2, 3]);
++  const view = new Uint8Array(sharedBuffer([4, 5, 6]), 1, 3);
++  const dataView = new DataView(sharedBuffer([7, 8, 9]), 1, 3);
++  const array = [sharedBuffer([10])];
++  const puts = [
++    store.put('whole', whole),
++    store.put('view', view),
++    store.put('data view', dataView),
++    store.put('array', array),
++  ];
++  new Uint8Array(whole).fill(0);
++  new Uint8Array(view.buffer).fill(0);
++  new Uint8Array(dataView.buffer).fill(0);
++  new Uint8Array(array[0]).fill(0);
++
++  assert_array_equals(bytesOf(await result(puts[0])), [0, 1, 2, 3, 0]);
++  assert_array_equals(bytesOf(await result(puts[1])), [4, 5, 6]);
++  assert_array_equals(bytesOf(await result(puts[2])), [7, 8, 9]);
++  const arrayKey = await result(puts[3]);
++  assert_array_equals(bytesOf(arrayKey[0]), [0, 10, 0]);
++
++  assert_equals(await result(store.get(new Uint8Array([0, 1, 2, 3, 0]))), 'whole');
++  assert_equals(await result(store.get(new Uint8Array([4, 5, 6]).buffer)), 'view');
++  assert_equals(await result(store.get(new Uint8Array([7, 8, 9]))), 'data view');
++  assert_equals(await result(store.get([new Uint8Array([0, 10, 0])])), 'array');
++  await done;
++}, 'SharedArrayBuffers, views on them and Arrays of them are keys with a copy of the bytes');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('store');
++    for (let i = 1; i <= 4; i++) {
++      store.put(i, new Uint8Array([i]));
++    }
++  });
++  const store = db.transaction('store').objectStore('store');
++  const shared = n => new Uint8Array(sharedBuffer([n]), 1, 1);
++  assert_equals(indexedDB.cmp(sharedBuffer([1, 2]), new Uint8Array([0, 1, 2, 0])), 0);
++  assert_equals(indexedDB.cmp(shared(2), new Uint8Array([1])), 1);
++  assert_array_equals(await result(store.getAll(shared(2))), [2],
++                      'getAll() takes a view on a SharedArrayBuffer as a query');
++  assert_array_equals(await result(store.getAll(IDBKeyRange.bound(shared(2), shared(3)))), [2, 3]);
++  assert_array_equals(await result(store.getAll(IDBKeyRange.only(shared(4)))), [4]);
++  assert_equals(await result(store.count(shared(1))), 1);
++  const cursor = await result(store.openCursor(IDBKeyRange.lowerBound(shared(3), true)));
++  assert_equals(cursor.value, 4);
++}, 'SharedArrayBuffers and views on them are keys for queries and key ranges');

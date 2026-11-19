@@ -304,6 +304,11 @@ pub struct Preferences {
     pub js_mem_max: i64,
     pub js_native_regex_enabled: bool,
     pub js_offthread_compilation_enabled: bool,
+    /// For the IndexedDB fork tests only: gives every global `SharedArrayBuffer` and `Atomics`,
+    /// whether or not it is cross-origin isolated, which Servo doesn't implement. Other Web APIs
+    /// are not shared-memory aware (the bindings have no `[AllowShared]` checks) and panic on a
+    /// view of shared memory.
+    pub js_shared_memory_enabled_for_testing: bool,
     pub js_timers_minimum_duration: i64,
     pub js_wasm_baseline_enabled: bool,
     pub js_wasm_enabled: bool,
@@ -597,6 +602,7 @@ impl Preferences {
             js_mem_max: -1,
             js_native_regex_enabled: true,
             js_offthread_compilation_enabled: true,
+            js_shared_memory_enabled_for_testing: false,
             js_timers_minimum_duration: 1000,
             js_wasm_baseline_enabled: true,
             js_wasm_enabled: true,

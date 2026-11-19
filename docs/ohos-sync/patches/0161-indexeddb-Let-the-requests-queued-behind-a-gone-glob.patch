@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 23:39:09 +0000
+Subject: [PATCH] indexeddb: Let the requests queued behind a gone global's
+ upgrade go on
+
+When a global goes away while one of its open requests runs its upgrade
+transaction, the factory's teardown sends AbortPendingUpgrades, and the
+manager takes the request out of the connection queue and reverts the
+upgrade. It didn't advance the queue, though: the open and delete
+requests of other globals queued behind the removed one waited forever.
+abort_pending_upgrades now advances the queue when the request it
+removed was the one running, as abort_pending_upgrade (one request, from
+an aborted upgrade transaction) already did.
+
+Found with a fork WPT test that removes an iframe while its upgrade
+populates an index; the P3.1 binary hangs the same way without any
+createIndex, so the bug predates the population.
+
+Validation: New integration test test_indexeddb_aborted_pending_upgrade_lets_the_next_open_run (an open request queued behind one whose global sends AbortPendingUpgrades during its upgrade gets its upgrade): passes on SQLite, fails after 5 s without the fix; `cargo nextest run -p servo-storage -p servo-storage-traits` 134 passed, 1 skipped. New fork test tests/wpt/mozilla/tests/IndexedDB/removed-iframe-during-upgrade.html (an iframe removed during its upgrade, without and with a createIndex that populates 5,000 records; the parent then opens and writes): 2 of 2 on SM, QuickJS and the DAYU200, TIMEOUT with the P3.1 binary already in the first subtest; removed-iframe-aborts-its-transactions.html still passes. Host WPT tests/wpt/tests/IndexedDB at this commit: SpiderMonkey 3,392, QuickJS 3,389 of 4,511, the same as the previous commit's results reported there; /_mozilla/IndexedDB/ 172 of 172 on SM, QuickJS, SM --multiprocess and the DAYU200; DAYU200 WPT IndexedDB/ 3,381 (QuickJS + RDB). These counts predate the P3 review fixes folded into the P3.1 and P3.2 commits, which add a backend test and fork subtests.
+AI-assisted: Yes (agent session; found the hang with a new WPT test, fixed the queue advance, wrote the integration and WPT tests, ran them)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/storage/indexeddb/mod.rs           | 16 +++--
+ components/storage/tests/indexeddb.rs         | 44 +++++++++++-
+ tests/wpt/mozilla/meta/MANIFEST.json          | 13 ++++
+ .../removed-iframe-during-upgrade.html        | 69 +++++++++++++++++++
+ .../IndexedDB/resources/upgrade-frame.html    | 14 ++++
+ 5 files changed, 151 insertions(+), 5 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/removed-iframe-during-upgrade.html
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/resources/upgrade-frame.html
+
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index e561a9a33e3..ec6f5724e08 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -1278,11 +1278,14 @@ impl IndexedDBManager {
+             for id in ids.iter() {
+                 self.remove_connection(&key, id);
+             }
+-            {
+-                let is_empty = {
++            let front_removed = {
++                let (is_empty, front_removed) = {
+                     let Some(queue) = self.connection_queues.get_mut(&key) else {
+                         continue;
+                     };
++                    let front_removed = queue
++                        .front()
++                        .is_some_and(|open_request| ids.contains(&open_request.get_id()));
+                     queue.retain_mut(|open_request| {
+                         if ids.contains(&open_request.get_id()) {
+                             let upgrade = open_request.abort();
+@@ -1297,15 +1300,20 @@ impl IndexedDBManager {
+                             true
+                         }
+                     });
+-                    queue.is_empty()
++                    (queue.is_empty(), front_removed)
+                 };
+                 if is_empty {
+                     self.connection_queues.remove(&key);
+                 }
+-            }
++                front_removed
++            };
+             if let Some((upgrade, proxy_map)) = upgrade_to_revert {
+                 self.revert_aborted_upgrade(&key, &upgrade, &proxy_map);
+             }
++            // The requests queued behind a removed request that was running go on.
++            if front_removed {
++                self.advance_connection_queue(key);
++            }
+         }
+     }
+ 
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index 2f8915ee868..ed1d5e18176 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -3,7 +3,7 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use std::cell::{Cell, RefCell};
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
+ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{LazyLock, Mutex, OnceLock, mpsc};
+ use std::time::Duration;
+@@ -82,6 +82,7 @@ backend_tests!(
+     test_indexeddb_requests_outside_the_mode_or_scope_fail_the_transaction,
+     test_indexeddb_versionchange_follows_the_open_result_on_one_channel,
+     test_indexeddb_create_index_population_runs_before_later_requests,
++    test_indexeddb_aborted_pending_upgrade_lets_the_next_open_run,
+ );
+ 
+ static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+@@ -2619,3 +2620,44 @@ fn test_indexeddb_create_index_population_runs_before_later_requests() {
+     close_database(&ctx, id, db_name);
+     ctx.shutdown();
+ }
++
++/// When the global of an open request whose upgrade runs goes away, the open requests queued
++/// behind it go on.
++fn test_indexeddb_aborted_pending_upgrade_lets_the_next_open_run() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-aborted-pending-upgrade";
++    let first = open_database(&ctx, db_name, Some(1));
++    let ConnectionMsg::Upgrade { id, .. } = recv_callback_timeout(&first, "first upgrade") else {
++        panic!("expected an upgrade");
++    };
++    let second = open_database(&ctx, db_name, None);
++    assert!(
++        second.recv_timeout(Duration::from_millis(200)).is_err(),
++        "the second open waits for the first"
++    );
++
++    GenericSend::send(
++        &ctx.private_threads,
++        IndexedDBThreadMsg::Sync(SyncOperation::AbortPendingUpgrades {
++            pending_upgrades: HashMap::from([(db_name.into(), HashSet::from([id]))]),
++            origin: ctx.origin.clone(),
++        }),
++    )
++    .unwrap();
++    let ConnectionMsg::Upgrade {
++        version,
++        old_version,
++        transaction,
++        ..
++    } = recv_callback_timeout(&second, "second upgrade")
++    else {
++        panic!("expected an upgrade of the database that the first upgrade didn't create");
++    };
++    assert_eq!((version, old_version), (1, 0));
++    commit_upgrade_transaction(&ctx, db_name, transaction);
++    let ConnectionMsg::Connection { id, .. } = recv_callback_timeout(&second, "connection") else {
++        panic!("expected the connection");
++    };
++    close_database(&ctx, id, db_name);
++    ctx.shutdown();
++}
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 2faee6bd465..c06485ee9c4 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -8570,6 +8570,10 @@
+      "removed-iframe-writer.html": [
+       "728c70ad75c2804ca49320cd69afec1026e7fad8",
+       []
++     ],
++     "upgrade-frame.html": [
++      "3e3e64899775946887e3efbfcc6d5e6bf5d3de24",
++      []
+      ]
+     }
+    },
+@@ -11895,6 +11899,15 @@
+       {}
+      ]
+     ],
++    "removed-iframe-during-upgrade.html": [
++     "faeb433113f2502f2f3141ded3cdf4c2afb3934a",
++     [
++      null,
++      {
++       "timeout": "long"
++      }
++     ]
++    ],
+     "request-result-order.any.js": [
+      "0d1ffcde775dfce11401ffeff8241639595d00d8",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/removed-iframe-during-upgrade.html b/tests/wpt/mozilla/tests/IndexedDB/removed-iframe-during-upgrade.html
+new file mode 100644
+index 00000000000..faeb433113f
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/removed-iframe-during-upgrade.html
+@@ -0,0 +1,69 @@
++<!doctype html>
++<meta charset="utf-8">
++<title>IndexedDB: the upgrade of a removed iframe holds back no one</title>
++<link rel="help" href="https://w3c.github.io/IndexedDB/#closing-connection">
++<link rel="help" href="https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex">
++<meta name="timeout" content="long">
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script>
++// An iframe that goes away while its upgrade transaction populates an index leaves either the
++// whole upgrade or none of it, and the database opens and writes afterwards.
++
++function request(r) {
++  return new Promise((resolve, reject) => {
++    r.onsuccess = () => resolve(r.result);
++    r.onerror = () => reject(r.error);
++  });
++}
++
++function complete(tx) {
++  return new Promise((resolve, reject) => {
++    tx.oncomplete = resolve;
++    tx.onabort = () => reject(tx.error);
++  });
++}
++
++const RECORDS = 5000;
++
++// Removes an iframe while its upgrade transaction runs, which creates an index on a store with
++// many records if `index` is set, and checks the database afterwards.
++async function removeFrameDuringUpgrade(t, index) {
++  const name = 'removed-iframe-upgrade-' + Math.random();
++  const setup = indexedDB.open(name, 1);
++  setup.onupgradeneeded = () => {
++    const store = setup.result.createObjectStore('items');
++    for (let i = 0; i < RECORDS; i++) {
++      store.add({k: 'k' + i, padding: 'x'.repeat(100)}, i);
++    }
++  };
++  (await request(setup)).close();
++  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
++
++  const frame = document.createElement('iframe');
++  const upgrading = new Promise(resolve => window.onmessage = e => resolve(e.data));
++  frame.src = 'resources/upgrade-frame.html?' + encodeURIComponent(name) +
++      (index ? '&index' : '');
++  document.body.appendChild(frame);
++  assert_equals(await upgrading, 'upgrading');
++  frame.remove();
++
++  const db = await request(indexedDB.open(name));
++  t.add_cleanup(() => { db.close(); });
++  const tx = db.transaction('items', 'readwrite');
++  const store = tx.objectStore('items');
++  const indexes = db.version === 1 || !index ? [] : ['k'];
++  assert_array_equals([...store.indexNames], indexes, `indexes at version ${db.version}`);
++  const count = request(store.count());
++  store.put({k: 'parent'}, 'parent');
++  await complete(tx);
++  assert_equals(await count, RECORDS);
++}
++
++promise_test(t => removeFrameDuringUpgrade(t, false),
++             "The upgrade of a removed iframe holds back no later open");
++
++promise_test(t => removeFrameDuringUpgrade(t, true),
++             "An upgrade that populates an index in a removed iframe holds back no one");
++</script>
++<body></body>
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/resources/upgrade-frame.html b/tests/wpt/mozilla/tests/IndexedDB/resources/upgrade-frame.html
+new file mode 100644
+index 00000000000..3e3e6489977
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/resources/upgrade-frame.html
+@@ -0,0 +1,14 @@
++<!doctype html>
++<meta charset="utf-8">
++<script>
++// Upgrades the database to version 2, creating an index on the store `items` if the query has
++// `index`, reports once the upgrade runs, and waits until the frame goes away.
++const [name, index] = location.search.slice(1).split('&').map(decodeURIComponent);
++const request = indexedDB.open(name, 2);
++request.onupgradeneeded = () => {
++  if (index) {
++    request.transaction.objectStore('items').createIndex('k', 'k');
++  }
++  parent.postMessage('upgrading', '*');
++};
++</script>

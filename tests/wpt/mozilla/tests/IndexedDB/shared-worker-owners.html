@@ -1,0 +1,121 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>IndexedDB: a shared worker closes its connections once its last owner document is gone</title>
+<link rel="help" href="https://html.spec.whatwg.org/multipage/#the-worker's-lifetime">
+<link rel="help" href="https://html.spec.whatwg.org/multipage/#destroy-a-document">
+<link rel="help" href="https://w3c.github.io/IndexedDB/#database-connection">
+<meta name="timeout" content="long">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+// A shared worker started by an iframe holds a connection that doesn't close on versionchange.
+// Removing the iframe destroys the worker's only owner, so the worker is closed and its connection
+// with it; while the window owns the worker as well, the worker and its connection stay.
+
+function requestDone(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function createDatabase(t) {
+  const name = 'shared-worker-owners-' + Math.random();
+  t.add_cleanup(() => {
+    indexedDB.deleteDatabase(name);
+  });
+  const request = indexedDB.open(name, 1);
+  request.onupgradeneeded = () => request.result.createObjectStore('store');
+  (await requestDone(request)).close();
+  return name;
+}
+
+// Returns a function that resolves with the next message of `target`, in order.
+function messages(target) {
+  const queue = [];
+  const waiting = [];
+  target.onmessage = event => {
+    if (waiting.length) {
+      waiting.shift()(event.data);
+    } else {
+      queue.push(event.data);
+    }
+  };
+  return () => queue.length ? Promise.resolve(queue.shift()) :
+      new Promise(resolve => waiting.push(resolve));
+}
+
+async function frameWithSharedWorker(t, name) {
+  const frame = document.createElement('iframe');
+  const opened = new Promise(resolve => {
+    window.onmessage = event => resolve(event.data);
+  });
+  frame.src = 'resources/shared-worker-connection-frame.html?' + encodeURIComponent(name);
+  document.body.appendChild(frame);
+  t.add_cleanup(() => frame.remove());
+  assert_equals(await opened, 'opened');
+  return frame;
+}
+
+promise_test(async t => {
+  const name = await createDatabase(t);
+  const frame = await frameWithSharedWorker(t, name);
+
+  const events = [];
+  const deletion = indexedDB.deleteDatabase(name);
+  deletion.onblocked = event => {
+    events.push(`blocked ${event.oldVersion} ${event.newVersion}`);
+    frame.remove();
+  };
+  await requestDone(deletion);
+  events.push('deleted');
+  assert_array_equals(events, ['blocked 1 null', 'deleted']);
+}, 'Removing the only owner of a shared worker closes the worker\'s connection');
+
+promise_test(async t => {
+  const name = await createDatabase(t);
+  const frame = await frameWithSharedWorker(t, name);
+  const worker = new SharedWorker(
+      'resources/connection-holder.js?' + encodeURIComponent(name));
+  const closed = new Promise(resolve => {
+    worker.port.onmessage = event => resolve(event.data);
+  });
+
+  let deleted = false;
+  const deletion = indexedDB.deleteDatabase(name);
+  const blocked = new Promise(resolve => deletion.onblocked = resolve);
+  const done = requestDone(deletion).then(() => deleted = true);
+  await blocked;
+  frame.remove();
+  await new Promise(resolve => t.step_timeout(resolve, 500));
+  assert_false(deleted, 'the worker still has an owner and keeps its connection');
+
+  worker.port.postMessage('close');
+  assert_equals(await closed, 'closed');
+  await done;
+}, 'A shared worker with another owner keeps its connection when one owner goes away');
+
+promise_test(async t => {
+  const name = await createDatabase(t);
+  const url = 'resources/connection-holder.js?' + encodeURIComponent(name);
+  const worker = new SharedWorker(url);
+  const next = messages(worker.port);
+  worker.port.postMessage({name, close: false});
+  assert_equals(await next(), 'opened');
+
+  const mismatch = new SharedWorker(url, {type: 'module'});
+  await new Promise(resolve => mismatch.onerror = resolve);
+
+  let deleted = false;
+  const deletion = indexedDB.deleteDatabase(name);
+  const done = requestDone(deletion).then(() => deleted = true);
+  assert_equals(await next(), 'versionchange 1 null');
+  await new Promise(resolve => t.step_timeout(resolve, 500));
+  assert_false(deleted, 'the worker is still owned by this document');
+
+  worker.port.postMessage('close');
+  assert_equals(await next(), 'closed');
+  await done;
+}, 'A SharedWorker constructor that fails to connect leaves the owner set as it was');
+</script>
+<body></body>

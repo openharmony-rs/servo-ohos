@@ -35,6 +35,7 @@ use servo_constellation_traits::{MessagePortImpl, WorkerGlobalScopeInit, WorkerS
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use style::thread_state::{self, ThreadState};
 use stylo_atoms::Atom;
+use timers::TimerEventRequest;
 use uuid::Uuid;
 
 use crate::dom::abstractworker::{SimpleWorkerErrorHandler, WorkerScriptMsg};
@@ -55,7 +56,10 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlscriptelement::Script;
 use crate::dom::messageport::MessagePort;
-use crate::dom::sharedworker::{SharedWorker, SharedWorkerStorageKey, TrustedSharedWorkerAddress};
+use crate::dom::sharedworker::{
+    EXTENDED_LIFETIME_SHARED_WORKER_TIMEOUT, SharedWorker, SharedWorkerStorageKey,
+    TrustedSharedWorkerAddress,
+};
 #[cfg(feature = "devtools")]
 use crate::dom::types::DebuggerGlobalScope;
 #[cfg(feature = "webgpu")]
@@ -78,9 +82,11 @@ pub(crate) enum SharedWorkerScriptMsg {
 }
 
 pub(crate) enum SharedWorkerControlMsg {
-    #[expect(dead_code)]
     Exit,
     SetNetworkOnlineState(bool),
+    /// The worker's owner set became empty in its extended lifetime: close the worker if the set
+    /// is still at this generation after the extended lifetime shared worker timeout.
+    CloseIfStillOrphanedAfterTimeout(u64),
 }
 
 pub(crate) enum MixedMessage {
@@ -508,10 +514,12 @@ impl SharedWorkerGlobalScope {
                 );
 
                 /// A data structure that ensures that a panicking SharedWorker will
-                /// always call `clear_js_runtime` in order to prevent it from leaking.
+                /// always close its IndexedDB connections and call `clear_js_runtime` in
+                /// order to prevent it from leaking.
                 struct ClearJsRuntime<'a>(&'a WorkerGlobalScope);
                 impl Drop for ClearJsRuntime<'_> {
                     fn drop(&mut self) {
+                        self.0.close_indexeddb_connections();
                         self.0.upcast::<GlobalScope>().tear_down();
                         self.0.clear_js_runtime();
                     }
@@ -807,6 +815,19 @@ impl SharedWorkerGlobalScope {
             MixedMessage::Control(SharedWorkerControlMsg::SetNetworkOnlineState(online)) => {
                 self.upcast::<WorkerGlobalScope>()
                     .set_network_online_state(online);
+            },
+            MixedMessage::Control(SharedWorkerControlMsg::CloseIfStillOrphanedAfterTimeout(
+                generation,
+            )) => {
+                let id = self.registration_id;
+                self.upcast::<WorkerGlobalScope>()
+                    .timer_scheduler()
+                    .schedule_timer(TimerEventRequest {
+                        callback: Box::new(move || {
+                            SharedWorker::close_if_still_orphaned(id, generation)
+                        }),
+                        duration: EXTENDED_LIFETIME_SHARED_WORKER_TIMEOUT,
+                    });
             },
             MixedMessage::Timer => {},
         }

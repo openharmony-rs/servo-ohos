@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 17 Nov 2026 20:53:36 +0000
+Subject: [PATCH] docs: record patches 150 to 157 in the stack manifest
+
+Phase P2 of the IndexedDB redesign: the storage bottle map obtained in
+the backend, transactions created without waiting for the backend,
+object stores and indexes addressed by id from a metadata snapshot, one
+ordered result channel per connection with the request list in script,
+the event target that IndexedDB's event parents keep in DOM dispatch,
+string keys and names as UTF-16 code units, and key path identifiers
+looked up by their code units. All seven edit upstream files and are
+tier C; this bookkeeping entry is B, like the earlier ones. Entry 152
+includes P2.2's crown fix for it, folded in before this commit, and
+entries 152 to 154 the fixes of the P2 review, folded in later.
+
+Validation: `uv run docs/ohos-sync/check_stack.py base/2026-11-09` passes.
+AI-assisted: Yes (agent session; written by the agent, and the patches regenerated after the P2 review fixes)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index b0130f29ad8..bb204076637 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -173,6 +173,14 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 147. `indexeddb: Abort a global's unfinished transactions when it goes away` — C · CI+device · watch: components/script/dom/window/window.rs components/script/dom/workers/workerglobalscope.rs components/shared/storage/indexeddb.rs
+ 148. `indexeddb: Answer the manager's metadata reads from the committed metadata` — C · CI+device · watch: components/script/dom/indexeddb/idbtransaction.rs components/script/dom/indexeddb/idbdatabase.rs
+ 149. `docs: record patches 143 to 149 in the stack manifest` — B · none · watch: -
++150. `indexeddb: Obtain the storage bottle map in the backend` — C · CI+device · watch: components/storage/client_storage.rs components/shared/storage/client_storage.rs
++151. `indexeddb: Create transactions without waiting for the backend` — C · CI+device · watch: components/shared/storage/lib.rs
++152. `indexeddb: Address object stores and indexes by id, from a metadata snapshot` — C · CI+device · watch: components/script/dom/attributes/domstringlist.rs
++153. `indexeddb: Deliver a connection's results in request order on one channel` — C · CI+device · watch: components/shared/profile/generic_callback.rs
++154. `script: Keep the target of events that IndexedDB objects pass on` — C · CI+device · watch: components/script/dom/event/eventtarget.rs tests/wpt/tests/dom/events
++155. `indexeddb: Keep string keys and names as UTF-16 code units` — C · CI+device · watch: components/script_bindings/domstring.rs components/storage/cache_storage.rs
++156. `indexeddb: Look up key path identifiers by their code units` — C · CI+device · watch: components/script_bindings/js.rs components/script_bindings/utils.rs
++157. `docs: record patches 150 to 157 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 

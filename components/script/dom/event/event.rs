@@ -498,7 +498,9 @@ impl Event {
                         },
                         _ => false,
                     };
-                if parent.is::<Window>() || root_is_shadow_inclusive_ancestor {
+                // Deviation, as in browsers: any parent that isn't a node, also an IndexedDB request's
+                // transaction or connection, is handled like a Window and doesn't become the target.
+                if !parent.is::<Node>() || root_is_shadow_inclusive_ancestor {
                     // Step 6.9.6.1. If isActivationEvent is true, event’s bubbles attribute is true, activationTarget
                     // is null, and parent has activation behavior, then set activationTarget to parent.
                     if is_activation_event &&

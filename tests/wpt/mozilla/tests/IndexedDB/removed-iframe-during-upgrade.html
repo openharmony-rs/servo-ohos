@@ -1,0 +1,69 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>IndexedDB: the upgrade of a removed iframe holds back no one</title>
+<link rel="help" href="https://w3c.github.io/IndexedDB/#closing-connection">
+<link rel="help" href="https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex">
+<meta name="timeout" content="long">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+// An iframe that goes away while its upgrade transaction populates an index leaves either the
+// whole upgrade or none of it, and the database opens and writes afterwards.
+
+function request(r) {
+  return new Promise((resolve, reject) => {
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+
+function complete(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+const RECORDS = 5000;
+
+// Removes an iframe while its upgrade transaction runs, which creates an index on a store with
+// many records if `index` is set, and checks the database afterwards.
+async function removeFrameDuringUpgrade(t, index) {
+  const name = 'removed-iframe-upgrade-' + Math.random();
+  const setup = indexedDB.open(name, 1);
+  setup.onupgradeneeded = () => {
+    const store = setup.result.createObjectStore('items');
+    for (let i = 0; i < RECORDS; i++) {
+      store.add({k: 'k' + i, padding: 'x'.repeat(100)}, i);
+    }
+  };
+  (await request(setup)).close();
+  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
+
+  const frame = document.createElement('iframe');
+  const upgrading = new Promise(resolve => window.onmessage = e => resolve(e.data));
+  frame.src = 'resources/upgrade-frame.html?' + encodeURIComponent(name) +
+      (index ? '&index' : '');
+  document.body.appendChild(frame);
+  assert_equals(await upgrading, 'upgrading');
+  frame.remove();
+
+  const db = await request(indexedDB.open(name));
+  t.add_cleanup(() => { db.close(); });
+  const tx = db.transaction('items', 'readwrite');
+  const store = tx.objectStore('items');
+  const indexes = db.version === 1 || !index ? [] : ['k'];
+  assert_array_equals([...store.indexNames], indexes, `indexes at version ${db.version}`);
+  const count = request(store.count());
+  store.put({k: 'parent'}, 'parent');
+  await complete(tx);
+  assert_equals(await count, RECORDS);
+}
+
+promise_test(t => removeFrameDuringUpgrade(t, false),
+             "The upgrade of a removed iframe holds back no later open");
+
+promise_test(t => removeFrameDuringUpgrade(t, true),
+             "An upgrade that populates an index in a removed iframe holds back no one");
+</script>
+<body></body>

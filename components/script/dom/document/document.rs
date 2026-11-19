@@ -211,6 +211,7 @@ use crate::dom::sanitizer::Sanitizer;
 use crate::dom::selection::Selection;
 use crate::dom::servoparser::ServoParser;
 use crate::dom::shadowroot::shadowroot::ShadowRoot;
+use crate::dom::sharedworker::SharedWorker;
 use crate::dom::storageevent::StorageEvent;
 use crate::dom::svg::svgsvgelement::SVGSVGElement;
 use crate::dom::text::Text;
@@ -3062,6 +3063,7 @@ impl Document {
         exited_window
             .as_global_scope()
             .disable_owned_worker_animation_frame_providers();
+        SharedWorker::remove_owner_from_owner_sets(exited_window.pipeline_id());
 
         // Step 11. For each workletGlobalScope in document's worklet global scopes,
         // terminate workletGlobalScope.
@@ -4895,6 +4897,19 @@ impl Document {
 
     pub(crate) fn salvageable(&self) -> bool {
         self.salvageable.get()
+    }
+
+    /// Evicts this document, which is not fully active, from the back/forward cache: the
+    /// constellation closes the pipeline of the session history entry that holds it, also for a
+    /// document in an iframe of another script thread, and reloads the entry if it is traversed
+    /// to again. It does nothing if the document is fully active again by then.
+    pub(crate) fn evict_from_back_forward_cache(&self) {
+        let msg = ScriptToConstellationMessage::EvictFromBackForwardCache;
+        let _ = self
+            .window
+            .as_global_scope()
+            .script_to_constellation_chan()
+            .send(msg);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#make-document-unsalvageable>

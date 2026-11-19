@@ -1,0 +1,742 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 07:58:05 +0000
+Subject: [PATCH] indexeddb: Reset databases stored with another schema version
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The IndexedDB database files carried no version, so a later change to
+the tables, or to how records are stored in them, could not tell an old
+database from a current one. The rule for this fork is to delete and
+recreate such a database rather than migrate it.
+
+schema.rs now has SCHEMA_VERSION, 1, which the transaction that creates
+the tables also stores in the file's `PRAGMA user_version`.
+`schema::open_database` opens the database and reads that value:
+
+- 0 and no tables: a new file, which gets its tables;
+- SCHEMA_VERSION: kept as it is;
+- anything else, including 0 with tables, which every database created
+  before this change has: deleted with all its files and created anew.
+
+The IndexedDB version in the `database` table is a separate value that
+this doesn't touch. `SqlEngine::new` reports a recreated database as
+created, so that `open()` without a version upgrades it to 1, as it does
+for a new one. Every later change to the tables or to the record format
+bumps SCHEMA_VERSION.
+
+`SqlExecutor::delete` closes the connection and deletes the database.
+The SQLite executor closes it and removes the -wal, -shm and -journal
+files, then the database file. The RDB executor drops its handles and
+calls OH_Rdb_DeleteStoreV2 (API 14), which also removes RDB's -dwr and
+-compare files and closes the store in RDB's store cache; it refuses to
+while other executors on the store exist, which RDB would close the
+store under. OH_Rdb_DeleteStoreV2 reports success even when it couldn't
+remove the files, so after reopening, `open_database` checks that the
+database is new, and fails the open otherwise rather than running the
+current code on an old database. The RDB store configuration moved into
+`OhosRdbConfig::for_store`, which open and delete share.
+
+On the DAYU200, user_version behaves as in plain SQLite across RDB's
+connection pool: set in a transaction, it is rolled back with it;
+committed, the store's other connections see it, and so does a reopened
+store, and OH_Rdb_GetVersion returns the same value. RDB opens NDK
+stores with version -1, so it never writes user_version itself.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 78 passed (71 before; the 7 new tests below). DAYU200 (`OHOS_TEST_RUNNER_HDC_TARGET=… CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_RUNNER=ohos-test-runner ./mach test-unit --ohos -p servo-storage -- [--no-default-features] --features ohos-rdb-backend --status-level all`): RDB only 77 passed, both backends 126 passed (one documented skip). The new tests: a new database is stamped; a matching one is kept with its stores and version; one stored with version 0 (the state before this change) or SCHEMA_VERSION + 1 is recreated, without a table that was added to the old file; a reset whose delete leaves the old file fails the open, and the next open resets; an IndexedDB version of 2^53 - 1 leaves the schema version alone; user_version is transactional and seen by other connections and after reopening; delete removes the database, also with a transaction open; on RDB, delete refuses while another executor on the store exists. `./mach check --ohos -- -p servo-storage --all-targets` warning-free in the three configurations. WPT IndexedDB/ with the whole P0 series applied, as measured for "indexeddb: Run the SQLite and RDB backends as executors of one engine": host SpiderMonkey 3,224, host QuickJS 3,229 and DAYU200 3,222 passing subtests of 4,511, every unexpected result also seen with the baseline build; idbtransaction-oncomplete 60 of 60.
+AI-assisted: Yes (agent session; the agent wrote the change and its tests, checked user_version and store deletion on the DAYU200, and ran the host and device tests and WPT; after a review, it made a reset that leaves the old file fail the open, made the RDB delete refuse while other executors exist, and measured again)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../storage/indexeddb/backend/engine.rs       |   8 +-
+ .../storage/indexeddb/backend/executor.rs     |  17 +-
+ components/storage/indexeddb/backend/rdb.rs   |  25 ++-
+ .../storage/indexeddb/backend/schema.rs       |  61 +++++-
+ .../storage/indexeddb/backend/sqlite.rs       |  21 ++
+ components/storage/indexeddb/backend/tests.rs | 201 ++++++++++++++++++
+ components/storage/indexeddb/backend/twin.rs  |   4 +
+ components/storage/ohos_rdb/mod.rs            |  92 +++++---
+ 8 files changed, 379 insertions(+), 50 deletions(-)
+
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index 1c78f1e9599..72900aa7ccd 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -47,19 +47,19 @@ impl<X: SqlExecutor> SqlEngine<X> {
+         db_info: &IndexedDBDescription,
+         pool: Arc<ThreadPool>,
+     ) -> Result<Self, SqlError> {
+-        let mut connection = X::open(&path)?;
+-        schema::init_database(&mut connection, db_info)?;
++        let (connection, created_database) = schema::open_database::<X>(&path, db_info)?;
+         Ok(Self {
+             connector: Arc::from(connection.connector()),
+             connection: RefCell::new(connection),
+             batches: Default::default(),
+             read_pool: pool.clone(),
+             write_pool: pool,
+-            created_db_path: created,
++            created_db_path: created || created_database,
+         })
+     }
+ 
+-    /// Returns whether the physical db was created as part of `new`.
++    /// Returns whether the physical db was created as part of `new`, which includes recreating
++    /// a database of another schema version.
+     pub(crate) fn created_db_path(&self) -> bool {
+         self.created_db_path
+     }
+diff --git a/components/storage/indexeddb/backend/executor.rs b/components/storage/indexeddb/backend/executor.rs
+index d3d24686d2c..e348ef4847c 100644
+--- a/components/storage/indexeddb/backend/executor.rs
++++ b/components/storage/indexeddb/backend/executor.rs
+@@ -75,6 +75,10 @@ pub(crate) trait SqlExecutor: Send + Sized + 'static {
+     /// connection pool runs the statements.
+     fn connector(&self) -> Connector<Self>;
+ 
++    /// Closes this connection and deletes the database with all its files. No other connection
++    /// to the database may be open.
++    fn delete(self) -> Result<(), SqlError>;
++
+     /// Runs a statement that returns no rows. Returns the number of rows an `UPDATE` or `DELETE`
+     /// changed; the value is unspecified for other statements.
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError>;
+@@ -169,8 +173,14 @@ pub(crate) enum SqlError {
+     KeyPath(postcard::Error),
+     /// A stored key that can't be decoded.
+     InvalidKey,
+-    /// [`SqlExecutor::begin`] while a transaction is open, or a commit without one.
++    /// A misuse of the executor: [`SqlExecutor::begin`] while a transaction is open, a commit
++    /// without one, or a delete while other executors on the database exist.
+     TransactionState(&'static str),
++    /// A database of another schema version that is still there after deleting it.
++    ResetFailed,
++    /// A failure to delete a database file.
++    #[cfg(feature = "sqlite-backend")]
++    Io(std::io::Error),
+     /// A statement that the RDB executor would reject, which the SQLite executor refuses too.
+     #[cfg(feature = "sqlite-backend")]
+     NotOnRdb(String),
+@@ -188,6 +198,9 @@ impl fmt::Display for SqlError {
+             Self::KeyPath(error) => write!(formatter, "invalid stored key path: {error}"),
+             Self::InvalidKey => write!(formatter, "invalid stored key"),
+             Self::TransactionState(context) => write!(formatter, "transaction state: {context}"),
++            Self::ResetFailed => write!(formatter, "failed to delete a database to reset it"),
++            #[cfg(feature = "sqlite-backend")]
++            Self::Io(error) => error.fmt(formatter),
+             #[cfg(feature = "sqlite-backend")]
+             Self::NotOnRdb(sql) => write!(formatter, "statement that RDB would reject: {sql}"),
+         }
+@@ -202,6 +215,8 @@ impl std::error::Error for SqlError {
+             #[cfg(ohos_rdb)]
+             Self::Rdb(error) => Some(error),
+             Self::KeyPath(error) => Some(error),
++            #[cfg(feature = "sqlite-backend")]
++            Self::Io(error) => Some(error),
+             _ => None,
+         }
+     }
+diff --git a/components/storage/indexeddb/backend/rdb.rs b/components/storage/indexeddb/backend/rdb.rs
+index fb05c6406ab..dd0ff836ca2 100644
+--- a/components/storage/indexeddb/backend/rdb.rs
++++ b/components/storage/indexeddb/backend/rdb.rs
+@@ -4,7 +4,7 @@
+ 
+ use std::error::Error as StdError;
+ use std::fs;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex, MutexGuard};
+ 
+ use ohos_rdb_sys::rdb_transaction::OH_RDB_TransType;
+@@ -26,6 +26,8 @@ const DATABASE_FILE_NAME: &str = "indexeddb.rdb";
+ /// is a handle of its own; statements outside one go to the store, which picks a connection per
+ /// statement.
+ pub(crate) struct RdbExecutor {
++    /// The directory the store was opened in, which RDB keeps its files under.
++    directory: PathBuf,
+     /// Declared before the store, so that it is dropped, and rolled back, first.
+     transaction: Option<OhosRdbTransaction>,
+     /// Shared with the executors of [`SqlExecutor::connector`]. The lock serializes the calls on
+@@ -95,21 +97,42 @@ impl SqlExecutor for RdbExecutor {
+             let _ = store.execute(pragma);
+         }
+         Ok(Self {
++            directory: directory.to_owned(),
+             store: Arc::new(Mutex::new(store)),
+             transaction: None,
+         })
+     }
+ 
+     fn connector(&self) -> Connector<Self> {
++        let directory = self.directory.clone();
+         let store = self.store.clone();
+         Box::new(move || {
+             Ok(Self {
++                directory: directory.clone(),
+                 store: store.clone(),
+                 transaction: None,
+             })
+         })
+     }
+ 
++    fn delete(self) -> Result<(), SqlError> {
++        let Self {
++            directory,
++            store,
++            transaction,
++        } = self;
++        drop(transaction);
++        // RDB would close the store under the other executors.
++        let Some(store) = Arc::into_inner(store) else {
++            return Err(SqlError::TransactionState(
++                "delete while other executors on the database exist",
++            ));
++        };
++        drop(store);
++        OhosRdbStore::delete(&directory, DATABASE_FILE_NAME)?;
++        Ok(())
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         let values = values(params)?;
+         // RDB returns the number of changed rows for UPDATE and DELETE, and the row id or -1 for
+diff --git a/components/storage/indexeddb/backend/schema.rs b/components/storage/indexeddb/backend/schema.rs
+index 44f20aff59e..1f5e0c59d20 100644
+--- a/components/storage/indexeddb/backend/schema.rs
++++ b/components/storage/indexeddb/backend/schema.rs
+@@ -2,6 +2,8 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
++use std::path::Path;
++
+ use log::info;
+ 
+ use super::executor::{
+@@ -10,6 +12,11 @@ use super::executor::{
+ use crate::indexeddb::IndexedDBDescription;
+ use crate::shared::DB_INIT_PRAGMAS;
+ 
++/// The version of the tables below and of how records are stored in them, kept in the database
++/// file's `user_version`. Bump it with every change to either: a database stored with another
++/// version is deleted and created anew when it is opened, as there are no migrations.
++pub(crate) const SCHEMA_VERSION: i64 = 1;
++
+ // Adapted from:
+ // https://github.com/mozilla-firefox/firefox/blob/ee102e926521b3e460293b0aea6b54b1a03f6f74/dom/indexedDB/DBSchema.cpp#L78
+ const CREATE_TABLES: [&str; 6] = [
+@@ -76,20 +83,55 @@ CREATE TABLE IF NOT EXISTS unique_index_data (
+ ) WITHOUT ROWID;"#,
+ ];
+ 
+-/// Creates the tables of a new database.
+-pub(crate) fn init_database<X: SqlExecutor>(
+-    executor: &mut X,
++/// Opens the database in `directory`, creating its tables if it is new. A database stored with
++/// another [`SCHEMA_VERSION`] is deleted and created anew. Returns the connection and whether
++/// the database was created.
++pub(crate) fn open_database<X: SqlExecutor>(
++    directory: &Path,
+     description: &IndexedDBDescription,
+-) -> Result<(), SqlError> {
+-    let exists = query_row(
++) -> Result<(X, bool), SqlError> {
++    let mut executor = X::open(directory)?;
++    let stored_version = stored_schema_version(&mut executor)?;
++    // A new database file has neither a version nor tables.
++    if stored_version != SCHEMA_VERSION && (stored_version != 0 || is_initialized(&mut executor)?) {
++        info!(
++            "Resetting indexeddb database {:?} of schema version {stored_version}",
++            description.name
++        );
++        executor.delete()?;
++        executor = X::open(directory)?;
++        // RDB's delete reports success even when it couldn't remove the files.
++        if stored_schema_version(&mut executor)? != 0 || is_initialized(&mut executor)? {
++            return Err(SqlError::ResetFailed);
++        }
++    }
++    let created = init_database(&mut executor, description)?;
++    Ok((executor, created))
++}
++
++/// The schema version a database was stored with, 0 if it has none.
++pub(crate) fn stored_schema_version<X: SqlExecutor>(executor: &mut X) -> Result<i64, SqlError> {
++    Ok(query_row(executor, "PRAGMA user_version", &[], |row| row.integer(0))?.unwrap_or(0))
++}
++
++fn is_initialized<X: SqlExecutor>(executor: &mut X) -> Result<bool, SqlError> {
++    Ok(query_row(
+         executor,
+         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'database'",
+         &[],
+         |_| Ok(()),
+     )?
+-    .is_some();
+-    if exists {
+-        return Ok(());
++    .is_some())
++}
++
++/// Creates the tables of a new database, stamped with [`SCHEMA_VERSION`]. Returns whether the
++/// database was new.
++fn init_database<X: SqlExecutor>(
++    executor: &mut X,
++    description: &IndexedDBDescription,
++) -> Result<bool, SqlError> {
++    if is_initialized(executor)? {
++        return Ok(false);
+     }
+ 
+     info!("Initializing indexeddb database {:?}", description.name);
+@@ -108,6 +150,7 @@ pub(crate) fn init_database<X: SqlExecutor>(
+             "INSERT INTO database (name, origin, version) VALUES (?, ?, 0)",
+             &[SqlParam::Text(&description.name), SqlParam::Text(&origin)],
+         )?;
+-        Ok(())
++        executor.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), &[])?;
++        Ok(true)
+     })
+ }
+diff --git a/components/storage/indexeddb/backend/sqlite.rs b/components/storage/indexeddb/backend/sqlite.rs
+index fbcaf44480b..3b1e2c48dbc 100644
+--- a/components/storage/indexeddb/backend/sqlite.rs
++++ b/components/storage/indexeddb/backend/sqlite.rs
+@@ -3,6 +3,7 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use std::path::{Path, PathBuf};
++use std::{fs, io};
+ 
+ use rusqlite::types::{ToSqlOutput, ValueRef};
+ use rusqlite::{Connection, ToSql, ffi};
+@@ -14,6 +15,10 @@ use crate::shared::DB_PRAGMAS;
+ 
+ const DATABASE_FILE_NAME: &str = "indexeddb.sqlite";
+ 
++/// The suffixes of the files SQLite keeps next to a database file, and the empty one of the
++/// database file itself, which is deleted last.
++const DATABASE_FILE_SUFFIXES: [&str; 4] = ["-wal", "-shm", "-journal", ""];
++
+ /// Enough for every distinct statement of the IndexedDB layer, so none is prepared twice.
+ const STATEMENT_CACHE_CAPACITY: usize = 64;
+ 
+@@ -119,6 +124,22 @@ impl SqlExecutor for SqliteExecutor {
+         Box::new(move || Self::open_file(path.clone()))
+     }
+ 
++    fn delete(self) -> Result<(), SqlError> {
++        let Self { path, connection } = self;
++        connection.close().map_err(|(_, error)| error)?;
++        for suffix in DATABASE_FILE_SUFFIXES {
++            let mut file = path.clone().into_os_string();
++            file.push(suffix);
++            match fs::remove_file(&file) {
++                Err(error) if error.kind() != io::ErrorKind::NotFound => {
++                    return Err(SqlError::Io(error));
++                },
++                _ => {},
++            }
++        }
++        Ok(())
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         let mut statement = self.connection.prepare_cached(sql)?;
+         check_runs_on_rdb(sql, &statement, false)?;
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index 390f2d5b91d..48c98fb1a97 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -26,6 +26,7 @@ use super::executor::{
+     Connector, OnRow, SqlError, SqlExecutor, SqlParam, TransactionBehavior, query_row, query_rows,
+ };
+ use super::queries;
++use super::schema::{self, SCHEMA_VERSION};
+ use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction};
+ use crate::indexeddb::{BackendErrorMapper, IndexedDBDescription};
+ 
+@@ -63,6 +64,13 @@ executor_tests!(
+     executor_round_trips_params,
+     executor_counts_changed_rows,
+     executor_disk_full_maps_to_quota_exceeded,
++    executor_user_version_is_transactional_and_persistent,
++    executor_delete_removes_the_database,
++    schema_version_is_stamped_on_a_new_database,
++    schema_version_match_keeps_the_database,
++    schema_version_mismatch_resets_the_database,
++    indexeddb_version_is_independent_of_the_schema_version,
++    schema_reset_that_keeps_the_old_database_fails,
+     test_cycle,
+     test_create_store,
+     test_create_store_empty_name,
+@@ -108,6 +116,31 @@ fn open_engine<X: SqlExecutor>(dir: &TempDir) -> SqlEngine<X> {
+     .expect("Opening a database should not fail")
+ }
+ 
++fn open_engine_in<X: SqlExecutor>(dir: &Path, created: bool) -> SqlEngine<X> {
++    SqlEngine::new(
++        dir.to_path_buf(),
++        created,
++        &test_description(),
++        ThreadPool::global(),
++    )
++    .expect("Opening a database should not fail")
++}
++
++fn schema_version_of<X: SqlExecutor>(db: &SqlEngine<X>) -> i64 {
++    schema::stored_schema_version(&mut *db.connection()).unwrap()
++}
++
++fn has_table<X: SqlExecutor>(executor: &mut X, name: &str) -> bool {
++    query_row(
++        executor,
++        "SELECT 1 FROM sqlite_master WHERE name = ?",
++        &[SqlParam::Text(name)],
++        |_| Ok(()),
++    )
++    .unwrap()
++    .is_some()
++}
++
+ /// An executor on a new database with a table `t (k INTEGER PRIMARY KEY, v BLOB)`.
+ fn open_executor<X: SqlExecutor>(dir: &Path) -> X {
+     let mut executor = X::open(dir).unwrap();
+@@ -270,6 +303,148 @@ fn executor_disk_full_maps_to_quota_exceeded<X: SqlExecutor>() {
+     assert_eq!(error.into_backend_error(), BackendError::QuotaExceeded);
+ }
+ 
++fn executor_user_version_is_transactional_and_persistent<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let mut executor = open_executor::<X>(dir.path());
++    let version = |executor: &mut X| schema::stored_schema_version(executor).unwrap();
++    assert_eq!(version(&mut executor), 0);
++
++    executor.begin(TransactionBehavior::Immediate).unwrap();
++    executor.execute("PRAGMA user_version = 5", &[]).unwrap();
++    assert_eq!(version(&mut executor), 5);
++    executor.rollback().unwrap();
++    assert_eq!(version(&mut executor), 0);
++
++    executor.begin(TransactionBehavior::Immediate).unwrap();
++    executor.execute("PRAGMA user_version = 6", &[]).unwrap();
++    executor.commit().unwrap();
++    assert_eq!(version(&mut executor), 6);
++
++    // RDB runs each transaction, and each statement outside one, on a pool connection.
++    let mut other = executor.connector()().unwrap();
++    assert_eq!(version(&mut other), 6);
++    other.begin(TransactionBehavior::Deferred).unwrap();
++    assert_eq!(version(&mut other), 6);
++    other.commit().unwrap();
++    drop(other);
++    drop(executor);
++
++    let mut executor = X::open(dir.path()).unwrap();
++    assert_eq!(version(&mut executor), 6);
++}
++
++fn executor_delete_removes_the_database<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    for in_transaction in [false, true] {
++        let mut executor = open_executor::<X>(dir.path());
++        insert_into_t(&mut executor, 1);
++        executor.execute("PRAGMA user_version = 3", &[]).unwrap();
++        if in_transaction {
++            executor.begin(TransactionBehavior::Immediate).unwrap();
++            insert_into_t(&mut executor, 2);
++        }
++        executor.delete().unwrap();
++
++        let mut executor = X::open(dir.path()).unwrap();
++        assert!(!has_table(&mut executor, "t"));
++        assert_eq!(schema::stored_schema_version(&mut executor).unwrap(), 0);
++    }
++}
++
++fn schema_version_is_stamped_on_a_new_database<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    // The directory may exist already when the database file doesn't.
++    let db = open_engine_in::<X>(dir.path(), false);
++    assert!(db.created_db_path());
++    assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
++    assert_eq!(db.version().unwrap(), 0);
++    assert!(db.object_store_names().unwrap().is_empty());
++}
++
++fn schema_version_match_keeps_the_database<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine_in::<X>(dir.path(), true);
++    db.create_store("store", None, false).unwrap();
++    db.set_version(3).unwrap();
++    drop(db);
++
++    let db = open_engine_in::<X>(dir.path(), false);
++    assert!(!db.created_db_path());
++    assert_eq!(db.object_store_names().unwrap(), vec!["store".to_owned()]);
++    assert_eq!(db.version().unwrap(), 3);
++    assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
++}
++
++fn schema_version_mismatch_resets_the_database<X: SqlExecutor>() {
++    // 0 is what a database from before schema versions has.
++    for stored_version in [0, SCHEMA_VERSION + 1] {
++        let dir = tempfile::tempdir().unwrap();
++        let db = open_engine_in::<X>(dir.path(), true);
++        db.create_store("store", None, false).unwrap();
++        db.set_version(3).unwrap();
++        {
++            let mut connection = db.connection();
++            connection.execute("CREATE TABLE extra (x)", &[]).unwrap();
++            connection
++                .execute(&format!("PRAGMA user_version = {stored_version}"), &[])
++                .unwrap();
++        }
++        drop(db);
++
++        let db = open_engine_in::<X>(dir.path(), false);
++        assert!(db.created_db_path(), "stored version {stored_version}");
++        assert!(db.object_store_names().unwrap().is_empty());
++        assert_eq!(db.version().unwrap(), 0);
++        assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
++        assert!(
++            !has_table(&mut *db.connection(), "extra"),
++            "The database file should have been deleted"
++        );
++    }
++}
++
++fn indexeddb_version_is_independent_of_the_schema_version<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine_in::<X>(dir.path(), true);
++    // https://w3c.github.io/IndexedDB/#dom-idbfactory-open: the largest version.
++    let largest_version = (1 << 53) - 1;
++    db.set_version(largest_version).unwrap();
++    assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
++    drop(db);
++
++    let db = open_engine_in::<X>(dir.path(), false);
++    assert!(!db.created_db_path());
++    assert_eq!(db.version().unwrap(), largest_version);
++    assert_eq!(schema_version_of(&db), SCHEMA_VERSION);
++}
++
++fn schema_reset_that_keeps_the_old_database_fails<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine_in::<X>(dir.path(), true);
++    db.create_store("store", None, false).unwrap();
++    db.connection()
++        .execute(
++            &format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1),
++            &[],
++        )
++        .unwrap();
++    drop(db);
++
++    faults_for(dir.path()).lock().unwrap().keep_on_delete = true;
++    let open = SqlEngine::<Faulty<X>>::new(
++        dir.path().to_path_buf(),
++        false,
++        &test_description(),
++        ThreadPool::global(),
++    );
++    assert!(matches!(open, Err(SqlError::ResetFailed)));
++
++    faults_for(dir.path()).lock().unwrap().keep_on_delete = false;
++    let db = open_engine_in::<Faulty<X>>(dir.path(), false);
++    assert!(db.created_db_path());
++    assert!(db.object_store_names().unwrap().is_empty());
++}
++
+ fn test_cycle<X: SqlExecutor>() {
+     let dir = tempfile::tempdir().unwrap();
+     // Test create
+@@ -846,6 +1021,8 @@ struct Faults {
+     /// Fail the statement or query whose SQL contains this text, after letting the given number
+     /// of them through, and end the open transaction the way SQLite does after SQLITE_FULL.
+     statement: Option<(&'static str, usize)>,
++    /// Leave the database in place on delete, as RDB does when it can't remove the files.
++    keep_on_delete: bool,
+ }
+ 
+ /// The faults of the [`Faulty`] executors opened on each directory.
+@@ -905,6 +1082,13 @@ impl<X: SqlExecutor> SqlExecutor for Faulty<X> {
+         })
+     }
+ 
++    fn delete(self) -> Result<(), SqlError> {
++        if self.faults.lock().unwrap().keep_on_delete {
++            return Ok(());
++        }
++        self.inner.delete()
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         self.inject(sql)?;
+         self.inner.execute(sql, params)
+@@ -1143,6 +1327,23 @@ fn test_batches_reply_in_dispatch_order<X: SqlExecutor>() {
+     assert_eq!(replies, (0..8).collect::<Vec<_>>());
+ }
+ 
++/// Deleting the store would close it under the other executors on it.
++#[cfg(ohos_rdb)]
++#[test]
++fn rdb_delete_refuses_while_other_executors_exist() {
++    use super::rdb::RdbExecutor;
++
++    let dir = tempfile::tempdir().unwrap();
++    let executor = RdbExecutor::open(dir.path()).unwrap();
++    let other = executor.connector()().unwrap();
++    assert!(matches!(
++        executor.delete(),
++        Err(SqlError::TransactionState(_))
++    ));
++    drop(other);
++    RdbExecutor::open(dir.path()).unwrap().delete().unwrap();
++}
++
+ #[test]
+ fn key_path_round_trip() {
+     let key_path = KeyPath::String("field".to_string());
+diff --git a/components/storage/indexeddb/backend/twin.rs b/components/storage/indexeddb/backend/twin.rs
+index feda56cb4dc..d5c59f4d8da 100644
+--- a/components/storage/indexeddb/backend/twin.rs
++++ b/components/storage/indexeddb/backend/twin.rs
+@@ -49,6 +49,10 @@ impl SqlExecutor for TwinExecutor {
+         }
+     }
+ 
++    fn delete(self) -> Result<(), SqlError> {
++        delegate!(self, |executor| executor.delete())
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         delegate!(self, |executor| executor.execute(sql, params))
+     }
+diff --git a/components/storage/ohos_rdb/mod.rs b/components/storage/ohos_rdb/mod.rs
+index fc7736c67d7..9d9679abff6 100644
+--- a/components/storage/ohos_rdb/mod.rs
++++ b/components/storage/ohos_rdb/mod.rs
+@@ -31,10 +31,10 @@ use ohos_rdb_sys::rdb_transaction::{
+ use ohos_rdb_sys::rdb_types::{OH_ColumnType, OH_Data_Value};
+ use ohos_rdb_sys::relational_store::{
+     OH_Rdb_CloseStore, OH_Rdb_ConfigV2, OH_Rdb_CreateConfig, OH_Rdb_CreateOrOpen,
+-    OH_Rdb_CreateTransaction, OH_Rdb_DestroyConfig, OH_Rdb_Execute, OH_Rdb_ExecuteQueryV2,
+-    OH_Rdb_ExecuteV2, OH_Rdb_SecurityLevel, OH_Rdb_SetArea, OH_Rdb_SetDatabaseDir,
+-    OH_Rdb_SetDbType, OH_Rdb_SetSecurityLevel, OH_Rdb_SetStoreName, OH_Rdb_Store, Rdb_DBType,
+-    Rdb_SecurityArea,
++    OH_Rdb_CreateTransaction, OH_Rdb_DeleteStoreV2, OH_Rdb_DestroyConfig, OH_Rdb_Execute,
++    OH_Rdb_ExecuteQueryV2, OH_Rdb_ExecuteV2, OH_Rdb_SecurityLevel, OH_Rdb_SetArea,
++    OH_Rdb_SetDatabaseDir, OH_Rdb_SetDbType, OH_Rdb_SetSecurityLevel, OH_Rdb_SetStoreName,
++    OH_Rdb_Store, Rdb_DBType, Rdb_SecurityArea,
+ };
+ use ohos_rdb_sys::relational_store_error_code::OH_Rdb_ErrCode;
+ pub(crate) use params::OhosRdbValues;
+@@ -94,6 +94,45 @@ impl OhosRdbConfig {
+         }
+     }
+ 
++    /// The configuration of the store `store_name` in `database_dir`.
++    fn for_store(database_dir: &Path, store_name: &str) -> Result<Self> {
++        let config = Self::new()?;
++        let database_dir = cstring_from_path(database_dir)?;
++        let store_name = CString::new(store_name)?;
++
++        // SAFETY: The config handle is initialized above and the strings outlive the calls,
++        // which copy them.
++        unsafe {
++            ensure_success(
++                OH_Rdb_SetDatabaseDir(config.as_ptr(), database_dir.as_ptr()),
++                "OH_Rdb_SetDatabaseDir",
++            )?;
++            ensure_success(
++                OH_Rdb_SetStoreName(config.as_ptr(), store_name.as_ptr()),
++                "OH_Rdb_SetStoreName",
++            )?;
++            ensure_success(
++                OH_Rdb_SetDbType(config.as_ptr(), Rdb_DBType::RDB_SQLITE.0 as c_int),
++                "OH_Rdb_SetDbType",
++            )?;
++            // securityLevel is mandatory for OH_Rdb_ConfigV2; without it
++            // OH_Rdb_CreateOrOpen fails with RDB_E_INVALID_ARGS (14800001).
++            ensure_success(
++                OH_Rdb_SetSecurityLevel(config.as_ptr(), OH_Rdb_SecurityLevel::S1.0 as c_int),
++                "OH_Rdb_SetSecurityLevel",
++            )?;
++            // App storage lives in the EL2 (post-unlock) area.
++            ensure_success(
++                OH_Rdb_SetArea(
++                    config.as_ptr(),
++                    Rdb_SecurityArea::RDB_SECURITY_AREA_EL2.0 as c_int,
++                ),
++                "OH_Rdb_SetArea",
++            )?;
++        }
++        Ok(config)
++    }
++
+     fn as_ptr(&self) -> *mut OH_Rdb_ConfigV2 {
+         self.inner.as_ptr()
+     }
+@@ -162,39 +201,9 @@ unsafe impl Send for OhosRdbStore {}
+ 
+ impl OhosRdbStore {
+     pub(crate) fn open(database_dir: &Path, store_name: &str) -> Result<Self> {
+-        let config = OhosRdbConfig::new()?;
+-        let database_dir = cstring_from_path(database_dir)?;
+-        let store_name = CString::new(store_name)?;
+-
++        let config = OhosRdbConfig::for_store(database_dir, store_name)?;
+         // SAFETY: The config handle is initialized above and all FFI writes target local values.
+         unsafe {
+-            ensure_success(
+-                OH_Rdb_SetDatabaseDir(config.as_ptr(), database_dir.as_ptr()),
+-                "OH_Rdb_SetDatabaseDir",
+-            )?;
+-            ensure_success(
+-                OH_Rdb_SetStoreName(config.as_ptr(), store_name.as_ptr()),
+-                "OH_Rdb_SetStoreName",
+-            )?;
+-            ensure_success(
+-                OH_Rdb_SetDbType(config.as_ptr(), Rdb_DBType::RDB_SQLITE.0 as c_int),
+-                "OH_Rdb_SetDbType",
+-            )?;
+-            // securityLevel is mandatory for OH_Rdb_ConfigV2; without it
+-            // OH_Rdb_CreateOrOpen fails with RDB_E_INVALID_ARGS (14800001).
+-            ensure_success(
+-                OH_Rdb_SetSecurityLevel(config.as_ptr(), OH_Rdb_SecurityLevel::S1.0 as c_int),
+-                "OH_Rdb_SetSecurityLevel",
+-            )?;
+-            // App storage lives in the EL2 (post-unlock) area.
+-            ensure_success(
+-                OH_Rdb_SetArea(
+-                    config.as_ptr(),
+-                    Rdb_SecurityArea::RDB_SECURITY_AREA_EL2.0 as c_int,
+-                ),
+-                "OH_Rdb_SetArea",
+-            )?;
+-
+             let mut err = 0;
+             let raw = OH_Rdb_CreateOrOpen(config.as_ptr(), &mut err);
+             if err != OH_Rdb_ErrCode::RDB_OK.0 {
+@@ -211,6 +220,19 @@ impl OhosRdbStore {
+         }
+     }
+ 
++    /// Deletes the store that [`Self::open`] opens, with all its files. RDB closes the store
++    /// if a handle to it is still open, so every handle must have been dropped first.
++    pub(crate) fn delete(database_dir: &Path, store_name: &str) -> Result<()> {
++        let config = OhosRdbConfig::for_store(database_dir, store_name)?;
++        // SAFETY: The config handle is initialized above and outlives the call.
++        unsafe {
++            ensure_success(
++                OH_Rdb_DeleteStoreV2(config.as_ptr()),
++                "OH_Rdb_DeleteStoreV2",
++            )
++        }
++    }
++
+     /// # Safety
+     ///
+     /// `raw` must be a live `OH_Rdb_Store` returned by `OH_Rdb_CreateOrOpen`.

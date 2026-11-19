@@ -2,25 +2,34 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cmp::Ordering;
 use std::ffi::CString;
-use std::ptr;
+use std::sync::atomic::{self, AtomicU8};
+use std::{ptr, slice};
 
 use itertools::Itertools;
 use js::context::JSContext;
-use js::conversions::{ToJSValConvertible, jsstr_to_string};
+use js::conversions::ToJSValConvertible;
 use js::jsapi::{
-    ClippedTime, IsArrayBufferObject, IsDetachedArrayBufferObject, JS_GetArrayBufferViewBuffer,
-    JS_GetStringLength, JS_IsArrayBufferViewObject, NewArrayObject1, PropertyKey,
+    ClippedTime, ESClass, GetArrayBufferMaybeSharedLengthAndData, GetArrayBufferViewLengthAndData,
+    IsArrayBufferObject, IsDetachedArrayBufferObject, IsSharedArrayBufferObject,
+    JS_DeprecatedStringHasLatin1Chars, JS_GetArrayBufferViewBuffer, JS_GetStringLength,
+    JS_IsArrayBufferViewObject, JSObject, JSString, NewArrayObject1, PropertyKey,
 };
-use js::jsval::{DoubleValue, ObjectValue, UndefinedValue};
+use js::jsval::{DoubleValue, ObjectValue, StringValue, UndefinedValue};
 use js::rust::wrappers2::{
-    GetArrayLength, IsArrayObject, JS_HasOwnPropertyById, JS_IndexToId, JS_IsIdentifier,
+    GetArrayLength, GetBuiltinClass, IsArrayObject, JS_AtomizeUCStringN, JS_ClearPendingException,
+    JS_DefinePropertyById2, JS_GetLatin1StringCharsAndLength, JS_GetTwoByteStringCharsAndLength,
+    JS_HasOwnPropertyById, JS_IndexToId, JS_IsIdentifier, JS_NewUCStringCopyN, JS_StringToId,
     NewDateObject, ObjectIsDate, SameValue,
 };
-use js::rust::{HandleValue, MutableHandleValue};
+use js::rust::{HandleId, HandleObject, HandleValue, MutableHandleId, MutableHandleValue};
 use js::typedarray::{ArrayBuffer, ArrayBufferU8, ArrayBufferView};
-use script_bindings::js::{JS_GetPropertyById, JS_NewObject};
-use storage_traits::indexeddb::{BackendError, IndexedDBKeyRange, IndexedDBKeyType};
+use script_bindings::js::{JS_GetPropertyById, JS_IsExceptionPending, JS_NewObject, PropertyFlags};
+use storage_traits::indexeddb::{
+    BackendError, IndexedDBIndex, IndexedDBIndexKey, IndexedDBKeyRange, IndexedDBKeyType,
+    Utf16String,
+};
 
 use crate::dom::bindings::buffer_source::create_buffer_source;
 use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
@@ -28,12 +37,136 @@ use crate::dom::bindings::codegen::Bindings::FileBinding::FileMethods;
 use crate::dom::bindings::codegen::UnionTypes::StringOrStringSequence as StrOrStringSequence;
 use crate::dom::bindings::conversions::{get_property_jsval, root_from_handlevalue};
 use crate::dom::bindings::error::Error;
+use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::utils::{define_dictionary_property, has_own_property};
+use crate::dom::bindings::utils::define_dictionary_property;
 use crate::dom::blob::Blob;
+use crate::dom::domstringlist::DOMStringList;
 use crate::dom::file::File;
+use crate::dom::globalscope::GlobalScope;
 use crate::dom::idbkeyrange::IDBKeyRange;
 use crate::dom::idbobjectstore::KeyPath;
+
+/// The code units of the JavaScript string `string`, which must not be null.
+#[expect(unsafe_code)]
+fn js_string_code_units(cx: &JSContext, string: *mut JSString) -> Vec<u16> {
+    let mut length = 0;
+    // SAFETY: `string` is a live string, and its characters are copied before anything can
+    // garbage collect.
+    unsafe {
+        if JS_DeprecatedStringHasLatin1Chars(string) {
+            let chars = JS_GetLatin1StringCharsAndLength(cx, string, &mut length);
+            assert!(!chars.is_null());
+            slice::from_raw_parts(chars, length)
+                .iter()
+                .map(|&char| char.into())
+                .collect()
+        } else {
+            let chars = JS_GetTwoByteStringCharsAndLength(cx, string, &mut length);
+            assert!(!chars.is_null());
+            slice::from_raw_parts(chars, length).to_vec()
+        }
+    }
+}
+
+/// Sets `result` to a JavaScript string of the code units of `string`.
+#[expect(unsafe_code)]
+fn utf16_string_to_jsval(cx: &mut JSContext, string: &Utf16String, mut result: MutableHandleValue) {
+    let units = string.units();
+    // SAFETY: `units` is valid for `units.len()` code units, which the call copies.
+    let js_string = unsafe { JS_NewUCStringCopyN(cx, units.as_ptr(), units.len()) };
+    assert!(
+        !js_string.is_null(),
+        "Failed to convert an IndexedDB string into a JS string"
+    );
+    // SAFETY: `js_string` is a new, non-null string.
+    result.set(StringValue(unsafe { &*js_string }));
+}
+
+/// Sets `id` to the property key of the key path identifier `identifier`, made from its code
+/// units: the property functions that take a C string read it as Latin-1 on SpiderMonkey, which
+/// changes a non-ASCII identifier.
+#[expect(unsafe_code)]
+fn identifier_id(cx: &mut JSContext, identifier: &str, id: MutableHandleId) -> Result<(), Error> {
+    let units: Vec<u16> = identifier.encode_utf16().collect();
+    // SAFETY: `units` is valid for `units.len()` code units, which the call copies.
+    rooted!(&in(cx) let string = unsafe { JS_AtomizeUCStringN(cx, units.as_ptr(), units.len()) });
+    // SAFETY: `string` is rooted and not null.
+    if string.is_null() || !unsafe { JS_StringToId(cx, string.handle(), id) } {
+        return Err(Error::JSFailed);
+    }
+    Ok(())
+}
+
+/// ? HasOwnProperty(object, id).
+#[expect(unsafe_code)]
+fn has_own_identifier(
+    cx: &mut JSContext,
+    object: HandleObject,
+    id: HandleId,
+) -> Result<bool, Error> {
+    let mut found = false;
+    // SAFETY: `object` and `id` are rooted.
+    if !unsafe { JS_HasOwnPropertyById(cx, object, id, &mut found) } {
+        return Err(Error::JSFailed);
+    }
+    Ok(found)
+}
+
+/// ? Get(object, id).
+fn get_identifier(
+    cx: &mut JSContext,
+    object: HandleObject,
+    id: HandleId,
+    value: MutableHandleValue,
+) -> Result<(), Error> {
+    if !JS_GetPropertyById(cx, object, id, value) {
+        return Err(Error::JSFailed);
+    }
+    Ok(())
+}
+
+/// CreateDataProperty(object, id, value).
+#[expect(unsafe_code)]
+fn create_identifier(
+    cx: &mut JSContext,
+    object: HandleObject,
+    id: HandleId,
+    value: HandleValue,
+) -> Result<(), Error> {
+    let attributes =
+        (PropertyFlags::ENUMERABLE | PropertyFlags::WRITABLE | PropertyFlags::CONFIGURABLE)
+            .as_jsprop_flags();
+    // SAFETY: `object`, `id` and `value` are rooted.
+    if !unsafe { JS_DefinePropertyById2(cx, object, id, value, attributes) } {
+        return Err(Error::JSFailed);
+    }
+    Ok(())
+}
+
+/// The name (<https://w3c.github.io/IndexedDB/#name>) that the DOMString `name` gives.
+pub(crate) fn name_from_dom_string(name: &DOMString) -> Utf16String {
+    Utf16String::from(&*name.str())
+}
+
+/// The DOMString of the name `name`.
+pub(crate) fn dom_string_from_name(name: &Utf16String) -> DOMString {
+    DOMString::from(name.to_string_lossy())
+}
+
+/// <https://w3c.github.io/IndexedDB/#sorted-name-list> of `names`, sorted by code unit.
+pub(crate) fn sorted_name_list(
+    cx: &mut JSContext,
+    global: &GlobalScope,
+    names: impl IntoIterator<Item = Utf16String>,
+) -> DomRoot<DOMStringList> {
+    let names = names
+        .into_iter()
+        .sorted_unstable()
+        .map(|name| dom_string_from_name(&name))
+        .collect();
+    DOMStringList::new(cx, global, names)
+}
 
 // https://www.w3.org/TR/IndexedDB-3/#convert-key-to-value
 #[expect(unsafe_code)]
@@ -50,7 +183,7 @@ pub fn key_type_to_jsval(
         IndexedDBKeyType::Number(n) => result.set(DoubleValue(*n)),
 
         // Step 3. If type is string, return an ECMAScript String value equal to value.
-        IndexedDBKeyType::String(s) => s.to_jsval(cx, result),
+        IndexedDBKeyType::String(s) => utf16_string_to_jsval(cx, s, result),
 
         IndexedDBKeyType::Date(d) => unsafe {
             // Step 3.1. Let date be the result of executing the ECMAScript Date
@@ -253,9 +386,10 @@ pub fn convert_value_to_key(
     // If Type(input) is String:
     if input.is_string() {
         // 3.1. Return a new key with type string and value input.
-        let string_ptr = std::ptr::NonNull::new(input.to_string()).unwrap();
-        let key = unsafe { jsstr_to_string(cx, string_ptr) };
-        return Ok(ConversionResult::Valid(IndexedDBKeyType::String(key)));
+        let units = js_string_code_units(cx, input.to_string());
+        return Ok(ConversionResult::Valid(IndexedDBKeyType::String(
+            Utf16String::from_units(units),
+        )));
     }
 
     if input.is_object() {
@@ -282,12 +416,17 @@ pub fn convert_value_to_key(
             }
 
             // If input is a buffer source type:
-            if IsArrayBufferObject(*object) || JS_IsArrayBufferViewObject(*object) {
+            let is_shared_array_buffer = IsSharedArrayBufferObject(*object);
+            if IsArrayBufferObject(*object) ||
+                is_shared_array_buffer ||
+                JS_IsArrayBufferViewObject(*object)
+            {
+                let mut is_shared = is_shared_array_buffer;
                 let is_detached = if IsArrayBufferObject(*object) {
                     IsDetachedArrayBufferObject(*object)
+                } else if is_shared_array_buffer {
+                    false
                 } else {
-                    // Shared ArrayBuffers are not supported here, so this stays false.
-                    let mut is_shared = false;
                     rooted!(
                         in (cx.raw_cx()) let view_buffer =
                             JS_GetArrayBufferViewBuffer(
@@ -304,7 +443,9 @@ pub fn convert_value_to_key(
                 }
                 // 3.2. Let bytes be the result of getting a copy of the bytes held
                 // by the buffer source input.
-                let bytes = if IsArrayBufferObject(*object) {
+                let bytes = if is_shared {
+                    Some(shared_memory_bytes(*object))
+                } else if IsArrayBufferObject(*object) {
                     let array_buffer = ArrayBuffer::from(*object).map_err(|()| Error::JSFailed)?;
                     array_buffer.to_vec()
                 } else {
@@ -379,6 +520,112 @@ pub fn convert_value_to_key(
     Ok(ConversionResult::Invalid)
 }
 
+/// A copy of the bytes of `object`, a SharedArrayBuffer or a view on one. Shared memory may change
+/// at any time, so the bytes are read as atomics.
+#[expect(unsafe_code)]
+fn shared_memory_bytes(object: *mut JSObject) -> Vec<u8> {
+    let mut length = 0;
+    let mut is_shared = false;
+    let mut data = ptr::null_mut();
+    // SAFETY: `object` is a live SharedArrayBuffer or view, and the out-parameters are valid.
+    unsafe {
+        if JS_IsArrayBufferViewObject(object) {
+            GetArrayBufferViewLengthAndData(object, &mut length, &mut is_shared, &mut data);
+        } else {
+            GetArrayBufferMaybeSharedLengthAndData(object, &mut length, &mut is_shared, &mut data);
+        }
+    }
+    if data.is_null() {
+        return Vec::new();
+    }
+    (0..length)
+        // SAFETY: `data` points to `length` bytes of the buffer, which no JavaScript code runs to
+        // detach or shrink (a SharedArrayBuffer can only grow) while they are read, and a u8 is
+        // always aligned for AtomicU8.
+        .map(|i| unsafe { AtomicU8::from_ptr(data.add(i)) }.load(atomic::Ordering::Relaxed))
+        .collect()
+}
+
+/// <https://w3c.github.io/IndexedDB/#convert-a-value-to-a-multientry-key>, except that the keys
+/// of an array key are in key order rather than in the order of the array: each becomes a record
+/// of a multiEntry index, so their order isn't observable.
+///
+/// `input` is part of a clone, which the spec makes in a user-agent defined realm, whose
+/// prototypes have no indexed properties. Servo clones into the page's realm, so an index that
+/// `input` doesn't have reads as undefined here instead of reaching the page's `Array.prototype`.
+#[expect(unsafe_code)]
+pub(crate) fn convert_value_to_multientry_key(
+    cx: &mut JSContext,
+    input: HandleValue,
+) -> Result<ConversionResult, Error> {
+    // Step 1. If input is an Array exotic object, then:
+    let mut is_array = false;
+    // SAFETY: `input` is rooted.
+    if !unsafe { IsArrayObject(cx, input, &mut is_array) } {
+        return Err(Error::JSFailed);
+    }
+    if !is_array {
+        // Step 2. Otherwise, return the result of converting a value to a key with argument
+        // input. Rethrow any exceptions.
+        return convert_value_to_key(cx, input, None);
+    }
+    rooted!(&in(cx) let object = input.to_object());
+
+    // Step 1.1. Let len be ? ToLength( ? Get(input, "length")).
+    let mut len = 0;
+    // SAFETY: `object` is rooted.
+    if !unsafe { GetArrayLength(cx, object.handle(), &mut len) } {
+        return Err(Error::JSFailed);
+    }
+    // Step 1.2. Let seen be a new set containing only input.
+    // Step 1.3. Let keys be a new empty list.
+    let mut keys = vec![];
+    // Step 1.4. Let index be 0.
+    // Step 1.5. While index is less than len:
+    for index in 0..len {
+        // Step 1.5.1. Let entry be Get(input, index).
+        rooted!(&in(cx) let mut id: PropertyKey);
+        rooted!(&in(cx) let mut entry = UndefinedValue());
+        let mut own = false;
+        // SAFETY: `id` and `object` are rooted.
+        let got = unsafe {
+            JS_IndexToId(cx, index, id.handle_mut()) &&
+                JS_HasOwnPropertyById(cx, object.handle(), id.handle(), &mut own)
+        } && (!own ||
+            JS_GetPropertyById(cx, object.handle(), id.handle(), entry.handle_mut()));
+        // Step 1.5.2. If entry is not an abrupt completion, then:
+        if !got {
+            clear_pending_exception(cx);
+            continue;
+        }
+        // Step 1.5.2.1. Let key be the result of converting a value to a key with arguments entry
+        // and seen.
+        // Step 1.5.2.2. If key is not "invalid value" or "invalid type" or an abrupt completion,
+        // and there is no item in keys equal to key, then append key to keys.
+        match convert_value_to_key(cx, entry.handle(), Some(vec![input])) {
+            Ok(ConversionResult::Valid(key)) => keys.push(key),
+            Ok(ConversionResult::Invalid) => {},
+            Err(_) => clear_pending_exception(cx),
+        }
+        // Step 1.5.3. Increase index by 1.
+    }
+    // NOTE: Removing the duplicates after sorting takes O(n log n) comparisons rather than the
+    // spec's O(n²). Valid keys never compare as unordered.
+    keys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    keys.dedup();
+    // Step 1.6. Return a new array key with value set to keys.
+    Ok(ConversionResult::Valid(IndexedDBKeyType::Array(keys)))
+}
+
+/// Clears the exception of a failed JavaScript operation whose failure is ignored.
+#[expect(unsafe_code)]
+pub(crate) fn clear_pending_exception(cx: &mut JSContext) {
+    if JS_IsExceptionPending(cx) {
+        // SAFETY: `cx` is the context the exception is pending on.
+        unsafe { JS_ClearPendingException(cx) };
+    }
+}
+
 /// <https://www.w3.org/TR/IndexedDB-3/#convert-a-value-to-a-key-range>
 pub fn convert_value_to_key_range(
     cx: &mut JSContext,
@@ -417,16 +664,86 @@ pub fn convert_value_to_key_range(
     Ok(IndexedDBKeyRange::only(key))
 }
 
+/// <https://w3c.github.io/IndexedDB/#is-a-potentially-valid-key-range>
+#[expect(unsafe_code)]
+pub(crate) fn is_potentially_valid_key_range(
+    cx: &mut JSContext,
+    value: HandleValue,
+) -> Result<bool, Error> {
+    // Step 1. If value is a key range, return true.
+    if root_from_handlevalue::<IDBKeyRange>(cx, value).is_ok() {
+        return Ok(true);
+    }
+    // Step 2. Let key be the result of converting a value to a key with value.
+    // Step 3. If key is "invalid type" return false.
+    // Step 4. Else return true.
+    // NOTE: Converting a value to a key gives "invalid type" exactly when the value has none of
+    // the types that `convert_value_to_key` converts, whose checks these are: an Array of
+    // anything else is "invalid value". So the conversion's getters don't run twice.
+    if value.is_number() || value.is_string() {
+        return Ok(true);
+    }
+    if !value.is_object() {
+        return Ok(false);
+    }
+    rooted!(&in(cx) let object = value.to_object());
+    let mut is_date = false;
+    // SAFETY: `object` is rooted.
+    if !unsafe { ObjectIsDate(cx, object.handle(), &mut is_date) } {
+        return Err(Error::JSFailed);
+    }
+    // SAFETY: `object` is a live object.
+    if is_date ||
+        unsafe {
+            IsArrayBufferObject(*object) ||
+                IsSharedArrayBufferObject(*object) ||
+                JS_IsArrayBufferViewObject(*object)
+        }
+    {
+        return Ok(true);
+    }
+    let mut is_array = false;
+    // SAFETY: `value` is rooted.
+    if !unsafe { IsArrayObject(cx, value, &mut is_array) } {
+        return Err(Error::JSFailed);
+    }
+    Ok(is_array)
+}
+
+/// The error of an open or delete request that the backend failed, mapped as
+/// [`map_transaction_error_to_dom_error`] maps it: an "UnknownError" unless the disk is full, as
+/// the spec's examples for open step 6 and delete step 11 have it.
 pub(crate) fn map_backend_error_to_dom_error(error: BackendError) -> Error {
+    map_backend_failure(error, "The IndexedDB open or delete request failed")
+}
+
+/// The error of a request, or of a transaction, that the backend, or script on its behalf, failed:
+/// a "QuotaExceededError" for a full disk, a "ConstraintError" for a key that a unique index or
+/// an object store would have had for two records, an "AbortError" for a transaction that was
+/// aborted, and otherwise an "UnknownError" with a neutral message, as
+/// <https://w3c.github.io/IndexedDB/#commit-a-transaction> step 2.4 suggests; the details only go
+/// to the log. No backend failure is a "DataError": the spec throws those before a request is
+/// made.
+pub(crate) fn map_transaction_error_to_dom_error(error: BackendError) -> Error {
+    map_backend_failure(error, "The IndexedDB transaction failed")
+}
+
+/// Maps `error` as [`map_transaction_error_to_dom_error`] describes, with `message` for an
+/// "UnknownError".
+fn map_backend_failure(error: BackendError, message: &str) -> Error {
     match error {
         BackendError::QuotaExceeded => Error::QuotaExceeded {
             quota: None,
             requested: None,
         },
-        BackendError::DbErr(details) => {
-            Error::Operation(Some(format!("IndexedDB open failed: {details}")))
+        BackendError::Constraint => Error::Constraint(Some(
+            "A unique index or an object store has the same key for two records".to_owned(),
+        )),
+        BackendError::Abort => Error::Abort(Some("The transaction was aborted".to_owned())),
+        other => {
+            warn!("IndexedDB backend failure: {other}");
+            Error::Unknown(Some(message.to_owned()))
         },
-        other => Error::Operation(Some(format!("IndexedDB open failed: {other:?}"))),
     }
 }
 
@@ -449,7 +766,11 @@ pub(crate) fn evaluate_key_path_on_value(
         // Step 1. If keyPath is a list of strings, then:
         KeyPath::StringSequence(key_path) => {
             // Step 1.1. Let result be a new Array object created as if by the expression [].
-            rooted!(&in(cx) let mut result = JS_NewObject(cx, None));
+            // SAFETY: `cx` is a live context; the new array is rooted right away.
+            rooted!(&in(cx) let mut result = unsafe { NewArrayObject1(cx.raw_cx(), 0) });
+            if result.is_null() {
+                return Err(Error::JSFailed);
+            }
 
             // Step 1.2. Let i be 0.
             // Step 1.3. For each item in keyPath:
@@ -592,12 +913,11 @@ pub(crate) fn evaluate_key_path_on_value(
                 }
 
                 rooted!(&in(cx) let object = current_value.to_object());
-                let identifier_name =
-                    CString::new(identifier).expect("Failed to convert str to CString");
+                rooted!(&in(cx) let mut id: PropertyKey);
+                identifier_id(cx, identifier, id.handle_mut())?;
 
                 // Let hop be ! HasOwnProperty(value, identifier).
-                let hop = has_own_property(cx, object.handle(), identifier_name.as_c_str())
-                    .map_err(|_| Error::JSFailed)?;
+                let hop = has_own_identifier(cx, object.handle(), id.handle())?;
 
                 // If hop is false, return failure.
                 if !hop {
@@ -605,12 +925,7 @@ pub(crate) fn evaluate_key_path_on_value(
                 }
 
                 // Let value be ! Get(value, identifier).
-                get_property_jsval(
-                    cx,
-                    object.handle(),
-                    identifier_name.as_c_str(),
-                    current_value.handle_mut(),
-                )?;
+                get_identifier(cx, object.handle(), id.handle(), current_value.handle_mut())?;
 
                 // If value is undefined, return failure.
                 if current_value.get().is_undefined() {
@@ -662,12 +977,11 @@ pub(crate) fn can_inject_key_into_value(
         }
 
         rooted!(&in(cx) let current_object = current_value.to_object());
-        let identifier_name =
-            CString::new(identifier).expect("Failed to convert key path identifier to CString");
+        rooted!(&in(cx) let mut id: PropertyKey);
+        identifier_id(cx, identifier, id.handle_mut())?;
 
         // Step 3.2. Let hop be ? HasOwnProperty(value, identifier).
-        let hop = has_own_property(cx, current_object.handle(), identifier_name.as_c_str())
-            .map_err(|_| Error::JSFailed)?;
+        let hop = has_own_identifier(cx, current_object.handle(), id.handle())?;
 
         // Step 3.3. If hop is false, set value to a new Object created as if by the expression
         // ({}).
@@ -678,16 +992,55 @@ pub(crate) fn can_inject_key_into_value(
         }
 
         // Step 3.4. Set value to ? Get(value, identifier).
-        get_property_jsval(
+        get_identifier(
             cx,
             current_object.handle(),
-            identifier_name.as_c_str(),
+            id.handle(),
             current_value.handle_mut(),
         )?;
     }
 
     // Step 4. Return true if value is an Object or an Array, and false otherwise.
     Ok(current_value.is_object())
+}
+
+/// Whether a key that <https://w3c.github.io/IndexedDB/#inject-a-key-into-a-value-using-a-key-path>
+/// puts into `value` at `key_path` is stored with the value. StructuredSerializeForStorage keeps
+/// the own properties of ordinary objects and Arrays only, so a key that attaches to any other
+/// object, such as a Date, a Map, a Blob or a typed array, or to an object below one, is dropped.
+/// The objects that injecting creates are ordinary ones.
+#[expect(unsafe_code)]
+pub(crate) fn injected_key_is_stored(
+    cx: &mut JSContext,
+    value: HandleValue,
+    key_path: &DOMString,
+) -> Result<bool, Error> {
+    let key_path = key_path.str();
+    let mut identifiers = key_path.split('.').peekable();
+    rooted!(&in(cx) let mut current_value = *value);
+    while let Some(identifier) = identifiers.next() {
+        if !current_value.is_object() {
+            return Ok(false);
+        }
+        rooted!(&in(cx) let object = current_value.to_object());
+        let mut class = ESClass::Other;
+        if !unsafe { GetBuiltinClass(cx, object.handle(), &mut class) } {
+            return Err(Error::JSFailed);
+        }
+        if class != ESClass::Object && class != ESClass::Array {
+            return Ok(false);
+        }
+        if identifiers.peek().is_none() {
+            break;
+        }
+        rooted!(&in(cx) let mut id: PropertyKey);
+        identifier_id(cx, identifier, id.handle_mut())?;
+        if !has_own_identifier(cx, object.handle(), id.handle())? {
+            break;
+        }
+        get_identifier(cx, object.handle(), id.handle(), current_value.handle_mut())?;
+    }
+    Ok(true)
 }
 
 /// <https://w3c.github.io/IndexedDB/#inject-a-key-into-a-value-using-a-key-path>
@@ -719,12 +1072,11 @@ pub(crate) fn inject_key_into_value(
         }
 
         rooted!(&in(cx) let current_object = current_value.to_object());
-        let identifier_name =
-            CString::new(identifier).expect("Failed to convert key path identifier to CString");
+        rooted!(&in(cx) let mut id: PropertyKey);
+        identifier_id(cx, identifier, id.handle_mut())?;
 
         // Step 4.2 Let hop be ! HasOwnProperty(value, identifier).
-        let hop = has_own_property(cx, current_object.handle(), identifier_name.as_c_str())
-            .map_err(|_| Error::JSFailed)?;
+        let hop = has_own_identifier(cx, current_object.handle(), id.handle())?;
 
         // Step 4.3 If hop is false, then:
         if !hop {
@@ -734,22 +1086,16 @@ pub(crate) fn inject_key_into_value(
             o.to_jsval(cx, o_value.handle_mut());
 
             // Step 4.3.2 Let status be CreateDataProperty(value, identifier, o).
-            define_dictionary_property(
-                cx,
-                current_object.handle(),
-                identifier_name.as_c_str(),
-                o_value.handle(),
-            )
-            .map_err(|_| Error::JSFailed)?;
+            create_identifier(cx, current_object.handle(), id.handle(), o_value.handle())?;
 
             // Step 4.3.3 Assert: status is true.
         }
 
         // Step 4.3 Let value be ! Get(value, identifier).
-        get_property_jsval(
+        get_identifier(
             cx,
             current_object.handle(),
-            identifier_name.as_c_str(),
+            id.handle(),
             current_value.handle_mut(),
         )?;
 
@@ -768,16 +1114,16 @@ pub(crate) fn inject_key_into_value(
         return Ok(false);
     }
     rooted!(&in(cx) let parent_object = current_value.to_object());
-    let last_name = CString::new(last).expect("Failed to convert final key path identifier");
+    rooted!(&in(cx) let mut last_id: PropertyKey);
+    identifier_id(cx, last, last_id.handle_mut())?;
 
     // Step 7. Let status be CreateDataProperty(value, last, keyValue).
-    define_dictionary_property(
+    create_identifier(
         cx,
         parent_object.handle(),
-        last_name.as_c_str(),
+        last_id.handle(),
         key_value.handle(),
-    )
-    .map_err(|_| Error::JSFailed)?;
+    )?;
 
     // Step 8. Assert: status is true.
     // The JS_DefineProperty success check above enforces this assertion.
@@ -806,17 +1152,141 @@ pub(crate) fn extract_key(
     // multiEntry flag is unset, and the result of running the steps to convert a value to a
     // multiEntry key with r otherwise. Rethrow any exceptions.
     let key = match multi_entry {
-        Some(true) => {
-            // TODO: implement convert_value_to_multientry_key
-            unimplemented!("multiEntry keys are not yet supported");
+        Some(true) => convert_value_to_multientry_key(cx, r.handle())?,
+        _ => convert_value_to_key(cx, r.handle(), None)?,
+    };
+    match key {
+        // Step 4. If key is "invalid value" or "invalid type", return invalid.
+        ConversionResult::Invalid => Ok(ExtractionResult::Invalid),
+        // Step 5. Return key.
+        ConversionResult::Valid(key) => Ok(ExtractionResult::Key(key)),
+    }
+}
+
+/// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store> steps 5.1 and 5.2 for
+/// `index`, where `value` is the clone being stored: the keys of the records that `index` gets,
+/// without duplicates.
+///
+/// `generated_key_path` is the store's key path when the backend generates the record's key, which
+/// step 1.1.3 injects into the value at that key path before step 5. Script doesn't know the key,
+/// so the parts of the index key that come from it are placeholders, and the keys are those that
+/// the key path gives on the value with the key injected.
+pub(crate) fn index_keys(
+    cx: &mut JSContext,
+    value: HandleValue,
+    index: &IndexedDBIndex,
+    generated_key_path: Option<&str>,
+) -> Vec<IndexedDBIndexKey> {
+    // Step 5.1. Let index key be the result of extracting a key from a value using a key path
+    // with value, index’s key path, and index’s multiEntry flag.
+    let key_path = KeyPath::from(index.key_path.clone());
+    let index_key = match generated_key_path {
+        Some(store_key_path) => {
+            index_key_with_generated_key(cx, value, &key_path, index.multi_entry, store_key_path)
         },
-        _ => match convert_value_to_key(cx, r.handle(), None)? {
-            ConversionResult::Valid(key) => key,
-            // Step 4. If key is invalid, return invalid.
-            ConversionResult::Invalid => return Ok(ExtractionResult::Invalid),
+        None => extracted_index_key(cx, value, &key_path, index.multi_entry),
+    };
+    // Step 5.2. If index key is an exception, or invalid, or failure, take no further actions for
+    // index, and continue these steps for the next index.
+    // NOTE: An exception thrown in this step is not rethrown.
+    let index_key = match index_key {
+        Ok(Some(index_key)) => index_key,
+        Ok(None) => return vec![],
+        Err(_) => {
+            clear_pending_exception(cx);
+            return vec![];
         },
     };
+    // Step 5.5 and 5.6: a multiEntry index gets a record for each subkey of an array key, any
+    // other index one for the key.
+    match index_key {
+        IndexedDBIndexKey::Key(IndexedDBKeyType::Array(subkeys)) if index.multi_entry => {
+            subkeys.into_iter().map(IndexedDBIndexKey::Key).collect()
+        },
+        index_key => vec![index_key],
+    }
+}
 
-    // Step 5. Return key.
-    Ok(ExtractionResult::Key(key))
+/// The index key that extracting a key from `value` with `key_path` gives, `None` for invalid or
+/// failure.
+fn extracted_index_key(
+    cx: &mut JSContext,
+    value: HandleValue,
+    key_path: &KeyPath,
+    multi_entry: bool,
+) -> Result<Option<IndexedDBIndexKey>, Error> {
+    Ok(match extract_key(cx, value, key_path, Some(multi_entry))? {
+        ExtractionResult::Key(key) => Some(IndexedDBIndexKey::Key(key)),
+        ExtractionResult::Invalid | ExtractionResult::Failure => None,
+    })
+}
+
+/// What evaluating a key path item gives on a value into which a generated key was injected at
+/// the store's key path.
+enum OnInjectedKey {
+    /// The key.
+    Key,
+    /// Failure: the item goes below the key, which is a number.
+    Failure,
+    /// The same index key as on the value without the key, or likewise none. The injection only
+    /// adds the key's property and possibly ordinary objects on the way to it: an item that
+    /// reaches such an object gets an invalid key instead of failure, and an existing object
+    /// converts to the same key with the added property.
+    Unchanged,
+}
+
+fn on_injected_key(item: &str, store_key_path: &str) -> OnInjectedKey {
+    match item.strip_prefix(store_key_path) {
+        Some("") => OnInjectedKey::Key,
+        Some(rest) if rest.starts_with('.') => OnInjectedKey::Failure,
+        _ => OnInjectedKey::Unchanged,
+    }
+}
+
+/// The index key that extracting a key with `key_path` gives on `value` once a generated key is
+/// injected into it at `store_key_path`, with the key as a placeholder.
+fn index_key_with_generated_key(
+    cx: &mut JSContext,
+    value: HandleValue,
+    key_path: &KeyPath,
+    multi_entry: bool,
+    store_key_path: &str,
+) -> Result<Option<IndexedDBIndexKey>, Error> {
+    match key_path {
+        KeyPath::String(path) => match on_injected_key(&path.str(), store_key_path) {
+            // The key is a number, which a multiEntry index also gets as it is.
+            OnInjectedKey::Key => Ok(Some(IndexedDBIndexKey::PrimaryKey)),
+            OnInjectedKey::Failure => Ok(None),
+            OnInjectedKey::Unchanged => extracted_index_key(cx, value, key_path, multi_entry),
+        },
+        KeyPath::StringSequence(items) => {
+            let on_key: Vec<OnInjectedKey> = items
+                .iter()
+                .map(|item| on_injected_key(&item.str(), store_key_path))
+                .collect();
+            if on_key
+                .iter()
+                .all(|on_key| matches!(on_key, OnInjectedKey::Unchanged))
+            {
+                return extracted_index_key(cx, value, key_path, multi_entry);
+            }
+            // Evaluating a sequence fails if an item fails, and converting the array of the items'
+            // values gives invalid if one of them is invalid.
+            let mut parts = Vec::with_capacity(items.len());
+            for (item, on_key) in items.iter().zip(on_key) {
+                match on_key {
+                    OnInjectedKey::Key => parts.push(IndexedDBIndexKey::PrimaryKey),
+                    OnInjectedKey::Failure => return Ok(None),
+                    OnInjectedKey::Unchanged => {
+                        let item = KeyPath::String(item.clone());
+                        match extracted_index_key(cx, value, &item, false)? {
+                            Some(part) => parts.push(part),
+                            None => return Ok(None),
+                        }
+                    },
+                }
+            }
+            Ok(Some(IndexedDBIndexKey::Array(parts)))
+        },
+    }
 }

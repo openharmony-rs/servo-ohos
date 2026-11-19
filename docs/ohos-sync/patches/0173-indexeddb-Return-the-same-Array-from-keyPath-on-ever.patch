@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 08:33:19 +0000
+Subject: [PATCH] indexeddb: Return the same Array from keyPath on every read
+
+IDBObjectStore.keyPath and IDBIndex.keyPath converted the key path into
+a new value on every read, so an Array key path was a new Array each
+time. The spec's note on both attributes says that an object
+(specifically an Array) is the same instance every time it is
+inspected. Each handle now converts its key path once and keeps the
+value in a Heap, as IDBRecord keeps its keys; handles in different
+transactions still return different Arrays, as the tests expect.
+
+Validation: Host SpiderMonkey release build of this commit: idbobjectstore_keyPath, idbindex_keyPath, keypath, idbobjectstore_createIndex and idbdatabase_createObjectStore (all globals but serviceworker) 212 of 215 subtests, as expected (the three failures are keypath's self-referential array); the four keyPath subtests failed before on both engines (P4.2: 4,466 of 4,511 on host SpiderMonkey and QuickJS).
+AI-assisted: Yes (agent session; cached the key path values, ran the keyPath WPT tests on both engines)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbindex.rs   | 19 ++++++-----
+ .../script/dom/indexeddb/idbobjectstore.rs    | 33 +++++++++++++++++--
+ .../IndexedDB/idbindex_keyPath.any.js.ini     |  8 -----
+ .../idbobjectstore_keyPath.any.js.ini         |  8 -----
+ 4 files changed, 40 insertions(+), 28 deletions(-)
+ delete mode 100644 tests/wpt/meta/IndexedDB/idbindex_keyPath.any.js.ini
+ delete mode 100644 tests/wpt/meta/IndexedDB/idbobjectstore_keyPath.any.js.ini
+
+diff --git a/components/script/dom/indexeddb/idbindex.rs b/components/script/dom/indexeddb/idbindex.rs
+index 0fff61a4d93..725551c6618 100644
+--- a/components/script/dom/indexeddb/idbindex.rs
++++ b/components/script/dom/indexeddb/idbindex.rs
+@@ -3,8 +3,9 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ use dom_struct::dom_struct;
+ use js::context::JSContext;
+-use js::conversions::ToJSValConvertible;
+ use js::gc::MutableHandleValue;
++use js::jsapi::Heap;
++use js::jsval::JSVal;
+ use js::rust::HandleValue;
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::codegen::GenericBindings::IDBIndexBinding::IDBIndexMethods;
+@@ -42,6 +43,9 @@ pub(crate) struct IDBIndex {
+     multi_entry: bool,
+     unique: bool,
+     key_path: KeyPath,
++    /// The key path converted to a value by the first `keyPath` getter, undefined before.
++    #[ignore_malloc_size_of = "mozjs"]
++    key_path_value: Heap<JSVal>,
+ }
+ 
+ impl IDBIndex {
+@@ -61,6 +65,7 @@ impl IDBIndex {
+             multi_entry,
+             unique,
+             key_path,
++            key_path_value: Heap::default(),
+         }
+     }
+ 
+@@ -307,14 +312,10 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+ 
+     /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-keypath>
+     fn KeyPath(&self, cx: &mut JSContext, retval: MutableHandleValue) {
+-        match &self.key_path {
+-            KeyPath::String(string) => {
+-                string.to_jsval(cx, retval);
+-            },
+-            KeyPath::StringSequence(sequence) => {
+-                sequence.to_jsval(cx, retval);
+-            },
+-        }
++        // NOTE: If this attribute returns an object (specifically an Array), it returns the same
++        // object instance every time it is inspected.
++        self.key_path
++            .to_jsval_cached(cx, &self.key_path_value, retval);
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#dom-idbindex-get>
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index b0e582297c5..f52c737833b 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -7,7 +7,8 @@ use dom_struct::dom_struct;
+ use js::context::JSContext;
+ use js::conversions::ToJSValConvertible;
+ use js::gc::MutableHandleValue;
+-use js::jsval::{NullValue, UndefinedValue};
++use js::jsapi::Heap;
++use js::jsval::{JSVal, NullValue, UndefinedValue};
+ use js::rust::HandleValue;
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::codegen::GenericBindings::IDBObjectStoreBinding::{
+@@ -76,6 +77,27 @@ impl From<indexeddb::KeyPath> for KeyPath {
+     }
+ }
+ 
++impl KeyPath {
++    /// Sets `retval` to the key path converted to a value, which `cache` (undefined until then)
++    /// keeps, so that the keyPath getters of IDBObjectStore and IDBIndex return the same Array
++    /// every time.
++    pub(crate) fn to_jsval_cached(
++        &self,
++        cx: &mut JSContext,
++        cache: &Heap<JSVal>,
++        mut retval: MutableHandleValue,
++    ) {
++        if cache.get().is_undefined() {
++            match self {
++                KeyPath::String(path) => path.to_jsval(cx, retval.reborrow()),
++                KeyPath::StringSequence(paths) => paths.to_jsval(cx, retval.reborrow()),
++            }
++            cache.set(retval.get());
++        }
++        retval.set(cache.get());
++    }
++}
++
+ impl From<KeyPath> for indexeddb::KeyPath {
+     fn from(item: KeyPath) -> Self {
+         match item {
+@@ -95,6 +117,9 @@ pub struct IDBObjectStore {
+     #[no_trace]
+     name: DomRefCell<Utf16String>,
+     key_path: Option<KeyPath>,
++    /// The key path converted to a value by the first `keyPath` getter, undefined before.
++    #[ignore_malloc_size_of = "mozjs"]
++    key_path_value: Heap<JSVal>,
+     index_set: DomRefCell<HashMap<NoTrace<Utf16String>, Dom<IDBIndex>>>,
+     /// Every index handle of this handle, also those of indexes deleted since, whose names an
+     /// aborted upgrade transaction reverts.
+@@ -115,6 +140,7 @@ impl IDBObjectStore {
+             id: store.id,
+             name: DomRefCell::new(store.name.clone()),
+             key_path: store.key_path.clone().map(Into::into),
++            key_path_value: Heap::default(),
+             index_set: DomRefCell::new(HashMap::new()),
+             index_handles: Default::default(),
+             transaction: Dom::from_ref(transaction),
+@@ -959,9 +985,10 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-keypath>
+     fn KeyPath(&self, cx: &mut JSContext, mut ret_val: MutableHandleValue) {
++        // NOTE: If this attribute returns an object (specifically an Array), it returns the same
++        // object instance every time it is inspected.
+         match &self.key_path {
+-            Some(KeyPath::String(path)) => path.to_jsval(cx, ret_val),
+-            Some(KeyPath::StringSequence(paths)) => paths.to_jsval(cx, ret_val),
++            Some(key_path) => key_path.to_jsval_cached(cx, &self.key_path_value, ret_val),
+             None => ret_val.set(NullValue()),
+         }
+     }
+diff --git a/tests/wpt/meta/IndexedDB/idbindex_keyPath.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex_keyPath.any.js.ini
+deleted file mode 100644
+index 3c9d2dcb346..00000000000
+--- a/tests/wpt/meta/IndexedDB/idbindex_keyPath.any.js.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[idbindex_keyPath.any.html]
+-  [IDBIndex's keyPath attribute returns the same object.]
+-    expected: FAIL
+-
+-
+-[idbindex_keyPath.any.worker.html]
+-  [IDBIndex's keyPath attribute returns the same object.]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbobjectstore_keyPath.any.js.ini b/tests/wpt/meta/IndexedDB/idbobjectstore_keyPath.any.js.ini
+deleted file mode 100644
+index 88eff9bb6b1..00000000000
+--- a/tests/wpt/meta/IndexedDB/idbobjectstore_keyPath.any.js.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[idbobjectstore_keyPath.any.worker.html]
+-  [IDBObjectStore's keyPath attribute returns the same object.]
+-    expected: FAIL
+-
+-
+-[idbobjectstore_keyPath.any.html]
+-  [IDBObjectStore's keyPath attribute returns the same object.]
+-    expected: FAIL

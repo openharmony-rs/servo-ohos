@@ -159,6 +159,64 @@ those scripts (they need network access). `check_stack.py` runs each with
 133. `backport: deny: Allow chrono in cargo deny (#50002)` — B · CI · watch: -
 134. `wpt: Let fetch-cannot-overwhelm-system wait for its requests to a small file` — B · CI · watch: -
 135. `docs: record patches 131 to 135 in the stack manifest` — B · none · watch: -
+136. `indexeddb: Read only the records a cursor step needs` — C · CI+device · watch: components/script/dom/indexeddb components/shared/storage/indexeddb.rs tests/wpt/tests/IndexedDB
+137. `indexeddb: Run the SQLite and RDB backends as executors of one engine` — C · CI+device · watch: components/storage/indexeddb components/shared/storage/indexeddb.rs components/storage/client_storage.rs
+138. `storage: Run the IndexedDB integration tests on every backend` — A · CI+device · watch: components/shared/storage/indexeddb.rs components/storage/indexeddb/mod.rs
+139. `indexeddb: Reset databases stored with another schema version` — A · CI+device · watch: components/storage/indexeddb/mod.rs components/storage/client_storage.rs
+140. `indexeddb: End the executor's transaction after errors that may roll it back` — A · CI+device · watch: -
+141. `storage: Test the transaction and statement behaviour the executors rely on` — A · CI+device · watch: -
+142. `docs: record patches 136 to 142 in the stack manifest` — B · none · watch: -
+143. `indexeddb: Run each database's work on its one connection, in order` — A · CI+device · watch: components/storage/indexeddb/mod.rs components/storage/indexeddb/engines/mod.rs
+144. `indexeddb: Make each IndexedDB transaction one SQL transaction` — C · CI+device · watch: components/shared/storage/indexeddb.rs components/script/dom/indexeddb/idbtransaction.rs
+145. `indexeddb: Abort a transaction whose commit failed with the backend's error` — C · CI+device · watch: components/script/dom/indexeddb/key.rs
+146. `indexeddb: Move the key generator into the backend` — C · CI+device · watch: components/script/dom/bindings/structuredclone.rs tests/wpt/tests/IndexedDB
+147. `indexeddb: Abort a global's unfinished transactions when it goes away` — C · CI+device · watch: components/script/dom/window/window.rs components/script/dom/workers/workerglobalscope.rs components/shared/storage/indexeddb.rs
+148. `indexeddb: Answer the manager's metadata reads from the committed metadata` — C · CI+device · watch: components/script/dom/indexeddb/idbtransaction.rs components/script/dom/indexeddb/idbdatabase.rs
+149. `docs: record patches 143 to 149 in the stack manifest` — B · none · watch: -
+150. `indexeddb: Obtain the storage bottle map in the backend` — C · CI+device · watch: components/storage/client_storage.rs components/shared/storage/client_storage.rs
+151. `indexeddb: Create transactions without waiting for the backend` — C · CI+device · watch: components/shared/storage/lib.rs
+152. `indexeddb: Address object stores and indexes by id, from a metadata snapshot` — C · CI+device · watch: components/script/dom/attributes/domstringlist.rs
+153. `indexeddb: Deliver a connection's results in request order on one channel` — C · CI+device · watch: components/shared/profile/generic_callback.rs
+154. `script: Keep the target of events that IndexedDB objects pass on` — C · CI+device · watch: components/script/dom/event/eventtarget.rs tests/wpt/tests/dom/events
+155. `indexeddb: Keep string keys and names as UTF-16 code units` — C · CI+device · watch: components/script_bindings/domstring.rs components/storage/cache_storage.rs
+156. `indexeddb: Look up key path identifiers by their code units` — C · CI+device · watch: components/script_bindings/js.rs components/script_bindings/utils.rs
+157. `docs: record patches 150 to 157 in the stack manifest` — B · none · watch: -
+158. `indexeddb: Store index records with the records they index` — C · CI+device · watch: components/script/dom/bindings/structuredclone.rs tests/wpt/tests/IndexedDB
+159. `indexeddb: Evaluate a sequence key path into an Array` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+160. `indexeddb: Populate an index created on an object store with records` — C · CI+device · watch: components/script/dom/bindings/structuredclone.rs
+161. `indexeddb: Let the requests queued behind a gone global's upgrade go on` — C · CI+device · watch: components/script/dom/html/embedded_content/htmliframeelement.rs
+162. `indexeddb: Make a request's source its object store, index or cursor` — C · CI+device · watch: components/script_bindings/codegen/codegen.py
+163. `indexeddb: Read the records of an index` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+164. `indexeddb: Iterate cursors over indexes from their position in the index` — C · CI+device · watch: components/script_bindings/webidls/IDBCursor.webidl tests/wpt/tests/IndexedDB
+165. `docs: record patches 158 to 165 in the stack manifest` — B · none · watch: -
+166. `indexeddb: Get all keys, values and records with IDBGetAllOptions` — C · CI+device · watch: components/script_bindings/codegen/codegen.py tests/wpt/tests/IndexedDB
+167. `indexeddb: Read the key of an object store's record once` — A · CI+device · watch: -
+168. `indexeddb: Keep the object stores' rows in the database actor` — A · CI+device · watch: -
+169. `indexeddb: Check and store a put's index keys with one statement per table` — A · CI+device · watch: -
+170. `indexeddb: Write the key generator's current number once per transaction` — A · CI+device · watch: -
+171. `storage: Ask RDB whether a blob is NULL only when it is empty` — A · CI+device · watch: -
+172. `indexeddb: Prefetch the records of a cursor's next steps` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+173. `indexeddb: Return the same Array from keyPath on every read` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+174. `indexeddb: Throw from IDBObjectStore.index() once an abort has started` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+175. `indexeddb: Run no page code while computing keys from a clone` — C · CI+device · watch: components/script/dom/bindings/structuredclone.rs
+176. `script: Add a pref that exposes SharedArrayBuffer for testing` — B · CI+device · watch: components/script/dom/bindings/structuredclone.rs support/quickjs/cargo-config.toml
+177. `indexeddb: Convert SharedArrayBuffers and views on them to binary keys` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+178. `docs: record patches 166 to 178 in the stack manifest` — B · none · watch: -
+179. `script: Close a worker's IndexedDB connections when its event loop ends` — C · CI+device · watch: components/script/dom/workers/worker.rs tests/wpt/tests/IndexedDB
+180. `indexeddb: Wait for connections to close in a connection queue per database` — C · CI+device · watch: tests/wpt/tests/IndexedDB
+181. `indexeddb: Obtain the storage proxy map of a queued request in parallel` — C · CI+device · watch: components/storage/client_storage.rs
+182. `script: Wake an idle dedicated worker when it is terminated` — C · CI+device · watch: components/script/dom/workers/dedicatedworkerglobalscope.rs
+183. `script: Close a shared worker once its last owner document is gone` — C · CI+device · watch: tests/wpt/tests/workers
+184. `indexeddb: Evict a cached page whose connection gets a versionchange event` — C · CI+device · watch: components/constellation/constellation.rs tests/wpt/tests/html/browsers/browsing-the-web/back-forward-cache
+185. `indexeddb: Close the connections to a database that can't be used any more` — C · CI+device · watch: -
+186. `storage: Find and list the databases of a storage bottle in the client storage registry` — C · CI+device · watch: -
+187. `indexeddb: Make the manager's client storage calls on a thread of their own` — C · CI+device · watch: components/shared/storage/client_storage.rs
+188. `indexeddb: Find the databases of earlier sessions in the client storage registry` — C · CI+device · watch: components/storage/client_storage.rs
+189. `indexeddb: Fail a request with the error that its backend failure calls for` — C · CI+device · watch: components/script/dom/bindings/error.rs tests/wpt/tests/IndexedDB
+190. `indexeddb: Evict a cached page that holds back another page's request or transaction` — C · CI+device · watch: components/script/tasks/task_queue.rs tests/wpt/tests/IndexedDB
+191. `indexeddb: Close the connections of windows whose event loop died` — C · CI+device · watch: components/constellation/constellation.rs
+192. `indexeddb: Reset a corrupt database when it is opened` — C · CI+device · watch: -
+193. `docs: record patches 179 to 193 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

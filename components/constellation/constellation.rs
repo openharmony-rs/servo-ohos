@@ -1721,6 +1721,9 @@ where
             ScriptToConstellationMessage::DiscardDocument => {
                 self.handle_discard_document(webview_id, source_pipeline_id);
             },
+            ScriptToConstellationMessage::EvictFromBackForwardCache => {
+                self.handle_evict_from_back_forward_cache(webview_id, source_pipeline_id);
+            },
             ScriptToConstellationMessage::DiscardTopLevelBrowsingContext => {
                 self.handle_close_top_level_browsing_context(webview_id);
             },
@@ -3012,6 +3015,15 @@ where
             return;
         };
 
+        let event_loop = pipeline.event_loop.id();
+        let pipelines: Vec<PipelineId> = self
+            .pipelines
+            .values()
+            .filter(|pipeline| pipeline.event_loop.id() == event_loop)
+            .map(|pipeline| pipeline.id)
+            .collect();
+        self.close_indexeddb_connections_of(&pipelines);
+
         // Treat send error the same as receiving a panic message
         self.handle_panic_in_webview(
             pipeline.webview_id,
@@ -3052,6 +3064,7 @@ where
             self.handle_panic_in_webview(webview_id, &reason, &backtrace);
         }
 
+        self.close_indexeddb_connections_of(&crashed_pipelines);
         for pipeline_id in crashed_pipelines {
             self.close_pipeline(
                 pipeline_id,
@@ -3063,6 +3076,19 @@ where
             // that `Paint` cleans up the pipeline display immediately without waiting for
             // confirmation from the event loop.
             self.handle_pipeline_exited(pipeline_id, PipelineExitSource::all());
+        }
+    }
+
+    /// Tells the IndexedDB managers that the windows of `pipelines` are gone without their
+    /// IndexedDB teardown, as their event loop died, so that their connections close.
+    fn close_indexeddb_connections_of(&self, pipelines: &[PipelineId]) {
+        for storage_threads in [&self.public_storage_threads, &self.private_storage_threads] {
+            let message = IndexedDBThreadMsg::Sync(SyncOperation::CloseConnectionsOfPipelines(
+                pipelines.to_vec(),
+            ));
+            if let Err(error) = storage_threads.send(message) {
+                warn!("Failed to close the IndexedDB connections of crashed pipelines: {error}");
+            }
         }
     }
 
@@ -6048,6 +6074,49 @@ where
             load_data.url = pipeline.url.clone();
             load_data
         })
+    }
+
+    /// Discards the pipeline of the session history entry that holds `pipeline_id`, which is the
+    /// pipeline itself or, for an iframe, the first ancestor that isn't the current pipeline of
+    /// its browsing context. Nothing is discarded if every one of them is current, as the user
+    /// went back to the entry in the meantime.
+    fn handle_evict_from_back_forward_cache(
+        &mut self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+    ) {
+        let mut current = pipeline_id;
+        loop {
+            let Some(browsing_context) = self
+                .pipelines
+                .get(&current)
+                .and_then(|pipeline| self.browsing_contexts.get(&pipeline.browsing_context_id))
+            else {
+                return warn!("{pipeline_id}: Evicting a closed pipeline");
+            };
+            if browsing_context.pipeline_id != current {
+                break;
+            }
+            match browsing_context.parent_pipeline_id {
+                Some(parent) => current = parent,
+                None => return debug!("{pipeline_id}: Not evicting a fully active document"),
+            }
+        }
+        let in_session_history = self.webviews.get(&webview_id).is_some_and(|webview| {
+            let history = &webview.session_history;
+            history
+                .past
+                .iter()
+                .chain(history.future.iter())
+                .any(|diff| {
+                    diff.alive_old_pipeline() == Some(current) ||
+                        diff.alive_new_pipeline() == Some(current)
+                })
+        });
+        if !in_session_history {
+            return debug!("{current}: Not evicting a pipeline outside the session history");
+        }
+        self.handle_discard_document(webview_id, current);
     }
 
     // Discard the pipeline for a given document, udpdate the joint session history.

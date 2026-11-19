@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 17 Nov 2026 20:53:44 +0000
+Subject: [PATCH] docs: record patches 158 to 165 in the stack manifest
+
+Phase P3 of the IndexedDB redesign: index records written with the
+records they index, sequence key paths evaluated into an Array, the
+population of an index created on a store with records, the open and
+delete requests queued behind a gone global's upgrade let go on, a
+request's source as the spec has it, index reads, and cursors over
+indexes from their position in the index. All seven edit upstream files
+and are tier C; this bookkeeping entry is B, like the earlier ones.
+
+P3.1's fix of two tidy allowances that the P2 review's fold had left
+behind is folded into entry 153, whose patch file changes with it; the
+patches of the P2 bookkeeping commit were regenerated in the same
+rewrite, so that they match its tree.
+
+The P3 review fixes are folded into entries 158, 160 and 163, and the
+messages of entries 158 to 164 note them; the patches were regenerated
+after that rewrite.
+
+Validation: `uv run docs/ohos-sync/check_stack.py base/2026-11-09` passes.
+AI-assisted: Yes (agent session; written by the agent, with the patches regenerated after folding the tidy fix into entry 153 and the P3 review fixes into entries 158, 160 and 163)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index bb204076637..bcccdbc521a 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -181,6 +181,14 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 155. `indexeddb: Keep string keys and names as UTF-16 code units` — C · CI+device · watch: components/script_bindings/domstring.rs components/storage/cache_storage.rs
+ 156. `indexeddb: Look up key path identifiers by their code units` — C · CI+device · watch: components/script_bindings/js.rs components/script_bindings/utils.rs
+ 157. `docs: record patches 150 to 157 in the stack manifest` — B · none · watch: -
++158. `indexeddb: Store index records with the records they index` — C · CI+device · watch: components/script/dom/bindings/structuredclone.rs tests/wpt/tests/IndexedDB
++159. `indexeddb: Evaluate a sequence key path into an Array` — C · CI+device · watch: tests/wpt/tests/IndexedDB
++160. `indexeddb: Populate an index created on an object store with records` — C · CI+device · watch: components/script/dom/bindings/structuredclone.rs
++161. `indexeddb: Let the requests queued behind a gone global's upgrade go on` — C · CI+device · watch: components/script/dom/html/embedded_content/htmliframeelement.rs
++162. `indexeddb: Make a request's source its object store, index or cursor` — C · CI+device · watch: components/script_bindings/codegen/codegen.py
++163. `indexeddb: Read the records of an index` — C · CI+device · watch: tests/wpt/tests/IndexedDB
++164. `indexeddb: Iterate cursors over indexes from their position in the index` — C · CI+device · watch: components/script_bindings/webidls/IDBCursor.webidl tests/wpt/tests/IndexedDB
++165. `docs: record patches 158 to 165 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 

@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<script>
+// Upgrades the database to version 2, creating an index on the store `items` if the query has
+// `index`, reports once the upgrade runs, and waits until the frame goes away.
+const [name, index] = location.search.slice(1).split('&').map(decodeURIComponent);
+const request = indexedDB.open(name, 2);
+request.onupgradeneeded = () => {
+  if (index) {
+    request.transaction.objectStore('items').createIndex('k', 'k');
+  }
+  parent.postMessage('upgrading', '*');
+};
+</script>

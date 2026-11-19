@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 07:34:02 +0000
+Subject: [PATCH] indexeddb: Write the key generator's current number once per
+ transaction
+
+A put that moved the key generator wrote the new current number with an
+UPDATE of the object store's row: one more statement per generated key.
+The actor keeps the number in the store's row and writes the numbers that
+changed once, before the transaction commits and before a schema
+operation, which drops the rows; a rollback drops them unwritten.
+put_record no longer writes the number; set_key_generator_current_number
+does.
+
+Validation: `cargo nextest run -p servo-storage -p servo-storage-traits` (host SQLite): 144 passed, 1 skipped, with test_key_generator_is_written_before_commit_and_schema_changes (reopens the database after the commits; fails when schema operations don't write first) and the key generator and abort tests; `./mach check --ohos -- -p servo-storage --all-targets --no-default-features --features ohos-rdb-backend` and `cargo clippy -p servo-storage --lib -- -D warnings`: no warnings. DAYU200 (QuickJS + RDB, checked-release), 2,000 puts with generated keys into a store without indexes: 1,930/s before, 2,550 and 2,570/s with it (builds with the cursor prefetch of the series in both). The WPT runs of the series are in the last commit of the series (P4.2).
+AI-assisted: Yes (agent session; moved the write to commit and schema operations, added the backend test, measured puts on the board)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../storage/indexeddb/backend/engine.rs       | 101 +++++++++++++-----
+ .../storage/indexeddb/backend/queries.rs      |  26 +++--
+ components/storage/indexeddb/backend/tests.rs |  67 +++++++++++-
+ 3 files changed, 161 insertions(+), 33 deletions(-)
+
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index a67b612396c..04ea50d5200 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+ 
+ use log::{error, warn};
+ use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+-use rustc_hash::FxHashMap;
++use rustc_hash::{FxHashMap, FxHashSet};
+ use servo_base::threadpool::ThreadPool;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+@@ -66,7 +66,7 @@ impl<X: SqlExecutor> SqlEngine<X> {
+                     metadata: metadata.clone(),
+                     failed: FxHashMap::default(),
+                     population: None,
+-                    stores: FxHashMap::default(),
++                    stores: StoreRows::default(),
+                 })),
+             }),
+             metadata,
+@@ -89,6 +89,9 @@ impl<X: SqlExecutor> SqlEngine<X> {
+     ) -> Option<i64> {
+         self.actor
+             .call(move |database| {
++                if let Some(row) = database.stores.rows.get(&store) {
++                    return Ok((row.auto_increment != 0).then_some(row.auto_increment));
++                }
+                 queries::key_generator_current_number(&mut database.executor, store)
+             })
+             .and_then(|result| result)
+@@ -132,7 +135,7 @@ impl<X: SqlExecutor> Drop for SqlEngine<X> {
+ pub(super) struct TestConnection<'a, X>(MutexGuard<'a, Option<Database<X>>>);
+ 
+ #[cfg(test)]
+-impl<X> std::ops::Deref for TestConnection<'_, X> {
++impl<X: SqlExecutor> std::ops::Deref for TestConnection<'_, X> {
+     type Target = X;
+ 
+     fn deref(&self) -> &X {
+@@ -141,11 +144,15 @@ impl<X> std::ops::Deref for TestConnection<'_, X> {
+ }
+ 
+ #[cfg(test)]
+-impl<X> std::ops::DerefMut for TestConnection<'_, X> {
+-    /// The test may change the database, so the store rows that the actor keeps are dropped.
++impl<X: SqlExecutor> std::ops::DerefMut for TestConnection<'_, X> {
++    /// The test may change the database, so the store rows that the actor keeps are written and
++    /// dropped.
+     fn deref_mut(&mut self) -> &mut X {
+         let database = self.0.as_mut().expect("The database is open");
+-        database.stores.clear();
++        database
++            .stores
++            .write_and_drop(&mut database.executor)
++            .expect("Failed to write the key generators");
+         &mut database.executor
+     }
+ }
+@@ -295,21 +302,54 @@ pub(super) struct Database<X> {
+     /// The index population of the upgrade transaction, while one runs or while the requests
+     /// that waited for it run.
+     population: Option<Population>,
+-    /// The rows of the object stores that requests used, with their indexes and key generators,
+-    /// as the connection sees them: inside the open SQL transaction, or as of the last commit.
+-    /// Schema operations and rollbacks drop them, and puts keep the key generators up to date.
+     stores: StoreRows,
+ }
+ 
+-type StoreRows = FxHashMap<IndexedDBObjectStoreId, ObjectStore>;
++/// The rows of the object stores that requests used, with their indexes and key generators, as
++/// the connection sees them: inside the open SQL transaction, or as of the last commit. Puts move
++/// the key generators here, and their current numbers are written to the database before the
++/// transaction commits and before schema operations, which then drop the rows; a rollback drops
++/// them unwritten.
++#[derive(Default)]
++struct StoreRows {
++    rows: FxHashMap<IndexedDBObjectStoreId, ObjectStore>,
++    /// The stores whose key generator's current number differs from the one in the database.
++    unwritten: FxHashSet<IndexedDBObjectStoreId>,
++}
++
++impl StoreRows {
++    /// Writes the current numbers of the key generators that changed.
++    fn write<X: SqlExecutor>(&mut self, executor: &mut X) -> Result<(), SqlError> {
++        for id in std::mem::take(&mut self.unwritten) {
++            if let Some(store) = self.rows.get(&id) {
++                queries::set_key_generator_current_number(executor, id, store.auto_increment)?;
++            }
++        }
++        Ok(())
++    }
++
++    /// Writes the key generators and drops the rows, which a schema operation may change. On
++    /// failure, the transaction has failed and the rows are dropped all the same.
++    fn write_and_drop<X: SqlExecutor>(&mut self, executor: &mut X) -> Result<(), SqlError> {
++        let result = self.write(executor);
++        self.drop_after_rollback();
++        result
++    }
+ 
+-/// The row of the object store `id`, from `stores`, or read on `executor` and kept in `stores`.
++    /// Drops the rows and the key generators that changed, after a rollback.
++    fn drop_after_rollback(&mut self) {
++        self.rows.clear();
++        self.unwritten.clear();
++    }
++}
++
++/// The row of the object store `id`, from `rows`, or read on `executor` and kept in `rows`.
+ fn object_store<'a, X: SqlExecutor>(
+     executor: &mut X,
+-    stores: &'a mut StoreRows,
++    rows: &'a mut FxHashMap<IndexedDBObjectStoreId, ObjectStore>,
+     id: IndexedDBObjectStoreId,
+ ) -> Result<Option<&'a mut ObjectStore>, SqlError> {
+-    Ok(match stores.entry(id) {
++    Ok(match rows.entry(id) {
+         Entry::Occupied(entry) => Some(entry.into_mut()),
+         Entry::Vacant(entry) => {
+             queries::object_store(executor, id)?.map(|store| entry.insert(store))
+@@ -455,7 +495,7 @@ impl<X: SqlExecutor> Database<X> {
+             !self.executor.in_transaction()
+         {
+             self.writer = None;
+-            self.stores.clear();
++            self.stores.drop_after_rollback();
+             self.failed.insert(writer, error());
+         }
+     }
+@@ -528,6 +568,10 @@ impl<X: SqlExecutor> Database<X> {
+         if self.writer != Some(transaction) {
+             return Ok(());
+         }
++        if let Err(error) = self.stores.write(&mut self.executor) {
++            self.roll_back(transaction);
++            return Err(error.to_backend_error());
++        }
+         let metadata = if changes_metadata {
+             match Metadata::load(&mut self.executor) {
+                 Ok(metadata) => Some(metadata),
+@@ -546,7 +590,7 @@ impl<X: SqlExecutor> Database<X> {
+         // QuotaExceededError or an "UnknownError" DOMException, and terminate these steps.
+         self.executor.commit().map_err(|error| {
+             warn!("Failed to commit IndexedDB transaction {transaction}: {error:?}");
+-            self.stores.clear();
++            self.stores.drop_after_rollback();
+             error.to_backend_error()
+         })?;
+         if let Some(metadata) = metadata {
+@@ -586,7 +630,7 @@ impl<X: SqlExecutor> Database<X> {
+             return;
+         }
+         self.writer = None;
+-        self.stores.clear();
++        self.stores.drop_after_rollback();
+         if let Err(error) = self.executor.rollback() {
+             warn!("Failed to roll back IndexedDB transaction {transaction}: {error:?}");
+         }
+@@ -774,10 +818,17 @@ fn run_request<X: SqlExecutor>(
+         return Outcome::default();
+     };
+ 
+-    let (result, failure) = match object_store(executor, stores, store) {
+-        Ok(Some(store)) => match operation {
+-            AsyncOperation::ReadOnly(operation) => run_read_only(executor, store, operation),
+-            AsyncOperation::ReadWrite(operation) => run_read_write(executor, store, operation),
++    let (result, failure) = match object_store(executor, &mut stores.rows, store) {
++        Ok(Some(object_store)) => match operation {
++            AsyncOperation::ReadOnly(operation) => run_read_only(executor, object_store, operation),
++            AsyncOperation::ReadWrite(operation) => {
++                let current_number = object_store.auto_increment;
++                let outcome = run_read_write(executor, object_store, operation);
++                if object_store.auto_increment != current_number {
++                    stores.unwritten.insert(store);
++                }
++                outcome
++            },
+             AsyncOperation::Schema(_) => unreachable!("Schema operations run above"),
+         },
+         Ok(None) => (Err(BackendError::StoreNotFound), None),
+@@ -914,9 +965,11 @@ fn run_schema<X: SqlExecutor>(
+         return run_population_step(executor, stores, store, index_id, step);
+     }
+     // Every other schema operation changes the rows of the stores or their indexes.
+-    stores.clear();
++    if let Err(error) = stores.write_and_drop(executor) {
++        return Outcome::schema_failure(error.to_backend_error());
++    }
+     let outcome = run_metadata_change(executor, stores, store, operation);
+-    stores.clear();
++    stores.drop_after_rollback();
+     outcome
+ }
+ 
+@@ -996,7 +1049,7 @@ fn read_population_records<X: SqlExecutor>(
+     index_id: IndexedDBIndexId,
+     after: Option<&IndexedDBKeyType>,
+ ) -> Outcome {
+-    let result = object_store(executor, stores, store)
++    let result = object_store(executor, &mut stores.rows, store)
+         .and_then(|store| store.ok_or(SqlError::MissingRow("object store")))
+         .and_then(|store| queries::population_records(executor, store, after));
+     match result {
+@@ -1026,7 +1079,7 @@ fn run_population_step<X: SqlExecutor>(
+         },
+         IndexPopulationStep::SetIndexKeys { records, done } => (records, done),
+     };
+-    let result = object_store(executor, stores, store)
++    let result = object_store(executor, &mut stores.rows, store)
+         .and_then(|store| store.ok_or(SqlError::MissingRow("object store")))
+         .and_then(|store| {
+             let index = store
+diff --git a/components/storage/indexeddb/backend/queries.rs b/components/storage/indexeddb/backend/queries.rs
+index 94df21490e2..3ae14cd839f 100644
+--- a/components/storage/indexeddb/backend/queries.rs
++++ b/components/storage/indexeddb/backend/queries.rs
+@@ -361,6 +361,22 @@ pub(crate) fn key_generator_current_number<X: SqlExecutor>(
+         .and_then(|store| (store.auto_increment != 0).then_some(store.auto_increment)))
+ }
+ 
++/// Writes `current_number` as the current number of the key generator of the store `store_id`.
++pub(crate) fn set_key_generator_current_number<X: SqlExecutor>(
++    executor: &mut X,
++    store_id: IndexedDBObjectStoreId,
++    current_number: i64,
++) -> Result<(), SqlError> {
++    let changed = executor.execute(
++        "UPDATE object_store SET auto_increment = ? WHERE id = ?",
++        &[
++            SqlParam::Integer(current_number),
++            SqlParam::Integer(store_id),
++        ],
++    )?;
++    expect_one_changed_row(changed, "key generator update")
++}
++
+ /// The id of the index named `name` of the store `store_id`, if there is one.
+ fn index_named<X: SqlExecutor>(
+     executor: &mut X,
+@@ -1244,7 +1260,8 @@ fn delete_index_records<X: SqlExecutor>(
+ /// `key`, or under a key from the store's key generator if `key` is `None`, which requires that
+ /// the store has one, with `index_keys`, the keys script computed for each index of the store. A
+ /// record that can't be stored changes nothing, not even the key generator; a stored record
+-/// updates the key generator's current number in `store` along with the database.
++/// updates the key generator's current number in `store`, which the caller writes to the database
++/// with [`set_key_generator_current_number`] before the transaction commits.
+ pub(crate) fn put_record<X: SqlExecutor>(
+     executor: &mut X,
+     store: &mut ObjectStore,
+@@ -1358,13 +1375,6 @@ pub(crate) fn put_record<X: SqlExecutor>(
+     insert_index_records(executor, store, &encoded_key, &index_records)?;
+ 
+     if let Some(current_number) = new_current_number {
+-        executor.execute(
+-            "UPDATE object_store SET auto_increment = ? WHERE id = ?",
+-            &[
+-                SqlParam::Integer(current_number),
+-                SqlParam::Integer(store.id),
+-            ],
+-        )?;
+         store.auto_increment = current_number;
+     }
+ 
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index e96e99feb5f..cc985ccc939 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -102,6 +102,7 @@ executor_tests!(
+     test_large_explicit_keys_and_the_key_generator,
+     test_failed_add_changes_nothing,
+     test_abort_reverts_the_key_generator,
++    test_key_generator_is_written_before_commit_and_schema_changes,
+     test_abort_rolls_back_data_schema_and_version,
+     test_invalid_schema_operation_fails_the_transaction,
+     test_transaction_spanning_batches_commits_atomically,
+@@ -1049,7 +1050,7 @@ fn test_metadata_snapshot_and_renames<X: SqlExecutor>() {
+             index_keys(by_author, [IndexedDBKeyType::Number(1.0)]),
+         ];
+         queries::put_record(executor, &mut store, None, &[7], false, index_keys)?;
+-        Ok(())
++        queries::set_key_generator_current_number(executor, store.id, store.auto_increment)
+     })
+     .unwrap();
+ 
+@@ -2084,6 +2085,70 @@ fn test_abort_reverts_the_key_generator<X: SqlExecutor>() {
+     assert_eq!(db.key_generator_current_number(TEST_STORE), Some(2));
+ }
+ 
++/// The key generator's current number, which puts move in the actor, is written to the database
++/// before the transaction commits and before a schema operation.
++fn test_key_generator_is_written_before_commit_and_schema_changes<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    create_store(&db, "test_store", None, true).unwrap();
++    let replies = run_puts(
++        &db,
++        1,
++        TEST_STORE,
++        vec![(None, vec![1]), (None, vec![2])],
++        false,
++    );
++    assert_eq!(replies, vec![key_reply(1.0), key_reply(2.0)]);
++    assert_eq!(commit(&db, 1), Ok(()));
++    drop(db);
++    let db = open_engine_in::<X>(dir.path(), false);
++    assert_eq!(db.key_generator_current_number(TEST_STORE), Some(3));
++
++    db.upgrade_version(txn(2), 2);
++    let puts: Vec<_> = (0..3).map(|_| get_callback()).collect();
++    let put = |index: usize| {
++        indexed_put_request(
++            TEST_STORE,
++            puts[index].0,
++            None,
++            vec![index as u8],
++            false,
++            vec![],
++        )
++    };
++    let rename = |name: &str| {
++        schema(
++            TEST_STORE,
++            AsyncSchemaOperation::RenameObjectStore {
++                new_name: name.into(),
++            },
++        )
++    };
++    let failures = run_batch(
++        &db,
++        2,
++        IndexedDBTxnMode::Versionchange,
++        vec![
++            put(0),
++            rename("renamed"),
++            put(1),
++            rename("test_store"),
++            put(2),
++        ],
++    );
++    assert_eq!(failures, vec![]);
++    let replies: Vec<_> = puts.iter().map(|put| recv(&put.1)).collect();
++    assert_eq!(
++        replies,
++        vec![key_reply(3.0), key_reply(4.0), key_reply(5.0)]
++    );
++    assert_eq!(commit(&db, 2), Ok(()));
++    drop(db);
++    let db = open_engine_in::<X>(dir.path(), false);
++    assert_eq!(db.key_generator_current_number(TEST_STORE), Some(6));
++    assert_eq!(stored_keys(&db, TEST_STORE), number_keys([1, 2, 3, 4, 5]));
++}
++
+ /// Aborting a transaction rolls back everything it did in all its batches, and for an upgrade
+ /// transaction also its schema changes and the version.
+ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {

@@ -2,21 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+mod backend;
 mod engines;
 
 use std::borrow::ToOwned;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(ohos_rdb)]
-use std::error::Error as StdError;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 use log::{debug, error, warn};
 use malloc_size_of::MallocSizeOf;
 use malloc_size_of_derive::MallocSizeOf;
-#[cfg(ohos_rdb)]
-use ohos_rdb_sys::relational_store_error_code::OH_Rdb_ErrCode;
 use profile_traits::generic_callback::GenericCallback;
 use profile_traits::mem::{
     ProcessReports, ProfilerChan as MemProfilerChan, Report, ReportKind, perform_memory_report,
@@ -26,19 +24,21 @@ use profile_traits::path;
 use rusqlite::Error as RusqliteError;
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::generic_channel::{self, GenericReceiver, GenericSender, ReceiveError};
+use servo_base::id::PipelineId;
 use servo_base::threadpool::ThreadPool;
 use servo_url::origin::ImmutableOrigin;
-use storage_traits::client_storage::StorageProxyMap;
+use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
 use storage_traits::indexeddb::{
-    AsyncOperation, BackendError, BackendResult, ConnectionMsg, CreateObjectResult, DatabaseInfo,
-    DbResult, IndexedDBIndex, IndexedDBObjectStore, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath,
-    SyncOperation, TxnCompleteMsg,
+    AsyncOperation, BackendError, BackendResult, ConnectionEvent, ConnectionMsg, DatabaseInfo,
+    DeleteDatabaseEvent, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg,
+    IndexedDBTxnId, IndexedDBTxnMode, StorageBottleSource, SyncOperation, TransactionEvent,
+    Utf16String,
 };
 use uuid::Uuid;
 
-use crate::indexeddb::engines::{ActiveKvsEngine, KvsEngine, KvsOperation, KvsTransaction};
-#[cfg(ohos_rdb)]
-use crate::ohos_rdb::OhosRdbError;
+use crate::indexeddb::engines::{
+    ActiveKvsEngine, KvsEngine, KvsOperation, KvsTransaction, TransactionResults,
+};
 #[cfg(feature = "sqlite-backend")]
 use crate::shared::is_sqlite_disk_full_error;
 
@@ -76,50 +76,41 @@ impl IndexedDBThreadFactory for GenericSender<IndexedDBThreadMsg> {
 #[derive(Clone, Debug, Eq, Hash, MallocSizeOf, PartialEq)]
 pub struct IndexedDBDescription {
     pub origin: ImmutableOrigin,
-    pub name: String,
-}
-
-#[derive(MallocSizeOf)]
-struct KeyGeneratorSnapshot {
-    // Mirrors IndexedDB's "key generator current number" for rollback on abort.
-    // https://w3c.github.io/IndexedDB/#key-generator-current-number
-    // Backed by i64 so we can represent the IndexedDB-mandated range.
-    store_name: String,
-    current_number: i64,
-}
-
-#[derive(MallocSizeOf)]
-struct TxnScopeStore {
-    name: String,
-    key_generator_snapshot: Option<KeyGeneratorSnapshot>,
+    pub name: Utf16String,
 }
 
 #[derive(MallocSizeOf)]
 struct TxnInfo {
     created_seq: u64,
     mode: IndexedDBTxnMode,
-    scope: Vec<TxnScopeStore>,
+    scope: Vec<IndexedDBObjectStoreId>,
     live: bool,
+    /// Whether the engine has been handed a batch of this transaction.
+    started: bool,
+    /// The result channel of the transaction's connection.
+    results: GenericCallback<ConnectionEvent>,
+    /// Whether the connections of the transactions that keep this one from starting were asked
+    /// to evict their documents if they aren't fully active.
+    holders_asked: bool,
 }
 
 #[derive(MallocSizeOf)]
 struct IndexedDBEnvironment<E: KvsEngine> {
     engine: E,
     manager_sender: GenericSender<IndexedDBThreadMsg>,
-    transactions: FxHashMap<u64, KvsTransaction>,
+    transactions: FxHashMap<IndexedDBTxnId, KvsTransaction>,
     next_created_seq: u64,
-    txn_info: FxHashMap<u64, TxnInfo>,
-    queued_readwrite: VecDeque<u64>,
-    queued_readonly: VecDeque<u64>,
+    txn_info: FxHashMap<IndexedDBTxnId, TxnInfo>,
+    queued_readwrite: VecDeque<IndexedDBTxnId>,
+    queued_readonly: VecDeque<IndexedDBTxnId>,
     // Fast membership checks + de-dup for queued_*.
-    queued_readwrite_set: FxHashSet<u64>,
-    queued_readonly_set: FxHashSet<u64>,
-    running_readwrite: Option<u64>,
-    running_readonly: HashSet<u64>,
-    handled_next_unhandled_request_id: FxHashMap<u64, u64>,
-    handled_pending: FxHashMap<u64, HashSet<u64>>,
-    pending_commit_callbacks: FxHashMap<u64, Vec<GenericCallback<TxnCompleteMsg>>>,
-    pending_abort_callbacks: FxHashMap<u64, Vec<GenericCallback<TxnCompleteMsg>>>,
+    queued_readwrite_set: FxHashSet<IndexedDBTxnId>,
+    queued_readonly_set: FxHashSet<IndexedDBTxnId>,
+    running_readwrite: Option<IndexedDBTxnId>,
+    running_readonly: HashSet<IndexedDBTxnId>,
+    /// Transactions that script asked to commit, which commit once they can start and all their
+    /// requests have been handed to the engine.
+    pending_commits: FxHashSet<IndexedDBTxnId>,
 }
 
 impl<E: KvsEngine> IndexedDBEnvironment<E> {
@@ -139,36 +130,22 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             queued_readonly_set: FxHashSet::default(),
             running_readwrite: None,
             running_readonly: HashSet::new(),
-            handled_next_unhandled_request_id: FxHashMap::default(),
-            handled_pending: FxHashMap::default(),
-            pending_commit_callbacks: FxHashMap::default(),
-            pending_abort_callbacks: FxHashMap::default(),
+            pending_commits: FxHashSet::default(),
         }
     }
 
-    fn register_transaction(&mut self, txn: u64, mode: IndexedDBTxnMode, scope: Vec<String>) {
+    /// Registers the transaction `txn`, whose results go to `results`.
+    fn register_transaction(
+        &mut self,
+        txn: IndexedDBTxnId,
+        mode: IndexedDBTxnMode,
+        scope: Vec<IndexedDBObjectStoreId>,
+        results: GenericCallback<ConnectionEvent>,
+    ) {
         if self.txn_info.contains_key(&txn) {
             return;
         }
-        let scope: HashSet<String> = scope.into_iter().collect();
-        let scope: Vec<TxnScopeStore> = scope
-            .into_iter()
-            .map(|store_name| {
-                let key_generator_snapshot = if mode == IndexedDBTxnMode::Readwrite {
-                    self.key_generator_current_number(&store_name)
-                        .map(|current_number| KeyGeneratorSnapshot {
-                            store_name: store_name.clone(),
-                            current_number,
-                        })
-                } else {
-                    None
-                };
-                TxnScopeStore {
-                    name: store_name,
-                    key_generator_snapshot,
-                }
-            })
-            .collect();
+        let scope: HashSet<IndexedDBObjectStoreId> = scope.into_iter().collect();
         let created_seq = self.next_created_seq;
         self.next_created_seq += 1;
         self.txn_info.insert(
@@ -176,8 +153,11 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             TxnInfo {
                 created_seq,
                 mode: mode.clone(),
-                scope,
+                scope: scope.into_iter().collect(),
                 live: true,
+                started: false,
+                results,
+                holders_asked: false,
             },
         );
         self.transactions
@@ -186,6 +166,56 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 requests: VecDeque::new(),
                 mode,
             });
+    }
+
+    fn knows_transaction(&self, txn: IndexedDBTxnId) -> bool {
+        self.txn_info.contains_key(&txn)
+    }
+
+    /// Whether a transaction created using the connection `connection` hasn't finished.
+    fn has_transactions_of(&self, connection: Uuid) -> bool {
+        self.txn_info.keys().any(|txn| txn.connection == connection)
+    }
+
+    /// Why `operation` can't run in `txn`, if it can't: DbNotFound for a transaction that isn't
+    /// registered, Abort for one that was aborted, and DbErr for an operation that its mode or
+    /// scope doesn't allow, which script never sends.
+    fn check_operation(
+        &self,
+        txn: IndexedDBTxnId,
+        operation: &KvsOperation,
+    ) -> Result<(), BackendError> {
+        let info = self.check_usable(txn)?;
+        let allowed = match (&info.mode, &operation.operation) {
+            (IndexedDBTxnMode::Versionchange, _) => true,
+            (_, AsyncOperation::Schema(_)) => false,
+            (IndexedDBTxnMode::Readonly, AsyncOperation::ReadWrite(_)) => false,
+            _ => info.scope.contains(&operation.store),
+        };
+        if !allowed {
+            return Err(BackendError::DbErr(format!(
+                "A {:?} transaction can't run this request on store {}",
+                info.mode, operation.store
+            )));
+        }
+        Ok(())
+    }
+
+    /// The scheduling state of `txn`, if it is registered and wasn't aborted.
+    fn check_usable(&self, txn: IndexedDBTxnId) -> Result<&TxnInfo, BackendError> {
+        let info = self.txn_info.get(&txn).ok_or(BackendError::DbNotFound)?;
+        if !self.transactions.contains_key(&txn) {
+            return Err(BackendError::Abort);
+        }
+        Ok(info)
+    }
+
+    /// Where the results of `txn` go.
+    fn results(&self, txn: IndexedDBTxnId) -> TransactionResults {
+        TransactionResults::new(
+            txn,
+            self.txn_info.get(&txn).map(|info| info.results.clone()),
+        )
     }
 
     fn scopes_overlap(a: &TxnInfo, b: &TxnInfo) -> bool {
@@ -200,12 +230,10 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             return true;
         }
 
-        a.scope
-            .iter()
-            .any(|store| b.scope.iter().any(|other| other.name == store.name))
+        a.scope.iter().any(|store| b.scope.contains(store))
     }
 
-    fn earlier_overlapping_live_exists<F>(&self, transaction: u64, predicate: F) -> bool
+    fn earlier_overlapping_live_exists<F>(&self, transaction: IndexedDBTxnId, predicate: F) -> bool
     where
         F: Fn(&TxnInfo) -> bool,
     {
@@ -225,7 +253,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
         })
     }
 
-    fn can_start_by_spec(&self, txn: u64) -> bool {
+    fn can_start_by_spec(&self, txn: IndexedDBTxnId) -> bool {
         let Some(info) = self.txn_info.get(&txn) else {
             return false;
         };
@@ -234,12 +262,73 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 other.mode != IndexedDBTxnMode::Readonly
             }),
             IndexedDBTxnMode::Readwrite | IndexedDBTxnMode::Versionchange => {
-                !self.earlier_overlapping_live_exists(txn, |_other| true)
+                !self.earlier_overlapping_live_exists(txn, |_other| true) &&
+                    !self.other_writer_started(txn)
             },
         }
     }
 
-    fn enqueue_txn(&mut self, txn: u64, mode: &IndexedDBTxnMode) {
+    /// Whether the transaction `other` keeps `waiting` from starting, by the rules of
+    /// [`Self::can_start_by_spec`].
+    fn holds_back(waiting: &TxnInfo, other: &TxnInfo) -> bool {
+        if !other.live {
+            return false;
+        }
+        let earlier_overlapping =
+            other.created_seq < waiting.created_seq && Self::scopes_overlap(waiting, other);
+        match waiting.mode {
+            IndexedDBTxnMode::Readonly => {
+                earlier_overlapping && other.mode != IndexedDBTxnMode::Readonly
+            },
+            IndexedDBTxnMode::Readwrite | IndexedDBTxnMode::Versionchange => {
+                earlier_overlapping || (other.started && other.mode != IndexedDBTxnMode::Readonly)
+            },
+        }
+    }
+
+    /// Asks the connections of the transactions that keep `txn` from starting to evict their
+    /// documents if they aren't fully active, once for each transaction that waits: a cached
+    /// document never finishes its transactions, as its tasks are held back, so `txn` would wait
+    /// until the user goes back to that page.
+    fn ask_holders_to_evict_if_inactive(&mut self, txn: IndexedDBTxnId) {
+        let Some(waiting) = self
+            .txn_info
+            .get(&txn)
+            .filter(|waiting| !waiting.holders_asked)
+        else {
+            return;
+        };
+        let holders: Vec<GenericCallback<ConnectionEvent>> = self
+            .txn_info
+            .iter()
+            .filter(|(other_txn, other)| {
+                other_txn.connection != txn.connection && Self::holds_back(waiting, other)
+            })
+            .map(|(_, other)| other.results.clone())
+            .collect();
+        if let Some(waiting) = self.txn_info.get_mut(&txn) {
+            waiting.holders_asked = true;
+        }
+        for results in holders {
+            if results.send(ConnectionEvent::EvictIfInactive).is_err() {
+                debug!("Script went away before it was asked to evict a page");
+            }
+        }
+    }
+
+    /// Whether a readwrite or versionchange transaction other than `txn` has started and is
+    /// still live. The engine runs each such transaction as the one SQL transaction of its
+    /// connection, so writers run one after another, also those with disjoint scopes.
+    fn other_writer_started(&self, txn: IndexedDBTxnId) -> bool {
+        self.txn_info.iter().any(|(other_txn, other)| {
+            *other_txn != txn &&
+                other.live &&
+                other.started &&
+                other.mode != IndexedDBTxnMode::Readonly
+        })
+    }
+
+    fn enqueue_txn(&mut self, txn: IndexedDBTxnId, mode: &IndexedDBTxnMode) {
         match mode {
             IndexedDBTxnMode::Readonly => {
                 if self.queued_readonly_set.insert(txn) {
@@ -256,10 +345,9 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
 
     fn queue_operation(
         &mut self,
-        store_name: &str,
-        serial_number: u64,
+        serial_number: IndexedDBTxnId,
         mode: IndexedDBTxnMode,
-        operation: AsyncOperation,
+        operation: KvsOperation,
     ) {
         let mut enqueue_mode = None;
         match self.transactions.entry(serial_number) {
@@ -267,10 +355,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 let transaction = entry.get_mut();
                 let transaction_mode = transaction.mode.clone();
                 let was_empty = transaction.requests.is_empty();
-                transaction.requests.push_back(KvsOperation {
-                    operation,
-                    store_name: String::from(store_name),
-                });
+                transaction.requests.push_back(operation);
                 if was_empty {
                     // If the queue was empty and we just added work, we must enqueue the txn
                     // even if it is currently running a prior batch. The next batch will run
@@ -285,10 +370,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                         mode: mode.clone(),
                     })
                     .requests
-                    .push_back(KvsOperation {
-                        operation,
-                        store_name: String::from(store_name),
-                    });
+                    .push_back(operation);
                 enqueue_mode = Some(mode);
             },
         };
@@ -298,7 +380,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
     }
 
     /// <https://w3c.github.io/IndexedDB/#transaction-scheduling>
-    fn schedule_transactions(&mut self, origin: ImmutableOrigin, db_name: &str) {
+    fn schedule_transactions(&mut self, origin: ImmutableOrigin, db_name: &Utf16String) {
         let readonly_len = self.queued_readonly.len();
         for _ in 0..readonly_len {
             let Some(txn) = self.queued_readonly.pop_front() else {
@@ -323,13 +405,14 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 if self.queued_readonly_set.insert(txn) {
                     self.queued_readonly.push_back(txn);
                 }
+                self.ask_holders_to_evict_if_inactive(txn);
                 continue;
             }
 
             // Mark running and start async.
             // DO NOT clear here; clear on EngineTxnBatchComplete.
             self.running_readonly.insert(txn);
-            self.start_transaction(origin.clone(), db_name.to_string(), txn, None);
+            self.start_transaction(origin.clone(), db_name.clone(), txn, None);
         }
 
         // Start at most one readwrite txn.
@@ -362,13 +445,14 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
                 if self.queued_readwrite_set.insert(txn) {
                     self.queued_readwrite.push_back(txn);
                 }
+                self.ask_holders_to_evict_if_inactive(txn);
                 continue;
             }
 
             // Mark running and start async.
             // DO NOT clear here; clear on EngineTxnBatchComplete.
             self.running_readwrite = Some(txn);
-            self.start_transaction(origin, db_name.to_string(), txn, None);
+            self.start_transaction(origin, db_name.clone(), txn, None);
             return;
         }
     }
@@ -377,8 +461,8 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
     fn start_transaction(
         &mut self,
         origin: ImmutableOrigin,
-        db_name: String,
-        txn: u64,
+        db_name: Utf16String,
+        txn: IndexedDBTxnId,
         sender: Option<GenericSender<BackendResult<()>>>,
     ) {
         // https://w3c.github.io/IndexedDB/#transaction-lifetime
@@ -409,9 +493,14 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             return;
         }
 
+        if let Some(info) = self.txn_info.get_mut(&txn) {
+            info.started = true;
+        }
         let manager_sender = self.manager_sender.clone();
         self.engine.process_transaction(
+            txn,
             KvsTransaction { mode, requests },
+            self.results(txn),
             Box::new(move || {
                 // Notify the manager thread when the engine finishes so it can:
                 // - clear running_readonly / running_readwrite
@@ -438,32 +527,8 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
         );
     }
 
-    fn mark_request_handled(&mut self, txn: u64, request_id: u64) {
-        let current = self
-            .handled_next_unhandled_request_id
-            .get(&txn)
-            .copied()
-            .unwrap_or(0);
-        if request_id == current {
-            let mut next = current + 1;
-            if let Some(pending) = self.handled_pending.get_mut(&txn) {
-                while pending.remove(&next) {
-                    next += 1;
-                }
-                if pending.is_empty() {
-                    self.handled_pending.remove(&txn);
-                }
-            }
-            self.handled_next_unhandled_request_id.insert(txn, next);
-        } else if request_id > current {
-            self.handled_pending
-                .entry(txn)
-                .or_default()
-                .insert(request_id);
-        }
-    }
-
-    fn can_notify_txn_maybe_commit(&self, txn: u64) -> bool {
+    /// Whether no request of `txn` waits to be handed to the engine or runs.
+    fn is_idle(&self, txn: IndexedDBTxnId) -> bool {
         if self.running_readwrite == Some(txn) || self.running_readonly.contains(&txn) {
             return false;
         }
@@ -477,32 +542,18 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
         }
     }
 
-    fn can_commit_now(&self, txn: u64) -> bool {
-        self.can_start_by_spec(txn) && self.can_notify_txn_maybe_commit(txn)
+    fn can_commit_now(&self, txn: IndexedDBTxnId) -> bool {
+        self.can_start_by_spec(txn) && self.is_idle(txn)
     }
 
-    fn queue_pending_commit_callback(
-        &mut self,
-        txn: u64,
-        callback: GenericCallback<TxnCompleteMsg>,
-    ) {
-        self.pending_commit_callbacks
-            .entry(txn)
-            .or_default()
-            .push(callback);
-    }
-
-    fn take_pending_commit_callbacks(&mut self, txn: u64) -> Vec<GenericCallback<TxnCompleteMsg>> {
-        self.pending_commit_callbacks
-            .remove(&txn)
-            .unwrap_or_default()
-    }
-
-    fn maybe_commit_candidates(&self) -> Vec<u64> {
-        let mut candidates: Vec<(u64, u64)> = self
-            .txn_info
+    /// The transactions that script asked to commit and that can commit now, in the order they
+    /// were created.
+    fn commit_candidates(&self) -> Vec<IndexedDBTxnId> {
+        let mut candidates: Vec<(IndexedDBTxnId, u64)> = self
+            .pending_commits
             .iter()
-            .filter_map(|(txn, info)| {
+            .filter_map(|txn| {
+                let info = self.txn_info.get(txn)?;
                 if !info.live || !self.can_commit_now(*txn) {
                     return None;
                 }
@@ -513,7 +564,15 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
         candidates.into_iter().map(|(txn, _)| txn).collect()
     }
 
-    fn finish_transaction(&mut self, txn: u64) {
+    /// Commits the transactions that script asked to commit and that can commit now.
+    fn commit_ready_transactions(&mut self) {
+        for txn in self.commit_candidates() {
+            self.pending_commits.remove(&txn);
+            self.commit(txn);
+        }
+    }
+
+    fn finish_transaction(&mut self, txn: IndexedDBTxnId) {
         if let Some(info) = self.txn_info.get_mut(&txn) {
             info.live = false;
         }
@@ -527,34 +586,10 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             self.running_readwrite = None;
         }
         self.running_readonly.remove(&txn);
-        self.handled_next_unhandled_request_id.remove(&txn);
-        self.handled_pending.remove(&txn);
-        self.pending_commit_callbacks.remove(&txn);
+        self.pending_commits.remove(&txn);
     }
 
-    fn abort_transaction(&mut self, txn: u64) {
-        let key_generator_snapshots = self
-            .txn_info
-            .get(&txn)
-            .filter(|info| info.mode == IndexedDBTxnMode::Readwrite)
-            .map(|info| {
-                info.scope
-                    .iter()
-                    .filter_map(|store| store.key_generator_snapshot.as_ref())
-                    .map(|snapshot| KeyGeneratorSnapshot {
-                        store_name: snapshot.store_name.clone(),
-                        current_number: snapshot.current_number,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        // https://w3c.github.io/IndexedDB/#key-generator-construct
-        // Likewise, if a transaction is aborted, the current number of the
-        // key generator for each object store in the transaction’s scope is
-        // reverted to the value it had before the transaction was started.
-        let res = self.restore_key_generators_after_abort(&key_generator_snapshots);
-        debug_assert!(res.is_ok(), "Restoring key generators should not fail.");
-
+    fn abort_transaction(&mut self, txn: IndexedDBTxnId) {
         // Keep scheduling metadata until script reports TransactionFinished.
         // https://w3c.github.io/IndexedDB/#transaction-lifetime
         self.transactions.remove(&txn);
@@ -566,209 +601,28 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
             self.running_readwrite = None;
         }
         self.running_readonly.remove(&txn);
-        self.handled_next_unhandled_request_id.remove(&txn);
-        self.handled_pending.remove(&txn);
-        self.pending_commit_callbacks.remove(&txn);
+        self.pending_commits.remove(&txn);
     }
 
-    fn key_generator_current_number(&self, store_name: &str) -> Option<i64> {
-        self.engine.key_generator_current_number(store_name)
+    /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>
+    ///
+    /// Reports the result to the transaction's connection once the engine has written the
+    /// transaction's changes, or failed to.
+    fn commit(&self, txn: IndexedDBTxnId) {
+        let results = self.results(txn);
+        self.engine.commit(
+            txn,
+            Box::new(move |result| results.send(TransactionEvent::Committed(result))),
+        );
     }
 
-    fn set_key_generator_current_number(
-        &self,
-        store_name: &str,
-        current_number: i64,
-    ) -> DbResult<()> {
-        self.engine
-            .set_key_generator_current_number(store_name, current_number)
-            .map_err(|err| format!("{err:?}"))
-    }
-
-    /// <https://w3c.github.io/IndexedDB/#key-generator-construct>
-    fn restore_key_generators_after_abort(
-        &self,
-        key_generator_snapshots: &[KeyGeneratorSnapshot],
-    ) -> DbResult<()> {
-        // Likewise, if a transaction is aborted, the current number of the key
-        // generator for each object store in the transaction’s scope is
-        // reverted to the value it had before the transaction was started.
-        for snapshot in key_generator_snapshots {
-            self.set_key_generator_current_number(&snapshot.store_name, snapshot.current_number)?;
-        }
-        Ok(())
-    }
-
-    /// <https://w3c.github.io/IndexedDB/#key-generator-construct>
-    fn object_store(&self, store_name: &str) -> DbResult<IndexedDBObjectStore> {
-        // A key generator has a current number.
-        let key_generator_current_number = self.key_generator_current_number(store_name);
-        Ok(IndexedDBObjectStore {
-            key_path: self.key_path(store_name),
-            has_key_generator: key_generator_current_number.is_some(),
-            key_generator_current_number,
-            indexes: self.indexes(store_name)?,
-            name: store_name.to_string(),
-        })
-    }
-
-    fn object_stores(&self) -> DbResult<Vec<IndexedDBObjectStore>> {
-        self.object_store_names()?
-            .into_iter()
-            .map(|store_name| self.object_store(&store_name))
-            .collect()
-    }
-
-    fn key_path(&self, store_name: &str) -> Option<KeyPath> {
-        self.engine.key_path(store_name)
-    }
-
-    fn object_store_names(&self) -> DbResult<Vec<String>> {
-        self.engine
-            .object_store_names()
-            .map_err(|err| format!("{err:?}"))
-    }
-
-    fn indexes(&self, store_name: &str) -> DbResult<Vec<IndexedDBIndex>> {
-        self.engine
-            .indexes(store_name)
-            .map_err(|err| format!("{err:?}"))
-    }
-
-    fn create_index(
-        &self,
-        store_name: &str,
-        index_name: String,
-        key_path: KeyPath,
-        unique: bool,
-        multi_entry: bool,
-    ) -> DbResult<CreateObjectResult> {
-        self.engine
-            .create_index(store_name, index_name, key_path, unique, multi_entry)
-            .map_err(|err| format!("{err:?}"))
-    }
-
-    fn delete_index(&self, store_name: &str, index_name: String) -> DbResult<()> {
-        self.engine
-            .delete_index(store_name, index_name)
-            .map_err(|err| format!("{err:?}"))
-    }
-
-    fn create_object_store(
-        &mut self,
-        store_name: &str,
-        key_path: Option<KeyPath>,
-        auto_increment: bool,
-    ) -> DbResult<CreateObjectResult> {
-        self.engine
-            .create_store(store_name, key_path, auto_increment)
-            .map_err(|err| format!("{err:?}"))
-    }
-
-    fn delete_object_store(&mut self, store_name: &str) -> DbResult<()> {
-        // https://www.w3.org/TR/IndexedDB-3/#dom-idbdatabase-deleteobjectstore
-        // Step 7. Destroy store.
-        let indexes = self
-            .engine
-            .indexes(store_name)
-            .map_err(|err| format!("{err:?}"))?;
-        for index in indexes {
-            self.engine
-                .delete_index(store_name, index.name)
-                .map_err(|err| format!("{err:?}"))?;
-        }
-        self.engine
-            .delete_store(store_name)
-            .map_err(|err| format!("{err:?}"))
-    }
-
-    /// Restores the object-store metadata snapshot captured before an aborted
-    /// upgrade: remove stores/indexes created during the aborted upgrade, create
-    /// stores/indexes that existed before it, and reset key-generator current
-    /// numbers for stores that use key generators.
-    fn restore_object_stores(&mut self, object_stores: &[IndexedDBObjectStore]) -> DbResult<()> {
-        let mut current_store_names: HashSet<String> =
-            self.object_store_names()?.into_iter().collect();
-        let expected_store_names: HashSet<String> = object_stores
-            .iter()
-            .map(|store| store.name.clone())
-            .collect();
-
-        for store_name in current_store_names.clone() {
-            if !expected_store_names.contains(&store_name) {
-                self.delete_object_store(&store_name)?;
-                current_store_names.remove(&store_name);
-            }
-        }
-
-        for store in object_stores {
-            if !current_store_names.contains(&store.name) {
-                // https://w3c.github.io/IndexedDB/#key-generator-construct
-                // The initial value of a key generator’s current number is 1,
-                // set when the associated object store is created.
-                self.create_object_store(
-                    &store.name,
-                    store.key_path.clone(),
-                    store.has_key_generator,
-                )?;
-                current_store_names.insert(store.name.clone());
-            }
-
-            if let Some(current_number) = store.key_generator_current_number {
-                // https://w3c.github.io/IndexedDB/#key-generator-construct
-                // Modifying a key generator’s current number is considered part
-                // of a database operation. This means that if the operation
-                // fails and the operation is reverted, the current number is
-                // reverted to the value it had before the operation started.
-                // Likewise, if a transaction is aborted, the current number of
-                // the key generator for each object store in the transaction’s
-                // scope is reverted to the value it had before the transaction
-                // was started.
-                self.set_key_generator_current_number(&store.name, current_number)?;
-            }
-
-            let mut current_index_names: HashSet<String> = self
-                .indexes(&store.name)?
-                .into_iter()
-                .map(|index| index.name)
-                .collect();
-            let expected_index_names: HashSet<String> = store
-                .indexes
-                .iter()
-                .map(|index| index.name.clone())
-                .collect();
-
-            for index_name in current_index_names.clone() {
-                if !expected_index_names.contains(&index_name) {
-                    self.delete_index(&store.name, index_name.clone())?;
-                    current_index_names.remove(&index_name);
-                }
-            }
-
-            for index in &store.indexes {
-                if !current_index_names.contains(&index.name) {
-                    self.create_index(
-                        &store.name,
-                        index.name.clone(),
-                        index.key_path.clone(),
-                        index.unique,
-                        index.multi_entry,
-                    )?;
-                }
-            }
-        }
-
-        Ok(())
+    /// The committed metadata of the object stores, for a connection's object store set.
+    fn object_stores(&self) -> Vec<IndexedDBObjectStore> {
+        self.engine.object_stores()
     }
 
     fn version(&self) -> Result<u64, E::Error> {
         self.engine.version()
-    }
-
-    fn set_version(&mut self, version: u64) -> DbResult<()> {
-        self.engine
-            .set_version(version)
-            .map_err(|err| format!("{err:?}"))
     }
 
     /// <https://w3c.github.io/IndexedDB/#abort-a-transaction>
@@ -776,41 +630,19 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
     /// > When a transaction is aborted the implementation must undo (roll back) any changes that
     /// > were made to the database during that transaction.
     ///
-    /// This only aborts the transaction if one was previously queued by adding an abort
-    /// callback to [`Self::pending_abort_callbacks`].
-    ///
-    /// TODO: implement the abort algorithm and rollback for the engine.
-    fn abort(&mut self, origin: &ImmutableOrigin, database_name: &str, transaction: u64) -> bool {
-        let message = || TxnCompleteMsg {
-            origin: origin.clone(),
-            db_name: database_name.into(),
-            txn: transaction,
-            result: Err(BackendError::Abort),
-        };
-
-        let Some(abort_callbacks) = self.pending_abort_callbacks.remove(&transaction) else {
-            return false;
-        };
-        if abort_callbacks.is_empty() {
-            return false;
-        }
-
-        for callback in self
-            .take_pending_commit_callbacks(transaction)
-            .into_iter()
-            .chain(abort_callbacks)
-        {
-            if callback.send(message()).is_err() {
-                error!(
-                    "Failed to send deferred abort completion for \
-                    database '{database_name}' transaction {transaction}.",
-                );
-            }
-        }
-
+    /// The engine rolls the transaction back after the work handed over before, which also
+    /// reverts the key generators and, for an upgrade transaction, the version and the object
+    /// stores and indexes. A commit that script asked for and that hasn't been handed over is
+    /// dropped.
+    fn abort(
+        &mut self,
+        origin: &ImmutableOrigin,
+        database_name: &Utf16String,
+        transaction: IndexedDBTxnId,
+    ) {
+        self.engine.rollback(transaction, Box::new(|| {}));
         self.abort_transaction(transaction);
         self.schedule_transactions(origin.clone(), database_name);
-        true
     }
 }
 
@@ -829,209 +661,259 @@ impl BackendErrorMapper for RusqliteError {
     }
 }
 
-#[cfg(ohos_rdb)]
-impl BackendErrorMapper for OhosRdbError {
-    fn into_backend_error(self) -> BackendError {
-        if matches!(self, OhosRdbError::Api { code, .. } if code == OH_Rdb_ErrCode::RDB_E_SQLITE_FULL.0 || code == OH_Rdb_ErrCode::RDB_E_SQLITE_IOERR.0) ||
-            crate::shared::has_enospc(Some(&self as &(dyn StdError + 'static)))
-        {
-            BackendError::QuotaExceeded
-        } else {
-            BackendError::DbErr(format!("{self:?}"))
-        }
-    }
-}
-
-#[cfg(all(feature = "sqlite-backend", ohos_rdb))]
-impl BackendErrorMapper for crate::shared::TwinError {
-    fn into_backend_error(self) -> BackendError {
-        match self {
-            Self::Sqlite(error) => error.into_backend_error(),
-            Self::Rdb(error) => error.into_backend_error(),
-        }
-    }
-}
-
 fn backend_error_from_storage_error<E: BackendErrorMapper>(err: E) -> BackendError {
     err.into_backend_error()
 }
 
-/// <https://w3c.github.io/IndexedDB/#request-open-request>
-/// Used here to implement the
-/// <https://w3c.github.io/IndexedDB/#connection-queue>
+/// What the client storage thread answers on `receiver`.
+fn client_storage_result<T>(receiver: GenericReceiver<Result<T, String>>) -> BackendResult<T>
+where
+    T: for<'de> serde::Deserialize<'de> + serde::Serialize,
+{
+    receiver
+        .recv()
+        .map_err(|_| BackendError::DbErr("Failed to communicate with client storage.".to_owned()))?
+        .map_err(|error| BackendError::DbErr(format!("Client storage error: {error}")))
+}
+
+/// <https://storage.spec.whatwg.org/#obtain-a-local-storage-bottle-map>
+fn obtain_a_local_storage_bottle_map(
+    source: &StorageBottleSource,
+    origin: &ImmutableOrigin,
+) -> BackendResult<StorageProxyMap> {
+    client_storage_result(source.client_storage.obtain_a_storage_bottle_map(
+        StorageType::Local,
+        source.webview,
+        StorageIdentifier::IndexedDB,
+        origin.clone(),
+    ))
+}
+
+/// The directory of the database `name` in the storage bottle of `proxy_map`, which creates the
+/// database there if it doesn't exist, and whether it did.
+fn create_database_in_bottle(
+    proxy_map: &StorageProxyMap,
+    name: &Utf16String,
+) -> BackendResult<(PathBuf, bool)> {
+    client_storage_result(
+        proxy_map
+            .handle
+            .create_database(proxy_map.bottle_id, name.clone()),
+    )
+}
+
+/// The directory of the database `name` in the storage bottle of `proxy_map`, if it exists.
+fn find_database_in_bottle(
+    proxy_map: &StorageProxyMap,
+    name: &Utf16String,
+) -> BackendResult<Option<PathBuf>> {
+    client_storage_result(
+        proxy_map
+            .handle
+            .find_database(proxy_map.bottle_id, name.clone()),
+    )
+}
+
+/// Deletes the database `name` from the storage bottle of `proxy_map`, with its files.
+fn delete_database_in_bottle(proxy_map: &StorageProxyMap, name: &Utf16String) -> BackendResult<()> {
+    client_storage_result(
+        proxy_map
+            .handle
+            .delete_database(proxy_map.bottle_id, name.clone()),
+    )
+}
+
+/// <https://w3c.github.io/IndexedDB/#delete-a-database>, steps 10 and 11, for the database `key`
+/// stored in `path` that the manager hasn't opened since it started, so that no connection to it
+/// is open: deletes it and returns the version it had. A database whose version can't be read,
+/// such as a corrupt one, is deleted all the same, and its version counts as 0.
+fn delete_stored_database(
+    key: &IndexedDBDescription,
+    path: &Path,
+    proxy_map: &StorageProxyMap,
+) -> BackendResult<u64> {
+    // Step 10: Let version be db’s version.
+    let version = ActiveKvsEngine::committed_version(path).unwrap_or_else(|error| {
+        warn!(
+            "Deleting IndexedDB database {:?}, whose version can't be read: {error:?}",
+            key.name
+        );
+        0
+    });
+    // Step 11: Delete db. If this fails for any reason, return an appropriate error (e.g. a
+    // QuotaExceededError, or an "UnknownError" DOMException).
+    delete_database_in_bottle(proxy_map, &key.name)?;
+    Ok(version)
+}
+
+/// <https://w3c.github.io/IndexedDB/#request-open-request> in a
+/// <https://w3c.github.io/IndexedDB/#connection-queue>: a request to open a connection to a
+/// database, or to delete the database.
 #[derive(MallocSizeOf)]
-enum OpenRequest {
+struct OpenRequest {
+    /// The id of the request, which is also the id of the connection that an open request opens.
+    id: Uuid,
+    kind: OpenRequestKind,
+    /// <https://storage.spec.whatwg.org/#storage-proxy-map>, which the manager obtains in
+    /// parallel once the request is queued; `None` until it has arrived.
+    proxy_map: Option<BackendResult<StorageProxyMap>>,
+    state: OpenRequestState,
+    /// Whether the open request created its database, which then opens at version 1 if no
+    /// version is asked for.
+    created: bool,
+    /// The pipeline of the window that made the request, if a window did.
+    pipeline: Option<PipelineId>,
+    /// Whether a failure showed the database to be unusable, so that the open request deletes
+    /// it and creates it anew.
+    reset: bool,
+}
+
+#[derive(MallocSizeOf)]
+enum OpenRequestKind {
+    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>, with the version asked for,
+    /// if any.
     Open {
-        /// The callback used to send a result to script.
-        sender: GenericCallback<ConnectionMsg>,
-
-        /// The name of the database.
-        db_name: String,
-
-        /// Optionnaly, a requested db version.
-        /// Note: when the open algorithm starts, this will be mutated and set to something as per the algo.
         version: Option<u64>,
-
-        /// <https://w3c.github.io/IndexedDB/#request-processed-flag>
-        processed: bool,
-
-        /// Optionally, a version pending upgrade.
-        pending_upgrade: Option<VersionUpgrade>,
-
-        /// This request is pending on these connections to close.
-        pending_close: HashSet<Uuid>,
-
-        /// This request is pending on these connections to fire a versionchange event.
-        /// Note: This starts as equal to `pending_close`, but when all events have fired,
-        /// not all connections need to have closed, in which case the `blocked` event
-        /// is fired on this request.
-        pending_versionchange: HashSet<Uuid>,
-
-        id: Uuid,
-
-        /// <https://storage.spec.whatwg.org/#storage-proxy-map>
-        proxy_map: StorageProxyMap,
+        /// The result channel of the request and of the connection it opens: the request's
+        /// outcome and, once it opened, everything about the connection go there, in order.
+        results: GenericCallback<ConnectionEvent>,
     },
+    /// <https://w3c.github.io/IndexedDB/#delete-a-database>
     Delete {
-        /// The callback used to send a result to script.
-        sender: GenericCallback<BackendResult<u64>>,
-
-        _origin: ImmutableOrigin,
-
-        /// The name of the database.
-        /// Note: will be used when the full spec is implemented.
-        db_name: String,
-
-        /// <https://w3c.github.io/IndexedDB/#request-processed-flag>
-        processed: bool,
-
-        id: Uuid,
-
-        /// <https://storage.spec.whatwg.org/#storage-proxy-map>
-        proxy_map: StorageProxyMap,
+        results: GenericCallback<DeleteDatabaseEvent>,
     },
 }
 
+/// How far a request in a connection queue has got. Only the request at the front of the queue
+/// gets past `Queued`.
+#[derive(MallocSizeOf)]
+enum OpenRequestState {
+    /// Step 3: waiting for the requests before it to be processed, and for its storage proxy
+    /// map.
+    Queued,
+    /// Step 4: waiting for the client storage registry to find the database, which the manager
+    /// asks in parallel, for a database that it hasn't opened since it started. An open request
+    /// also creates the database there if it doesn't exist (open step 6).
+    Locating,
+    /// Waiting for the other connections to the database to close: steps 10.2 to 10.5 of open a
+    /// database connection, steps 6 to 9 of delete a database.
+    WaitingForConnections(ConnectionsToClose),
+    /// Step 10.6 of open a database connection: waiting for the upgrade transaction to finish.
+    Upgrading(VersionUpgrade),
+}
+
+/// The connections that an open or delete request waits for to close.
+#[derive(MallocSizeOf)]
+struct ConnectionsToClose {
+    /// openConnections.
+    connections: Vec<Uuid>,
+    /// The connections that were fired a versionchange event at.
+    fired: HashSet<Uuid>,
+    /// The connections that were fired a versionchange event at, and that have neither reported
+    /// it dispatched nor closed.
+    versionchange: HashSet<Uuid>,
+    /// The database's version.
+    old_version: u64,
+    /// The version that the open request asks for, or `None` for a delete.
+    new_version: Option<u64>,
+    /// Whether the request checked if it is blocked, once all versionchange events were fired.
+    checked_blocked: bool,
+}
+
 impl OpenRequest {
-    fn get_id(&self) -> Uuid {
-        let id = match self {
-            OpenRequest::Open {
-                sender: _,
-                db_name: _,
-                version: _,
-                processed: _,
-                pending_upgrade: _,
-                pending_close: _,
-                pending_versionchange: _,
-                id,
-                proxy_map: _,
-            } => id,
-            OpenRequest::Delete {
-                sender: _,
-                _origin: _,
-                db_name: _,
-                processed: _,
-                proxy_map: _,
-                id,
-            } => id,
+    fn new(id: Uuid, kind: OpenRequestKind, pipeline: Option<PipelineId>) -> OpenRequest {
+        OpenRequest {
+            id,
+            kind,
+            proxy_map: None,
+            state: OpenRequestState::Queued,
+            created: false,
+            pipeline,
+            reset: false,
+        }
+    }
+
+    fn proxy_map(&self) -> Option<&StorageProxyMap> {
+        self.proxy_map
+            .as_ref()
+            .and_then(|proxy_map| proxy_map.as_ref().ok())
+    }
+
+    /// Sends `message` about an open request to script.
+    fn send_open_message(&self, message: ConnectionMsg) {
+        let OpenRequestKind::Open { results, .. } = &self.kind else {
+            return debug_assert!(false, "Only an open request opens a connection");
         };
-        *id
-    }
-
-    fn is_open(&self) -> bool {
-        match self {
-            OpenRequest::Open {
-                sender: _,
-                db_name: _,
-                version: _,
-                processed: _,
-                pending_upgrade: _,
-                pending_close: _,
-                pending_versionchange: _,
-                id: _,
-                proxy_map: _,
-            } => true,
-            OpenRequest::Delete {
-                sender: _,
-                _origin: _,
-                db_name: _,
-                processed: _,
-                proxy_map: _,
-                id: _,
-            } => false,
+        if results.send(ConnectionEvent::Open(message)).is_err() {
+            debug!("Script went away during an IndexedDB open request");
         }
     }
 
-    /// An open request remains pending until it has been processed,
-    /// and while waiting on upgrade completion or other connections.
-    fn is_pending(&self) -> bool {
-        match self {
-            OpenRequest::Open {
-                sender: _,
-                db_name: _,
-                version: _,
-                processed,
-                pending_upgrade,
-                pending_close,
-                pending_versionchange,
-                id: _,
-                proxy_map: _,
-            } => {
-                !processed ||
-                    pending_upgrade.is_some() ||
-                    !pending_close.is_empty() ||
-                    !pending_versionchange.is_empty()
+    /// Sends the result of a delete request to script.
+    fn send_delete_result(&self, result: BackendResult<u64>) {
+        let OpenRequestKind::Delete { results } = &self.kind else {
+            return debug_assert!(false, "Only a delete request deletes the database");
+        };
+        if results.send(DeleteDatabaseEvent::Done(result)).is_err() {
+            debug!("Script went away during an IndexedDB delete request");
+        }
+    }
+
+    /// Ends the request with `error`.
+    fn fail(&self, name: &Utf16String, error: BackendError) {
+        match self.kind {
+            OpenRequestKind::Open { .. } => self.send_open_message(ConnectionMsg::DatabaseError {
+                name: name.clone(),
+                id: self.id,
+                error,
+            }),
+            OpenRequestKind::Delete { .. } => self.send_delete_result(Err(error)),
+        }
+    }
+
+    /// Ends the request with an "AbortError" DOMException, as its upgrade was aborted or its
+    /// global went away.
+    fn abort(&self, name: &Utf16String) {
+        match self.kind {
+            OpenRequestKind::Open { .. } => self.send_open_message(ConnectionMsg::AbortError {
+                name: name.clone(),
+                id: self.id,
+            }),
+            OpenRequestKind::Delete { .. } => self.send_delete_result(Err(BackendError::Abort)),
+        }
+    }
+
+    /// Asks the global of this open request, whose upgrade runs, to evict its document if it
+    /// isn't fully active: the requests queued behind it wait for the upgrade, which a document
+    /// in the back/forward cache never finishes.
+    fn ask_to_evict_if_inactive(&self) {
+        if let OpenRequestKind::Open { results, .. } = &self.kind &&
+            results.send(ConnectionEvent::EvictIfInactive).is_err()
+        {
+            debug!("Script went away during an IndexedDB open request");
+        }
+    }
+
+    /// Fires a blocked event at the request: open step 10.4, delete step 8.
+    fn fire_blocked(&self, name: &Utf16String, old_version: u64, new_version: Option<u64>) {
+        match (&self.kind, new_version) {
+            (OpenRequestKind::Open { .. }, Some(version)) => {
+                self.send_open_message(ConnectionMsg::Blocked {
+                    name: name.clone(),
+                    id: self.id,
+                    version,
+                    old_version,
+                })
             },
-            OpenRequest::Delete {
-                sender: _,
-                _origin: _,
-                db_name: _,
-                processed,
-                id: _,
-                proxy_map: _,
-            } => !processed,
-        }
-    }
-
-    /// Abort the open request,
-    /// optionally returning a version to revert to.
-    fn abort(&self) -> Option<VersionUpgrade> {
-        match self {
-            OpenRequest::Open {
-                sender,
-                db_name,
-                version: _,
-                processed: _,
-                pending_close: _,
-                pending_versionchange: _,
-                pending_upgrade,
-                id,
-                proxy_map: _,
-            } => {
-                if sender
-                    .send(ConnectionMsg::AbortError {
-                        name: db_name.clone(),
-                        id: *id,
-                    })
+            (OpenRequestKind::Delete { results }, None) => {
+                if results
+                    .send(DeleteDatabaseEvent::Blocked { old_version })
                     .is_err()
                 {
-                    error!("Failed to send ConnectionMsg::Connection to script.");
-                };
-                pending_upgrade.clone()
+                    debug!("Script went away during an IndexedDB delete request");
+                }
             },
-            OpenRequest::Delete {
-                sender,
-                _origin: _,
-                db_name: _,
-                processed: _,
-                id: _,
-                proxy_map: _,
-            } => {
-                if sender.send(Err(BackendError::DbNotFound)).is_err() {
-                    error!("Failed to send result of database delete to script.");
-                };
-                None
-            },
+            _ => debug_assert!(false, "Only an open request asks for a version"),
         }
     }
 }
@@ -1040,18 +922,55 @@ impl OpenRequest {
 struct VersionUpgrade {
     old: u64,
     new: u64,
-    transaction: u64,
-    object_stores: Vec<IndexedDBObjectStore>,
+    transaction: IndexedDBTxnId,
 }
 
 /// <https://w3c.github.io/IndexedDB/#connection>
 #[derive(MallocSizeOf)]
 struct Connection {
-    /// <https://w3c.github.io/IndexedDB/#connection-close-pending-flag>
+    /// <https://w3c.github.io/IndexedDB/#connection-close-pending-flag>. The connection is closed,
+    /// and forgotten, once this is set and the transactions created using it have finished.
     close_pending: bool,
 
-    /// The callback used to send a result to script.
-    sender: GenericCallback<ConnectionMsg>,
+    /// When the connection was opened, relative to the others: versionchange events are fired
+    /// in this order.
+    opened: u64,
+
+    /// The result channel of the connection, for its transactions and versionchange events.
+    results: GenericCallback<ConnectionEvent>,
+
+    /// The pipeline of the window that opened the connection, if a window did.
+    pipeline: Option<PipelineId>,
+}
+
+/// A thread of the manager's own for its calls to the client storage thread, which run there one
+/// after another and hand their results back to the manager as messages. Neither the manager
+/// thread, which serves every database, nor the thread pool, which runs the databases' work,
+/// waits for the client storage thread, whose registry writes are slow.
+struct ClientStorageCalls {
+    sender: mpsc::Sender<Box<dyn FnOnce() + Send>>,
+}
+
+impl ClientStorageCalls {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        thread::Builder::new()
+            .name("IndexedDBClientStorage".to_owned())
+            .spawn(move || {
+                while let Ok(call) = receiver.recv() {
+                    call();
+                }
+            })
+            .expect("Thread spawning failed");
+        Self { sender }
+    }
+
+    /// Runs `call` after the calls handed over before, unless the thread is gone.
+    fn run(&self, call: impl FnOnce() + Send + 'static) -> BackendResult<()> {
+        self.sender.send(Box::new(call)).map_err(|_| {
+            BackendError::DbErr("The IndexedDB manager's client storage thread is gone".to_owned())
+        })
+    }
 }
 
 struct IndexedDBManager {
@@ -1059,18 +978,16 @@ struct IndexedDBManager {
     manager_sender: GenericSender<IndexedDBThreadMsg>,
     databases: HashMap<IndexedDBDescription, IndexedDBEnvironment<ActiveKvsEngine>>,
     thread_pool: Arc<ThreadPool>,
-
-    /// A global counter to produce unique transaction ids.
-    /// TODO: remove once db connections lifecyle is managed.
-    /// A global counter is only necessary because of how deleting a db currently
-    /// does not wait for connection to close and transactions to finish.
-    serial_number_counter: u64,
+    client_storage_calls: ClientStorageCalls,
 
     /// <https://w3c.github.io/IndexedDB/#connection-queue>
     connection_queues: HashMap<IndexedDBDescription, VecDeque<OpenRequest>>,
 
     /// <https://w3c.github.io/IndexedDB/#connection>
     connections: HashMap<IndexedDBDescription, HashMap<Uuid, Connection>>,
+
+    /// The opening order of the next connection.
+    next_connection: u64,
 }
 
 impl IndexedDBManager {
@@ -1085,9 +1002,10 @@ impl IndexedDBManager {
             manager_sender,
             databases: HashMap::new(),
             thread_pool: ThreadPool::global(),
-            serial_number_counter: 0,
+            client_storage_calls: ClientStorageCalls::new(),
             connection_queues: Default::default(),
             connections: Default::default(),
+            next_connection: 0,
         }
     }
 }
@@ -1109,6 +1027,8 @@ impl IndexedDBManager {
             };
             match message {
                 IndexedDBThreadMsg::Sync(SyncOperation::Exit(sender)) => {
+                    // Close the databases first, so that nothing uses their files any more.
+                    self.databases.clear();
                     let _ = sender.send(());
                     break;
                 },
@@ -1118,295 +1038,539 @@ impl IndexedDBManager {
                 IndexedDBThreadMsg::Async(
                     origin,
                     db_name,
-                    store_name,
+                    store,
                     txn,
-                    _request_id,
+                    request_id,
                     mode,
                     operation,
                 ) => {
-                    if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
-                        // Queues an operation for a transaction without starting it
-                        db.queue_operation(&store_name, txn, mode, operation);
-                        db.schedule_transactions(origin, &db_name);
-                    }
+                    let operation = KvsOperation {
+                        store,
+                        request_id: Some(request_id),
+                        operation,
+                    };
+                    self.queue_operation(origin, db_name, txn, mode, operation);
                 },
                 IndexedDBThreadMsg::EngineTxnBatchComplete {
                     origin,
                     db_name,
                     txn,
                 } => {
-                    let should_notify = self
-                        .get_database_mut(origin.clone(), db_name.clone())
-                        .is_some_and(|db| {
-                            // Decide which running flag to clear based on txn mode.
-                            let mode = db.transactions.get(&txn).map(|t| t.mode.clone());
+                    if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
+                        // Decide which running flag to clear based on txn mode.
+                        match db.transactions.get(&txn).map(|t| t.mode.clone()) {
+                            Some(IndexedDBTxnMode::Readonly) => {
+                                db.running_readonly.remove(&txn);
+                            },
+                            Some(_) if db.running_readwrite == Some(txn) => {
+                                db.running_readwrite = None;
+                            },
+                            Some(_) => {},
+                            None => {
+                                // txn might have been aborted/removed; nothing to clear
+                            },
+                        }
 
-                            match mode {
-                                Some(IndexedDBTxnMode::Readonly) => {
-                                    db.running_readonly.remove(&txn);
-                                },
-                                Some(_) if db.running_readwrite == Some(txn) => {
-                                    db.running_readwrite = None;
-                                },
-                                Some(_) => {},
-                                None => {
-                                    // txn might have been aborted/removed; nothing to clear
-                                },
-                            }
-
-                            if db.abort(&origin, &db_name, txn) {
-                                return false;
-                            }
-
-                            // If more requests were queued while this batch was running,
-                            // schedule again now.
-                            db.schedule_transactions(origin.clone(), &db_name);
-                            db.can_notify_txn_maybe_commit(txn)
-                        });
-
-                    if should_notify {
-                        self.handle_sync_operation(SyncOperation::TxnMaybeCommit {
-                            origin,
-                            db_name,
-                            txn,
-                        });
+                        // If more requests were queued while this batch was running,
+                        // schedule again now.
+                        db.schedule_transactions(origin.clone(), &db_name);
+                        db.commit_ready_transactions();
                     }
+                    self.close_connections_if_unusable(IndexedDBDescription {
+                        origin,
+                        name: db_name,
+                    });
                 },
                 IndexedDBThreadMsg::CollectMemoryReport(sender) => {
                     let reports = self.collect_memory_reports();
                     sender.send(ProcessReports::new(reports));
                 },
+                IndexedDBThreadMsg::StorageProxyMapObtained {
+                    origin,
+                    db_name,
+                    request,
+                    result,
+                } => {
+                    let key = IndexedDBDescription {
+                        origin,
+                        name: db_name,
+                    };
+                    self.storage_proxy_map_obtained(key, request, result);
+                },
+                IndexedDBThreadMsg::DatabaseLocated {
+                    origin,
+                    db_name,
+                    request,
+                    result,
+                } => {
+                    let key = IndexedDBDescription {
+                        origin,
+                        name: db_name,
+                    };
+                    self.database_located(key, request, result);
+                },
+                IndexedDBThreadMsg::DatabasesListed {
+                    origin,
+                    sender,
+                    result,
+                } => {
+                    self.databases_listed(origin, sender, result);
+                },
                 IndexedDBThreadMsg::AsyncSchemaOperation {
                     origin,
                     database_name,
-                    store_name,
+                    store_id,
                     operation,
-                    transaction_serial_number,
+                    transaction,
                 } => {
-                    if let Some(database) =
-                        self.get_database_mut(origin.clone(), database_name.clone())
-                    {
-                        // Queues an operation for a transaction without starting it
-                        database.queue_operation(
-                            &store_name,
-                            transaction_serial_number,
-                            IndexedDBTxnMode::Versionchange,
-                            AsyncOperation::Schema(operation),
-                        );
-                        database.schedule_transactions(origin, &database_name);
-                    } else {
-                        operation.notify_error(BackendError::DbNotFound);
-                    }
+                    let operation = KvsOperation {
+                        store: store_id,
+                        request_id: None,
+                        operation: AsyncOperation::Schema(operation),
+                    };
+                    self.queue_operation(
+                        origin,
+                        database_name,
+                        transaction,
+                        IndexedDBTxnMode::Versionchange,
+                        operation,
+                    );
                 },
             }
         }
     }
 
-    fn dispatch_txn_maybe_commit(&self, origin: ImmutableOrigin, db_name: String, txn: u64) {
-        let key = IndexedDBDescription {
-            origin,
-            name: db_name.clone(),
-        };
-        let Some(connections) = self.connections.get(&key) else {
-            return;
-        };
-        for connection in connections.values() {
-            if connection.close_pending {
-                continue;
-            }
-            let _ = connection.sender.send(ConnectionMsg::TxnMaybeCommit {
-                db_name: db_name.clone(),
-                txn,
-            });
-        }
-    }
-
-    fn handle_txn_maybe_commit(&mut self, origin: ImmutableOrigin, db_name: String, txn: u64) {
-        let key = IndexedDBDescription {
-            origin: origin.clone(),
-            name: db_name.clone(),
-        };
-        let callbacks = {
-            let Some(db) = self.databases.get_mut(&key) else {
-                return;
-            };
-            if !db.can_commit_now(txn) {
-                return;
-            }
-            db.take_pending_commit_callbacks(txn)
-        };
-
-        if callbacks.is_empty() {
-            self.dispatch_txn_maybe_commit(origin, db_name, txn);
-            return;
-        }
-
-        for callback in callbacks {
-            if callback
-                .send(TxnCompleteMsg {
-                    origin: origin.clone(),
-                    db_name: db_name.clone(),
-                    txn,
-                    result: Ok(()),
-                })
-                .is_err()
-            {
-                error!(
-                    "Failed to send deferred commit completion for db '{}' txn {}.",
-                    db_name, txn
-                );
-            }
-        }
-    }
-
-    /// Handle when an upgrade transaction finishes in script.
-    fn handle_upgrade_transaction_finished(
+    /// Queues `operation` for `txn` and schedules it. An operation for a database or a
+    /// transaction the backend doesn't know fails with DbNotFound, and one of an aborted
+    /// transaction with Abort. An operation that the transaction's mode or scope doesn't allow
+    /// fails and aborts the transaction.
+    fn queue_operation(
         &mut self,
-        name: String,
         origin: ImmutableOrigin,
-        txn: u64,
-        committed: bool,
+        db_name: Utf16String,
+        txn: IndexedDBTxnId,
+        mode: IndexedDBTxnMode,
+        operation: KvsOperation,
     ) {
         let key = IndexedDBDescription {
-            name: name.clone(),
-            origin: origin.clone(),
+            origin,
+            name: db_name,
         };
+        let check = self
+            .databases
+            .get(&key)
+            .map_or(Err(BackendError::DbNotFound), |db| {
+                db.check_operation(txn, &operation)
+            });
+        let error = match check {
+            Ok(()) => {
+                let db = self.databases.get_mut(&key).expect("Checked above");
+                // Queues an operation for a transaction without starting it
+                db.queue_operation(txn, mode, operation);
+                db.schedule_transactions(key.origin, &key.name);
+                return;
+            },
+            Err(error) => error,
+        };
+        self.transaction_results(&key, txn)
+            .send(operation.failure_event(error.clone()));
+        if let BackendError::DbErr(reason) = error &&
+            let Some(db) = self.databases.get_mut(&key)
+        {
+            warn!("Aborting IndexedDB transaction {txn}: {reason}");
+            db.abort(&key.origin, &key.name, txn);
+        }
+    }
 
-        if committed {
-            let Some(queue) = self.connection_queues.get_mut(&key) else {
-                return debug_assert!(false, "A connection queue should exist.");
-            };
-            let Some(front) = queue.front() else {
-                return debug_assert!(false, "A pending open request should exist.");
-            };
-            let OpenRequest::Open {
-                pending_upgrade: Some(pending_upgrade),
-                ..
-            } = front
-            else {
-                return;
-            };
-            if pending_upgrade.transaction != txn {
-                return;
-            }
+    /// Where the results of `txn` go: the result channel it was registered with, or for a
+    /// transaction the database doesn't know, the result channel of its connection, if the
+    /// connection is open.
+    fn transaction_results(
+        &self,
+        key: &IndexedDBDescription,
+        txn: IndexedDBTxnId,
+    ) -> TransactionResults {
+        if let Some(db) = self.databases.get(key) &&
+            db.knows_transaction(txn)
+        {
+            return db.results(txn);
+        }
+        let channel = self
+            .connections
+            .get(key)
+            .and_then(|connections| connections.get(&txn.connection))
+            .map(|connection| connection.results.clone());
+        TransactionResults::new(txn, channel)
+    }
 
-            let Some(open_request) = queue.pop_front() else {
-                return;
-            };
-            let OpenRequest::Open {
-                sender,
-                db_name,
-                version: _,
-                processed: _,
-                pending_upgrade: Some(pending_upgrade),
-                pending_close: _,
-                pending_versionchange: _,
+    /// Handles the end of the upgrade transaction `txn`, which script reports once its complete or
+    /// abort event was fired: <https://w3c.github.io/IndexedDB/#open-a-database-connection> steps
+    /// 10.7 to 11.
+    fn handle_upgrade_transaction_finished(
+        &mut self,
+        name: Utf16String,
+        origin: ImmutableOrigin,
+        txn: IndexedDBTxnId,
+        committed: bool,
+    ) {
+        let key = IndexedDBDescription { name, origin };
+        let Some(request) = self.front_request(&key) else {
+            return debug!("No open request for upgrade transaction {txn}");
+        };
+        let OpenRequestState::Upgrading(upgrade) = &request.state else {
+            return debug!("No upgrade for transaction {txn}");
+        };
+        if upgrade.transaction != txn {
+            return debug!("Upgrade transaction {txn} isn't the running one");
+        }
+        let id = request.id;
+        if !committed {
+            // Step 10.8: If request’s error is set, run the steps to close a database connection
+            // with connection, return a newly created "AbortError" DOMException and abort these
+            // steps.
+            // Note: an aborted upgrade transaction leaves the open request with an error.
+            return self.abort_pending_upgrade(key, id);
+        }
+
+        // Step 10.7: If connection was closed, return a newly created "AbortError" DOMException
+        // and abort these steps.
+        // Note: its close is pending, and the upgrade transaction was its only transaction.
+        let closed = self
+            .connections
+            .get(&key)
+            .and_then(|connections| connections.get(&id))
+            .is_none_or(|connection| connection.close_pending);
+        let object_stores = self
+            .databases
+            .get(&key)
+            .map(|db| db.object_stores())
+            .unwrap_or_default();
+        let Some(request) = self.pop_front_request(&key) else {
+            return;
+        };
+        let OpenRequestState::Upgrading(upgrade) = &request.state else {
+            return;
+        };
+        if closed {
+            request.abort(&key.name);
+        } else {
+            // Step 11: Return connection.
+            request.send_open_message(ConnectionMsg::Connection {
                 id,
-                proxy_map: _,
-            } = open_request
-            else {
-                return;
-            };
-            let VersionUpgrade { new, .. } = pending_upgrade;
-            let object_store_names = self
-                .databases
-                .get(&key)
-                .and_then(|db| db.object_store_names().ok())
-                .unwrap_or_default();
-            if sender
-                .send(ConnectionMsg::Connection {
-                    id,
-                    name: db_name,
-                    version: new,
-                    upgraded: true,
-                    object_store_names,
+                name: key.name.clone(),
+                version: upgrade.new,
+                upgraded: true,
+                object_stores,
+            });
+        }
+        self.advance_connection_queue(key);
+    }
+
+    fn front_request(&self, key: &IndexedDBDescription) -> Option<&OpenRequest> {
+        self.connection_queues.get(key).and_then(VecDeque::front)
+    }
+
+    fn front_request_mut(&mut self, key: &IndexedDBDescription) -> Option<&mut OpenRequest> {
+        self.connection_queues
+            .get_mut(key)
+            .and_then(VecDeque::front_mut)
+    }
+
+    fn pop_front_request(&mut self, key: &IndexedDBDescription) -> Option<OpenRequest> {
+        self.connection_queues
+            .get_mut(key)
+            .and_then(VecDeque::pop_front)
+    }
+
+    /// Steps 1 and 2 of <https://w3c.github.io/IndexedDB/#open-a-database-connection> and of
+    /// <https://w3c.github.io/IndexedDB/#delete-a-database>: adds the request `id` of `kind` to the
+    /// connection queue for `key`, and obtains its storage proxy map in parallel.
+    fn queue_open_request(
+        &mut self,
+        key: IndexedDBDescription,
+        id: Uuid,
+        kind: OpenRequestKind,
+        bottle_source: StorageBottleSource,
+        pipeline: Option<PipelineId>,
+    ) {
+        let mut request = OpenRequest::new(id, kind, pipeline);
+        let failed = self
+            .obtain_storage_proxy_map(&key, id, bottle_source)
+            .is_err_and(|error| {
+                request.proxy_map = Some(Err(error));
+                true
+            });
+        // Step 1: Let queue be the connection queue for storageKey and name.
+        // Step 2: Add request to queue.
+        let queue = self.connection_queues.entry(key.clone()).or_default();
+        if let Some(front) = queue.front() &&
+            matches!(front.state, OpenRequestState::Upgrading(_))
+        {
+            front.ask_to_evict_if_inactive();
+        }
+        queue.push_back(request);
+        if failed {
+            self.advance_connection_queue(key);
+        }
+    }
+
+    /// Obtains the storage proxy map of the queued request `request` on the manager's client
+    /// storage thread, which waits for the client storage thread instead of this one, and hands
+    /// it to this thread.
+    fn obtain_storage_proxy_map(
+        &self,
+        key: &IndexedDBDescription,
+        request: Uuid,
+        bottle_source: StorageBottleSource,
+    ) -> BackendResult<()> {
+        let manager_sender = self.manager_sender.clone();
+        let IndexedDBDescription { origin, name } = key.clone();
+        self.client_storage_calls.run(move || {
+            let result = obtain_a_local_storage_bottle_map(&bottle_source, &origin);
+            if manager_sender
+                .send(IndexedDBThreadMsg::StorageProxyMapObtained {
+                    origin,
+                    db_name: name,
+                    request,
+                    result,
                 })
                 .is_err()
             {
-                error!("Failed to send ConnectionMsg::Connection to script.");
-            };
+                debug!("IndexedDB manager went away while obtaining a storage proxy map");
+            }
+        })
+    }
 
-            self.advance_connection_queue(key);
+    fn storage_proxy_map_obtained(
+        &mut self,
+        key: IndexedDBDescription,
+        request: Uuid,
+        result: BackendResult<StorageProxyMap>,
+    ) {
+        let Some(queued) = self
+            .connection_queues
+            .get_mut(&key)
+            .and_then(|queue| queue.iter_mut().find(|queued| queued.id == request))
+        else {
+            return debug!("IndexedDB request {request} went away");
+        };
+        queued.proxy_map = Some(result);
+        self.advance_connection_queue(key);
+    }
+
+    /// Runs the requests in the connection queue for `key` in order, each as far as it can go:
+    /// "Wait until all previous requests in queue have been processed."
+    fn advance_connection_queue(&mut self, key: IndexedDBDescription) {
+        enum Next {
+            Wait,
+            Fail(BackendError),
+            Open,
+            Delete,
+            ContinueWhenConnectionsClosed,
+        }
+        loop {
+            let Some(request) = self.front_request(&key) else {
+                self.connection_queues.remove(&key);
+                return;
+            };
+            let next = match (&request.state, &request.proxy_map, &request.kind) {
+                (OpenRequestState::Queued, None, _) |
+                (OpenRequestState::Locating | OpenRequestState::Upgrading(_), ..) => Next::Wait,
+                (OpenRequestState::Queued, Some(Err(error)), _) => Next::Fail(error.clone()),
+                (OpenRequestState::Queued, Some(Ok(_)), OpenRequestKind::Open { .. }) => Next::Open,
+                (OpenRequestState::Queued, Some(Ok(_)), OpenRequestKind::Delete { .. }) => {
+                    Next::Delete
+                },
+                (OpenRequestState::WaitingForConnections(_), ..) => {
+                    Next::ContinueWhenConnectionsClosed
+                },
+            };
+            let ended = match next {
+                Next::Wait => false,
+                Next::Fail(error) => {
+                    request.fail(&key.name, error);
+                    true
+                },
+                Next::Open => self.open_database(&key),
+                Next::Delete => self.delete_database(&key),
+                Next::ContinueWhenConnectionsClosed => self.continue_when_connections_closed(&key),
+            };
+            if !ended {
+                return;
+            }
+            // <https://w3c.github.io/IndexedDB/#dom-idbfactory-open> and
+            // <https://w3c.github.io/IndexedDB/#dom-idbfactory-deletedatabase>, step 4.2: Set
+            // request’s processed flag to true.
+            self.pop_front_request(&key);
+        }
+    }
+
+    /// Fires versionchange events at those of `connections` whose close pending flag isn't set,
+    /// for the open or delete request `request` (open step 10.2, delete step 6), in the order the
+    /// connections were opened, and returns those it fired at. A connection whose global is gone
+    /// is closed instead.
+    fn fire_versionchange(
+        &mut self,
+        key: &IndexedDBDescription,
+        connections: &[Uuid],
+        old_version: u64,
+        new_version: Option<u64>,
+        request: Uuid,
+    ) -> HashSet<Uuid> {
+        let Some(open) = self.connections.get(key) else {
+            return HashSet::new();
+        };
+        let mut fired = HashSet::new();
+        let mut gone = Vec::new();
+        for id in connections {
+            let Some(connection) = open.get(id).filter(|connection| !connection.close_pending)
+            else {
+                continue;
+            };
+            let event = ConnectionEvent::VersionChange {
+                old_version,
+                new_version,
+                request,
+            };
+            if connection.results.send(event).is_err() {
+                gone.push(*id);
+            } else {
+                fired.insert(*id);
+            }
+        }
+        for id in gone {
+            debug!("Script went away before a versionchange event");
+            self.close_connection_of_gone_global(key, id);
+        }
+        fired
+    }
+
+    /// Closes the connection `id` to the database `key`, whose global went away without closing
+    /// it, so that nothing waits for it: rolls back and finishes the transactions created using
+    /// it, and forgets it.
+    fn close_connection_of_gone_global(&mut self, key: &IndexedDBDescription, id: Uuid) {
+        if let Some(db) = self.databases.get_mut(key) {
+            let transactions: Vec<IndexedDBTxnId> = db
+                .txn_info
+                .keys()
+                .filter(|txn| txn.connection == id)
+                .copied()
+                .collect();
+            for txn in transactions {
+                db.engine.rollback(txn, Box::new(|| {}));
+                db.finish_transaction(txn);
+            }
+            db.schedule_transactions(key.origin.clone(), &key.name);
+            db.commit_ready_transactions();
+        }
+        self.remove_connection(key, &id);
+        self.versionchange_settled(key, id, None);
+    }
+
+    /// The connections to the database `key`, except `except`, in the order they were opened.
+    fn open_connections(&self, key: &IndexedDBDescription, except: Option<Uuid>) -> Vec<Uuid> {
+        let Some(connections) = self.connections.get(key) else {
+            return Vec::new();
+        };
+        let mut open: Vec<(u64, Uuid)> = connections
+            .iter()
+            .filter(|(id, _)| Some(**id) != except)
+            .map(|(id, connection)| (connection.opened, *id))
+            .collect();
+        open.sort_unstable();
+        open.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Continues the request at the front of the connection queue for `key` once the connections
+    /// it waits for have handled their versionchange events and closed: open steps 10.3 to 10.6,
+    /// delete steps 7 to 12. Returns whether the request has ended.
+    fn continue_when_connections_closed(&mut self, key: &IndexedDBDescription) -> bool {
+        let connections = self.connections.get(key);
+        let Some(request) = self
+            .connection_queues
+            .get_mut(key)
+            .and_then(VecDeque::front_mut)
+        else {
+            return false;
+        };
+        let OpenRequestState::WaitingForConnections(wait) = &mut request.state else {
+            return false;
+        };
+
+        // Open step 10.3, delete step 7: Wait for all of the events to be fired.
+        if !wait.versionchange.is_empty() {
+            return false;
+        }
+
+        let still_open: Vec<(&Uuid, &Connection)> = wait
+            .connections
+            .iter()
+            .filter_map(|id| connections.and_then(|connections| connections.get_key_value(id)))
+            .collect();
+        // Open step 10.4, delete step 8: If any of the connections in openConnections are still
+        // not closed, queue a database task to fire a version change event named blocked at
+        // request with db’s version and version (null for a delete).
+        // Note: as in Gecko and Chromium, a connection that the page closed in its versionchange
+        // handler doesn't block while its transactions finish. One whose close was pending
+        // before, which got no versionchange event, does, as in Chromium. A connection whose
+        // close is pending waits for its transactions, which a document in the back/forward cache
+        // never finishes, so its document is asked to leave the cache if it isn't fully active.
+        let (old_version, new_version) = (wait.old_version, wait.new_version);
+        if !wait.checked_blocked {
+            wait.checked_blocked = true;
+            let mut blocked = false;
+            for (id, connection) in &still_open {
+                blocked |= !connection.close_pending || !wait.fired.contains(id);
+                if connection.close_pending &&
+                    connection
+                        .results
+                        .send(ConnectionEvent::EvictIfInactive)
+                        .is_err()
+                {
+                    debug!("Script went away before it was asked to evict a page");
+                }
+            }
+            if blocked {
+                request.fire_blocked(&key.name, old_version, new_version);
+            }
+        }
+
+        // Open step 10.5, delete step 9: Wait until all connections in openConnections are
+        // closed.
+        if !still_open.is_empty() {
+            return false;
+        }
+
+        match new_version {
+            Some(version) => {
+                // Open step 10.6: Run upgrade a database using connection, version and request.
+                self.upgrade_database(key, version);
+                false
+            },
+            None => {
+                self.delete_the_database(key);
+                true
+            },
+        }
+    }
+
+    /// Notes that the connection `id` was fired the versionchange event it was sent, or that it
+    /// can't be any more: the request at the front of the queue no longer waits for it.
+    fn versionchange_settled(
+        &mut self,
+        key: &IndexedDBDescription,
+        id: Uuid,
+        request: Option<Uuid>,
+    ) {
+        let Some(front) = self.front_request_mut(key) else {
+            return;
+        };
+        if request.is_some_and(|request| request != front.id) {
             return;
         }
-
-        let (request_id, proxy_map) = {
-            let Some(queue) = self.connection_queues.get_mut(&key) else {
-                return debug_assert!(false, "A connection queue should exist.");
-            };
-            let Some(front) = queue.front() else {
-                return debug_assert!(false, "A pending open request should exist.");
-            };
-            let OpenRequest::Open {
-                pending_upgrade: Some(pending_upgrade),
-                id,
-                proxy_map,
-                ..
-            } = front
-            else {
-                return;
-            };
-            if pending_upgrade.transaction != txn {
-                return;
-            }
-            (*id, (*proxy_map).clone())
-        };
-
-        self.abort_pending_upgrade(name, request_id, origin, &proxy_map);
-    }
-
-    /// Run the next open request in the queue.
-    fn advance_connection_queue(&mut self, key: IndexedDBDescription) {
-        loop {
-            let is_open = {
-                let Some(queue) = self.connection_queues.get_mut(&key) else {
-                    return;
-                };
-                if queue.is_empty() {
-                    return;
-                }
-                queue.front().expect("Queue is not empty.").is_open()
-            };
-
-            if is_open {
-                self.open_database(key.clone());
-            } else {
-                self.delete_database(key.clone());
-            }
-
-            let was_pruned = self.maybe_remove_front_from_queue(&key);
-
-            if !was_pruned {
-                // Note: requests to delete a database are, at this point in the implementation,
-                // done in one step; so we can continue on to the next request.
-                // Request to open a connection consists of multiple async steps, so we must break if
-                // it is still pending.
-                break;
-            }
+        if let OpenRequestState::WaitingForConnections(wait) = &mut front.state {
+            wait.versionchange.remove(&id);
         }
-    }
-
-    /// Remove the record at the front if it is not pending.
-    fn maybe_remove_front_from_queue(&mut self, key: &IndexedDBDescription) -> bool {
-        let (is_empty, was_pruned) = {
-            let Some(queue) = self.connection_queues.get_mut(key) else {
-                debug_assert!(false, "A connection queue should exist.");
-                return false;
-            };
-            let mut pruned = false;
-            let front_is_pending = queue.front().map(|record| record.is_pending());
-            if let Some(is_pending) = front_is_pending &&
-                !is_pending
-            {
-                queue.pop_front().expect("Queue has a non-pending item.");
-                pruned = true
-            }
-            (queue.is_empty(), pruned)
-        };
-        if is_empty {
-            self.connection_queues.remove(key);
-        }
-        was_pruned
     }
 
     fn remove_connection(&mut self, key: &IndexedDBDescription, id: &Uuid) {
@@ -1423,6 +1587,81 @@ impl IndexedDBManager {
         }
     }
 
+    /// Forgets the connection `id` if it is closed: its close pending flag is set and the
+    /// transactions created using it have finished (close a database connection, step 3).
+    fn remove_connection_if_closed(&mut self, key: &IndexedDBDescription, id: Uuid) {
+        let close_pending = self
+            .connections
+            .get(key)
+            .and_then(|connections| connections.get(&id))
+            .is_some_and(|connection| connection.close_pending);
+        if !close_pending ||
+            self.databases
+                .get(key)
+                .is_some_and(|db| db.has_transactions_of(id))
+        {
+            return;
+        }
+        self.remove_connection(key, &id);
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#database-connection>: "A connection may be closed by a
+    /// user agent in exceptional circumstances, for example due to loss of access to the file
+    /// system, a permission change, or clearing of the storage key's storage. If this occurs the
+    /// user agent must run close a database connection with the connection and with the forced
+    /// flag set to true." Servo does so for the connections to a database that a failure has
+    /// shown to be unusable, such as a corrupt one.
+    fn close_connections_if_unusable(&mut self, key: IndexedDBDescription) {
+        if !self
+            .databases
+            .get(&key)
+            .is_some_and(|db| db.engine.is_unusable())
+        {
+            return;
+        }
+        let Some(connections) = self.connections.get_mut(&key) else {
+            return;
+        };
+        let mut closing = Vec::new();
+        let mut gone = Vec::new();
+        for (id, connection) in connections.iter_mut() {
+            if connection.close_pending {
+                continue;
+            }
+            // <https://w3c.github.io/IndexedDB/#close-a-database-connection>
+            // Step 1: Set connection’s close pending flag to true.
+            connection.close_pending = true;
+            // Step 2: If the forced flag is true, then for each transaction created using
+            // connection run abort a transaction with transaction and newly created
+            // "AbortError" DOMException.
+            // Step 4: If the forced flag is true, then fire an event named close at connection.
+            // Note: script does both, and reports each aborted transaction as finished.
+            if connection
+                .results
+                .send(ConnectionEvent::ForcedClose)
+                .is_err()
+            {
+                debug!("Script went away before its connection was closed");
+                gone.push(*id);
+            }
+            closing.push(*id);
+        }
+        if closing.is_empty() {
+            return;
+        }
+        warn!("Closing the connections to an unusable IndexedDB database");
+        for id in gone {
+            self.close_connection_of_gone_global(&key, id);
+        }
+        // Step 3: Wait for all transactions created using connection to complete. Once they are
+        // complete, connection is closed.
+        for id in closing {
+            self.versionchange_settled(&key, id, None);
+            self.remove_connection_if_closed(&key, id);
+        }
+        self.advance_connection_queue(key);
+    }
+
     /// Revert the backing database state after aborting an upgrade transaction.
     ///
     /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
@@ -1431,31 +1670,23 @@ impl IndexedDBManager {
     /// empty set if the database was newly created. Servo eagerly creates the
     /// backing database with version `0` and no stores during open, so aborting
     /// that first upgrade must roll back to the pre-creation state by deleting the
-    /// placeholder backing store entirely.
+    /// placeholder backing store entirely. Otherwise rolling back the upgrade
+    /// transaction restores both; it has been rolled back already unless the
+    /// upgrade is aborted without its transaction, as when a global goes away.
     ///
     /// Related: <https://github.com/servo/servo/pull/42998>
     fn revert_aborted_upgrade(
         &mut self,
         key: &IndexedDBDescription,
         upgrade: &VersionUpgrade,
-        proxy_map: &StorageProxyMap,
+        proxy_map: Option<&StorageProxyMap>,
     ) {
         if upgrade.old == 0 {
-            if let Some(db) = self.databases.remove(key) {
-                // Note: ensure db is dropped before deleting directory,
-                // to get around windows file locks.
-                drop(db);
-                let response = proxy_map
-                    .handle
-                    .delete_database(proxy_map.bottle_id, key.name.clone())
-                    .recv();
-                if response.is_err() {
-                    error!("Failed to communicate with client storage.");
-                    return;
-                }
-                if response.unwrap().is_err() {
-                    error!("Failed to delete database {:?}", key.name);
-                }
+            let Some(proxy_map) = proxy_map else {
+                return debug_assert!(false, "An upgraded database has a storage proxy map");
+            };
+            if let Err(error) = self.remove_database(key, proxy_map) {
+                error!("Failed to delete database {:?}: {error}", key.name);
             }
             return;
         }
@@ -1463,159 +1694,136 @@ impl IndexedDBManager {
         let Some(db) = self.databases.get_mut(key) else {
             return debug_assert!(false, "Db should have been created");
         };
-        let res = db.set_version(upgrade.old);
-        debug_assert!(res.is_ok(), "Setting a db version should not fail.");
-
-        // Step 4. Set connection’s object store set to the set of object stores
-        // in database if database previously existed, or the empty set if
-        // database was newly created.
-        let res = db.restore_object_stores(&upgrade.object_stores);
-        debug_assert!(res.is_ok(), "Restoring object stores should not fail.");
+        db.finish_transaction(upgrade.transaction);
+        db.engine.rollback(upgrade.transaction, Box::new(|| {}));
     }
 
-    /// Aborting the current upgrade for an origin.
+    /// Ends the open request `id` at the front of the connection queue for `key`, whose upgrade
+    /// transaction was aborted: reverts the upgrade, forgets the connection, which script closed,
+    /// and reports an "AbortError" DOMException.
     /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
-    fn abort_pending_upgrade(
-        &mut self,
-        name: String,
-        id: Uuid,
-        origin: ImmutableOrigin,
-        proxy_map: &StorageProxyMap,
-    ) {
-        let key = IndexedDBDescription { name, origin };
-        let upgrade = {
-            let Some(queue) = self.connection_queues.get_mut(&key) else {
-                return debug_assert!(
-                    false,
-                    "There should be a connection queue for the aborted upgrade."
-                );
-            };
-            let Some(open_request) = queue.pop_front() else {
-                return debug_assert!(false, "There should be an open request to upgrade.");
-            };
-            if open_request.get_id() != id {
-                return debug_assert!(
-                    false,
-                    "Open request to abort should be at the head of the queue."
-                );
-            }
-            open_request.abort()
+    fn abort_pending_upgrade(&mut self, key: IndexedDBDescription, id: Uuid) {
+        let Some(request) = self.pop_front_request(&key) else {
+            return debug_assert!(false, "There should be an open request to upgrade.");
         };
-        if let Some(upgrade) = upgrade {
-            self.revert_aborted_upgrade(&key, &upgrade, proxy_map);
+        debug_assert_eq!(
+            request.id, id,
+            "The aborted upgrade should be the running one"
+        );
+        if let OpenRequestState::Upgrading(upgrade) = &request.state {
+            self.revert_aborted_upgrade(&key, upgrade, request.proxy_map());
         }
-
+        request.abort(&key.name);
         self.remove_connection(&key, &id);
-
         self.advance_connection_queue(key);
     }
 
-    /// Aborting all upgrades for an origin
-    // https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction
-    /// Note: this only reverts the version at this point.
+    /// Ends the open requests and forgets the connections `ids` of each database, whose global
+    /// went away: a connection whose global is gone is closed. A request whose upgrade runs has
+    /// its upgrade reverted.
+    /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
     fn abort_pending_upgrades(
         &mut self,
-        pending_upgrades: HashMap<String, HashSet<Uuid>>,
+        pending_upgrades: HashMap<Utf16String, HashSet<Uuid>>,
         origin: ImmutableOrigin,
-        proxy_map: StorageProxyMap,
     ) {
         for (name, ids) in pending_upgrades.into_iter() {
-            let mut upgrade_to_revert: Option<VersionUpgrade> = None;
             let key = IndexedDBDescription {
                 name: name.clone(),
                 origin: origin.clone(),
             };
             for id in ids.iter() {
                 self.remove_connection(&key, id);
+                self.versionchange_settled(&key, *id, None);
             }
-            {
-                let is_empty = {
-                    let Some(queue) = self.connection_queues.get_mut(&key) else {
-                        continue;
-                    };
-                    queue.retain_mut(|open_request| {
-                        if ids.contains(&open_request.get_id()) {
-                            let upgrade = open_request.abort();
-                            if upgrade_to_revert.is_none() &&
-                                let Some(upgrade) = upgrade
-                            {
-                                upgrade_to_revert = Some(upgrade);
-                            }
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    queue.is_empty()
-                };
-                if is_empty {
-                    self.connection_queues.remove(&key);
+            let removed: VecDeque<OpenRequest> = match self.connection_queues.get_mut(&key) {
+                Some(queue) => {
+                    let (removed, kept) = std::mem::take(queue)
+                        .into_iter()
+                        .partition(|request| ids.contains(&request.id));
+                    *queue = kept;
+                    removed
+                },
+                None => VecDeque::new(),
+            };
+            for request in removed {
+                if let OpenRequestState::Upgrading(upgrade) = &request.state {
+                    // An upgrade transaction that committed before its global went away stays
+                    // committed: step 10.7 only fails the request.
+                    let committed = self.databases.get(&key).and_then(|db| db.version().ok()) ==
+                        Some(upgrade.new);
+                    match self.databases.get_mut(&key) {
+                        Some(db) if committed => db.finish_transaction(upgrade.transaction),
+                        _ => self.revert_aborted_upgrade(&key, upgrade, request.proxy_map()),
+                    }
+                }
+                request.abort(&name);
+            }
+            // The requests queued behind a removed request go on, and so does one that waited
+            // for a removed connection.
+            self.advance_connection_queue(key);
+        }
+    }
+
+    /// Ends the open requests and closes the connections of the windows of `pipelines`, which
+    /// went away without the IndexedDB teardown, as their event loop died: their transactions
+    /// are rolled back, and the rest is what [`Self::abort_pending_upgrades`] does for a global
+    /// that went away.
+    fn close_connections_of_pipelines(&mut self, pipelines: Vec<PipelineId>) {
+        let of_pipelines = |pipeline: Option<PipelineId>| {
+            pipeline.is_some_and(|pipeline| pipelines.contains(&pipeline))
+        };
+        let mut gone: HashMap<IndexedDBDescription, HashSet<Uuid>> = HashMap::new();
+        for (key, connections) in &self.connections {
+            for (id, connection) in connections {
+                if of_pipelines(connection.pipeline) {
+                    gone.entry(key.clone()).or_default().insert(*id);
                 }
             }
-            if let Some(upgrade) = upgrade_to_revert {
-                self.revert_aborted_upgrade(&key, &upgrade, &proxy_map);
+        }
+        for (key, queue) in &self.connection_queues {
+            for request in queue {
+                if of_pipelines(request.pipeline) {
+                    gone.entry(key.clone()).or_default().insert(request.id);
+                }
             }
         }
-    }
-
-    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
-    fn open_a_database_connection(
-        &mut self,
-        sender: GenericCallback<ConnectionMsg>,
-        origin: ImmutableOrigin,
-        db_name: String,
-        version: Option<u64>,
-        id: Uuid,
-        proxy_map: StorageProxyMap,
-    ) {
-        let key = IndexedDBDescription {
-            name: db_name.clone(),
-            origin,
-        };
-        let open_request = OpenRequest::Open {
-            sender,
-            db_name,
-            version,
-            processed: false,
-            pending_close: Default::default(),
-            pending_versionchange: Default::default(),
-            pending_upgrade: None,
-            id,
-            proxy_map,
-        };
-        let should_continue = {
-            // Step 1: Let queue be the connection queue for storageKey and name.
-            let queue = self.connection_queues.entry(key.clone()).or_default();
-
-            // Step 2: Add request to queue.
-            queue.push_back(open_request);
-            queue.len() == 1
-        };
-
-        // Step 3: Wait until all previous requests in queue have been processed.
-        if should_continue {
-            self.open_database(key.clone());
-            self.maybe_remove_front_from_queue(&key);
+        for (key, ids) in gone {
+            warn!(
+                "Closing the IndexedDB connections to {:?} of a window whose event loop died",
+                key.name
+            );
+            for id in &ids {
+                self.close_connection_of_gone_global(&key, *id);
+            }
+            self.abort_pending_upgrades(HashMap::from([(key.name, ids)]), key.origin);
         }
     }
 
-    fn get_database(
-        &self,
+    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>, steps 1 and 2.
+    #[expect(clippy::too_many_arguments)]
+    fn open_a_database_connection(
+        &mut self,
         origin: ImmutableOrigin,
-        db_name: String,
-    ) -> Option<&IndexedDBEnvironment<ActiveKvsEngine>> {
-        let idb_description = IndexedDBDescription {
-            origin,
+        db_name: Utf16String,
+        version: Option<u64>,
+        id: Uuid,
+        bottle_source: StorageBottleSource,
+        results: GenericCallback<ConnectionEvent>,
+        pipeline: Option<PipelineId>,
+    ) {
+        let key = IndexedDBDescription {
             name: db_name,
+            origin,
         };
-
-        self.databases.get(&idb_description)
+        let kind = OpenRequestKind::Open { version, results };
+        self.queue_open_request(key, id, kind, bottle_source, pipeline);
     }
 
     fn get_database_mut(
         &mut self,
         origin: ImmutableOrigin,
-        db_name: String,
+        db_name: Utf16String,
     ) -> Option<&mut IndexedDBEnvironment<ActiveKvsEngine>> {
         let idb_description = IndexedDBDescription {
             origin,
@@ -1628,46 +1836,39 @@ impl IndexedDBManager {
     /// <https://w3c.github.io/IndexedDB/#upgrade-a-database>
     /// To upgrade a database with connection (a connection),
     /// a new version, and a request, run these steps:
-    fn upgrade_database(&mut self, key: IndexedDBDescription, new_version: u64) {
-        let Some(queue) = self.connection_queues.get_mut(&key) else {
-            return debug_assert!(false, "A connection queue should exist.");
-        };
-        let Some(open_request) = queue.front_mut() else {
+    fn upgrade_database(&mut self, key: &IndexedDBDescription, new_version: u64) {
+        let Some(open_request) = self
+            .connection_queues
+            .get_mut(key)
+            .and_then(VecDeque::front_mut)
+        else {
             return debug_assert!(false, "An open request should be in the queue.");
         };
-        let OpenRequest::Open {
-            sender,
-            db_name,
-            version: _,
-            processed,
-            id,
-            pending_close: _,
-            pending_versionchange: _,
-            pending_upgrade,
-            proxy_map: _,
-        } = open_request
-        else {
-            return;
+        let OpenRequestKind::Open { results, .. } = &open_request.kind else {
+            return debug_assert!(false, "Only an open request upgrades the database.");
         };
 
         // Step 1: Let db be connection’s database.
         let db = self
             .databases
-            .get_mut(&key)
+            .get_mut(key)
             .expect("Db should have been opened.");
 
         // Step 2: Let transaction be a new upgrade transaction with connection used as connection.
-        let transaction = self.serial_number_counter;
-        self.serial_number_counter += 1;
+        let transaction = IndexedDBTxnId::upgrade(open_request.id);
 
         // Step 3: Set transaction’s scope to connection’s object store set.
-        let scope = db
-            .object_store_names()
-            .expect("Fetching object store names should not fail.");
+        let object_stores = db.object_stores();
+        let scope = object_stores.iter().map(|store| store.id).collect();
 
         // Step 4: Set db’s upgrade transaction to transaction.
-        // Backend tracks the active upgrade transaction in `pending_upgrade` below.
-        db.register_transaction(transaction, IndexedDBTxnMode::Versionchange, scope.clone());
+        // Backend tracks the active upgrade transaction in the request's state below.
+        db.register_transaction(
+            transaction,
+            IndexedDBTxnMode::Versionchange,
+            scope,
+            results.clone(),
+        );
 
         // Step 5: Set transaction’s state to inactive.
         // Step 6: Start transaction.
@@ -1676,689 +1877,672 @@ impl IndexedDBManager {
 
         // Step 7: Let old version be db’s version.
         let old_version = db.version().expect("DB should have a version.");
-        let object_stores = db
-            .object_stores()
-            .expect("Fetching object stores should not fail.");
 
         // Step 8: Set db’s version to version. This change is considered part of the
         // transaction, and so if the transaction is aborted, this change is reverted.
-        db.set_version(new_version)
-            .expect("Setting the version should not fail");
+        db.engine.upgrade_version(transaction, new_version);
 
         // Step 9: Set request’s processed flag to true.
-        *processed = true;
-        let _ = pending_upgrade.insert(VersionUpgrade {
+        // Note: the next request in the queue waits until the upgrade transaction has finished
+        // and the request's result was sent, as in Chromium: "until this transaction is
+        // finished, no other connections can be opened to the same database", and the success
+        // event must reach the connection before a versionchange event.
+        open_request.state = OpenRequestState::Upgrading(VersionUpgrade {
             old: old_version,
             new: new_version,
+            transaction,
+        });
+
+        // Step 10: Queue a database task to run these steps:
+        open_request.send_open_message(ConnectionMsg::Upgrade {
+            id: open_request.id,
+            name: key.name.clone(),
+            version: new_version,
+            old_version,
             transaction,
             object_stores,
         });
 
-        // Step 10: Queue a database task to run these steps.
-        if sender
-            .send(ConnectionMsg::Upgrade {
-                id: *id,
-                name: db_name.clone(),
-                version: new_version,
-                old_version,
-                transaction,
-                object_store_names: scope,
-            })
-            .is_err()
+        if self
+            .connection_queues
+            .get(key)
+            .is_some_and(|queue| queue.len() > 1) &&
+            let Some(open_request) = self.front_request(key)
         {
-            error!("Couldn't queue task for indexeddb upgrade event.");
+            open_request.ask_to_evict_if_inactive();
         }
 
         // Step 11: Wait for transaction to finish.
-        // Queue progression remains blocked while `pending_upgrade` is set.
+        // Note: see `handle_upgrade_transaction_finished`.
     }
 
-    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
+    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>, steps 10.3 and 10.5: the
+    /// connection `id` reports that it was fired the versionchange event of the request
+    /// `request`.
     fn handle_version_change_done(
         &mut self,
-        name: String,
-        from_id: Uuid,
-        old_version: u64,
+        name: Utf16String,
+        id: Uuid,
+        request: Uuid,
         origin: ImmutableOrigin,
     ) {
-        let key = IndexedDBDescription {
-            name: name.clone(),
-            origin,
-        };
-        let (can_upgrade, version) = {
-            let Some(queue) = self.connection_queues.get_mut(&key) else {
-                return debug_assert!(false, "A connection queue should exist.");
-            };
-            let Some(open_request) = queue.front_mut() else {
-                return debug_assert!(false, "An open request should be in the queue.");
-            };
-            let OpenRequest::Open {
-                sender,
-                db_name: _,
-                version,
-                id,
-                pending_upgrade: _,
-                processed: _,
-                pending_versionchange,
-                pending_close,
-                proxy_map: _,
-            } = open_request
-            else {
-                return debug_assert!(
-                    false,
-                    "An request to open a connection should be in the queue."
-                );
-            };
-            debug_assert!(
-                pending_versionchange.contains(&from_id),
-                "The open request should be pending on the versionchange event for the connection sending the message."
-            );
-
-            pending_versionchange.remove(&from_id);
-
-            // Step 10.3: Wait for all of the events to be fired.
-            if !pending_versionchange.is_empty() {
-                return;
-            }
-
-            let Some(version) = *version else {
-                return debug_assert!(
-                    false,
-                    "An upgrade version should have been determined by now."
-                );
-            };
-
-            // Step 10.4: If any of the connections in openConnections are still not closed,
-            // queue a database task to fire a version change event named blocked
-            // at request with db’s version and version.
-            if !pending_close.is_empty() &&
-                sender
-                    .send(ConnectionMsg::Blocked {
-                        name,
-                        id: *id,
-                        version,
-                        old_version,
-                    })
-                    .is_err()
-            {
-                return debug!("Script exit during indexeddb database open");
-            }
-
-            (pending_close.is_empty(), version)
-        };
-
-        // Step 10.5: Wait until all connections in openConnections are closed.
-        // Note: if we still need to wait, the algorithm will continue in the handling of the close message.
-        if can_upgrade {
-            // Step 10.6: Run upgrade a database using connection, version and request.
-            self.upgrade_database(key.clone(), version);
-
-            let was_pruned = self.maybe_remove_front_from_queue(&key);
-            if was_pruned {
-                self.advance_connection_queue(key);
-            }
-        }
+        let key = IndexedDBDescription { name, origin };
+        self.versionchange_settled(&key, id, Some(request));
+        self.advance_connection_queue(key);
     }
 
-    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
-    /// The part where the open request is ready for processing.
-    fn open_database(&mut self, key: IndexedDBDescription) {
-        let Some(queue) = self.connection_queues.get_mut(&key) else {
-            return debug_assert!(false, "A connection queue should exist.");
+    /// Looks the database `key`, which the manager hasn't opened since it started, up in the
+    /// client storage registry for the request at the front of its connection queue. An open
+    /// request creates it there if it doesn't exist. This runs on the manager's client storage
+    /// thread, and the result comes back as [`IndexedDBThreadMsg::DatabaseLocated`]. Returns
+    /// whether the request has ended, as it failed because the lookup couldn't be handed over.
+    fn locate_database(&mut self, key: &IndexedDBDescription) -> bool {
+        let Some(request) = self.front_request_mut(key) else {
+            debug_assert!(false, "A request should be in the queue.");
+            return false;
         };
-        let Some(open_request) = queue.front_mut() else {
-            return debug_assert!(false, "An open request should be in the queue.");
+        let Some(proxy_map) = request.proxy_map().cloned() else {
+            debug_assert!(false, "The request's storage proxy map should be there.");
+            return false;
         };
-        let OpenRequest::Open {
-            sender,
-            db_name,
-            version,
-            id,
-            processed,
-            pending_upgrade: _pending_upgrade,
-            pending_close,
-            pending_versionchange,
-            proxy_map,
-        } = open_request
-        else {
-            return debug_assert!(
-                false,
-                "An request to open a connection should be in the queue."
-            );
-        };
-
-        let requested_version = *version;
-
-        // Step 4: Let db be the database named name in origin, or null otherwise.
-        let db_version = match self.databases.entry(key.clone()) {
-            Entry::Vacant(e) => {
-                // Step 5: If version is undefined, let version be 1 if db is null, or db’s version otherwise.
-                // Note: done below with the zero as first tuple item.
-
-                // https://www.w3.org/TR/IndexedDB/#open-a-database-connection
-                // Step 6: If db is null, let db be a new database
-                // with name name, version 0 (zero), and with no object stores.
-                // If this fails for any reason, return an appropriate error
-                // (e.g. a "QuotaExceededError" or "UnknownError" DOMException).
-                let Ok(response) = proxy_map
-                    .handle
-                    .create_database(proxy_map.bottle_id, db_name.clone())
-                    .recv()
-                else {
-                    if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
-                        id: *id,
-                        name: db_name.clone(),
-                        error: BackendError::DbErr(
-                            "Failed to communicate with client storage.".to_string(),
-                        ),
-                    }) {
-                        debug!("Script exit during indexeddb database open {:?}", e);
-                    }
-                    return;
-                };
-                let (path, created) = match response {
-                    Ok((path, created)) => (path, created),
-                    Err(err) => {
-                        if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
-                            id: *id,
-                            name: db_name.clone(),
-                            error: BackendError::DbErr(format!("{err:?}")),
-                        }) {
-                            debug!("Script exit during indexeddb database open {:?}", e);
-                        }
-                        return;
-                    },
-                };
-                let engine =
-                    match ActiveKvsEngine::new(path, created, &key, self.thread_pool.clone()) {
-                        Ok(engine) => engine,
-                        Err(err) => {
-                            let error = backend_error_from_storage_error(err);
-                            if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
-                                id: *id,
-                                name: db_name.clone(),
-                                error,
-                            }) {
-                                debug!("Script exit during indexeddb database open {:?}", e);
-                            }
-                            *processed = true;
-                            return;
-                        },
-                    };
-                let created_db_path = engine.created_db_path();
-                let db = IndexedDBEnvironment::new(engine, self.manager_sender.clone());
-                let db_version = match db.version() {
-                    Ok(version) => version,
-                    Err(err) => {
-                        let error = backend_error_from_storage_error(err);
-                        if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
-                            id: *id,
-                            name: db_name.clone(),
-                            error,
-                        }) {
-                            debug!("Script exit during indexeddb database open {:?}", e);
-                        }
-                        *processed = true;
-                        return;
-                    },
-                };
-
-                *version = if created_db_path {
-                    Some(requested_version.unwrap_or(1))
-                } else {
-                    Some(requested_version.unwrap_or(db_version))
-                };
-
-                e.insert(db);
-                db_version
-            },
-            Entry::Occupied(db) => {
-                let db_version = match db.get().version() {
-                    Ok(version) => version,
-                    Err(err) => {
-                        let error = backend_error_from_storage_error(err);
-                        if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
-                            id: *id,
-                            name: db_name.clone(),
-                            error,
-                        }) {
-                            debug!("Script exit during indexeddb database open {:?}", e);
-                        }
-                        *processed = true;
-                        return;
-                    },
-                };
-                // Step 5: If version is undefined, let version be 1 if db is null, or db’s version otherwise.
-                *version = Some(requested_version.unwrap_or(db_version));
-                db_version
-            },
-        };
-
-        let Some(version) = *version else {
-            return debug_assert!(
-                false,
-                "An upgrade version should have been determined by now."
-            );
-        };
-
-        // Step 7: If db’s version is greater than version,
-        // return a newly created "VersionError" DOMException
-        // and abort these steps.
-        if version < db_version {
-            if sender
-                .send(ConnectionMsg::VersionError {
-                    name: db_name.clone(),
-                    id: *id,
+        request.state = OpenRequestState::Locating;
+        let id = request.id;
+        let create = matches!(request.kind, OpenRequestKind::Open { .. });
+        let manager_sender = self.manager_sender.clone();
+        let IndexedDBDescription { origin, name } = key.clone();
+        let handed_over = self.client_storage_calls.run(move || {
+            let result = if create {
+                create_database_in_bottle(&proxy_map, &name).map(Some)
+            } else {
+                find_database_in_bottle(&proxy_map, &name)
+                    .map(|path| path.map(|path| (path, false)))
+            };
+            if manager_sender
+                .send(IndexedDBThreadMsg::DatabaseLocated {
+                    origin,
+                    db_name: name,
+                    request: id,
+                    result,
                 })
                 .is_err()
             {
-                debug!("Script exit during indexeddb database open");
+                debug!("IndexedDB manager went away while looking up a database");
             }
-            *processed = true;
-            return;
+        });
+        let Err(error) = handed_over else {
+            return false;
+        };
+        if let Some(request) = self.front_request(key) {
+            request.fail(&key.name, error);
+        }
+        true
+    }
+
+    /// Continues the request `request` at the front of the connection queue for `key`, which
+    /// looked its database up in the client storage registry and found it in the directory that
+    /// `result` holds, or found none.
+    fn database_located(
+        &mut self,
+        key: IndexedDBDescription,
+        request: Uuid,
+        result: BackendResult<Option<(PathBuf, bool)>>,
+    ) {
+        let Some(front) = self.front_request(&key).filter(|front| {
+            front.id == request && matches!(front.state, OpenRequestState::Locating)
+        }) else {
+            return debug!("IndexedDB request {request} went away");
+        };
+        let opens = matches!(front.kind, OpenRequestKind::Open { .. });
+        let ended = match result {
+            Err(error) => {
+                front.fail(&key.name, error);
+                true
+            },
+            Ok(Some((path, created))) if opens => {
+                // <https://w3c.github.io/IndexedDB/#open-a-database-connection>
+                // Step 6: If db is null, let db be a new database with name name, version 0
+                // (zero), and with no object stores. If this fails for any reason, return an
+                // appropriate error (e.g. a "QuotaExceededError" or "UnknownError" DOMException).
+                let reset = if front.reset {
+                    warn!(
+                        "Resetting IndexedDB database {:?}, which is corrupt",
+                        key.name
+                    );
+                    ActiveKvsEngine::delete_files(&path)
+                } else {
+                    Ok(())
+                };
+                match reset.and_then(|()| {
+                    ActiveKvsEngine::new(path, created, &key, self.thread_pool.clone())
+                }) {
+                    Ok(engine) => {
+                        let created = engine.created_db_path();
+                        let db = IndexedDBEnvironment::new(engine, self.manager_sender.clone());
+                        self.databases.insert(key.clone(), db);
+                        let front = self.front_request_mut(&key).expect("Checked above");
+                        front.created = created;
+                        front.state = OpenRequestState::Queued;
+                        false
+                    },
+                    Err(error) => {
+                        front.fail(&key.name, backend_error_from_storage_error(error));
+                        true
+                    },
+                }
+            },
+            Ok(None) if opens => {
+                debug_assert!(
+                    false,
+                    "The registry creates the database of an open request"
+                );
+                front.fail(&key.name, BackendError::DbNotFound);
+                true
+            },
+            // <https://w3c.github.io/IndexedDB/#delete-a-database>
+            // Step 4: Let db be the database named name in storageKey, if one exists. Otherwise,
+            // return 0 (zero).
+            Ok(None) => {
+                front.send_delete_result(Ok(0));
+                true
+            },
+            // Steps 5 to 9 have nothing to wait for: no connection to db is open.
+            Ok(Some((path, _))) => {
+                let result = match front.proxy_map() {
+                    Some(proxy_map) => delete_stored_database(&key, &path, proxy_map),
+                    None => Err(BackendError::DbNotFound),
+                };
+                // Step 12: Return version.
+                front.send_delete_result(result);
+                true
+            },
+        };
+        if ended {
+            self.pop_front_request(&key);
+        }
+        self.advance_connection_queue(key);
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>, steps 4 to 11, for the
+    /// request at the front of the connection queue for `key`. Returns whether the request has
+    /// ended.
+    fn open_database(&mut self, key: &IndexedDBDescription) -> bool {
+        let Some(request) = self.front_request(key) else {
+            debug_assert!(false, "An open request should be in the queue.");
+            return false;
+        };
+        let OpenRequestKind::Open {
+            version: requested_version,
+            results,
+        } = &request.kind
+        else {
+            debug_assert!(
+                false,
+                "A request to open a connection should be in the queue."
+            );
+            return false;
+        };
+        let (id, requested_version, results, created, pipeline) = (
+            request.id,
+            *requested_version,
+            results.clone(),
+            request.created,
+            request.pipeline,
+        );
+
+        // A database that a failure showed to be unusable is deleted and created anew, once its
+        // connections are closed, as one that turns out to be corrupt when it is opened.
+        if self
+            .databases
+            .get(key)
+            .is_some_and(|db| db.engine.is_unusable())
+        {
+            if self.connections.contains_key(key) {
+                return false;
+            }
+            self.databases.remove(key);
+            if let Some(request) = self.front_request_mut(key) {
+                request.reset = true;
+            }
+        }
+
+        // Step 4: Let db be the database named name in storageKey, or null otherwise.
+        // Note: a database that the manager hasn't opened since it started is looked up in the
+        // client storage registry first, in parallel, which also does step 6.
+        if !self.databases.contains_key(key) {
+            return self.locate_database(key);
+        }
+        let db_version = match self.databases.get(key).map(|db| db.version()) {
+            Some(Ok(version)) => version,
+            Some(Err(error)) => {
+                let error = backend_error_from_storage_error(error);
+                self.front_request(key)
+                    .expect("Checked above")
+                    .fail(&key.name, error);
+                return true;
+            },
+            None => {
+                debug_assert!(false, "The database should be open.");
+                return false;
+            },
+        };
+
+        // Step 5: If version is undefined, let version be 1 if db is null, or db’s version
+        // otherwise.
+        // Note: a stored database of version 0 counts as null, as databases() skips it: it was
+        // created by an earlier session that ended before its first upgrade committed.
+        let version = requested_version.unwrap_or(if created || db_version == 0 {
+            1
+        } else {
+            db_version
+        });
+
+        // Step 7: If db’s version is greater than version, return a newly created
+        // "VersionError" DOMException and abort these steps.
+        if version < db_version {
+            self.front_request(key)
+                .expect("Checked above")
+                .send_open_message(ConnectionMsg::VersionError {
+                    name: key.name.clone(),
+                    id,
+                });
+            return true;
         }
 
         // Step 8: Let connection be a new connection to db.
         // Step 9: Set connection’s version to version.
-        let connection = Connection {
-            close_pending: false,
-            sender: sender.clone(),
-        };
-        let entry = self.connections.entry(key.clone()).or_default();
-        entry.insert(*id, connection);
+        let opened = self.next_connection;
+        self.next_connection += 1;
+        self.connections.entry(key.clone()).or_default().insert(
+            id,
+            Connection {
+                close_pending: false,
+                opened,
+                results,
+                pipeline,
+            },
+        );
 
         // Step 10: If db’s version is less than version, then:
         if db_version < version {
-            // Step 10.1: Let openConnections be the set of all connections,
-            // except connection, associated with db.
-            let open_connections = entry
-                .iter_mut()
-                .filter(|(other_id, conn)| !conn.close_pending && *other_id != id);
-            for (id_to_close, conn) in open_connections {
-                // Step 10.2: For each entry of openConnections
-                // queue a database task to fire a version change event
-                // named versionchange at entry with db’s version and version.
-                if conn
-                    .sender
-                    .send(ConnectionMsg::VersionChange {
-                        name: db_name.clone(),
-                        id: *id_to_close,
-                        version,
-                        old_version: db_version,
-                    })
-                    .is_err()
-                {
-                    error!("Failed to send ConnectionMsg::Connection to script.");
-                };
-                pending_close.insert(*id_to_close);
-                pending_versionchange.insert(*id_to_close);
-            }
-            if !pending_close.is_empty() {
-                // Step 10.3: Wait for all of the events to be fired.
-                return;
+            // Step 10.1: Let openConnections be the set of all connections, except connection,
+            // associated with db.
+            let connections = self.open_connections(key, Some(id));
+
+            // Step 10.2: For each entry of openConnections that does not have its close pending
+            // flag set to true, queue a database task to fire a version change event named
+            // versionchange at entry with db’s version and version.
+            let versionchange =
+                self.fire_versionchange(key, &connections, db_version, Some(version), id);
+            if let Some(request) = self.front_request_mut(key) {
+                request.state = OpenRequestState::WaitingForConnections(ConnectionsToClose {
+                    connections,
+                    fired: versionchange.clone(),
+                    versionchange,
+                    old_version: db_version,
+                    new_version: Some(version),
+                    checked_blocked: false,
+                });
             }
 
-            // Step 10.6: Run upgrade a database using connection, version and request.
-            self.upgrade_database(key, version);
-            return;
+            // Steps 10.3 to 10.6.
+            return self.continue_when_connections_closed(key);
         }
 
-        // Step 11:
-        let object_store_names = self
+        // Step 11: Return connection.
+        let object_stores = self
             .databases
-            .get(&key)
-            .and_then(|db| db.object_store_names().ok())
+            .get(key)
+            .map(|db| db.object_stores())
             .unwrap_or_default();
-        *processed = true;
-        if sender
-            .send(ConnectionMsg::Connection {
-                name: db_name.clone(),
-                id: *id,
+        self.front_request(key)
+            .expect("Checked above")
+            .send_open_message(ConnectionMsg::Connection {
+                name: key.name.clone(),
+                id,
                 version: db_version,
                 upgraded: false,
-                object_store_names,
-            })
-            .is_err()
-        {
-            error!("Failed to send ConnectionMsg::Connection to script.");
-        };
+                object_stores,
+            });
+        true
     }
 
-    /// <https://www.w3.org/TR/IndexedDB/#delete-a-database>
-    /// The part adding the request to the connection queue.
+    /// <https://w3c.github.io/IndexedDB/#delete-a-database>, steps 1 and 2.
     fn start_delete_database(
         &mut self,
         key: IndexedDBDescription,
         id: Uuid,
-        proxy_map: StorageProxyMap,
-        sender: GenericCallback<BackendResult<u64>>,
+        bottle_source: StorageBottleSource,
+        results: GenericCallback<DeleteDatabaseEvent>,
     ) {
-        let open_request = OpenRequest::Delete {
-            sender,
-            _origin: key.origin.clone(),
-            db_name: key.name.clone(),
-            processed: false,
-            proxy_map,
-            id,
-        };
-
-        let should_continue = {
-            // Step 1: Let queue be the connection queue for storageKey and name.
-            let queue = self.connection_queues.entry(key.clone()).or_default();
-
-            // Step 2: Add request to queue.
-            queue.push_back(open_request);
-            queue.len() == 1
-        };
-
-        // Step 3: Wait until all previous requests in queue have been processed.
-        if should_continue {
-            self.delete_database(key.clone());
-            self.maybe_remove_front_from_queue(&key);
-        }
+        let kind = OpenRequestKind::Delete { results };
+        self.queue_open_request(key, id, kind, bottle_source, None);
     }
 
-    /// <https://www.w3.org/TR/IndexedDB/#delete-a-database>
-    fn delete_database(&mut self, key: IndexedDBDescription) {
-        let Some(queue) = self.connection_queues.get_mut(&key) else {
-            return debug_assert!(false, "A connection queue should exist.");
+    /// <https://w3c.github.io/IndexedDB/#delete-a-database>, steps 4 to 12, for the request at the
+    /// front of the connection queue for `key`. Returns whether the request has ended.
+    fn delete_database(&mut self, key: &IndexedDBDescription) -> bool {
+        let Some(request) = self.front_request(key) else {
+            debug_assert!(false, "A delete request should be in the queue.");
+            return false;
         };
-        let Some(open_request) = queue.front_mut() else {
-            return debug_assert!(false, "An open request should be in the queue.");
+        let id = request.id;
+
+        // Step 4: Let db be the database named name in storageKey, if one exists. Otherwise,
+        // return 0 (zero).
+        // Note: a database that the manager hasn't opened since it started is looked up in the
+        // client storage registry, in parallel.
+        let old_version = match self.databases.get(key).map(|db| db.version()) {
+            None => {
+                return self.locate_database(key);
+            },
+            Some(Ok(version)) => version,
+            Some(Err(error)) => {
+                request.fail(&key.name, backend_error_from_storage_error(error));
+                return true;
+            },
         };
-        let OpenRequest::Delete {
-            sender,
-            _origin: _,
-            db_name,
-            processed,
-            id: _,
-            proxy_map,
-        } = open_request
+
+        // Step 5: Let openConnections be the set of all connections associated with db.
+        let connections = self.open_connections(key, None);
+
+        // Step 6: For each entry of openConnections that does not have its close pending flag set
+        // to true, queue a database task to fire a version change event named versionchange at
+        // entry with db’s version and null.
+        let versionchange = self.fire_versionchange(key, &connections, old_version, None, id);
+        if let Some(request) = self.front_request_mut(key) {
+            request.state = OpenRequestState::WaitingForConnections(ConnectionsToClose {
+                connections,
+                fired: versionchange.clone(),
+                versionchange,
+                old_version,
+                new_version: None,
+                checked_blocked: false,
+            });
+        }
+
+        // Steps 7 to 12.
+        self.continue_when_connections_closed(key)
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#delete-a-database>, steps 10 to 12, once no connection to
+    /// the database is open.
+    fn delete_the_database(&mut self, key: &IndexedDBDescription) {
+        let Some(proxy_map) = self
+            .front_request(key)
+            .and_then(OpenRequest::proxy_map)
+            .cloned()
         else {
-            return debug_assert!(
-                false,
-                "An request to open a connection should be in the queue."
-            );
+            return debug_assert!(false, "The request's storage proxy map should be there.");
         };
-
-        // Step 4: Let db be the database named name in storageKey, if one exists. Otherwise, return 0 (zero).
-        let version = if let Some(db) = self.databases.remove(&key) {
-            // Step 5: Let openConnections be the set of all connections associated with db.
-            // Step6: For each entry of openConnections that does not have its close pending flag set to true,
-            // queue a database task to fire a version change event named versionchange
-            // at entry with db’s version and null.
-            // Step 7: Wait for all of the events to be fired.
-            // Step 8: If any of the connections in openConnections are still not closed,
-            // queue a database task to fire a version change event
-            // named blocked at request with db’s version and null.
-            // Step 9: Wait until all connections in openConnections are closed.
-            // TODO: implement connections.
-
-            // Step 10: Let version be db’s version.
-            let res = db.version();
-            let Ok(version) = res else {
-                *processed = true;
-                if sender
-                    .send(BackendResult::Err(BackendError::DbErr(
-                        res.unwrap_err().to_string(),
-                    )))
-                    .is_err()
-                {
-                    debug!("Script went away during pending database delete.");
-                }
-                return;
-            };
-
-            // Note: ensure db is dropped before deleting directory,
-            // to get around windows file locks.
-            drop(db);
-
-            // Step 11: Delete db.
-            // If this fails for any reason,
-            // return an appropriate error (e.g. a QuotaExceededError, or an "UnknownError" DOMException).
-            let Ok(response) = proxy_map
-                .handle
-                .delete_database(proxy_map.bottle_id, db_name.clone())
-                .recv()
-            else {
-                if sender
-                    .send(BackendResult::Err(BackendError::DbErr(
-                        "Failed to communicate with client storage.".to_string(),
-                    )))
-                    .is_err()
-                {
-                    debug!("Script went away during pending database delete.");
-                }
-                return;
-            };
-            if let Err(err) = response {
-                if sender
-                    .send(BackendResult::Err(BackendError::DbErr(format!(
-                        "Client storage error: {err:?}"
-                    ))))
-                    .is_err()
-                {
-                    debug!("Script went away during pending database delete.");
-                }
-                return;
-            }
-            version
-        } else {
-            0
-        };
-
-        // step 12: Return version.
-        if sender.send(BackendResult::Ok(version)).is_err() {
-            debug!("Script went away during pending database delete.");
+        let result = self.remove_database(key, &proxy_map);
+        // Step 12: Return version.
+        if let Some(request) = self.front_request(key) {
+            request.send_delete_result(result);
         }
-
-        *processed = true;
     }
 
-    /// <https://w3c.github.io/IndexedDB/#closing-connection>
-    fn close_database(&mut self, origin: ImmutableOrigin, id: Uuid, name: String) {
-        // Step 1: Set connection’s close pending flag to true.
-        // TODO: seems like a script only flag.
+    /// Deletes the database `key` and its files, and returns the version it had:
+    /// <https://w3c.github.io/IndexedDB/#delete-a-database> steps 10 and 11.
+    fn remove_database(
+        &mut self,
+        key: &IndexedDBDescription,
+        proxy_map: &StorageProxyMap,
+    ) -> BackendResult<u64> {
+        let Some(db) = self.databases.remove(key) else {
+            return Ok(0);
+        };
 
-        // Step 2: If the forced flag is true,
-        // then for each transaction created using connection
+        // Step 10: Let version be db’s version.
+        let version = db
+            .version()
+            .map_err(|error| BackendError::DbErr(error.to_string()))?;
+
+        // Note: ensure db is dropped before deleting directory,
+        // to get around windows file locks.
+        drop(db);
+
+        // Step 11: Delete db. If this fails for any reason, return an appropriate error (e.g. a
+        // QuotaExceededError, or an "UnknownError" DOMException).
+        delete_database_in_bottle(proxy_map, &key.name)?;
+        Ok(version)
+    }
+
+    /// The in-parallel steps of <https://w3c.github.io/IndexedDB/#dom-idbfactory-databases>,
+    /// which start by listing the databases in the storage bottle of `origin` in the client
+    /// storage registry, on the manager's client storage thread; the list comes back as
+    /// [`IndexedDBThreadMsg::DatabasesListed`].
+    fn list_databases(
+        &self,
+        sender: GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
+        origin: ImmutableOrigin,
+        bottle_source: StorageBottleSource,
+    ) {
+        let manager_sender = self.manager_sender.clone();
+        let reply = sender.clone();
+        let handed_over = self.client_storage_calls.run(move || {
+            let result =
+                obtain_a_local_storage_bottle_map(&bottle_source, &origin).and_then(|proxy_map| {
+                    client_storage_result(proxy_map.handle.list_databases(proxy_map.bottle_id))
+                });
+            if manager_sender
+                .send(IndexedDBThreadMsg::DatabasesListed {
+                    origin,
+                    sender,
+                    result,
+                })
+                .is_err()
+            {
+                debug!("IndexedDB manager went away while listing databases");
+            }
+        });
+        if let Err(error) = handed_over &&
+            reply.send(Err(error)).is_err()
+        {
+            debug!("Couldn't send SyncOperation::GetDatabases reply.");
+        }
+    }
+
+    /// The in-parallel steps of <https://w3c.github.io/IndexedDB/#dom-idbfactory-databases> for
+    /// the databases of `origin` that the client storage registry lists in `listed`, with their
+    /// directories, answered to `sender`.
+    fn databases_listed(
+        &self,
+        origin: ImmutableOrigin,
+        sender: GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
+        listed: BackendResult<Vec<(Utf16String, PathBuf)>>,
+    ) {
+        // Step 4.1 Let databases be the set of databases in storageKey.
+        // If this cannot be determined for any reason,
+        // then queue a database task to reject p with an appropriate error
+        // (e.g. an "UnknownError" DOMException) and terminate these steps.
+        // Note: the databases that the manager has opened since it started, each with the
+        // version of its last committed upgrade (a running upgrade's version doesn't count yet,
+        // and a database counts until its delete request deletes it), and the other databases
+        // in the registry, with the version stored in their files.
+        let listed = match listed {
+            Ok(listed) => listed,
+            Err(error) => {
+                if sender.send(Err(error)).is_err() {
+                    debug!("Couldn't send SyncOperation::GetDatabases reply.");
+                }
+                return;
+            },
+        };
+        let mut databases: Vec<(Utf16String, u64)> = self
+            .databases
+            .iter()
+            .filter(|(description, _)| description.origin == origin)
+            .filter_map(|(description, db)| {
+                db.version()
+                    .ok()
+                    .map(|version| (description.name.clone(), version))
+            })
+            .collect();
+        for (name, path) in listed {
+            let key = IndexedDBDescription {
+                origin: origin.clone(),
+                name,
+            };
+            if self.databases.contains_key(&key) {
+                continue;
+            }
+            match ActiveKvsEngine::committed_version(&path) {
+                Ok(version) => databases.push((key.name, version)),
+                Err(error) => warn!(
+                    "Couldn't read the version of IndexedDB database {:?}: {error:?}",
+                    key.name
+                ),
+            }
+        }
+
+        // Step 4.2: Let result be a new list.
+        let info_list: Vec<DatabaseInfo> = databases
+            .into_iter()
+            // Step 4.3: For each db of databases:
+            // Step 4.3.4: If db’s version is 0, then continue.
+            .filter(|(_, version)| *version != 0)
+            // Step 4.3.5: Let info be a new IDBDatabaseInfo dictionary.
+            // Step 4.3.6: Set info’s name dictionary member to db’s name.
+            // Step 4.3.7: Set info’s version dictionary member to db’s version.
+            // Step 4.3.8: Append info to result.
+            .map(|(name, version)| DatabaseInfo { name, version })
+            .collect();
+
+        // Step 4.4: Queue a database task to resolve p with result.
+        if sender.send(Ok(info_list)).is_err() {
+            debug!("Couldn't send SyncOperation::GetDatabases reply.");
+        }
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#close-a-database-connection>
+    fn close_database(&mut self, origin: ImmutableOrigin, id: Uuid, name: Utf16String) {
+        let key = IndexedDBDescription { origin, name };
+
+        // Step 1: Set connection’s close pending flag to true.
+        let Some(connection) = self
+            .connections
+            .get_mut(&key)
+            .and_then(|connections| connections.get_mut(&id))
+        else {
+            return debug!("Connection {id} is closed already");
+        };
+        connection.close_pending = true;
+
+        // Step 2: If the forced flag is true, then for each transaction created using connection
         // run abort a transaction with transaction and newly created "AbortError" DOMException.
-        // Step 3: Wait for all transactions created using connection to complete.
-        // Once they are complete, connection is closed.
-        // TODO: transaction lifecycle.
+        // Note: script aborts them before it closes the connection.
+
+        // Step 3: Wait for all transactions created using connection to complete. Once they are
+        // complete, connection is closed.
+        // Note: also checked whenever a transaction finishes.
+        self.remove_connection_if_closed(&key, id);
 
         // Step 4: If the forced flag is true, then fire an event named close at connection.
-        // TODO: implement, probably only on the script side of things.
+        // Note: only a global that goes away forces the close, and it fires no events any more.
 
-        // Note: below we are continuing
-        // <https://w3c.github.io/IndexedDB/#open-a-database-connection>
-        // in the case that an open request is waiting for connections to close.
-        let key = IndexedDBDescription { origin, name };
-        let (can_upgrade, version) = {
-            self.remove_connection(&key, &id);
-
-            let Some(queue) = self.connection_queues.get_mut(&key) else {
-                return;
-            };
-            let Some(open_request) = queue.front_mut() else {
-                return;
-            };
-            if let OpenRequest::Open {
-                sender: _,
-                db_name: _,
-                version,
-                id: _,
-                processed: _,
-                pending_upgrade,
-                pending_versionchange,
-                pending_close,
-                proxy_map: _,
-            } = open_request
-            {
-                pending_close.remove(&id);
-                (
-                    // Note: need to exclude requests that have already started upgrading.
-                    pending_close.is_empty() &&
-                        pending_versionchange.is_empty() &&
-                        !pending_upgrade.is_some(),
-                    *version,
-                )
-            } else {
-                (false, None)
-            }
-        };
-
-        // <https://w3c.github.io/IndexedDB/#open-a-database-connection>
-        // Step 10.3: Wait for all of the events to be fired.
-        // Step 10.5: Wait until all connections in openConnections are closed.
-        // Note: both conditions must be checked here,
-        // because that is the condition enabling the upgrade to proceed.
-        if can_upgrade {
-            // Step 10.6: Run upgrade a database using connection, version and request.
-            let Some(version) = version else {
-                return debug_assert!(
-                    false,
-                    "An upgrade version should have been determined by now."
-                );
-            };
-            self.upgrade_database(key.clone(), version);
-
-            let was_pruned = self.maybe_remove_front_from_queue(&key);
-            if was_pruned {
-                self.advance_connection_queue(key);
-            }
-        }
+        // <https://w3c.github.io/IndexedDB/#open-a-database-connection> step 10.2 and
+        // <https://w3c.github.io/IndexedDB/#delete-a-database> step 6: "Firing this event might
+        // cause one or more of the other objects in openConnections to be closed, in which case
+        // the versionchange event is not fired at those objects, even if that hasn’t yet been
+        // done."
+        self.versionchange_settled(&key, id, None);
+        self.advance_connection_queue(key);
     }
 
     fn handle_sync_operation(&mut self, operation: SyncOperation) {
         match operation {
-            SyncOperation::GetDatabases(sender, origin) => {
-                // The in-parallel steps of https://www.w3.org/TR/IndexedDB/#dom-idbfactory-databases
-
-                // Step 4.1 Let databases be the set of databases in storageKey.
-                // If this cannot be determined for any reason,
-                // then queue a database task to reject p with an appropriate error
-                // (e.g. an "UnknownError" DOMException) and terminate these steps.
-                // TODO: separate database and connection concepts.
-                // For now using `self.databases`, which track connections.
-
-                // Step 4.2: Let result be a new list.
-                let info_list: Vec<DatabaseInfo> = self
-                    .databases
-                    .iter()
-                    .filter_map(|(description, info)| {
-                        // Step 4.3: For each db of databases:
-                        if let Ok(version) = info.version() {
-                            // Step 4.3.4: If db’s version is 0, then continue.
-                            if version == 0 {
-                                None
-                            } else {
-                                // Step 4.3.5: Let info be a new IDBDatabaseInfo dictionary.
-                                // Step 4.3.6: Set info’s name dictionary member to db’s name.
-                                // Step 4.3.7: Set info’s version dictionary member to db’s version.
-                                // Step 4.3.8: Append info to result.
-                                if description.origin == origin {
-                                    Some(DatabaseInfo {
-                                        name: description.name.clone(),
-                                        version,
-                                    })
-                                } else {
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                // IndexedDB `databases()` / "get a list of databases" returns the visible list;
-                // filtering out non-user-visible entries must not turn success into an internal error.
-                // https://w3c.github.io/IndexedDB/#dom-idbfactory-databases
-                let result = Ok(info_list);
-
-                // Step 4.4: Queue a database task to resolve p with result.
-                if sender.send(result).is_err() {
-                    debug!("Couldn't send SyncOperation::GetDatabases reply.");
-                }
+            SyncOperation::GetDatabases(sender, origin, bottle_source) => {
+                self.list_databases(sender, origin, bottle_source);
             },
             SyncOperation::CloseDatabase(origin, id, db_name) => {
                 self.close_database(origin, id, db_name);
             },
-            SyncOperation::OpenDatabase(sender, origin, db_name, version, id, proxy_map) => {
-                self.open_a_database_connection(sender, origin, db_name, version, id, proxy_map);
+            SyncOperation::OpenDatabase(
+                origin,
+                db_name,
+                version,
+                id,
+                bottle_source,
+                results,
+                pipeline,
+            ) => {
+                self.open_a_database_connection(
+                    origin,
+                    db_name,
+                    version,
+                    id,
+                    bottle_source,
+                    results,
+                    pipeline,
+                );
+            },
+            SyncOperation::CloseConnectionsOfPipelines(pipelines) => {
+                self.close_connections_of_pipelines(pipelines);
             },
             SyncOperation::AbortPendingUpgrades {
                 pending_upgrades,
                 origin,
-                proxy_map,
             } => {
-                self.abort_pending_upgrades(pending_upgrades, origin, proxy_map);
+                self.abort_pending_upgrades(pending_upgrades, origin);
             },
-            SyncOperation::DeleteDatabase(callback, origin, db_name, proxy_map, id) => {
+            SyncOperation::DeleteDatabase(callback, origin, db_name, bottle_source, id) => {
                 let idb_description = IndexedDBDescription {
                     origin,
                     name: db_name,
                 };
-                self.start_delete_database(idb_description, id, proxy_map, callback);
+                self.start_delete_database(idb_description, id, bottle_source, callback);
             },
-            SyncOperation::GetObjectStore(sender, origin, db_name, store_name) => {
-                // FIXME:(arihant2math) Should we error out more aggressively here?
-                let result = self.get_database(origin, db_name).map(|db| {
-                    let key_generator_current_number = db.key_generator_current_number(&store_name);
-                    IndexedDBObjectStore {
-                        key_path: db.key_path(&store_name),
-                        has_key_generator: key_generator_current_number.is_some(),
-                        key_generator_current_number,
-                        indexes: db.indexes(&store_name).unwrap_or_default(),
-                        name: store_name,
-                    }
-                });
-                let _ = sender.send(result.ok_or(BackendError::DbNotFound));
-            },
-            SyncOperation::Commit(callback, origin, db_name, txn) => {
+            SyncOperation::Commit {
+                origin,
+                db_name,
+                txn,
+            } => {
                 // https://w3c.github.io/IndexedDB/#commit-a-transaction
-                // TODO: implement the commit algorithm and only reply after the backend has
-                // transitioned the transaction to committed/aborted (should be atomic).
-                if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
-                    if db.can_commit_now(txn) {
-                        if callback
-                            .send(TxnCompleteMsg {
-                                origin: origin.clone(),
-                                db_name: db_name.clone(),
-                                txn,
-                                result: Ok(()),
-                            })
-                            .is_err()
-                        {
-                            error!(
-                                "Failed to send immediate commit completion for db '{}' txn {}.",
-                                db_name, txn
-                            );
-                        }
-                    } else {
-                        db.queue_pending_commit_callback(txn, callback);
-                    }
-                    db.schedule_transactions(origin, &db_name);
-                } else if callback
-                    .send(TxnCompleteMsg {
-                        origin,
-                        db_name: db_name.clone(),
-                        txn,
-                        // If the database entry has already been removed, treat commit as a
-                        // no-op success so script side completion does not spuriously abort.
-                        result: Ok(()),
-                    })
-                    .is_err()
+                // The reply follows the engine's COMMIT, or its failure.
+                let key = IndexedDBDescription {
+                    origin: origin.clone(),
+                    name: db_name.clone(),
+                };
+                match self
+                    .databases
+                    .get(&key)
+                    .map(|db| db.check_usable(txn).map(|_| ()))
                 {
-                    error!(
-                        "Failed to send commit completion for missing db '{}' txn {}.",
-                        db_name, txn
-                    );
+                    Some(Ok(())) => {
+                        let db = self.databases.get_mut(&key).expect("Checked above");
+                        if db.can_commit_now(txn) {
+                            db.commit(txn);
+                        } else {
+                            db.pending_commits.insert(txn);
+                            if !db.can_start_by_spec(txn) {
+                                db.ask_holders_to_evict_if_inactive(txn);
+                            }
+                        }
+                        db.schedule_transactions(origin, &db_name);
+                    },
+                    Some(Err(error)) => {
+                        debug!("Commit of IndexedDB transaction {txn} failed: {error}");
+                        self.transaction_results(&key, txn)
+                            .send(TransactionEvent::Committed(Err(error)));
+                    },
+                    None => {
+                        // A database is only deleted once its connections are closed, so no
+                        // transaction of it is left to commit.
+                        self.transaction_results(&key, txn)
+                            .send(TransactionEvent::Committed(Err(BackendError::DbNotFound)));
+                    },
                 }
             },
-            SyncOperation::Abort(abort_callback, origin, db_name, txn) => {
-                self.handle_abort(abort_callback, origin, db_name, txn);
+            SyncOperation::Abort {
+                origin,
+                db_name,
+                txn,
+            } => {
+                // Done at once, also while a batch of the transaction runs: the engine runs the
+                // rollback after it, and before any batch the scheduler hands over later.
+                if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
+                    db.abort(&origin, &db_name, txn);
+                }
             },
             SyncOperation::UpgradeTransactionFinished {
                 origin,
@@ -2368,153 +2552,79 @@ impl IndexedDBManager {
             } => {
                 self.handle_upgrade_transaction_finished(db_name, origin, txn, committed);
             },
-            SyncOperation::RequestHandled {
-                origin,
-                db_name,
-                txn,
-                request_id,
-            } => {
-                // https://w3c.github.io/IndexedDB/#transaction-lifecycl
-                // The implementation must attempt to commit an inactive transaction
-                // when all requests placed against the transaction have completed
-                // and their returned results handled, no new requests have been
-                // placed against the transaction, and the transaction has not been aborted
-
-                let should_notify =
-                    if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
-                        db.mark_request_handled(txn, request_id);
-                        db.can_notify_txn_maybe_commit(txn)
-                    } else {
-                        false
-                    };
-                if should_notify {
-                    self.handle_sync_operation(SyncOperation::TxnMaybeCommit {
-                        origin,
-                        db_name,
-                        txn,
-                    });
-                }
-            },
-            SyncOperation::TxnMaybeCommit {
-                origin,
-                db_name,
-                txn,
-            } => {
-                self.handle_txn_maybe_commit(origin, db_name, txn);
-            },
             SyncOperation::TransactionFinished {
                 origin,
                 db_name,
                 txn,
             } => {
-                let maybe_commit_txns =
-                    if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
-                        db.finish_transaction(txn);
-                        db.schedule_transactions(origin.clone(), &db_name);
-                        db.maybe_commit_candidates()
-                    } else {
-                        Vec::new()
-                    };
-                for candidate in maybe_commit_txns {
-                    self.handle_txn_maybe_commit(origin.clone(), db_name.clone(), candidate);
+                if let Some(db) = self.get_database_mut(origin.clone(), db_name.clone()) {
+                    db.finish_transaction(txn);
+                    // A no-op after a commit or an abort, but a transaction that finished
+                    // otherwise, such as one whose global went away, must not leave its SQL
+                    // transaction open.
+                    db.engine.rollback(txn, Box::new(|| {}));
+                    db.schedule_transactions(origin.clone(), &db_name);
+                    db.commit_ready_transactions();
                 }
+                // https://w3c.github.io/IndexedDB/#close-a-database-connection
+                // Step 3: Wait for all transactions created using connection to complete. Once
+                // they are complete, connection is closed.
+                let key = IndexedDBDescription {
+                    origin,
+                    name: db_name,
+                };
+                self.remove_connection_if_closed(&key, txn.connection);
+                self.close_connections_if_unusable(key.clone());
+                self.advance_connection_queue(key);
             },
             SyncOperation::CreateTransaction {
-                sender,
                 origin,
                 db_name,
+                txn,
                 mode,
                 scope,
             } => {
+                // https://w3c.github.io/IndexedDB/#transaction-scheduling
+                // A transaction counts as created when this message arrives. Script sends it
+                // before transaction() returns, and every global's messages reach this thread
+                // through the one channel, so of two transactions whose creations are ordered,
+                // in one global or across globals, the earlier one is registered first.
                 let key = IndexedDBDescription {
                     origin: origin.clone(),
                     name: db_name.clone(),
                 };
+                // A transaction of a connection that isn't open isn't registered, so that it
+                // holds back no other transaction; its requests and its commit fail, and with no
+                // channel to report on, the failures are dropped. Script doesn't create such
+                // transactions: a connection is closed before the backend drops it.
+                let Some(results) = self
+                    .connections
+                    .get(&key)
+                    .and_then(|connections| connections.get(&txn.connection))
+                    .map(|connection| connection.results.clone())
+                else {
+                    return warn!("Transaction {txn} created for a connection that isn't open.");
+                };
                 if let Some(db) = self.databases.get_mut(&key) {
-                    let transaction_id = self.serial_number_counter;
-                    self.serial_number_counter += 1;
-                    db.register_transaction(transaction_id, mode, scope);
+                    db.register_transaction(txn, mode, scope, results);
                     db.schedule_transactions(origin, &db_name);
-                    let _ = sender.send(Ok(transaction_id));
                 } else {
-                    let _ = sender.send(Err(BackendError::DbNotFound));
-                }
-            },
-            SyncOperation::UpgradeVersion(sender, origin, db_name, _txn, version) => {
-                if let Some(db) = self.get_database_mut(origin, db_name) {
-                    if version > db.version().unwrap_or(0) {
-                        let _ = db.set_version(version);
-                    }
-                    // erroring out if the version is not upgraded can be and non-replicable
-                    let _ = sender.send(db.version().map_err(backend_error_from_storage_error));
-                } else {
-                    let _ = sender.send(Err(BackendError::DbNotFound));
-                }
-            },
-            SyncOperation::Version(sender, origin, db_name) => {
-                if let Some(db) = self.get_database(origin, db_name) {
-                    let _ = sender.send(db.version().map_err(backend_error_from_storage_error));
-                } else {
-                    let _ = sender.send(Err(BackendError::DbNotFound));
+                    // Its requests fail with DbNotFound, see `IndexedDBThreadMsg::Async`.
+                    debug!("Transaction {txn} created for a database that is gone.");
                 }
             },
             SyncOperation::NotifyEndOfVersionChange {
                 name,
                 id,
-                old_version,
+                request,
                 origin,
             } => {
-                self.handle_version_change_done(name, id, old_version, origin);
+                self.handle_version_change_done(name, id, request, origin);
             },
             SyncOperation::Exit(_) => {
                 unreachable!("We must've already broken out of event loop.");
             },
         }
-    }
-
-    /// Handling for the `Abort` message which will call [`Self::abort`] if the transaction
-    /// being aborted is not ongoing. If the transaction is in process, abort is delayed until
-    /// the batch finishes.
-    fn handle_abort(
-        &mut self,
-        abort_callback: GenericCallback<TxnCompleteMsg>,
-        origin: ImmutableOrigin,
-        database_name: String,
-        transaction: u64,
-    ) {
-        let message = || TxnCompleteMsg {
-            origin: origin.clone(),
-            db_name: database_name.clone(),
-            txn: transaction,
-            result: Err(BackendError::Abort),
-        };
-
-        let Some(database) = self.get_database_mut(origin.clone(), database_name.clone()) else {
-            // We didn't find the database, so just treat the transaction as aborted.
-            if abort_callback.send(message()).is_err() {
-                error!(
-                    "Failed to send abort completion for database \
-                    '{database_name}' transaction {transaction}.",
-                );
-            }
-            return;
-        };
-
-        database
-            .pending_abort_callbacks
-            .entry(transaction)
-            .or_default()
-            .push(abort_callback);
-
-        // If the transaction is running wait to abort until after it finishes to actually
-        // abort.
-        if database.running_readwrite == Some(transaction) ||
-            database.running_readonly.contains(&transaction)
-        {
-            return;
-        }
-
-        database.abort(&origin, &database_name, transaction);
     }
 
     fn collect_memory_reports(&self) -> Vec<Report> {
@@ -2532,17 +2642,39 @@ impl IndexedDBManager {
     }
 }
 
-#[cfg(feature = "sqlite-backend")]
 #[cfg(test)]
 mod tests {
-    use servo_base::generic_channel;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use profile_traits::generic_callback::GenericCallback;
+    use servo_base::generic_channel::{self, GenericReceiver};
     use servo_base::threadpool::ThreadPool;
     use servo_url::ImmutableOrigin;
-    use storage_traits::indexeddb::{IndexedDBTxnMode, KeyPath};
+    use storage_traits::indexeddb::{
+        AsyncOperation, AsyncReadWriteOperation, AsyncSchemaOperation, BackendError, BackendResult,
+        ConnectionEvent, IndexedDBThreadMsg, IndexedDBTxnMode, KeyPath, TransactionEvent,
+    };
     use url::Host;
 
     use super::{IndexedDBDescription, IndexedDBEnvironment};
-    use crate::indexeddb::engines::SqliteEngine;
+    use crate::indexeddb::backend::SqlEngine;
+    use crate::indexeddb::backend::executor::SqlExecutor;
+    use crate::indexeddb::backend::tests::{
+        Faulty, executor_tests, faults_for, stored_version_and_store_names, txn,
+    };
+    use crate::indexeddb::engines::{KvsEngine, KvsOperation};
+
+    executor_tests!(
+        test_aborted_upgrade_rolls_back_created_store_and_index,
+        test_abort_transaction_restores_readwrite_key_generator_current_number,
+        test_failed_commit_reports_the_error_and_rolls_back,
+        test_only_a_started_writer_holds_back_other_writers,
+        test_readonly_waits_for_an_earlier_overlapping_writer,
+        test_readwrite_without_requests_commits,
+    );
 
     fn test_origin() -> ImmutableOrigin {
         ImmutableOrigin::Tuple(
@@ -2552,70 +2684,308 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_restore_object_stores_removes_created_store_and_indexes() {
-        let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let thread_pool = ThreadPool::global();
+    fn open_environment<X: SqlExecutor>(
+        base_dir: &tempfile::TempDir,
+    ) -> (
+        IndexedDBEnvironment<SqlEngine<X>>,
+        GenericReceiver<IndexedDBThreadMsg>,
+    ) {
         let description = IndexedDBDescription {
-            name: "test_db".to_string(),
+            name: "test_db".into(),
             origin: test_origin(),
         };
-        let engine = SqliteEngine::new(
+        let engine = SqlEngine::<X>::new(
             base_dir.path().to_path_buf(),
             true,
             &description,
-            thread_pool,
+            ThreadPool::global(),
         )
         .unwrap();
-        let (sender, _receiver) = generic_channel::channel().unwrap();
-        let mut env = IndexedDBEnvironment::new(engine, sender);
-
-        let object_stores = env.object_stores().unwrap();
-        assert!(object_stores.is_empty());
-
-        env.create_object_store("not_books", None, false).unwrap();
-        env.create_index(
-            "not_books",
-            "not_by_author".to_string(),
-            KeyPath::String("author".to_string()),
-            false,
-            false,
-        )
-        .unwrap();
-
-        env.restore_object_stores(&object_stores).unwrap();
-
-        assert_eq!(env.object_store_names().unwrap(), Vec::<String>::new());
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        (IndexedDBEnvironment::new(engine, sender), receiver)
     }
 
-    #[test]
-    fn test_abort_transaction_restores_readwrite_key_generator_current_number() {
-        let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let thread_pool = ThreadPool::global();
-        let description = IndexedDBDescription {
-            name: "test_db".to_string(),
-            origin: test_origin(),
-        };
-        let engine = SqliteEngine::new(
-            base_dir.path().to_path_buf(),
-            true,
-            &description,
-            thread_pool,
-        )
+    thread_local! {
+        /// The receivers of the result channels of the test's transactions, by serial number.
+        static RESULTS: RefCell<HashMap<u64, mpsc::Receiver<ConnectionEvent>>> =
+            Default::default();
+    }
+
+    /// Registers the transaction `serial` with a result channel that the test reads.
+    fn register<X: SqlExecutor>(
+        env: &mut IndexedDBEnvironment<SqlEngine<X>>,
+        serial: u64,
+        mode: IndexedDBTxnMode,
+        scope: &[i64],
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let channel = GenericCallback::new(move |event| {
+            let _ = sender.send(event.unwrap());
+        })
         .unwrap();
-        let (sender, _receiver) = generic_channel::channel().unwrap();
-        let mut env = IndexedDBEnvironment::new(engine, sender);
+        RESULTS.with(|results| results.borrow_mut().insert(serial, receiver));
+        env.register_transaction(txn(serial), mode, scope.to_vec(), channel);
+    }
 
-        env.create_object_store("books", None, true).unwrap();
-        assert_eq!(env.key_generator_current_number("books"), Some(1));
+    /// The next thing the backend reports about the transaction `serial`.
+    fn next_event(serial: u64) -> TransactionEvent {
+        let event = RESULTS.with(|results| {
+            results.borrow()[&serial]
+                .recv_timeout(Duration::from_secs(10))
+                .expect("The transaction should report")
+        });
+        match event {
+            ConnectionEvent::Transaction {
+                serial: reported,
+                event,
+            } => {
+                assert_eq!(reported, serial);
+                event
+            },
+            other => panic!("unexpected connection event {other:?}"),
+        }
+    }
 
-        env.register_transaction(1, IndexedDBTxnMode::Readwrite, vec!["books".to_string()]);
-        env.set_key_generator_current_number("books", 345680)
-            .unwrap();
+    /// Commits `serial` and returns the result the backend reports.
+    fn commit_result<X: SqlExecutor>(
+        env: &mut IndexedDBEnvironment<SqlEngine<X>>,
+        serial: u64,
+    ) -> BackendResult<()> {
+        env.commit(txn(serial));
+        loop {
+            match next_event(serial) {
+                TransactionEvent::Committed(result) => return result,
+                TransactionEvent::Request { .. } => {},
+                other => panic!("expected the commit result, got {other:?}"),
+            }
+        }
+    }
 
-        env.abort_transaction(1);
+    /// Queues `operation` for `txn`, runs it, and waits until it has run.
+    fn run<X: SqlExecutor>(
+        env: &mut IndexedDBEnvironment<SqlEngine<X>>,
+        batches: &GenericReceiver<IndexedDBThreadMsg>,
+        serial: u64,
+        mode: IndexedDBTxnMode,
+        store: i64,
+        operation: AsyncOperation,
+    ) {
+        let request_id = match operation {
+            AsyncOperation::Schema(_) => None,
+            _ => Some(0),
+        };
+        let operation = KvsOperation {
+            store,
+            request_id,
+            operation,
+        };
+        env.queue_operation(txn(serial), mode, operation);
+        env.schedule_transactions(test_origin(), &"test_db".into());
+        match batches.recv().unwrap() {
+            IndexedDBThreadMsg::EngineTxnBatchComplete { txn: done, .. } => {
+                assert_eq!(done, txn(serial));
+                env.running_readonly.remove(&done);
+                env.running_readwrite = None;
+            },
+            _ => panic!("expected the batch to complete"),
+        }
+    }
 
-        assert_eq!(env.key_generator_current_number("books"), Some(1));
+    /// Aborts `serial` and waits until the engine has rolled it back.
+    fn abort<X: SqlExecutor>(env: &mut IndexedDBEnvironment<SqlEngine<X>>, serial: u64) {
+        env.abort(&test_origin(), &"test_db".into(), txn(serial));
+        let (sender, rolled_back) = mpsc::channel();
+        // A second rollback is a no-op, which the engine runs after the first.
+        env.engine.rollback(
+            txn(serial),
+            Box::new(move || {
+                let _ = sender.send(());
+            }),
+        );
+        rolled_back.recv_timeout(Duration::from_secs(10)).unwrap();
+        env.finish_transaction(txn(serial));
+    }
+
+    fn commit<X: SqlExecutor>(env: &mut IndexedDBEnvironment<SqlEngine<X>>, serial: u64) {
+        assert!(env.can_commit_now(txn(serial)));
+        assert_eq!(commit_result(env, serial), Ok(()));
+        env.finish_transaction(txn(serial));
+    }
+
+    fn create_store_operation(name: &str, auto_increment: bool) -> AsyncOperation {
+        AsyncOperation::Schema(AsyncSchemaOperation::CreateObjectStore {
+            name: name.into(),
+            key_path: None,
+            auto_increment,
+        })
+    }
+
+    fn store_names<X: SqlExecutor>(env: &IndexedDBEnvironment<SqlEngine<X>>) -> Vec<String> {
+        env.object_stores()
+            .into_iter()
+            .map(|store| store.name.to_string())
+            .collect()
+    }
+
+    fn test_aborted_upgrade_rolls_back_created_store_and_index<X: SqlExecutor>() {
+        let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let (mut env, batches) = open_environment::<X>(&base_dir);
+        assert!(store_names(&env).is_empty());
+
+        register(&mut env, 1, IndexedDBTxnMode::Versionchange, &[]);
+        env.engine.upgrade_version(txn(1), 1);
+        let mode = IndexedDBTxnMode::Versionchange;
+        run(
+            &mut env,
+            &batches,
+            1,
+            mode.clone(),
+            1,
+            create_store_operation("not_books", false),
+        );
+        run(
+            &mut env,
+            &batches,
+            1,
+            mode,
+            1,
+            AsyncOperation::Schema(AsyncSchemaOperation::CreateIndex {
+                index_id: 1,
+                name: "not_by_author".into(),
+                key_path: KeyPath::String("author".to_string()),
+                unique: false,
+                multi_entry: false,
+                populate: false,
+            }),
+        );
+        assert_eq!(
+            stored_version_and_store_names(&env.engine),
+            (1, vec!["not_books".to_owned()])
+        );
+        assert!(store_names(&env).is_empty());
+
+        abort(&mut env, 1);
+
+        assert_eq!(stored_version_and_store_names(&env.engine), (0, vec![]));
+        assert_eq!(store_names(&env), Vec::<String>::new());
+        assert_eq!(env.version().unwrap(), 0);
+    }
+
+    /// The id of the store `books`.
+    const BOOKS: i64 = 1;
+
+    /// Creates a store `books` with a key generator in a committed upgrade transaction 1, and
+    /// puts a record with a generated key in the readwrite transaction 2, which stays open.
+    fn put_generated_key_in_new_store<X: SqlExecutor>(
+        env: &mut IndexedDBEnvironment<SqlEngine<X>>,
+        batches: &GenericReceiver<IndexedDBThreadMsg>,
+    ) {
+        register(env, 1, IndexedDBTxnMode::Versionchange, &[]);
+        env.engine.upgrade_version(txn(1), 1);
+        run(
+            env,
+            batches,
+            1,
+            IndexedDBTxnMode::Versionchange,
+            BOOKS,
+            create_store_operation("books", true),
+        );
+        commit(env, 1);
+        assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(1));
+
+        register(env, 2, IndexedDBTxnMode::Readwrite, &[BOOKS]);
+        run(
+            env,
+            batches,
+            2,
+            IndexedDBTxnMode::Readwrite,
+            BOOKS,
+            AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
+                key: None,
+                value: vec![1],
+                should_overwrite: false,
+                index_keys: vec![],
+            }),
+        );
+        assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(2));
+    }
+
+    fn test_abort_transaction_restores_readwrite_key_generator_current_number<X: SqlExecutor>() {
+        let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let (mut env, batches) = open_environment::<X>(&base_dir);
+        put_generated_key_in_new_store(&mut env, &batches);
+
+        abort(&mut env, 2);
+
+        assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(1));
+    }
+
+    fn test_failed_commit_reports_the_error_and_rolls_back<X: SqlExecutor>() {
+        let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let (mut env, batches) = open_environment::<Faulty<X>>(&base_dir);
+        put_generated_key_in_new_store(&mut env, &batches);
+
+        faults_for(base_dir.path()).lock().unwrap().commit = true;
+        let result = commit_result(&mut env, 2);
+        faults_for(base_dir.path()).lock().unwrap().commit = false;
+
+        assert!(matches!(result, Err(BackendError::DbErr(_))));
+        assert_eq!(env.engine.key_generator_current_number(BOOKS), Some(1));
+    }
+
+    fn clear_operation() -> AsyncOperation {
+        AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear)
+    }
+
+    /// Writers start one at a time, also with disjoint scopes, since each is the one SQL
+    /// transaction of the connection; one that hasn't started yet holds back no one.
+    fn test_only_a_started_writer_holds_back_other_writers<X: SqlExecutor>() {
+        let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let (mut env, batches) = open_environment::<X>(&base_dir);
+        register(&mut env, 1, IndexedDBTxnMode::Readwrite, &[1]);
+        register(&mut env, 2, IndexedDBTxnMode::Readwrite, &[2]);
+        assert!(env.can_start_by_spec(txn(1)));
+        assert!(env.can_start_by_spec(txn(2)));
+
+        run(
+            &mut env,
+            &batches,
+            1,
+            IndexedDBTxnMode::Readwrite,
+            1,
+            clear_operation(),
+        );
+        assert!(!env.can_start_by_spec(txn(2)));
+        register(&mut env, 3, IndexedDBTxnMode::Readonly, &[3]);
+        assert!(env.can_start_by_spec(txn(3)));
+
+        commit(&mut env, 1);
+        assert!(env.can_start_by_spec(txn(2)));
+    }
+
+    /// <https://w3c.github.io/IndexedDB/#transaction-scheduling>: a readonly transaction waits
+    /// for every earlier readwrite transaction with an overlapping scope, also one that hasn't
+    /// started.
+    fn test_readonly_waits_for_an_earlier_overlapping_writer<X: SqlExecutor>() {
+        let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let (mut env, _batches) = open_environment::<X>(&base_dir);
+        register(&mut env, 1, IndexedDBTxnMode::Readwrite, &[1]);
+        register(&mut env, 2, IndexedDBTxnMode::Readonly, &[1, 2]);
+        register(&mut env, 3, IndexedDBTxnMode::Readonly, &[2]);
+        assert!(!env.can_start_by_spec(txn(2)));
+        assert!(env.can_start_by_spec(txn(3)));
+        env.finish_transaction(txn(1));
+        assert!(env.can_start_by_spec(txn(2)));
+    }
+
+    /// A readwrite transaction without requests has no SQL transaction, and commits.
+    fn test_readwrite_without_requests_commits<X: SqlExecutor>() {
+        let base_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let (mut env, _batches) = open_environment::<X>(&base_dir);
+        register(&mut env, 1, IndexedDBTxnMode::Readwrite, &[1]);
+        commit(&mut env, 1);
+        register(&mut env, 2, IndexedDBTxnMode::Readwrite, &[2]);
+        assert!(env.can_start_by_spec(txn(2)));
     }
 
     #[derive(Debug)]
@@ -2661,61 +3031,5 @@ mod tests {
             },
             other => panic!("unexpected backend error: {other:?}"),
         }
-    }
-}
-
-#[cfg(all(test, ohos_rdb))]
-mod tests_ohos {
-    use tempfile::tempdir;
-
-    use super::backend_error_from_storage_error;
-    use crate::ohos_rdb::{OhosRdbStore, OhosRdbValues};
-    use crate::shared::has_enospc;
-
-    #[test]
-    fn has_enospc_detects_enospc_and_nothing_else() {
-        let full = std::io::Error::from_raw_os_error(libc::ENOSPC);
-        assert!(has_enospc(Some(&full)));
-        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
-        assert!(!has_enospc(Some(&denied)));
-        assert!(!has_enospc(None));
-    }
-
-    #[test]
-    fn sql_full_maps_to_quota_exceeded() {
-        let dir = tempdir().unwrap();
-        let store = OhosRdbStore::open(dir.path(), "quota-exceeded").unwrap();
-        let tx = store.transaction().unwrap();
-        let values = OhosRdbValues::new().unwrap();
-        tx.execute(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);",
-            &values,
-        )
-        .unwrap();
-        tx.execute("PRAGMA max_page_count = 2;", &values).unwrap();
-
-        let mut error = None;
-        for i in 0..128 {
-            let mut insert_values = OhosRdbValues::new().unwrap();
-            insert_values.push_int(i).unwrap();
-            insert_values.push_blob(&vec![0u8; 65536]).unwrap();
-            match tx.execute("INSERT INTO t (id, data) VALUES (?1, ?2);", &insert_values) {
-                Ok(()) => continue,
-                Err(err) => {
-                    error = Some(err);
-                    break;
-                },
-            }
-        }
-
-        let error = match error {
-            Some(error) => error,
-            None => tx.commit().expect_err("expected quota failure"),
-        };
-
-        assert_eq!(
-            backend_error_from_storage_error(error),
-            storage_traits::indexeddb::BackendError::QuotaExceeded
-        );
     }
 }

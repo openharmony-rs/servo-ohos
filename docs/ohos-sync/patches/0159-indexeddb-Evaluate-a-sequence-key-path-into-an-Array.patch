@@ -1,0 +1,294 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 21:29:29 +0000
+Subject: [PATCH] indexeddb: Evaluate a sequence key path into an Array
+
+https://w3c.github.io/IndexedDB/#evaluate-a-key-path-on-a-value step 1.1 collects the values of a
+sequence key path's items in "a new Array object created as if by the expression []", which then
+converts to an array key. evaluate_key_path_on_value made an ordinary object instead, which converts
+to no key at all, so stores with a sequence key path refused every value with a DataError and
+indexes with one got no records. Make an Array.
+
+Validation: Host WPT tests/wpt/tests/IndexedDB (4,511 subtests), 8 processes, on top of the previous commit: SpiderMonkey 3,369 (previous commit 3,298, P2 tip 3,289), QuickJS 3,371 (P2 tip 3,290); the 75 new passes in both are keypath.any.js (7 sequence key path subtests) and key_valid.any.js (18, which store under a ['x', 'keypath'] key path) in window, worker and sharedworker, and the previous commit's binary still fails them; the other differences are whole-test timeouts that pass 5 of 5 alone on both engines: SpiderMonkey get-databases.any.worker, idbfactory-origin-isolation and transaction-abort-multiple-metadata-revert.any.worker, QuickJS idbdatabase-createObjectStore-exception-order.any.sharedworker and idbindex-rename-abort.any.sharedworker. Expectations updated with `./mach update-wpt` from both engines' runs. /_mozilla/IndexedDB/ 134 of 134 on both engines and with --multiprocess. A page probe read back from the SQLite file gives ['a', 'b'] index records of [1, "x"] where the previous commit stored none. At this commit, DAYU200 (QuickJS + RDB, 2 processes): WPT IndexedDB/ 3,367 (P2 tip 3,281), the same 84 new passes as the host plus two flips that pass, nothing newly failing, the unexpected timeouts the known board set (interleaved-cursors-large, idbfactory-origin-isolation, rename and metadata-revert worker/sharedworker variants); /_mozilla/IndexedDB/ 134 of 134; `./mach test-unit --ohos -p servo-storage` RDB only 123 passed, 3 skipped (P2 tip 116), SQLite and RDB 215 passed, 4 skipped (201). `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release` passes. These counts predate the P3 review fixes folded into the previous commit, which add the fork test index-keys-page-code.any.js (2 subtests in 4 globals).
+AI-assisted: Yes (agent session; found the plain object with a probe of the stored index records, fixed it and ran the WPT runs)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/key.rs        |   6 +-
+ tests/wpt/meta/IndexedDB/key_valid.any.js.ini | 161 ------------------
+ tests/wpt/meta/IndexedDB/keypath.any.js.ini   |  63 -------
+ 3 files changed, 5 insertions(+), 225 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/key.rs b/components/script/dom/indexeddb/key.rs
+index ce3910682b2..e97cb59ff7e 100644
+--- a/components/script/dom/indexeddb/key.rs
++++ b/components/script/dom/indexeddb/key.rs
+@@ -653,7 +653,11 @@ pub(crate) fn evaluate_key_path_on_value(
+         // Step 1. If keyPath is a list of strings, then:
+         KeyPath::StringSequence(key_path) => {
+             // Step 1.1. Let result be a new Array object created as if by the expression [].
+-            rooted!(&in(cx) let mut result = JS_NewObject(cx, None));
++            // SAFETY: `cx` is a live context; the new array is rooted right away.
++            rooted!(&in(cx) let mut result = unsafe { NewArrayObject1(cx.raw_cx(), 0) });
++            if result.is_null() {
++                return Err(Error::JSFailed);
++            }
+ 
+             // Step 1.2. Let i be 0.
+             // Step 1.3. For each item in keyPath:
+diff --git a/tests/wpt/meta/IndexedDB/key_valid.any.js.ini b/tests/wpt/meta/IndexedDB/key_valid.any.js.ini
+index 611f9f7d8f7..9259a20430b 100644
+--- a/tests/wpt/meta/IndexedDB/key_valid.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/key_valid.any.js.ini
+@@ -1,169 +1,8 @@
+ [key_valid.any.worker.html]
+-  [Valid key - new Date()]
+-    expected: FAIL
+-
+-  [Valid key - new Date(0)]
+-    expected: FAIL
+-
+-  [Valid key - [\]]
+-    expected: FAIL
+-
+-  [Valid key - new Array()]
+-    expected: FAIL
+-
+-  [Valid key - ["undefined"\]]
+-    expected: FAIL
+-
+-  [Valid key - Infinity]
+-    expected: FAIL
+-
+-  [Valid key - -Infinity]
+-    expected: FAIL
+-
+-  [Valid key - 0]
+-    expected: FAIL
+-
+-  [Valid key - 1.5]
+-    expected: FAIL
+-
+-  [Valid key - 3e38]
+-    expected: FAIL
+-
+-  [Valid key - 3e-38]
+-    expected: FAIL
+-
+-  [Valid key - "foo"]
+-    expected: FAIL
+-
+-  [Valid key - "\\n"]
+-    expected: FAIL
+-
+-  [Valid key - ""]
+-    expected: FAIL
+-
+-  [Valid key - "\\""]
+-    expected: FAIL
+-
+-  [Valid key - "\\u1234"]
+-    expected: FAIL
+-
+-  [Valid key - "\\u0000"]
+-    expected: FAIL
+-
+-  [Valid key - "NaN"]
+-    expected: FAIL
+-
+ 
+ [key_valid.any.serviceworker.html]
+   expected: ERROR
+ 
+ [key_valid.any.html]
+-  [Valid key - new Date()]
+-    expected: FAIL
+-
+-  [Valid key - new Date(0)]
+-    expected: FAIL
+-
+-  [Valid key - [\]]
+-    expected: FAIL
+-
+-  [Valid key - new Array()]
+-    expected: FAIL
+-
+-  [Valid key - ["undefined"\]]
+-    expected: FAIL
+-
+-  [Valid key - Infinity]
+-    expected: FAIL
+-
+-  [Valid key - -Infinity]
+-    expected: FAIL
+-
+-  [Valid key - 0]
+-    expected: FAIL
+-
+-  [Valid key - 1.5]
+-    expected: FAIL
+-
+-  [Valid key - 3e38]
+-    expected: FAIL
+-
+-  [Valid key - 3e-38]
+-    expected: FAIL
+-
+-  [Valid key - "foo"]
+-    expected: FAIL
+-
+-  [Valid key - "\\n"]
+-    expected: FAIL
+-
+-  [Valid key - ""]
+-    expected: FAIL
+-
+-  [Valid key - "\\""]
+-    expected: FAIL
+-
+-  [Valid key - "\\u1234"]
+-    expected: FAIL
+-
+-  [Valid key - "\\u0000"]
+-    expected: FAIL
+-
+-  [Valid key - "NaN"]
+-    expected: FAIL
+-
+ 
+ [key_valid.any.sharedworker.html]
+-  [Valid key - new Date()]
+-    expected: FAIL
+-
+-  [Valid key - new Date(0)]
+-    expected: FAIL
+-
+-  [Valid key - [\]]
+-    expected: FAIL
+-
+-  [Valid key - new Array()]
+-    expected: FAIL
+-
+-  [Valid key - ["undefined"\]]
+-    expected: FAIL
+-
+-  [Valid key - Infinity]
+-    expected: FAIL
+-
+-  [Valid key - -Infinity]
+-    expected: FAIL
+-
+-  [Valid key - 0]
+-    expected: FAIL
+-
+-  [Valid key - 1.5]
+-    expected: FAIL
+-
+-  [Valid key - 3e38]
+-    expected: FAIL
+-
+-  [Valid key - 3e-38]
+-    expected: FAIL
+-
+-  [Valid key - "foo"]
+-    expected: FAIL
+-
+-  [Valid key - "\\n"]
+-    expected: FAIL
+-
+-  [Valid key - ""]
+-    expected: FAIL
+-
+-  [Valid key - "\\""]
+-    expected: FAIL
+-
+-  [Valid key - "\\u1234"]
+-    expected: FAIL
+-
+-  [Valid key - "\\u0000"]
+-    expected: FAIL
+-
+-  [Valid key - "NaN"]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/keypath.any.js.ini b/tests/wpt/meta/IndexedDB/keypath.any.js.ini
+index 9c4a7a61a48..4c8730ff754 100644
+--- a/tests/wpt/meta/IndexedDB/keypath.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/keypath.any.js.ini
+@@ -1,25 +1,4 @@
+ [keypath.any.worker.html]
+-  [undefined - [''\] uses value as [key\]]
+-    expected: FAIL
+-
+-  [undefined - ['x', 'y'\]]
+-    expected: FAIL
+-
+-  [undefined - [['x'\], 'y'\] (stringifies)]
+-    expected: FAIL
+-
+-  [undefined - ['x', {toString->'y'}\] (stringifies)]
+-    expected: FAIL
+-
+-  [undefined - name,type]
+-    expected: FAIL
+-
+-  [undefined - name,type.name]
+-    expected: FAIL
+-
+-  [undefined - list with 1 field]
+-    expected: FAIL
+-
+   [Key path conversion: a self-referential array exhausts the stack]
+     expected: FAIL
+ 
+@@ -28,52 +7,10 @@
+   expected: ERROR
+ 
+ [keypath.any.html]
+-  [undefined - [''\] uses value as [key\]]
+-    expected: FAIL
+-
+-  [undefined - ['x', 'y'\]]
+-    expected: FAIL
+-
+-  [undefined - [['x'\], 'y'\] (stringifies)]
+-    expected: FAIL
+-
+-  [undefined - ['x', {toString->'y'}\] (stringifies)]
+-    expected: FAIL
+-
+-  [undefined - name,type]
+-    expected: FAIL
+-
+-  [undefined - name,type.name]
+-    expected: FAIL
+-
+-  [undefined - list with 1 field]
+-    expected: FAIL
+-
+   [Key path conversion: a self-referential array exhausts the stack]
+     expected: FAIL
+ 
+ 
+ [keypath.any.sharedworker.html]
+-  [undefined - [''\] uses value as [key\]]
+-    expected: FAIL
+-
+-  [undefined - ['x', 'y'\]]
+-    expected: FAIL
+-
+-  [undefined - [['x'\], 'y'\] (stringifies)]
+-    expected: FAIL
+-
+-  [undefined - ['x', {toString->'y'}\] (stringifies)]
+-    expected: FAIL
+-
+-  [undefined - name,type]
+-    expected: FAIL
+-
+-  [undefined - name,type.name]
+-    expected: FAIL
+-
+-  [undefined - list with 1 field]
+-    expected: FAIL
+-
+   [Key path conversion: a self-referential array exhausts the stack]
+     expected: FAIL

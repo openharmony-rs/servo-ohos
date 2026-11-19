@@ -1,0 +1,10 @@
+<!doctype html>
+<meta charset="utf-8">
+<script>
+// Starts the shared worker resources/connection-holder.js?<query>, asks it to open the database
+// named in the query without closing on versionchange, and passes its messages to the parent.
+const query = location.search.slice(1);
+const worker = new SharedWorker('connection-holder.js?' + query);
+worker.port.onmessage = event => parent.postMessage(event.data, '*');
+worker.port.postMessage({name: decodeURIComponent(query), close: false});
+</script>

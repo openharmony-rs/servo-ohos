@@ -1,0 +1,416 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 16:17:09 +0000
+Subject: [PATCH] indexeddb: Fail a request with the error that its backend
+ failure calls for
+
+A request that failed in the backend got a "DataError" whatever the
+failure was (upstream FIXME in IDBRequest::convert_result). The spec has
+no such case: its DataErrors are thrown before a request is made. A put
+that finds the disk full should fail with a "QuotaExceededError", a
+constraint failure with a "ConstraintError", and an internal storage
+failure with an "UnknownError", which is also what its transaction then
+aborts with.
+
+convert_result now maps the backend error like the transaction errors
+since the P3 review: QuotaExceeded to QuotaExceededError, Constraint to
+ConstraintError, Abort to AbortError, anything else (including Unusable,
+DbNotFound and StoreNotFound) to UnknownError with a neutral message and
+the details in the log. The backend reports a violated constraint of its
+tables (SQLITE_CONSTRAINT, RDB_E_SQLITE_CONSTRAINT), which its checks
+before writing should prevent, as Constraint rather than DbErr. Stored
+values that script can't decode (a postcard failure, a generated key
+that can't be injected, a cursor record without its value) are internal
+failures too and become UnknownError: the spec's StructuredDeserialize
+there can't fail. A databases() call that fails rejects with an
+UnknownError, as the spec suggests, rather than "IndexedDB open failed",
+and so do open and delete requests that the backend fails (P5 review N5),
+as the spec's examples for open step 6 and delete step 11 say, rather
+than with an OperationError; the log says "IndexedDB backend failure"
+for all of them. idbrequest.rs has one message-less Error use fewer, so
+tidy's list of exceptions goes down.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 157 passed, 1 skipped (new backend tests, every executor: test_full_database_fails_the_transaction_with_quota_exceeded, a real SQLITE_FULL from max_page_count set inside the open transaction; test_constraint_violation_fails_the_transaction_with_constraint, a real primary key violation from the Faulty executor running an INSERT twice; executor_constraint_violation_keeps_the_transaction checks the Constraint mapping); host SM and QuickJS IndexedDB/ 4,484 of 4,511 each, /_mozilla/IndexedDB/ 312 of 312 SM, 310 of 312 QuickJS (interface lists, as before), every result as expected (WPT has no case where the backend fails a request); DAYU200 unit tests: both new tests pass with RDB only and with both backends (RDB only 158 passed, 3 skipped; both 284 passed, 4 skipped at this commit); a temporary hook that limited databases named quota-probe* to 64 pages (not committed, page in the P5.3 notes) gave on host SM: put error QuotaExceededError, the next request AbortError, transaction abort QuotaExceededError, and a later small put on the same connection stored and read back; `./mach test-tidy`: only the known libsqlite3-sys advisory; CI parity at this commit: `./mach clippy --locked -- -- --deny warnings`, the crown build (`RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`), both OHOS flavors with signed HAPs, `./mach test-unit --profile checked-release` 1,360 passed, 1 skipped, and `--doc` pass; after the P5 review fix (open and delete failures give UnknownError): host SM release builds, 160 passed, 1 skipped at this commit
+AI-assisted: Yes (agent session; the agent mapped the request errors, added the backend tests with a real full database and a real constraint violation, and measured the result; the P5 review fix gives open and delete failures UnknownError)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbcursor.rs  |  2 +-
+ components/script/dom/indexeddb/idbfactory.rs |  4 +-
+ .../script/dom/indexeddb/idbobjectstore.rs    |  4 +-
+ components/script/dom/indexeddb/idbrequest.rs | 12 +--
+ components/script/dom/indexeddb/key.rs        | 38 ++++----
+ components/shared/storage/indexeddb.rs        |  5 +-
+ .../storage/indexeddb/backend/executor.rs     | 18 +++-
+ components/storage/indexeddb/backend/rdb.rs   |  6 ++
+ components/storage/indexeddb/backend/tests.rs | 92 +++++++++++++++++--
+ python/tidy/error_message_exceptions.txt      |  2 +-
+ 10 files changed, 141 insertions(+), 42 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbcursor.rs b/components/script/dom/indexeddb/idbcursor.rs
+index 99641764603..d1445177002 100644
+--- a/components/script/dom/indexeddb/idbcursor.rs
++++ b/components/script/dom/indexeddb/idbcursor.rs
+@@ -937,7 +937,7 @@ pub(crate) fn iterate_cursor(
+         // Step 13.2. Set cursor’s value to ! StructuredDeserialize(serialized, targetRealm)
+         let serialized = found_record
+             .value
+-            .ok_or_else(|| Error::Data(Some("A cursor record without its value".to_owned())))?;
++            .ok_or_else(|| Error::Unknown(Some("A cursor record without its value".to_owned())))?;
+         rooted!(&in(cx) let mut new_cursor_value = UndefinedValue());
+         cursor.effective_object_store().deserialize_value(
+             cx,
+diff --git a/components/script/dom/indexeddb/idbfactory.rs b/components/script/dom/indexeddb/idbfactory.rs
+index 8943fe90c43..939ccd30335 100644
+--- a/components/script/dom/indexeddb/idbfactory.rs
++++ b/components/script/dom/indexeddb/idbfactory.rs
+@@ -33,7 +33,7 @@ use crate::dom::bindings::trace::HashMapTracedValues;
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::indexeddb::idbopendbrequest::IDBOpenDBRequest;
+ use crate::dom::indexeddb::key::{
+-    convert_value_to_key, dom_string_from_name, map_backend_error_to_dom_error,
++    convert_value_to_key, dom_string_from_name, map_transaction_error_to_dom_error,
+     name_from_dom_string,
+ };
+ use crate::dom::promise::Promise;
+@@ -457,7 +457,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
+                 let promise = trusted_promise.root(cx);
+                 match result {
+                     Err(err) => {
+-                        let error = map_backend_error_to_dom_error(err);
++                        let error = map_transaction_error_to_dom_error(err);
+                         rooted!(&in(cx) let mut rval = UndefinedValue());
+                         error
+                             .to_jsval(cx, &promise.global(), rval.handle_mut());
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index 4c096229119..ddbed03a851 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -290,7 +290,7 @@ impl IDBObjectStore {
+         mut value: MutableHandleValue,
+     ) -> Fallible<()> {
+         let data = postcard::from_bytes(serialized)
+-            .map_err(|_| Error::Data(Some("Failed to decode a stored value".to_owned())))?;
++            .map_err(|_| Error::Unknown(Some("Failed to decode a stored value".to_owned())))?;
+         structuredclone::read(cx, &self.global(), data, value.reborrow())?;
+         let Some(key_path) = self.key_path.as_ref().filter(|_| self.has_key_generator) else {
+             return Ok(());
+@@ -314,7 +314,7 @@ impl IDBObjectStore {
+             KeyPath::StringSequence(_) => false,
+         };
+         if !injected {
+-            return Err(Error::Data(Some(
++            return Err(Error::Unknown(Some(
+                 "Failed to inject the generated key into a stored value".to_owned(),
+             )));
+         }
+diff --git a/components/script/dom/indexeddb/idbrequest.rs b/components/script/dom/indexeddb/idbrequest.rs
+index 399f75dd6de..5d9d9a75c81 100644
+--- a/components/script/dom/indexeddb/idbrequest.rs
++++ b/components/script/dom/indexeddb/idbrequest.rs
+@@ -16,7 +16,7 @@ use script_bindings::cell::DomRefCell;
+ use script_bindings::reflector::{DomObject, reflect_dom_object};
+ use servo_base::generic_channel::GenericSend;
+ use storage_traits::indexeddb::{
+-    AsyncOperation, AsyncReadOnlyOperation, BackendError, BackendResult, IndexedDBCursorDirection,
++    AsyncOperation, AsyncReadOnlyOperation, BackendResult, IndexedDBCursorDirection,
+     IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode,
+     IndexedDBValue, PutItemResult, RequestOutput,
+ };
+@@ -46,6 +46,7 @@ use crate::dom::indexeddb::idbrecord::IDBRecord;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::key::{
+     convert_value_to_key_range, is_potentially_valid_key_range, key_type_to_jsval,
++    map_transaction_error_to_dom_error,
+ };
+ 
+ pub enum IdbResult {
+@@ -515,14 +516,7 @@ impl IDBRequest {
+         iteration_param: Option<&IterationParam>,
+         mut answer: MutableHandleValue,
+     ) -> Result<(), Error> {
+-        let result = result
+-            .inspect_err(|error| {
+-                if let BackendError::DbErr(error) = error {
+-                    error!("Error in IndexedDB operation: {}", error);
+-                }
+-            })
+-            // FIXME:(arihant2math) dispatch correct error
+-            .map_err(|_| Error::Data(None))?;
++        let result = result.map_err(map_transaction_error_to_dom_error)?;
+         match IdbResult::from(result) {
+             IdbResult::Key(key) => key_type_to_jsval(cx, &key, answer),
+             IdbResult::Keys(keys) => {
+diff --git a/components/script/dom/indexeddb/key.rs b/components/script/dom/indexeddb/key.rs
+index 9c9ecd816fb..ab9c4faf8bd 100644
+--- a/components/script/dom/indexeddb/key.rs
++++ b/components/script/dom/indexeddb/key.rs
+@@ -710,37 +710,39 @@ pub(crate) fn is_potentially_valid_key_range(
+     Ok(is_array)
+ }
+ 
++/// The error of an open or delete request that the backend failed, mapped as
++/// [`map_transaction_error_to_dom_error`] maps it: an "UnknownError" unless the disk is full, as
++/// the spec's examples for open step 6 and delete step 11 have it.
+ pub(crate) fn map_backend_error_to_dom_error(error: BackendError) -> Error {
+-    match error {
+-        BackendError::QuotaExceeded => Error::QuotaExceeded {
+-            quota: None,
+-            requested: None,
+-        },
+-        BackendError::DbErr(details) => {
+-            Error::Operation(Some(format!("IndexedDB open failed: {details}")))
+-        },
+-        other => Error::Operation(Some(format!("IndexedDB open failed: {other:?}"))),
+-    }
++    map_backend_failure(error, "The IndexedDB open or delete request failed")
+ }
+ 
+-/// The error that a transaction aborts with when the backend, or script on its behalf, failed
+-/// it: a "QuotaExceededError" for a full disk, a "ConstraintError" for a unique index that got
+-/// the same key for two records while it was populated, and otherwise an "UnknownError" with a
+-/// neutral message, as <https://w3c.github.io/IndexedDB/#commit-a-transaction> step 2.4 suggests;
+-/// the details only go to the log.
++/// The error of a request, or of a transaction, that the backend, or script on its behalf, failed:
++/// a "QuotaExceededError" for a full disk, a "ConstraintError" for a key that a unique index or
++/// an object store would have had for two records, an "AbortError" for a transaction that was
++/// aborted, and otherwise an "UnknownError" with a neutral message, as
++/// <https://w3c.github.io/IndexedDB/#commit-a-transaction> step 2.4 suggests; the details only go
++/// to the log. No backend failure is a "DataError": the spec throws those before a request is
++/// made.
+ pub(crate) fn map_transaction_error_to_dom_error(error: BackendError) -> Error {
++    map_backend_failure(error, "The IndexedDB transaction failed")
++}
++
++/// Maps `error` as [`map_transaction_error_to_dom_error`] describes, with `message` for an
++/// "UnknownError".
++fn map_backend_failure(error: BackendError, message: &str) -> Error {
+     match error {
+         BackendError::QuotaExceeded => Error::QuotaExceeded {
+             quota: None,
+             requested: None,
+         },
+         BackendError::Constraint => Error::Constraint(Some(
+-            "A unique index has the same key for two records".to_owned(),
++            "A unique index or an object store has the same key for two records".to_owned(),
+         )),
+         BackendError::Abort => Error::Abort(Some("The transaction was aborted".to_owned())),
+         other => {
+-            warn!("IndexedDB transaction failed: {other}");
+-            Error::Unknown(Some("The IndexedDB transaction failed".to_owned()))
++            warn!("IndexedDB backend failure: {other}");
++            Error::Unknown(Some(message.to_owned()))
+         },
+     }
+ }
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 9a0c104cf21..0faadaee519 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -36,8 +36,9 @@ pub enum BackendError {
+     QuotaExceeded,
+     /// The transaction was aborted
+     Abort,
+-    /// A unique index got the same key for two records while it was populated, which aborts the
+-    /// upgrade transaction with a "ConstraintError" DOMException.
++    /// A constraint failed: a unique index got the same key for two records while it was
++    /// populated, which aborts the upgrade transaction, or a statement violated a constraint of
++    /// the database's tables. Reported as a "ConstraintError" DOMException.
+     Constraint,
+     /// The database can't be used any more, for example because its file is corrupt: the
+     /// transaction fails, and the backend closes every connection to the database with the
+diff --git a/components/storage/indexeddb/backend/executor.rs b/components/storage/indexeddb/backend/executor.rs
+index 6a54e50b81f..8b9ae42d657 100644
+--- a/components/storage/indexeddb/backend/executor.rs
++++ b/components/storage/indexeddb/backend/executor.rs
+@@ -295,13 +295,29 @@ impl SqlError {
+         }
+     }
+ 
++    /// Whether the error reports a constraint of the tables that a statement violated, such as
++    /// a primary key or a unique index that would have had the same key twice.
++    fn is_constraint_violation(&self) -> bool {
++        match self {
++            #[cfg(feature = "sqlite-backend")]
++            Self::Sqlite(error) => {
++                error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)
++            },
++            #[cfg(ohos_rdb)]
++            Self::Rdb(error) => super::rdb::is_constraint_error(error),
++            _ => false,
++        }
++    }
++
+     /// The error to report for this one: QuotaExceeded for a full disk, Unusable for a damaged
+-    /// database, DbErr otherwise.
++    /// database, Constraint for a violated constraint, DbErr otherwise.
+     pub(crate) fn to_backend_error(&self) -> BackendError {
+         if self.is_disk_full() {
+             BackendError::QuotaExceeded
+         } else if self.makes_database_unusable() {
+             BackendError::Unusable(format!("{self:?}"))
++        } else if self.is_constraint_violation() {
++            BackendError::Constraint
+         } else {
+             BackendError::DbErr(format!("{self:?}"))
+         }
+diff --git a/components/storage/indexeddb/backend/rdb.rs b/components/storage/indexeddb/backend/rdb.rs
+index 6321b2f2850..7a925e9cfcf 100644
+--- a/components/storage/indexeddb/backend/rdb.rs
++++ b/components/storage/indexeddb/backend/rdb.rs
+@@ -82,6 +82,12 @@ pub(crate) fn is_corruption_error(error: &OhosRdbError) -> bool {
+         if *code == OH_Rdb_ErrCode::RDB_E_SQLITE_CORRUPT.0)
+ }
+ 
++/// Whether an RDB error reports a violated constraint, such as a primary key or a unique index.
++pub(crate) fn is_constraint_error(error: &OhosRdbError) -> bool {
++    matches!(error, OhosRdbError::Api { code, .. }
++        if *code == OH_Rdb_ErrCode::RDB_E_SQLITE_CONSTRAINT.0)
++}
++
+ /// Whether an RDB error reports a full disk or an exceeded size limit.
+ pub(crate) fn is_disk_full_error(error: &OhosRdbError) -> bool {
+     matches!(error, OhosRdbError::Api { code, .. }
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index db89a922418..e14fffa753b 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -114,6 +114,8 @@ executor_tests!(
+     test_statement_failure_that_ends_the_transaction_fails_it,
+     test_readonly_failure_that_ends_the_sql_transaction_fails_the_writer,
+     test_corrupt_database_makes_the_engine_unusable,
++    test_constraint_violation_fails_the_transaction_with_constraint,
++    test_full_database_fails_the_transaction_with_quota_exceeded,
+     test_commit_failure_rolls_back,
+     test_batches_reply_in_dispatch_order,
+     test_job_that_ends_the_sql_transaction_fails_the_writer,
+@@ -523,11 +525,10 @@ fn executor_constraint_violation_keeps_the_transaction<X: SqlExecutor>() {
+     insert_into_t(&mut executor, 1);
+     executor.begin(TransactionBehavior::Immediate).unwrap();
+     insert_into_t(&mut executor, 2);
+-    assert!(
+-        executor
+-            .execute("INSERT INTO t (k) VALUES (1)", &[])
+-            .is_err()
+-    );
++    let error = executor
++        .execute("INSERT INTO t (k) VALUES (1)", &[])
++        .unwrap_err();
++    assert_eq!(error.into_backend_error(), BackendError::Constraint);
+     assert!(executor.in_transaction());
+     insert_into_t(&mut executor, 3);
+     executor.commit().unwrap();
+@@ -2678,6 +2679,9 @@ pub(crate) struct Faults {
+     statement: Option<(&'static str, usize)>,
+     /// Make that failure report a corrupt database.
+     corrupt: bool,
++    /// Run the statement whose SQL contains this text a second time, which fails if it violates
++    /// a constraint the first run made it violate, such as an INSERT of the same row.
++    duplicate: Option<&'static str>,
+     /// Leave the database in place on delete, as RDB does when it can't remove the files.
+     keep_on_delete: bool,
+ }
+@@ -2756,7 +2760,18 @@ impl<X: SqlExecutor> SqlExecutor for Faulty<X> {
+ 
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         self.inject(sql)?;
+-        self.inner.execute(sql, params)
++        let duplicate = self
++            .faults
++            .lock()
++            .unwrap()
++            .duplicate
++            .take_if(|text| sql.contains(*text))
++            .is_some();
++        let changed = self.inner.execute(sql, params)?;
++        if duplicate {
++            return self.inner.execute(sql, params);
++        }
++        Ok(changed)
+     }
+ 
+     fn query(
+@@ -2950,6 +2965,71 @@ fn test_corrupt_database_makes_the_engine_unusable<X: SqlExecutor>() {
+     assert!(db.is_unusable());
+ }
+ 
++/// A write that violates a constraint of the tables, which the engine's checks before writing
++/// should prevent, fails its request with Constraint, and so do the transaction's later requests
++/// and its commit; nothing of the transaction is stored.
++fn test_constraint_violation_fails_the_transaction_with_constraint<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_faulty_engine::<X>(&dir);
++    faults_for(dir.path()).lock().unwrap().duplicate = Some("INSERT INTO object_data");
++    let puts: Vec<_> = (0..2).map(|_| get_callback()).collect();
++    run_batch(&db, 1, IndexedDBTxnMode::Readwrite, put_requests(&puts, 2));
++    assert_eq!(recv(&puts[0].1), Err(BackendError::Constraint));
++    assert_eq!(recv(&puts[1].1), Err(BackendError::Constraint));
++    assert_eq!(commit(&db, 1), Err(BackendError::Constraint));
++    assert_eq!(stored_keys(&db, TEST_STORE), number_keys([1]));
++}
++
++/// A write that finds the database full fails its request with QuotaExceeded, and so do the
++/// transaction's later requests and its commit; nothing of the transaction is stored.
++fn test_full_database_fails_the_transaction_with_quota_exceeded<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    create_store(&db, "test_store", None, false).unwrap();
++    let first = [get_callback()];
++    run_batch(&db, 1, IndexedDBTxnMode::Readwrite, put_requests(&first, 1));
++    assert!(recv(&first[0].1).is_ok());
++    // RDB runs a transaction on a connection of its own, so the limit is set inside it.
++    let (limited, limit_set) = mpsc::channel();
++    db.spawn_on_connection(move |executor| {
++        let pages = query_row(executor, "PRAGMA page_count", &[], |row| row.integer(0))
++            .unwrap()
++            .unwrap();
++        executor
++            .execute(&format!("PRAGMA max_page_count = {pages}"), &[])
++            .unwrap();
++        let _ = limited.send(());
++    });
++    limit_set.recv_timeout(TIMEOUT).unwrap();
++
++    let (large, after) = (get_callback(), get_callback());
++    run_batch(
++        &db,
++        1,
++        IndexedDBTxnMode::Readwrite,
++        vec![
++            put_request(
++                TEST_STORE,
++                large.0,
++                IndexedDBKeyType::Number(2.0),
++                vec![0; 1 << 20],
++                false,
++            ),
++            put_request(
++                TEST_STORE,
++                after.0,
++                IndexedDBKeyType::Number(3.0),
++                vec![3],
++                false,
++            ),
++        ],
++    );
++    assert_eq!(recv(&large.1), Err(BackendError::QuotaExceeded));
++    assert_eq!(recv(&after.1), Err(BackendError::QuotaExceeded));
++    assert_eq!(commit(&db, 1), Err(BackendError::QuotaExceeded));
++    assert!(stored_keys(&db, TEST_STORE).is_empty());
++}
++
+ /// A readonly request runs inside the open SQL transaction of a writer with a disjoint scope. If
+ /// it fails in a way that ends that SQL transaction, the writer's changes are gone, so the writer
+ /// fails, not only the readonly request.
+diff --git a/python/tidy/error_message_exceptions.txt b/python/tidy/error_message_exceptions.txt
+index e11265c8d76..d97c79a68c7 100644
+--- a/python/tidy/error_message_exceptions.txt
++++ b/python/tidy/error_message_exceptions.txt
+@@ -33,7 +33,7 @@
+ ./components/script/dom/indexeddb/idbkeyrange.rs 1
+ ./components/script/dom/indexeddb/idbobjectstore.rs 19
+ ./components/script/dom/indexeddb/idbopendbrequest.rs 3
+-./components/script/dom/indexeddb/idbrequest.rs 5
++./components/script/dom/indexeddb/idbrequest.rs 4
+ ./components/script/dom/indexeddb/idbtransaction.rs 6
+ ./components/script/dom/indexeddb/key.rs 2
+ ./components/script/dom/intersectionobserver/intersectionobserver.rs 2

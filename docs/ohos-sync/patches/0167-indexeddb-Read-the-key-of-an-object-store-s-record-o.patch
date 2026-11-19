@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 06:12:45 +0000
+Subject: [PATCH] indexeddb: Read the key of an object store's record once
+
+A read of an object store's records with their keys, getAllRecords()
+and the steps of object store cursors, selected each record's key twice,
+as its key and as its primary key, which are the same for a store. On
+RDB every column of every row costs a fetch through the cursor API: for
+50,000 records on the DAYU200 the second key column took about 0.4 s of
+the 2.85 s that the backend spent on getAllRecords(). The read now
+selects the key once and the record takes it as its primary key as well.
+
+Validation: `cargo nextest run -p servo-storage -p servo-storage-traits` (host SQLite): 141 passed, 1 skipped, with the store sources of test_cursor_steps_find_what_the_spec_finds (records and keys only) and test_get_all_retrieves_what_a_cursor_visits. Host WPT tests/wpt/tests/IndexedDB, 8 processes: SpiderMonkey 4,465, QuickJS 4,465 (previous commit 4,465 / 4,463), differences only known flips (SM idbversionchangeevent.any.sharedworker and idbfactory-origin-isolation swapped, QuickJS idbcursor-continuePrimaryKey-exception-order.any.sharedworker, idbfactory-origin-isolation and the lone-surrogate subtest of idbindex-rename.any.sharedworker); /_mozilla/IndexedDB/ and the interface lists 204 of 204 on SM, QuickJS as expected. DAYU200 (QuickJS + RDB, 2 processes): WPT IndexedDB/ 4,441 (previous commit 4,446), the differences in idb-partitioned-coverage, which times out as a whole there with a varying set of subtests, idbversionchangeevent.any.worker and idbobjectstore-rename-store.any.sharedworker, known flips; /_mozilla/IndexedDB/ 202 of 202; `./mach test-unit --ohos -p servo-storage` RDB only 142 passed / 3 skipped, SQLite and RDB 253 / 4; the 50,000-record probe's getAllRecords() of a store took 4.65 s (previous commit 5.15 and 5.06 s), an index's 8.1 s as before; interleaved-cursors-small and idbcursor_iterating within run-to-run noise. `./mach fmt`, `./mach check --ohos -- -p servo-storage --all-targets` with SQLite, RDB and both, clippy and test-tidy as for the previous commit.
+AI-assisted: Yes (agent session; measured the backend time of large reads on the board with a temporary timing build, changed the selected columns, reran the host and board checks)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../storage/indexeddb/backend/queries.rs      | 33 +++++++++++++++----
+ 1 file changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/components/storage/indexeddb/backend/queries.rs b/components/storage/indexeddb/backend/queries.rs
+index 25c297d6e1a..b75b828b77f 100644
+--- a/components/storage/indexeddb/backend/queries.rs
++++ b/components/storage/indexeddb/backend/queries.rs
+@@ -500,7 +500,8 @@ pub(crate) enum RecordSource<'a> {
+     Index(StoreIndex),
+ }
+ 
+-/// What a read selects of each record, in this order.
++/// What a read selects of each record, in this order. A store's record has its key once, as it is
++/// also the primary key: see [`record_of_row`].
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub(crate) enum RecordColumns {
+     /// The primary key: the key of a store's record, the value of an index's record.
+@@ -551,10 +552,13 @@ impl RecordSource<'_> {
+                 "o.data",
+             ),
+         };
++        let store = matches!(self, Self::ObjectStore(_));
+         let selected = match columns {
+             RecordColumns::PrimaryKey => primary_key.to_owned(),
+             RecordColumns::Value => format!("{primary_key}, {value}"),
++            RecordColumns::Record if store => format!("{key}, {value}"),
+             RecordColumns::Record => format!("{key}, {primary_key}, {value}"),
++            RecordColumns::Keys if store => key.to_owned(),
+             RecordColumns::Keys => format!("{key}, {primary_key}"),
+         };
+         (format!("{from}{}", condition.on(key)), selected)
+@@ -685,11 +689,26 @@ pub(crate) fn get_key<X: SqlExecutor>(
+     .pop())
+ }
+ 
+-fn record_of_row(row: &dyn SqlRow, with_value: bool) -> Result<IndexedDBRecord, SqlError> {
++/// The record of `source` in a row of [`RecordColumns::Record`], or of [`RecordColumns::Keys`]
++/// without `with_value`.
++fn record_of_row(
++    source: RecordSource,
++    row: &dyn SqlRow,
++    with_value: bool,
++) -> Result<IndexedDBRecord, SqlError> {
++    let key = decode_key(&row.blob(0)?)?;
++    let (primary_key, value_column) = match source {
++        RecordSource::ObjectStore(_) => (key.clone(), 1),
++        RecordSource::Index(_) => (decode_key(&row.blob(1)?)?, 2),
++    };
+     Ok(IndexedDBRecord {
+-        key: decode_key(&row.blob(0)?)?,
+-        primary_key: decode_key(&row.blob(1)?)?,
+-        value: if with_value { Some(row.blob(2)?) } else { None },
++        key,
++        primary_key,
++        value: if with_value {
++            Some(row.blob(value_column)?)
++        } else {
++            None
++        },
+     })
+ }
+ 
+@@ -811,7 +830,7 @@ pub(crate) fn get_all_records<X: SqlExecutor>(
+         range,
+         direction,
+         count,
+-        |row| record_of_row(row, true),
++        |row| record_of_row(source, row, true),
+     )
+ }
+ 
+@@ -1002,7 +1021,7 @@ pub(crate) fn cursor_records<X: SqlExecutor>(
+         reverse,
+         Some(records),
+         offset,
+-        |row| record_of_row(row, !key_only),
++        |row| record_of_row(source, row, !key_only),
+     )
+ }
+ 

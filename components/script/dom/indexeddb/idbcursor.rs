@@ -5,6 +5,7 @@
 #![cfg_attr(crown, allow(crown::jscontext_first_arg))]
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
@@ -14,27 +15,61 @@ use js::rust::{HandleValue, MutableHandleValue};
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use storage_traits::indexeddb::{
-    AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, IndexedDBKeyRange,
-    IndexedDBKeyType, IndexedDBRecord,
+    AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, IndexedDBCursorDirection,
+    IndexedDBCursorStep, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord, RequestOutput,
 };
 
 use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::{
     IDBCursorDirection, IDBCursorMethods,
 };
+use crate::dom::bindings::codegen::Bindings::IDBIndexBinding::IDBIndexMethods;
 use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::IDBTransactionMode;
 use crate::dom::bindings::codegen::UnionTypes::IDBObjectStoreOrIDBIndex;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
-use crate::dom::bindings::structuredclone;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbindex::IDBIndex;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
-use crate::dom::indexeddb::idbrequest::IDBRequest;
+use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource};
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::key::{
     ExtractionResult, convert_value_to_key, extract_key, key_type_to_jsval,
 };
+
+/// The backend's form of `direction`.
+pub(crate) fn backend_direction(direction: IDBCursorDirection) -> IndexedDBCursorDirection {
+    match direction {
+        IDBCursorDirection::Next => IndexedDBCursorDirection::Next,
+        IDBCursorDirection::Nextunique => IndexedDBCursorDirection::NextUnique,
+        IDBCursorDirection::Prev => IndexedDBCursorDirection::Prev,
+        IDBCursorDirection::Prevunique => IndexedDBCursorDirection::PrevUnique,
+    }
+}
+
+/// The most records that a cursor asks the backend for in one step: the record the step finds,
+/// and those that the next steps without a key would find, which the cursor keeps.
+const MAX_PREFETCHED_RECORDS: u32 = 64;
+
+/// The records that a cursor's request to the backend returned after the record that the
+/// request moved the cursor to, as the next steps without a key would find them.
+#[derive(Default, MallocSizeOf)]
+struct Prefetched {
+    records: VecDeque<IndexedDBRecord>,
+    /// The writes count of the cursor's transaction for its effective object store when the
+    /// request was made; the records are current while it stays the same.
+    writes: u64,
+}
+
+/// A request of a cursor that the backend runs.
+#[derive(Clone, Copy, MallocSizeOf)]
+struct Fetch {
+    /// The most records that it asks for.
+    records: u32,
+    /// The writes count of the cursor's transaction for its effective object store when it was
+    /// made.
+    writes: u64,
+}
 
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
@@ -79,6 +114,14 @@ pub(crate) struct IDBCursor {
 
     /// <https://w3c.github.io/IndexedDB/#cursor-request>
     request: MutNullableDom<IDBRequest>,
+
+    /// The records that the next steps of the cursor can take without asking the backend.
+    #[no_trace]
+    prefetched: DomRefCell<Prefetched>,
+    /// The last request of the cursor that the backend runs, and whether its result is pending.
+    #[no_trace]
+    last_fetch: Cell<Option<Fetch>>,
+    fetch_pending: Cell<bool>,
 }
 
 impl IDBCursor {
@@ -106,6 +149,9 @@ impl IDBCursor {
             object_store_position: DomRefCell::new(None),
             key_only,
             request: Default::default(),
+            prefetched: Default::default(),
+            last_fetch: Cell::new(None),
+            fetch_pending: Cell::new(false),
         }
     }
 
@@ -178,6 +224,15 @@ impl IDBCursor {
         }
     }
 
+    /// <https://www.w3.org/TR/IndexedDB-3/#cursor-source>, as the source of the requests that
+    /// iterate the cursor.
+    fn request_source(&self) -> RequestSource<'_> {
+        match &self.source {
+            ObjectStoreOrIndex::ObjectStore(store) => RequestSource::ObjectStore(store),
+            ObjectStoreOrIndex::Index(index) => RequestSource::Index(index),
+        }
+    }
+
     /// <https://www.w3.org/TR/IndexedDB-3/#cursor-effective-object-store>
     pub(crate) fn effective_object_store(&self) -> DomRoot<IDBObjectStore> {
         match &self.source {
@@ -209,6 +264,165 @@ impl IDBCursor {
                 "Transaction is a read-only transaction".to_owned(),
             )));
         }
+        Ok(())
+    }
+
+    /// How many records the next request of the cursor to the backend asks for: twice as many
+    /// as the last request, up to [`MAX_PREFETCHED_RECORDS`], for a step without a key, as
+    /// Chromium and Gecko prefetch; one at first, after a write in the transaction, and for a
+    /// step with a key, which went beyond the records taken before.
+    ///
+    /// A "nextunique" cursor over an index that isn't unique asks for one record: to return the
+    /// keys after the first, the backend reads every record of each key, while a step reads only
+    /// the first record of its key.
+    fn next_fetch(&self, with_key: bool) -> Fetch {
+        let writes = self.transaction.writes(self.effective_object_store().id());
+        let unique_steps = self.direction == IDBCursorDirection::Nextunique &&
+            matches!(&self.source, ObjectStoreOrIndex::Index(index) if !index.Unique());
+        let records = match self.last_fetch.get() {
+            Some(last) if last.writes == writes && !with_key && !unique_steps => {
+                (last.records * 2).min(MAX_PREFETCHED_RECORDS)
+            },
+            _ => 1,
+        };
+        Fetch { records, writes }
+    }
+
+    /// The operation of <https://w3c.github.io/IndexedDB/#iterate-a-cursor> with this cursor,
+    /// `key`, `primary_key` and `count`: the backend finds the record from the cursor's position
+    /// (step 9), which `iterate_cursor` then moves the cursor to, and returns the records that the
+    /// next steps without a key would find after it, which the cursor keeps.
+    pub(crate) fn iterate_operation(
+        &self,
+        key: Option<IndexedDBKeyType>,
+        primary_key: Option<IndexedDBKeyType>,
+        count: u32,
+    ) -> AsyncOperation {
+        // Step 3. Assert: if primaryKey is given, source is an index and direction is "next" or
+        // "prev".
+        if primary_key.is_some() {
+            assert!(matches!(self.source, ObjectStoreOrIndex::Index(..)));
+            assert!(matches!(
+                self.direction,
+                IDBCursorDirection::Next | IDBCursorDirection::Prev
+            ));
+        }
+        let index = match &self.source {
+            ObjectStoreOrIndex::ObjectStore(_) => None,
+            ObjectStoreOrIndex::Index(index) => Some(index.id()),
+        };
+        let fetch = self.next_fetch(key.is_some());
+        self.last_fetch.set(Some(fetch));
+        self.fetch_pending.set(true);
+        self.prefetched.borrow_mut().records.clear();
+        AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+            index,
+            key_range: self.range.clone(),
+            direction: backend_direction(self.direction),
+            step: IndexedDBCursorStep {
+                position: self.position.borrow().clone(),
+                object_store_position: self.object_store_position.borrow().clone(),
+                key,
+                primary_key,
+                count,
+            },
+            records: fetch.records,
+            key_only: self.key_only,
+        })
+    }
+
+    /// Takes the record that <https://w3c.github.io/IndexedDB/#iterate-a-cursor> step 9 finds
+    /// with `key`, `primary_key` and `count` from the prefetched records, with those before it, if
+    /// they are current and hold it; returns `None` and drops them otherwise.
+    ///
+    /// The prefetched records are the records that the steps without a key find one after the
+    /// other, from the cursor's position, as of the cursor's last request to the backend; no
+    /// write was made in the transaction since, so the records are still those. Step 9 with a key
+    /// (and a primary key) finds the first of them that meets its requirements for the key (and
+    /// primary key) as well, and with count n, the nth.
+    fn take_prefetched(
+        &self,
+        key: Option<&IndexedDBKeyType>,
+        primary_key: Option<&IndexedDBKeyType>,
+        count: u32,
+    ) -> Option<IndexedDBRecord> {
+        let mut prefetched = self.prefetched.borrow_mut();
+        if prefetched.writes != self.transaction.writes(self.effective_object_store().id()) {
+            prefetched.records.clear();
+            return None;
+        }
+        let reverse = matches!(
+            self.direction,
+            IDBCursorDirection::Prev | IDBCursorDirection::Prevunique
+        );
+        let beyond = |a: &IndexedDBKeyType, b: &IndexedDBKeyType| {
+            if reverse { a < b } else { a > b }
+        };
+        let found = match (key, primary_key) {
+            (None, _) => (count as usize).checked_sub(1),
+            // "If key is defined, the record’s key is greater than or equal to key", or less for
+            // "prev" and "prevunique".
+            (Some(key), None) => prefetched
+                .records
+                .iter()
+                .position(|record| record.key == *key || beyond(&record.key, key)),
+            // "If primaryKey is defined, the record’s key is equal to key and the record’s value
+            // is greater than or equal to primaryKey, or the record’s key is greater than key",
+            // or less for "prev".
+            (Some(key), Some(primary_key)) => prefetched.records.iter().position(|record| {
+                beyond(&record.key, key) ||
+                    (record.key == *key &&
+                        (record.primary_key == *primary_key ||
+                            beyond(&record.primary_key, primary_key)))
+            }),
+        };
+        match found.filter(|found| *found < prefetched.records.len()) {
+            Some(found) => {
+                prefetched.records.drain(..found);
+                prefetched.records.pop_front()
+            },
+            None => {
+                prefetched.records.clear();
+                None
+            },
+        }
+    }
+
+    /// Drops the records that the cursor keeps, which its transaction, once finished, can't use.
+    pub(crate) fn drop_prefetched_records(&self) {
+        self.prefetched.borrow_mut().records = VecDeque::new();
+    }
+
+    /// Runs <https://w3c.github.io/IndexedDB/#asynchronously-execute-a-request> with this
+    /// cursor's source, its request and the steps to iterate this cursor with `key`,
+    /// `primary_key` and `count`: with the record that the prefetched records give, or else
+    /// with the backend.
+    fn iterate(
+        &self,
+        cx: &mut JSContext,
+        key: Option<IndexedDBKeyType>,
+        primary_key: Option<IndexedDBKeyType>,
+        count: u32,
+    ) -> ErrorResult {
+        let request = self.Request();
+        let iteration_param = IterationParam {
+            cursor: Trusted::new(self),
+        };
+        if let Some(record) = self.take_prefetched(key.as_ref(), primary_key.as_ref(), count) {
+            return IDBRequest::execute_with_result(
+                self.request_source(),
+                Ok(RequestOutput::Records(vec![record])),
+                request,
+                iteration_param,
+            );
+        }
+        IDBRequest::execute_async(
+            cx,
+            self.request_source(),
+            self.iterate_operation(key, primary_key, count),
+            Some(request),
+            Some(iteration_param),
+        )?;
         Ok(())
     }
 }
@@ -313,39 +527,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         self.got_value.set(false);
 
         // Step 8: Let request be the request created when this cursor was created.
-        let request = self.Request();
-
         // Step 9: Unset the request's done flag on request.
-        request.unset_done_flag();
+        self.Request().unset_done_flag();
 
         // Step 10: Run the steps to asynchronously execute a request with the cursor's source as
         // source, the steps to iterate a cursor as operation and request, using the current Realm
         // as targetRealm, this cursor and count.
-        let iteration_param = IterationParam {
-            cursor: Trusted::new(self),
-            key: None,
-            primary_key: None,
-            count: Some(count),
-        };
-
-        let range = self.range.clone();
-        // NOTE: According to the spec, execute_async should take the cursor's source
-        // (which may be an index). Using effective_object_store here is a temporary
-        // workaround until execute_async supports ObjectStoreOrIndex as source.
-        IDBRequest::execute_async(
-            cx,
-            &self.effective_object_store(),
-            |callback| {
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
-                    callback,
-                    key_range: range,
-                })
-            },
-            Some(request),
-            Some(iteration_param),
-        )?;
-
-        Ok(())
+        self.iterate(cx, None, None, count)
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-continue>
@@ -407,39 +595,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         self.got_value.set(false);
 
         // Step 7: Let request be the request created when this cursor was created.
-        let request = self.Request();
-
         // Step 8: Unset the request's done flag on request.
-        request.unset_done_flag();
+        self.Request().unset_done_flag();
 
         // Step 9: Run the steps to asynchronously execute a request with the cursor's source as
         // source, the steps to iterate a cursor as operation and request, using the current Realm
         // as targetRealm, this cursor and key (if given).
-        let iteration_param = IterationParam {
-            cursor: Trusted::new(self),
-            key,
-            primary_key: None,
-            count: None,
-        };
-
-        let range = self.range.clone();
-        // NOTE: According to the spec, execute_async should take the cursor's source
-        // (which may be an index). Using effective_object_store here is a temporary
-        // workaround until execute_async supports ObjectStoreOrIndex as source.
-        IDBRequest::execute_async(
-            cx,
-            &self.effective_object_store(),
-            |callback| {
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
-                    callback,
-                    key_range: range,
-                })
-            },
-            Some(request),
-            Some(iteration_param),
-        )?;
-
-        Ok(())
+        self.iterate(cx, key, None, 1)
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-continueprimarykey>
@@ -553,39 +715,13 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         self.got_value.set(false);
 
         // Step 18: Let request be the request created when this cursor was created.
-        let request = self.Request();
-
         // Step 19: Unset the request's done flag on request.
-        request.unset_done_flag();
+        self.Request().unset_done_flag();
 
         // Step 20: Run the steps to asynchronously execute a request with the cursor's source as
         // source, the steps to iterate a cursor as operation and request, using the current Realm
         // as targetRealm, this cursor, key and primaryKey.
-        let iteration_param = IterationParam {
-            cursor: Trusted::new(self),
-            key: Some(key),
-            primary_key: Some(primary_key),
-            count: None,
-        };
-
-        let range = self.range.clone();
-        // NOTE: According to the spec, execute_async should take the cursor's source
-        // (which may be an index). Using effective_object_store here is a temporary
-        // workaround until execute_async supports ObjectStoreOrIndex as source.
-        IDBRequest::execute_async(
-            cx,
-            &self.effective_object_store(),
-            |callback| {
-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
-                    callback,
-                    key_range: range,
-                })
-            },
-            Some(request),
-            Some(iteration_param),
-        )?;
-
-        Ok(())
+        self.iterate(cx, Some(key), Some(primary_key), 1)
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-update>
@@ -623,7 +759,7 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
         // Step 8. Let clone be a clone of value in targetRealm during transaction. Rethrow any
         // exceptions.
         rooted!(&in(cx) let mut cloned_js_value = NullValue());
-        effective_object_store.clone_value_in_target_realm(
+        let serialized_value = effective_object_store.clone_value_in_target_realm(
             cx,
             value,
             cloned_js_value.handle_mut(),
@@ -659,29 +795,20 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
             }
         }
 
-        let cloned_value = structuredclone::write(cx, cloned_js_value.handle(), None)?;
-        let Ok(serialized_value) = postcard::to_stdvec(&cloned_value) else {
-            return Err(Error::InvalidState(Some(
-                "Failed to serialize cloned value".to_owned(),
-            )));
-        };
-
         // Step 10. Let operation be an algorithm to run store a record into an object store with
         // this's effective object store, clone, this's effective key, and false.
+        let index_keys = effective_object_store.index_keys(cx, cloned_js_value.handle(), false);
         // Step 11. Return the result (an IDBRequest) of running asynchronously execute a request
         // with this and operation.
         IDBRequest::execute_async(
             cx,
-            &effective_object_store,
-            |callback| {
-                AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
-                    callback,
-                    key: self.effective_key(),
-                    value: serialized_value,
-                    should_overwrite: true,
-                    key_generator_current_number: None,
-                })
-            },
+            RequestSource::Cursor(self),
+            AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
+                key: self.effective_key(),
+                value: serialized_value,
+                should_overwrite: true,
+                index_keys,
+            }),
             None,
             None,
         )
@@ -728,314 +855,96 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
 
         IDBRequest::execute_async(
             cx,
-            &effective_object_store,
-            |callback| {
-                AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
-                    callback,
-                    key_range: IndexedDBKeyRange::only(effective_key),
-                })
-            },
+            RequestSource::Cursor(self),
+            AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
+                key_range: IndexedDBKeyRange::only(effective_key),
+            }),
             None,
             None,
         )
     }
 }
 
-/// A struct containing parameters for
-/// <https://www.w3.org/TR/IndexedDB-3/#iterate-a-cursor>
+/// The cursor that a request runs <https://www.w3.org/TR/IndexedDB-3/#iterate-a-cursor> for.
 #[derive(Clone)]
 pub(crate) struct IterationParam {
     pub(crate) cursor: Trusted<IDBCursor>,
-    pub(crate) key: Option<IndexedDBKeyType>,
-    pub(crate) primary_key: Option<IndexedDBKeyType>,
-    pub(crate) count: Option<u32>,
 }
 
-/// <https://www.w3.org/TR/IndexedDB-3/#iterate-a-cursor>
+/// <https://www.w3.org/TR/IndexedDB-3/#iterate-a-cursor>, with `records` from the backend, which
+/// ran steps 2 to 9 but the cursor's changes (see `IDBCursor::iterate_operation`): first the
+/// record that the cursor moves to, none if it moves past the end.
 ///
-/// NOTE: Be cautious: this part of the specification seems to assume the cursor’s source is an
-/// index. Therefore,
-///   "record’s key" means the key of the record,
-///   "record’s value" means the primary key of the record, and
-///   "record’s referenced value" means the value of the record.
+/// NOTE: For an index source, "record’s key" is the index key, "record’s value" the primary key
+/// of the record in the object store, and "record’s referenced value" the value of that record.
 pub(crate) fn iterate_cursor(
-    global: &GlobalScope,
     cx: &mut JSContext,
     param: &IterationParam,
     records: Vec<IndexedDBRecord>,
 ) -> Result<Option<DomRoot<IDBCursor>>, Error> {
-    // Unpack IterationParam
     let cursor = param.cursor.root();
-    let key = param.key.clone();
-    let primary_key = param.primary_key.clone();
-    let count = param.count;
 
     // Step 1. Let source be cursor’s source.
     let source = &cursor.source;
 
-    // Step 2. Let direction be cursor’s direction.
-    let direction = cursor.direction;
-
-    // Step 3. Assert: if primaryKey is given, source is an index and direction is "next" or "prev".
-    if primary_key.is_some() {
-        assert!(matches!(source, ObjectStoreOrIndex::Index(..)));
-        assert!(matches!(
-            direction,
-            IDBCursorDirection::Next | IDBCursorDirection::Prev
-        ));
-    }
-
-    // Step 4. Let records be the list of records in source.
-    // NOTE: It is given as a function parameter.
-
-    // Step 5. Let range be cursor’s range.
-    let range = &cursor.range;
-
-    // Step 6. Let position be cursor’s position.
-    let mut position = cursor.position.borrow().clone();
-
-    // Step 7. Let object store position be cursor’s object store position.
-    let mut object_store_position = cursor.object_store_position.borrow().clone();
-
-    // Step 8. If count is not given, let count be 1.
-    let mut count = count.unwrap_or(1);
-
-    let mut found_record: Option<&IndexedDBRecord> = None;
-
-    // Step 9. While count is greater than 0:
-    while count > 0 {
-        // Step 9.1. Switch on direction:
-        found_record = match direction {
-            // "next"
-            IDBCursorDirection::Next => records.iter().find(|record| {
-                // Let found record be the first record in records which satisfy all of the
-                // following requirements:
-
-                // If key is defined, the record’s key is greater than or equal to key.
-                let requirement1 = || match &key {
-                    Some(key) => &record.key >= key,
-                    None => true,
-                };
-
-                // If primaryKey is defined, the record’s key is equal to key and the record’s
-                // value is greater than or equal to primaryKey, or the record’s key is greater
-                // than key.
-                let requirement2 = || match &primary_key {
-                    Some(primary_key) => key.as_ref().is_some_and(|key| {
-                        (&record.key == key && &record.primary_key >= primary_key) ||
-                            &record.key > key
-                    }),
-                    _ => true,
-                };
-
-                // If position is defined, and source is an object store, the record’s key is
-                // greater than position.
-                let requirement3 = || match (&position, source) {
-                    (Some(position), ObjectStoreOrIndex::ObjectStore(_)) => &record.key > position,
-                    _ => true,
-                };
-
-                // If position is defined, and source is an index, the record’s key is equal to
-                // position and the record’s value is greater than object store position or the
-                // record’s key is greater than position.
-                let requirement4 = || match (&position, source) {
-                    (Some(position), ObjectStoreOrIndex::Index(_)) => {
-                        (&record.key == position &&
-                            object_store_position.as_ref().is_some_and(
-                                |object_store_position| &record.primary_key > object_store_position,
-                            )) ||
-                            &record.key > position
-                    },
-                    _ => true,
-                };
-
-                // The record’s key is in range.
-                let requirement5 = || range.contains(&record.key);
-
-                // NOTE: Use closures here for lazy computation on requirements.
-                requirement1() &&
-                    requirement2() &&
-                    requirement3() &&
-                    requirement4() &&
-                    requirement5()
-            }),
-            // "nextunique"
-            IDBCursorDirection::Nextunique => records.iter().find(|record| {
-                // Let found record be the first record in records which satisfy all of the
-                // following requirements:
-
-                // If key is defined, the record’s key is greater than or equal to key.
-                let requirement1 = || match &key {
-                    Some(key) => &record.key >= key,
-                    None => true,
-                };
-
-                // If position is defined, the record’s key is greater than position.
-                let requirement2 = || match &position {
-                    Some(position) => &record.key > position,
-                    None => true,
-                };
-
-                // The record’s key is in range.
-                let requirement3 = || range.contains(&record.key);
-
-                // NOTE: Use closures here for lazy computation on requirements.
-                requirement1() && requirement2() && requirement3()
-            }),
-            // "prev"
-            IDBCursorDirection::Prev => {
-                records.iter().rev().find(|&record| {
-                    // Let found record be the last record in records which satisfy all of the
-                    // following requirements:
-
-                    // If key is defined, the record’s key is less than or equal to key.
-                    let requirement1 = || match &key {
-                        Some(key) => &record.key <= key,
-                        None => true,
-                    };
-
-                    // If primaryKey is defined, the record’s key is equal to key and the record’s
-                    // value is less than or equal to primaryKey, or the record’s key is less than
-                    // key.
-                    let requirement2 = || match &primary_key {
-                        Some(primary_key) => key.as_ref().is_some_and(|key| {
-                            (&record.key == key && &record.primary_key <= primary_key) ||
-                                &record.key < key
-                        }),
-                        _ => true,
-                    };
-
-                    // If position is defined, and source is an object store, the record’s key is
-                    // less than position.
-                    let requirement3 = || match (&position, source) {
-                        (Some(position), ObjectStoreOrIndex::ObjectStore(_)) => {
-                            &record.key < position
-                        },
-                        _ => true,
-                    };
-
-                    // If position is defined, and source is an index, the record’s key is equal to
-                    // position and the record’s value is less than object store position or the
-                    // record’s key is less than position.
-                    let requirement4 = || match (&position, source) {
-                        (Some(position), ObjectStoreOrIndex::Index(_)) => {
-                            (&record.key == position &&
-                                object_store_position.as_ref().is_some_and(
-                                    |object_store_position| {
-                                        &record.primary_key < object_store_position
-                                    },
-                                )) ||
-                                &record.key < position
-                        },
-                        _ => true,
-                    };
-
-                    // The record’s key is in range.
-                    let requirement5 = || range.contains(&record.key);
-
-                    // NOTE: Use closures here for lazy computation on requirements.
-                    requirement1() &&
-                        requirement2() &&
-                        requirement3() &&
-                        requirement4() &&
-                        requirement5()
-                })
-            },
-            // "prevunique"
-            IDBCursorDirection::Prevunique => records
-                .iter()
-                .rev()
-                .find(|&record| {
-                    // Let temp record be the last record in records which satisfy all of the
-                    // following requirements:
-
-                    // If key is defined, the record’s key is less than or equal to key.
-                    let requirement1 = || match &key {
-                        Some(key) => &record.key <= key,
-                        None => true,
-                    };
-
-                    // If position is defined, the record’s key is less than position.
-                    let requirement2 = || match &position {
-                        Some(position) => &record.key < position,
-                        None => true,
-                    };
-
-                    // The record’s key is in range.
-                    let requirement3 = || range.contains(&record.key);
-
-                    // NOTE: Use closures here for lazy computation on requirements.
-                    requirement1() && requirement2() && requirement3()
-                })
-                // If temp record is defined, let found record be the first record in records
-                // whose key is equal to temp record’s key.
-                .map(|temp_record| {
-                    records
-                        .iter()
-                        .find(|&record| record.key == temp_record.key)
-                        .expect(
-                            "Record with key equal to temp record's key should exist in records",
-                        )
-                }),
-        };
-
-        match found_record {
-            // Step 9.2. If found record is not defined, then:
-            None => {
-                // Step 9.2.1. Set cursor’s key to undefined.
-                cursor.set_key(None);
-
-                // Step 9.2.2. If source is an index, set cursor’s object store position to undefined.
-                if matches!(source, ObjectStoreOrIndex::Index(_)) {
-                    cursor.set_object_store_position(None);
-                }
-
-                // Step 9.2.3. If cursor’s key only flag is unset, set cursor’s value to undefined.
-                if !cursor.key_only {
-                    cursor.value.set(UndefinedValue());
-                }
-
-                // Step 9.2.4. Return null.
-                return Ok(None);
-            },
-            Some(found_record) => {
-                // Step 9.3. Let position be found record’s key.
-                position = Some(found_record.key.clone());
-
-                // Step 9.4. If source is an index, let object store position be found record’s value.
-                if matches!(source, ObjectStoreOrIndex::Index(_)) {
-                    object_store_position = Some(found_record.primary_key.clone());
-                }
-
-                // Step 9.5. Decrease count by 1.
-                count -= 1;
-            },
+    // Steps 2-9.1: the backend found the record, after count - 1 rounds of step 9.
+    let mut records = VecDeque::from(records);
+    let found_record = records.pop_front();
+    // The records after it are those that the next steps without a key find, as of the request.
+    // A transaction that is finishing or finished takes no more steps.
+    if cursor.fetch_pending.replace(false) && cursor.transaction.is_usable() {
+        let writes = cursor.last_fetch.get().map_or(0, |fetch| fetch.writes);
+        if !records.is_empty() {
+            cursor.transaction.note_prefetching_cursor(&cursor);
         }
+        *cursor.prefetched.borrow_mut() = Prefetched { records, writes };
     }
-    let found_record =
-        found_record.expect("The while loop above guarantees found_record is defined");
+    let Some(found_record) = found_record else {
+        // Step 9.2. If found record is not defined, then:
+        // Step 9.2.1. Set cursor’s key to undefined.
+        cursor.set_key(None);
 
+        // Step 9.2.2. If source is an index, set cursor’s object store position to undefined.
+        if matches!(source, ObjectStoreOrIndex::Index(_)) {
+            cursor.set_object_store_position(None);
+        }
+
+        // Step 9.2.3. If cursor’s key only flag is unset, set cursor’s value to undefined.
+        if !cursor.key_only {
+            cursor.value.set(UndefinedValue());
+        }
+
+        // Step 9.2.4. Return null.
+        return Ok(None);
+    };
+
+    // Step 9.3. Let position be found record’s key.
     // Step 10. Set cursor’s position to position.
-    cursor.set_position(position);
+    cursor.set_position(Some(found_record.key.clone()));
 
+    // Step 9.4. If source is an index, let object store position be found record’s value.
     // Step 11. If source is an index, set cursor’s object store position to object store position.
     if let ObjectStoreOrIndex::Index(_) = source {
-        cursor.set_object_store_position(object_store_position);
+        cursor.set_object_store_position(Some(found_record.primary_key.clone()));
     }
 
     // Step 12. Set cursor’s key to found record’s key.
-    cursor.set_key(Some(found_record.key.clone()));
+    cursor.set_key(Some(found_record.key));
 
     // Step 13. If cursor’s key only flag is unset, then:
     if !cursor.key_only {
         // Step 13.1. Let serialized be found record’s referenced value.
         // Step 13.2. Set cursor’s value to ! StructuredDeserialize(serialized, targetRealm)
+        let serialized = found_record
+            .value
+            .ok_or_else(|| Error::Unknown(Some("A cursor record without its value".to_owned())))?;
         rooted!(&in(cx) let mut new_cursor_value = UndefinedValue());
-        postcard::from_bytes(&found_record.value)
-            .map_err(|_| Error::Data(None))
-            .and_then(|data| {
-                structuredclone::read(cx, global, data, new_cursor_value.handle_mut())
-            })?;
+        cursor.effective_object_store().deserialize_value(
+            cx,
+            &found_record.primary_key,
+            &serialized,
+            new_cursor_value.handle_mut(),
+        )?;
         cursor.value.set(new_cursor_value.get());
     }
 

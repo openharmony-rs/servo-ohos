@@ -1,0 +1,797 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 18:43:04 +0000
+Subject: [PATCH] indexeddb: Evict a cached page that holds back another page's
+ request or transaction
+
+A document in the back/forward cache never finishes its IndexedDB
+transactions or upgrades: the event loop holds back its tasks, and with
+them the results on its connections' result channels, so script never
+commits. A page that wrote on pagehide (the pattern of WPT
+back-forward-cache-open-transaction) and then went into the cache held
+back, until the user went back to it or it was evicted for another
+reason:
+
+- a delete or upgrade of the next page, if the cached page closed its
+  connection: the closing connection waits for the write's transaction,
+  gets no versionchange event, and the request fired nothing at all;
+- a transaction of the next page on the same store, which the scheduler
+  holds behind the earlier writer;
+- every request queued behind an open whose upgrade runs in the cached
+  page.
+
+Do what Chromium's DisallowInactiveClient does: the backend sends
+ConnectionEvent::EvictIfInactive to the connection that holds the others
+back, and script, through the task without a pipeline that versionchange
+events take, evicts the connection's document if it isn't fully active
+and ignores the event otherwise (workers ignore it). The backend sends
+it
+
+- for a delete or upgrade that, once its versionchange events were
+  reported, waits for a connection whose close is pending (once per
+  request);
+- for a transaction that can't start, to the connections of the
+  transactions that keep it from starting (once per waiting
+  transaction, also for a commit without requests);
+- for an open request whose upgrade runs while a request is queued
+  behind it.
+
+A cached page that nothing waits for is still restored
+(back-forward-cache-open-transaction).
+
+Also fire blocked for a connection whose close was already pending when
+the request fired its versionchange events, as the spec and Chromium do,
+so that the waiting page hears something: Chromium's IDBDatabase reports
+VersionChangeIgnored for a close-pending connection, which makes its
+backend send blocked. A connection that the page closes in its
+versionchange handler still doesn't block while its transactions finish,
+as in Chromium and Gecko.
+
+The fork test back-forward-cache-held-back.window.js covers the four
+cases with RemoteContextHelper: a pagehide write and close followed by a
+delete and by an upgrade, a pagehide write without close followed by a
+read, and an open on pagehide whose upgrade a later open waits for.
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits` at this commit: 163 passed, 1 skipped (new: test_indexeddb_delete_blocked_by_a_closing_connection_asks_it_to_evict, test_indexeddb_held_back_transaction_asks_the_holder_to_evict, test_indexeddb_request_queued_behind_an_upgrade_asks_it_to_evict; the close-pending and request-order tests now expect blocked and the eviction requests; the first run had the known webstorage clear_data_for_sites_local timeout, which passed 20 of 20 alone); the new /_mozilla/IndexedDB/back-forward-cache-held-back.window.html passes 4 of 4 on host SM and QuickJS and times out on a binary whose script ignores EvictIfInactive (P5.3/review-fixes/bfc-neg.raw); the P5 review's probes, two runs each (P5.3/review-fixes/probe): a delete after a pagehide write and close gives blocked old=1 and deleted old=1, an upgrade gives blocked, upgradeneeded old=1 and success version=2, a read after a pagehide write without close completes with undefined, where all three stalled before, and the controls without the write are unchanged; IndexedDB/back-forward-cache-open-transaction, whose cached page nothing waits for, is still restored; on the stack tip host SM IndexedDB/ 4,484 of 4,511 in 3 of 3 back-to-back runs and QuickJS 4,484 in 14 of 15 runs (one whole-test timeout of idb-explicit-commit.any.html, 15 of 15 alone), every other result as expected, /_mozilla/IndexedDB/ 318 of 318 SM and 316 of 318 QuickJS (interface lists, as before), /workers/ 337 tests and html/browsers/browsing-the-web/back-forward-cache/ 23 tests as expected on SM; DAYU200 (QuickJS + RDB) IndexedDB/ 4,461 and 4,470 of 4,511 in two runs (P5.3: 4,468 to 4,476), unexpected only file_support (WebDriver send_keys) and idb-partitioned-coverage (iframe slowness), as before, /_mozilla/IndexedDB/ 316 of 316 with both back/forward cache fork tests 4 of 4; device unit tests RDB only 168 passed, 3 skipped, both backends 304 passed, 4 skipped
+AI-assisted: Yes (agent session; the agent designed and implemented the eviction requests and the blocked change, wrote the integration and fork tests, re-ran the review's probes and measured host and board)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../script/dom/indexeddb/idbdatabase.rs       |   1 +
+ components/script/dom/indexeddb/idbfactory.rs |  14 +-
+ components/shared/storage/indexeddb.rs        |   6 +
+ components/storage/indexeddb/mod.rs           | 137 ++++++++++++--
+ components/storage/tests/indexeddb.rs         | 173 +++++++++++++++++-
+ tests/wpt/mozilla/meta/MANIFEST.json          |  39 ++++
+ .../back-forward-cache-held-back.window.js    | 144 +++++++++++++++
+ 7 files changed, 490 insertions(+), 24 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/back-forward-cache-held-back.window.js
+
+diff --git a/components/script/dom/indexeddb/idbdatabase.rs b/components/script/dom/indexeddb/idbdatabase.rs
+index 0b8237bf21d..04a84c1aff8 100644
+--- a/components/script/dom/indexeddb/idbdatabase.rs
++++ b/components/script/dom/indexeddb/idbdatabase.rs
+@@ -200,6 +200,7 @@ impl IDBDatabase {
+                 }
+             },
+             ConnectionEvent::ForcedClose => self.close_by_user_agent(cx),
++            ConnectionEvent::EvictIfInactive => {},
+         }
+     }
+ 
+diff --git a/components/script/dom/indexeddb/idbfactory.rs b/components/script/dom/indexeddb/idbfactory.rs
+index 939ccd30335..730a00bd159 100644
+--- a/components/script/dom/indexeddb/idbfactory.rs
++++ b/components/script/dom/indexeddb/idbfactory.rs
+@@ -247,11 +247,18 @@ impl IDBFactory {
+             // A versionchange event at a connection of a document in the back/forward cache would
+             // wait there until the document is shown again, and the upgrade or delete with it.
+             // Like Gecko and Chromium, Servo evicts the document instead, which closes the
+-            // connection; the IndexedDB specification doesn't say. A forced close is the same.
++            // connection; the IndexedDB specification doesn't say. A forced close is the same,
++            // and so is the backend's request to evict a document that holds back another
++            // request or transaction, which is all that it asks for. Workers aren't cached.
++            if matches!(event, ConnectionEvent::EvictIfInactive) && !in_window {
++                return;
++            }
+             if in_window &&
+                 matches!(
+                     event,
+-                    ConnectionEvent::VersionChange { .. } | ConnectionEvent::ForcedClose
++                    ConnectionEvent::VersionChange { .. } |
++                        ConnectionEvent::ForcedClose |
++                        ConnectionEvent::EvictIfInactive
+                 )
+             {
+                 let event_task_source = task_source.clone();
+@@ -262,6 +269,9 @@ impl IDBFactory {
+                         {
+                             window.Document().evict_from_back_forward_cache();
+                         }
++                        if matches!(event, ConnectionEvent::EvictIfInactive) {
++                            return;
++                        }
+                         // The event itself is a normal task, behind the tasks held back so far,
+                         // such as the open request's success that created the connection. It is
+                         // dropped with an evicted document, and fired if the document was shown
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 0faadaee519..0ce3e8317af 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -773,6 +773,12 @@ pub enum ConnectionEvent {
+     /// backend can't use the database any more and has set the connection's close pending flag.
+     /// Script aborts the connection's transactions and fires close once they have finished.
+     ForcedClose,
++    /// Another request or transaction waits for this connection: for its transaction, for it to
++    /// close, or for the upgrade that its open request runs. Script evicts the connection's
++    /// document from the back/forward cache if it isn't fully active, as a cached document's
++    /// tasks are held back and it would never finish, and ignores the event otherwise. This is
++    /// Chromium's DisallowInactiveClient; the IndexedDB specification doesn't cover it.
++    EvictIfInactive,
+ }
+ 
+ /// What the backend reports about a request to delete a database
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 20577c289a7..2eed142fad8 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -88,6 +88,9 @@ struct TxnInfo {
+     started: bool,
+     /// The result channel of the transaction's connection.
+     results: GenericCallback<ConnectionEvent>,
++    /// Whether the connections of the transactions that keep this one from starting were asked
++    /// to evict their documents if they aren't fully active.
++    holders_asked: bool,
+ }
+ 
+ #[derive(MallocSizeOf)]
+@@ -153,6 +156,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+                 live: true,
+                 started: false,
+                 results,
++                holders_asked: false,
+             },
+         );
+         self.transactions
+@@ -263,6 +267,54 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+         }
+     }
+ 
++    /// Whether the transaction `other` keeps `waiting` from starting, by the rules of
++    /// [`Self::can_start_by_spec`].
++    fn holds_back(waiting: &TxnInfo, other: &TxnInfo) -> bool {
++        if !other.live {
++            return false;
++        }
++        let earlier_overlapping =
++            other.created_seq < waiting.created_seq && Self::scopes_overlap(waiting, other);
++        match waiting.mode {
++            IndexedDBTxnMode::Readonly => {
++                earlier_overlapping && other.mode != IndexedDBTxnMode::Readonly
++            },
++            IndexedDBTxnMode::Readwrite | IndexedDBTxnMode::Versionchange => {
++                earlier_overlapping || (other.started && other.mode != IndexedDBTxnMode::Readonly)
++            },
++        }
++    }
++
++    /// Asks the connections of the transactions that keep `txn` from starting to evict their
++    /// documents if they aren't fully active, once for each transaction that waits: a cached
++    /// document never finishes its transactions, as its tasks are held back, so `txn` would wait
++    /// until the user goes back to that page.
++    fn ask_holders_to_evict_if_inactive(&mut self, txn: IndexedDBTxnId) {
++        let Some(waiting) = self
++            .txn_info
++            .get(&txn)
++            .filter(|waiting| !waiting.holders_asked)
++        else {
++            return;
++        };
++        let holders: Vec<GenericCallback<ConnectionEvent>> = self
++            .txn_info
++            .iter()
++            .filter(|(other_txn, other)| {
++                other_txn.connection != txn.connection && Self::holds_back(waiting, other)
++            })
++            .map(|(_, other)| other.results.clone())
++            .collect();
++        if let Some(waiting) = self.txn_info.get_mut(&txn) {
++            waiting.holders_asked = true;
++        }
++        for results in holders {
++            if results.send(ConnectionEvent::EvictIfInactive).is_err() {
++                debug!("Script went away before it was asked to evict a page");
++            }
++        }
++    }
++
+     /// Whether a readwrite or versionchange transaction other than `txn` has started and is
+     /// still live. The engine runs each such transaction as the one SQL transaction of its
+     /// connection, so writers run one after another, also those with disjoint scopes.
+@@ -352,6 +404,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+                 if self.queued_readonly_set.insert(txn) {
+                     self.queued_readonly.push_back(txn);
+                 }
++                self.ask_holders_to_evict_if_inactive(txn);
+                 continue;
+             }
+ 
+@@ -391,6 +444,7 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
+                 if self.queued_readwrite_set.insert(txn) {
+                     self.queued_readwrite.push_back(txn);
+                 }
++                self.ask_holders_to_evict_if_inactive(txn);
+                 continue;
+             }
+ 
+@@ -747,6 +801,8 @@ enum OpenRequestState {
+ struct ConnectionsToClose {
+     /// openConnections.
+     connections: Vec<Uuid>,
++    /// The connections that were fired a versionchange event at.
++    fired: HashSet<Uuid>,
+     /// The connections that were fired a versionchange event at, and that have neither reported
+     /// it dispatched nor closed.
+     versionchange: HashSet<Uuid>,
+@@ -754,8 +810,8 @@ struct ConnectionsToClose {
+     old_version: u64,
+     /// The version that the open request asks for, or `None` for a delete.
+     new_version: Option<u64>,
+-    /// Whether a blocked event was fired at the request.
+-    blocked: bool,
++    /// Whether the request checked if it is blocked, once all versionchange events were fired.
++    checked_blocked: bool,
+ }
+ 
+ impl OpenRequest {
+@@ -819,6 +875,17 @@ impl OpenRequest {
+         }
+     }
+ 
++    /// Asks the global of this open request, whose upgrade runs, to evict its document if it
++    /// isn't fully active: the requests queued behind it wait for the upgrade, which a document
++    /// in the back/forward cache never finishes.
++    fn ask_to_evict_if_inactive(&self) {
++        if let OpenRequestKind::Open { results, .. } = &self.kind &&
++            results.send(ConnectionEvent::EvictIfInactive).is_err()
++        {
++            debug!("Script went away during an IndexedDB open request");
++        }
++    }
++
+     /// Fires a blocked event at the request: open step 10.4, delete step 8.
+     fn fire_blocked(&self, name: &Utf16String, old_version: u64, new_version: Option<u64>) {
+         match (&self.kind, new_version) {
+@@ -1223,10 +1290,13 @@ impl IndexedDBManager {
+             });
+         // Step 1: Let queue be the connection queue for storageKey and name.
+         // Step 2: Add request to queue.
+-        self.connection_queues
+-            .entry(key.clone())
+-            .or_default()
+-            .push_back(request);
++        let queue = self.connection_queues.entry(key.clone()).or_default();
++        if let Some(front) = queue.front() &&
++            matches!(front.state, OpenRequestState::Upgrading(_))
++        {
++            front.ask_to_evict_if_inactive();
++        }
++        queue.push_back(request);
+         if failed {
+             self.advance_connection_queue(key);
+         }
+@@ -1420,24 +1490,37 @@ impl IndexedDBManager {
+             return false;
+         }
+ 
+-        let still_open: Vec<&Connection> = wait
++        let still_open: Vec<(&Uuid, &Connection)> = wait
+             .connections
+             .iter()
+-            .filter_map(|id| connections.and_then(|connections| connections.get(id)))
++            .filter_map(|id| connections.and_then(|connections| connections.get_key_value(id)))
+             .collect();
+-        let (old_version, new_version) = (wait.old_version, wait.new_version);
+         // Open step 10.4, delete step 8: If any of the connections in openConnections are still
+         // not closed, queue a database task to fire a version change event named blocked at
+         // request with db’s version and version (null for a delete).
+-        // Note: as in Gecko and Chromium, a connection whose close is pending doesn't block: it
+-        // closes once its transactions have finished, without the page doing anything.
+-        let blocked = !wait.blocked &&
+-            still_open
+-                .iter()
+-                .any(|connection| !connection.close_pending);
+-        wait.blocked |= blocked;
+-        if blocked {
+-            request.fire_blocked(&key.name, old_version, new_version);
++        // Note: as in Gecko and Chromium, a connection that the page closed in its versionchange
++        // handler doesn't block while its transactions finish. One whose close was pending
++        // before, which got no versionchange event, does, as in Chromium. A connection whose
++        // close is pending waits for its transactions, which a document in the back/forward cache
++        // never finishes, so its document is asked to leave the cache if it isn't fully active.
++        let (old_version, new_version) = (wait.old_version, wait.new_version);
++        if !wait.checked_blocked {
++            wait.checked_blocked = true;
++            let mut blocked = false;
++            for (id, connection) in &still_open {
++                blocked |= !connection.close_pending || !wait.fired.contains(id);
++                if connection.close_pending &&
++                    connection
++                        .results
++                        .send(ConnectionEvent::EvictIfInactive)
++                        .is_err()
++                {
++                    debug!("Script went away before it was asked to evict a page");
++                }
++            }
++            if blocked {
++                request.fire_blocked(&key.name, old_version, new_version);
++            }
+         }
+ 
+         // Open step 10.5, delete step 9: Wait until all connections in openConnections are
+@@ -1771,6 +1854,15 @@ impl IndexedDBManager {
+             object_stores,
+         });
+ 
++        if self
++            .connection_queues
++            .get(key)
++            .is_some_and(|queue| queue.len() > 1) &&
++            let Some(open_request) = self.front_request(key)
++        {
++            open_request.ask_to_evict_if_inactive();
++        }
++
+         // Step 11: Wait for transaction to finish.
+         // Note: see `handle_upgrade_transaction_finished`.
+     }
+@@ -2019,10 +2111,11 @@ impl IndexedDBManager {
+             if let Some(request) = self.front_request_mut(key) {
+                 request.state = OpenRequestState::WaitingForConnections(ConnectionsToClose {
+                     connections,
++                    fired: versionchange.clone(),
+                     versionchange,
+                     old_version: db_version,
+                     new_version: Some(version),
+-                    blocked: false,
++                    checked_blocked: false,
+                 });
+             }
+ 
+@@ -2094,10 +2187,11 @@ impl IndexedDBManager {
+         if let Some(request) = self.front_request_mut(key) {
+             request.state = OpenRequestState::WaitingForConnections(ConnectionsToClose {
+                 connections,
++                fired: versionchange.clone(),
+                 versionchange,
+                 old_version,
+                 new_version: None,
+-                blocked: false,
++                checked_blocked: false,
+             });
+         }
+ 
+@@ -2343,6 +2437,9 @@ impl IndexedDBManager {
+                             db.commit(txn);
+                         } else {
+                             db.pending_commits.insert(txn);
++                            if !db.can_start_by_spec(txn) {
++                                db.ask_holders_to_evict_if_inactive(txn);
++                            }
+                         }
+                         db.schedule_transactions(origin, &db_name);
+                     },
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index 162d2cb0b9f..f9602250589 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -93,6 +93,9 @@ backend_tests!(
+     test_indexeddb_databases_of_an_earlier_session_are_listed_deleted_and_opened,
+     test_indexeddb_database_of_an_earlier_session_is_deleted_without_being_listed,
+     test_indexeddb_database_left_at_version_0_by_an_earlier_session_opens_as_new,
++    test_indexeddb_delete_blocked_by_a_closing_connection_asks_it_to_evict,
++    test_indexeddb_held_back_transaction_asks_the_holder_to_evict,
++    test_indexeddb_request_queued_behind_an_upgrade_asks_it_to_evict,
+ );
+ 
+ static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+@@ -2843,7 +2846,10 @@ fn test_indexeddb_open_and_delete_requests_run_in_order() {
+ 
+     let (open1_connection, old_version) = upgrade_without_changes(&ctx, db_name, &open1, 2);
+     assert_eq!((open1_connection, old_version), (open1_id, 1));
+-    wait_for_events(open1_connection, 3);
++    // Upgrade, EvictIfInactive for the requests queued behind the upgrade, Connection,
++    // VersionChange.
++    wait_for_events(open1_connection, 4);
++    assert_eq!(evict_requests(open1_connection), 1);
+     assert_eq!(
+         versionchange_events(open1_connection),
+         vec![format!(
+@@ -2865,7 +2871,8 @@ fn test_indexeddb_open_and_delete_requests_run_in_order() {
+ 
+     let (open2_connection, old_version) = upgrade_without_changes(&ctx, db_name, &open2, 3);
+     assert_eq!(old_version, 0, "delete1 deleted the database");
+-    wait_for_events(open2_connection, 3);
++    wait_for_events(open2_connection, 4);
++    assert_eq!(evict_requests(open2_connection), 1);
+     assert_eq!(
+         versionchange_events(open2_connection),
+         vec![format!(
+@@ -2978,11 +2985,22 @@ fn test_indexeddb_closed_connection_holds_back_the_upgrade_until_its_transaction
+     close_database(&ctx, connection, db_name);
+ 
+     let upgrade = open_database(&ctx, db_name, Some(2));
++    // The closing connection gets no versionchange event, so it blocks the open, and its
++    // document is asked to leave the back/forward cache if it is there.
++    match recv_callback_timeout(&upgrade, "blocked") {
++        ConnectionMsg::Blocked {
++            version,
++            old_version,
++            ..
++        } => assert_eq!((version, old_version), (2, 1)),
++        other => panic!("unexpected open message: {other:?}"),
++    }
+     assert_nothing(
+         &upgrade,
+         "upgrade while a transaction of the closed connection runs",
+     );
+     assert!(versionchange_events(connection).is_empty());
++    assert_eq!(evict_requests(connection), 1);
+ 
+     let commit = commit_transaction(&ctx, db_name, txn);
+     assert!(recv_callback_timeout(&commit, "commit").is_ok());
+@@ -3266,3 +3284,154 @@ fn test_indexeddb_database_left_at_version_0_by_an_earlier_session_opens_as_new(
+     assert_eq!(databases(&ctx), vec![(db_name.to_owned(), 1)]);
+     ctx.shutdown();
+ }
++
++/// How often the backend asked the document of `connection` to leave the back/forward cache if it
++/// is there.
++fn evict_requests(connection: Uuid) -> usize {
++    ROUTES
++        .lock()
++        .unwrap()
++        .events
++        .get(&connection)
++        .into_iter()
++        .flatten()
++        .filter(|event| *event == "EvictIfInactive")
++        .count()
++}
++
++/// A delete that waits for a connection whose close is pending, as its transaction still runs, is
++/// blocked, and asks the connection's document to leave the back/forward cache if it is there:
++/// a cached document never finishes its transactions (WPT back-forward-cache-open-transaction's
++/// pagehide pattern followed by a delete).
++fn test_indexeddb_delete_blocked_by_a_closing_connection_asks_it_to_evict() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-delete-blocked-by-a-closing-connection";
++    let connection = open_database_with_two_stores(&ctx, db_name);
++    let txn = create_transaction(
++        &ctx,
++        db_name,
++        connection,
++        IndexedDBTxnMode::Readwrite,
++        vec![A],
++    );
++    let put = put_item(
++        &ctx,
++        db_name,
++        A,
++        txn,
++        IndexedDBKeyType::Number(1.0),
++        b"written on pagehide".to_vec(),
++    );
++    assert!(recv_callback_timeout(&put, "put").is_ok());
++    close_database(&ctx, connection, db_name);
++
++    let (_, delete) = delete_database(&ctx, db_name);
++    match recv_callback_timeout(&delete, "blocked") {
++        DeleteDatabaseEvent::Blocked { old_version } => assert_eq!(old_version, 1),
++        other => panic!("unexpected delete event: {other:?}"),
++    }
++    assert_eq!(evict_requests(connection), 1);
++    assert_nothing(
++        &delete,
++        "delete while the closing connection's transaction runs",
++    );
++
++    abort_transaction(&ctx, db_name, txn);
++    finish_transaction(&ctx, db_name, txn);
++    match recv_callback_timeout(&delete, "delete result") {
++        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(1)),
++        other => panic!("unexpected delete event: {other:?}"),
++    }
++    assert_eq!(evict_requests(connection), 1);
++    ctx.shutdown();
++}
++
++/// A transaction that waits for a live transaction of another connection asks that connection's
++/// document, once, to leave the back/forward cache if it is there (Chromium's
++/// DisallowInactiveClient); one that doesn't wait asks nothing.
++fn test_indexeddb_held_back_transaction_asks_the_holder_to_evict() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-held-back-transaction";
++    let holder = open_database_with_two_stores(&ctx, db_name);
++    let other = match recv_callback_timeout(&open_database(&ctx, db_name, None), "open") {
++        ConnectionMsg::Connection { id, .. } => id,
++        message => panic!("unexpected open message: {message:?}"),
++    };
++    let writer = create_transaction(&ctx, db_name, holder, IndexedDBTxnMode::Readwrite, vec![A]);
++    let put = put_item(
++        &ctx,
++        db_name,
++        A,
++        writer,
++        IndexedDBKeyType::Number(1.0),
++        b"written on pagehide".to_vec(),
++    );
++    assert!(recv_callback_timeout(&put, "put").is_ok());
++
++    assert_eq!(
++        get_item_in_new_readonly_transaction(
++            &ctx,
++            db_name,
++            other,
++            B,
++            IndexedDBKeyType::Number(1.0)
++        ),
++        None
++    );
++    assert_eq!(evict_requests(holder), 0);
++
++    let reader = create_transaction(&ctx, db_name, other, IndexedDBTxnMode::Readonly, vec![A]);
++    let get = get_item(&ctx, db_name, A, reader, IndexedDBKeyType::Number(1.0));
++    let reader_commit = commit_transaction(&ctx, db_name, reader);
++    assert_nothing(&get, "read while an earlier writer runs");
++    assert_eq!(evict_requests(holder), 1);
++    assert_eq!(evict_requests(other), 0);
++
++    let commit = commit_transaction(&ctx, db_name, writer);
++    assert!(recv_callback_timeout(&commit, "commit").is_ok());
++    finish_transaction(&ctx, db_name, writer);
++    assert_eq!(
++        recv_callback_timeout(&get, "get")
++            .unwrap()
++            .map(|value| value.value),
++        Some(b"written on pagehide".to_vec())
++    );
++    assert!(recv_callback_timeout(&reader_commit, "reader commit").is_ok());
++    finish_transaction(&ctx, db_name, reader);
++    assert_eq!(evict_requests(holder), 1);
++    for connection in [holder, other] {
++        close_database(&ctx, connection, db_name);
++    }
++    ctx.shutdown();
++}
++
++/// A request queued behind an open request whose upgrade runs asks that request's document to
++/// leave the back/forward cache if it is there: the queue waits for the upgrade to finish.
++fn test_indexeddb_request_queued_behind_an_upgrade_asks_it_to_evict() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-queued-behind-an-upgrade";
++    let (upgrading, first) = open_database_request(&ctx, db_name, Some(1), ());
++    let transaction = match recv_callback_timeout(&first, "upgrade") {
++        ConnectionMsg::Upgrade { transaction, .. } => transaction,
++        other => panic!("unexpected open message: {other:?}"),
++    };
++    assert_eq!(evict_requests(upgrading), 0);
++
++    let second = open_database(&ctx, db_name, None);
++    assert_nothing(&second, "open behind a running upgrade");
++    assert_eq!(evict_requests(upgrading), 1);
++
++    commit_upgrade_transaction(&ctx, db_name, transaction);
++    let ConnectionMsg::Connection { id, .. } = recv_callback_timeout(&first, "connection") else {
++        panic!("expected the upgraded connection");
++    };
++    let ConnectionMsg::Connection { id: second_id, .. } =
++        recv_callback_timeout(&second, "second connection")
++    else {
++        panic!("expected the second connection");
++    };
++    for connection in [id, second_id] {
++        close_database(&ctx, connection, db_name);
++    }
++    ctx.shutdown();
++}
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 6e9c1eb3c81..fd37b92ddc0 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11640,6 +11640,45 @@
+   },
+   "testharness": {
+    "IndexedDB": {
++    "back-forward-cache-held-back.window.js": [
++     "1d953d7479412a537bfe7c1ef6016f342ca7bdb6",
++     [
++      "IndexedDB/back-forward-cache-held-back.window.html",
++      {
++       "script_metadata": [
++        [
++         "title",
++         "IndexedDB: a cached page that holds back another page's request or transaction is evicted"
++        ],
++        [
++         "script",
++         "/common/dispatcher/dispatcher.js"
++        ],
++        [
++         "script",
++         "/common/utils.js"
++        ],
++        [
++         "script",
++         "/IndexedDB/resources/support.js"
++        ],
++        [
++         "script",
++         "/html/browsers/browsing-the-web/back-forward-cache/resources/rc-helper.js"
++        ],
++        [
++         "script",
++         "/html/browsers/browsing-the-web/remote-context-helper/resources/remote-context-helper.js"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ]
++    ],
+     "back-forward-cache-versionchange.window.js": [
+      "2a30ff98ff0f8105c0d67766a5a158a5137e95f8",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/back-forward-cache-held-back.window.js b/tests/wpt/mozilla/tests/IndexedDB/back-forward-cache-held-back.window.js
+new file mode 100644
+index 00000000000..1d953d74794
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/back-forward-cache-held-back.window.js
+@@ -0,0 +1,144 @@
++// META: title=IndexedDB: a cached page that holds back another page's request or transaction is evicted
++// META: script=/common/dispatcher/dispatcher.js
++// META: script=/common/utils.js
++// META: script=/IndexedDB/resources/support.js
++// META: script=/html/browsers/browsing-the-web/back-forward-cache/resources/rc-helper.js
++// META: script=/html/browsers/browsing-the-web/remote-context-helper/resources/remote-context-helper.js
++// META: timeout=long
++
++'use strict';
++
++// A page in the back/forward cache never finishes its transactions or upgrades, as its tasks are
++// held back. When another page waits for one of them, or for a connection that closes only once
++// they have finished, Servo evicts the cached page, as Chromium does (DisallowInactiveClient).
++// The cached pages write or open on pagehide, as WPT's back-forward-cache-open-transaction does.
++
++// Opens `name` with a store in `rc`; on pagehide, the page writes to the store and, if `close`
++// is set, closes the connection while the write's transaction is still alive.
++function writeOnPagehide(rc, name, close) {
++  return rc.executeScript((name, close) => new Promise(resolve => {
++    const request = indexedDB.open(name, 1);
++    request.onupgradeneeded = () => request.result.createObjectStore('store');
++    request.onsuccess = () => {
++      const db = request.result;
++      addEventListener('pagehide', () => {
++        db.transaction('store', 'readwrite').objectStore('store').put('pagehide', 'key');
++        if (close)
++          db.close();
++      });
++      resolve();
++    };
++  }), [name, close]);
++}
++
++// The events of a delete of `name` in `rc`.
++function deleteDatabase(rc, name) {
++  return rc.executeScript(name => new Promise((resolve, reject) => {
++    const events = [];
++    const request = indexedDB.deleteDatabase(name);
++    request.onblocked = event => events.push(`blocked ${event.oldVersion}`);
++    request.onsuccess = event => {
++      events.push(`success ${event.oldVersion}`);
++      resolve(events.join(', '));
++    };
++    request.onerror = () => reject(request.error);
++  }), [name]);
++}
++
++// The events of an open of `name` at `version`, or without one if it is null, in `rc`.
++function openDatabase(rc, name, version) {
++  return rc.executeScript((name, version) => new Promise((resolve, reject) => {
++    const events = [];
++    const request = version ? indexedDB.open(name, version) : indexedDB.open(name);
++    request.onblocked = event => events.push(`blocked ${event.oldVersion}`);
++    request.onupgradeneeded = event => events.push(`upgradeneeded ${event.oldVersion}`);
++    request.onsuccess = () => {
++      events.push(`success ${request.result.version}`);
++      request.result.close();
++      resolve(events.join(', '));
++    };
++    request.onerror = () => reject(request.error);
++  }), [name, version]);
++}
++
++promise_test(async t => {
++  const rcHelper = new RemoteContextHelper();
++  const rc1 = await rcHelper.addWindow(null, {features: 'noopener'});
++  const name = t.name + Math.random();
++  await writeOnPagehide(rc1, name, true);
++
++  await prepareForBFCache(rc1);
++  const rc2 = await rc1.navigateToNew();
++  assert_equals(await deleteDatabase(rc2, name), 'blocked 1, success 1');
++
++  await rc2.historyBack();
++  await assertNotRestoredFromBFCache(rc1);
++}, 'A delete evicts the cached page whose closing connection still writes');
++
++promise_test(async t => {
++  const rcHelper = new RemoteContextHelper();
++  const rc1 = await rcHelper.addWindow(null, {features: 'noopener'});
++  const name = t.name + Math.random();
++  await writeOnPagehide(rc1, name, true);
++
++  await prepareForBFCache(rc1);
++  const rc2 = await rc1.navigateToNew();
++  assert_equals(
++      await openDatabase(rc2, name, 2), 'blocked 1, upgradeneeded 1, success 2');
++
++  await rc2.historyBack();
++  await assertNotRestoredFromBFCache(rc1);
++}, 'An upgrade evicts the cached page whose closing connection still writes');
++
++promise_test(async t => {
++  const rcHelper = new RemoteContextHelper();
++  const rc1 = await rcHelper.addWindow(null, {features: 'noopener'});
++  const name = t.name + Math.random();
++  await writeOnPagehide(rc1, name, false);
++
++  await prepareForBFCache(rc1);
++  const rc2 = await rc1.navigateToNew();
++  const value = await rc2.executeScript(name => new Promise((resolve, reject) => {
++    const request = indexedDB.open(name);
++    request.onsuccess = () => {
++      const db = request.result;
++      const get = db.transaction('store', 'readonly').objectStore('store').get('key');
++      get.onsuccess = () => {
++        db.close();
++        resolve(String(get.result));
++      };
++      get.onerror = () => reject(get.error);
++    };
++    request.onerror = () => reject(request.error);
++  }), [name]);
++  assert_equals(value, 'undefined', 'The evicted page\'s write is rolled back');
++
++  await rc2.historyBack();
++  await assertNotRestoredFromBFCache(rc1);
++}, 'A read evicts the cached page whose transaction writes to the store');
++
++promise_test(async t => {
++  const rcHelper = new RemoteContextHelper();
++  const rc1 = await rcHelper.addWindow(null, {features: 'noopener'});
++  const name = t.name + Math.random();
++  await rc1.executeScript(name => {
++    addEventListener('pagehide', () => {
++      const request = indexedDB.open(name, 1);
++      // Keeps the upgrade transaction busy for as long as the page runs.
++      request.onupgradeneeded = () => {
++        const store = request.result.createObjectStore('store');
++        const spin = () => {
++          store.get(0).onsuccess = spin;
++        };
++        spin();
++      };
++    });
++  }, [name]);
++
++  await prepareForBFCache(rc1);
++  const rc2 = await rc1.navigateToNew();
++  assert_equals(await openDatabase(rc2, name, null), 'upgradeneeded 0, success 1');
++
++  await rc2.historyBack();
++  await assertNotRestoredFromBFCache(rc1);
++}, 'An open evicts the cached page whose upgrade it waits for');

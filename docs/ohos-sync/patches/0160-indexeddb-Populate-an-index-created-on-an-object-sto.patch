@@ -1,0 +1,3117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 15 Nov 2026 23:37:18 +0000
+Subject: [PATCH] indexeddb: Populate an index created on an object store with
+ records
+
+createIndex on a store that has records gives the new index the records
+of the store's records: index creation is "processed as an asynchronous
+request within the upgrade transaction", and records that would give a
+unique index a key twice abort the upgrade transaction with a
+ConstraintError (https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex).
+Before this, the index stayed empty for the existing records. Script
+drives the population, as in Chromium (design decision 7):
+
+- CreateIndex carries `populate`, unless the upgrade created the store
+  and made no put or add on it. The backend creates the index and
+  reports the store's first records (IndexPopulationEvent::Records), at
+  most 500 or up to 1 MiB of values.
+- For each batch, script asks for the next one (PopulateIndex
+  ReadRecords) before it deserializes the values, with the generated-key
+  injection of reads, and computes their index keys with the code of
+  puts; it sends them as SetIndexKeys, the last batch's with `done`, and
+  the backend answers Done. As for puts, the transaction is inactive
+  while the keys are computed, so requests from page code that this
+  reaches throw a TransactionInactiveError; if that code aborts the
+  transaction, script computes no more keys and sends nothing.
+- The database actor keeps the transaction's requests and schema
+  operations that arrive after the CreateIndex waiting, in order, while
+  only the population's steps run, each as it arrives (engine.rs
+  Population, Chromium's preemptive queue): requests made after
+  createIndex see the whole index, and a later deleteIndex,
+  deleteObjectStore or createIndex runs after it, so a second population
+  sees the records added before its createIndex.
+  A unique index that gets a key twice fails the transaction with the new
+  BackendError::Constraint. A transaction that failed during a
+  population drops it when it commits, as when it aborts.
+- In script the population is a request list entry without an
+  IDBRequest, so it ends in request order: the abort with ConstraintError
+  comes after the events of the requests made before createIndex, and the
+  transaction can't commit before the population ends. An index or store
+  deleted meanwhile is still populated, since the requests made between
+  see the index.
+
+A transaction that the backend, or script on its behalf, fails aborts
+with an "UnknownError" DOMException, as step 2.4 of "commit a
+transaction" suggests, with the neutral message "The IndexedDB
+transaction failed" and the details only in the log
+(map_transaction_error_to_dom_error): a stored value that doesn't
+deserialize while populating, and a population, schema operation or
+commit that fails in the backend. A unique index's conflict stays a
+ConstraintError and a full disk a QuotaExceededError. Servo's Error and
+DOMException get UnknownError for this; before, such failures were
+OperationErrors, a schema operation's with "IndexedDB open failed" and
+the backend's details. Opening and deleting a database keep their
+mapping.
+
+Validation: `cargo nextest run -p servo-storage -p servo-storage-traits` (host SQLite): 133 passed, 1 skipped (P3.1 122/1), with population tests on every executor (index records equal to those of puts over three batches with multiEntry, unique and keyless records; unique conflicts across batches, inside a batch and in a later check statement; requests and a deleteIndex that wait for the population; populations in turn; abort during a population; an empty store; the batch size limit) and an integration test through the manager. Host WPT tests/wpt/tests/IndexedDB, 8 processes, with the next commit (which adds only a connection queue fix): SpiderMonkey 3,392, QuickJS 3,389 of 4,511 (P3.1 3,369 / 3,371); the new passes on both engines are idbobjectstore_createIndex's four population subtests, idbtransaction_abort and idbfactory-open-request-error, each in window, worker and sharedworker (18), the other differences known worker/sharedworker whole-test flips; expectations updated with `./mach update-wpt` from both engines' runs. At this commit those three tests and the new tests/wpt/mozilla/tests/IndexedDB/index-population.any.js (9 subtests in 4 globals) run as expected on SM; the fork test also passes on QuickJS and with --multiprocess. A page probe stores the same records in two databases, with the indexes created before and after the puts, and reads identical index records back from both SQLite files, generated keys included, on SM and QuickJS. DAYU200 (QuickJS + RDB) with the next commit: WPT IndexedDB/ 3,381 (P3.1 3,367) with the same 18 new passes, /_mozilla/IndexedDB/ 172 of 172, `./mach test-unit --ohos -p servo-storage` RDB only 135 passed / 3 skipped, SQLite and RDB 239 / 4. Populating 10,000 records takes 1.55 s on the board (4.7 s with a statement per key) and 13 ms on the host, linear up to 20,000; RSS rises by the same ~70 MiB for 200 MB and 600 MB stores. `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release` and `./mach check --ohos -- -p servo-storage --all-targets` with SQLite, RDB and both pass. With the P3 review fixes folded in: `./mach check` without warnings, test-tidy without new errors (the UnknownError arm raises error.rs's allowance to 30) and nextest 134 passed, 1 skipped at this commit, with the new test_commit_of_a_transaction_that_failed_while_populating, which fails a debug assertion at the next upgrade's population without the fix; with the new early return of run_waiting broken, 11 population tests (backend and integration) fail. index-population.any.js gets 2 subtests (11 in 4 globals: a getter that the population reaches and that throws, whose subkey is skipped and whose requests throw, or that aborts the upgrade, which leaves the database at its old version), which pass at the branch tip on SM, QuickJS and the DAYU200; the P3.3 binary fails the aborting one in all 4 globals, as it computed the keys of the whole batch after the abort.
+AI-assisted: Yes (agent session; designed and implemented the population protocol, the backend hold and the script driver, wrote the unit, integration and WPT tests, ran the host, board and performance checks; after the P3 review, computed the keys with the transaction inactive, ran population steps as they arrive, fixed the commit of a failed population, added UnknownError and wrote the tests)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/bindings/error.rs       |   4 +
+ components/script/dom/domexception.rs         |   5 +
+ .../script/dom/indexeddb/idbdatabase.rs       |   1 +
+ .../script/dom/indexeddb/idbobjectstore.rs    |  75 +-
+ .../script/dom/indexeddb/idbtransaction.rs    | 228 ++++-
+ components/script/dom/indexeddb/key.rs        |  24 +-
+ components/script_bindings/error.rs           |   2 +
+ components/shared/storage/indexeddb.rs        |  61 +-
+ .../storage/indexeddb/backend/engine.rs       | 335 ++++++-
+ .../storage/indexeddb/backend/queries.rs      | 114 ++-
+ components/storage/indexeddb/backend/tests.rs | 821 +++++++++++++++++-
+ components/storage/indexeddb/engines/mod.rs   |  39 +-
+ components/storage/indexeddb/mod.rs           |   1 +
+ components/storage/tests/indexeddb.rs         | 149 +++-
+ python/tidy/error_message_exceptions.txt      |   2 +-
+ .../idbfactory-open-request-error.any.js.ini  |   9 -
+ .../idbobjectstore_createIndex.any.js.ini     |  36 -
+ .../IndexedDB/idbtransaction_abort.any.js.ini |   8 -
+ tests/wpt/mozilla/meta/MANIFEST.json          |  83 ++
+ .../tests/IndexedDB/index-population.any.js   | 385 ++++++++
+ 20 files changed, 2228 insertions(+), 154 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/index-population.any.js
+
+diff --git a/components/script/dom/bindings/error.rs b/components/script/dom/bindings/error.rs
+index df347d0df98..3a8d94ba10e 100644
+--- a/components/script/dom/bindings/error.rs
++++ b/components/script/dom/bindings/error.rs
+@@ -233,6 +233,10 @@ pub(crate) fn create_dom_exception(
+             return new_custom_exception(DOMErrorName::ConstraintError, custom_message);
+         },
+         Error::Constraint(None) => DOMErrorName::ConstraintError,
++        Error::Unknown(Some(custom_message)) => {
++            return new_custom_exception(DOMErrorName::UnknownError, custom_message);
++        },
++        Error::Unknown(None) => DOMErrorName::UnknownError,
+         Error::Type(message) => return Err(JsEngineError::Type(message)),
+         Error::Range(message) => return Err(JsEngineError::Range(message)),
+         Error::JSFailed => return Err(JsEngineError::JSFailed),
+diff --git a/components/script/dom/domexception.rs b/components/script/dom/domexception.rs
+index 9c75b98a233..c8550ca3e06 100644
+--- a/components/script/dom/domexception.rs
++++ b/components/script/dom/domexception.rs
+@@ -58,6 +58,7 @@ pub(crate) enum DOMErrorName {
+     OperationError,
+     NotAllowedError,
+     ConstraintError,
++    UnknownError,
+ }
+ 
+ impl DOMErrorName {
+@@ -94,6 +95,7 @@ impl DOMErrorName {
+             "OperationError" => Some(DOMErrorName::OperationError),
+             "NotAllowedError" => Some(DOMErrorName::NotAllowedError),
+             "ConstraintError" => Some(DOMErrorName::ConstraintError),
++            "UnknownError" => Some(DOMErrorName::UnknownError),
+             _ => None,
+         )
+     }
+@@ -161,6 +163,9 @@ impl DOMException {
+             DOMErrorName::ConstraintError => {
+                 "A mutation operation in a transaction failed because a constraint was not satisfied."
+             },
++            DOMErrorName::UnknownError => {
++                "The operation failed for an unknown transient reason (e.g. out of memory)."
++            },
+         };
+ 
+         (
+diff --git a/components/script/dom/indexeddb/idbdatabase.rs b/components/script/dom/indexeddb/idbdatabase.rs
+index 8b1c3d95a3f..af56265a871 100644
+--- a/components/script/dom/indexeddb/idbdatabase.rs
++++ b/components/script/dom/indexeddb/idbdatabase.rs
+@@ -566,6 +566,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
+         self.object_stores
+             .safe_borrow_mut(cx.no_gc())
+             .push(store.clone());
++        transaction.note_new_empty_store(store_id);
+ 
+         let object_store = IDBObjectStore::new(cx, &self.global(), &store, &transaction);
+         transaction.register_object_store_handle(&object_store);
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index 03db108dae6..fd6fa89d5e4 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -17,8 +17,9 @@ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use servo_base::generic_channel::{GenericSend, GenericSender};
+ use storage_traits::indexeddb::{
+     self, AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+-    IndexedDBIndex, IndexedDBIndexId, IndexedDBIndexKeys, IndexedDBKeyType, IndexedDBObjectStore,
+-    IndexedDBObjectStoreId, IndexedDBThreadMsg, Utf16String,
++    BackendError, BackendResult, IndexPopulationStep, IndexedDBIndex, IndexedDBIndexId,
++    IndexedDBIndexKeys, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBObjectStoreId,
++    IndexedDBRecordIndexKeys, IndexedDBThreadMsg, IndexedDBValue, Utf16String,
+ };
+ 
+ use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
+@@ -41,10 +42,10 @@ use crate::dom::indexeddb::idbindex::IDBIndex;
+ use crate::dom::indexeddb::idbrequest::IDBRequest;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::key::{
+-    EvaluationResult, ExtractionResult, can_inject_key_into_value, convert_value_to_key,
+-    convert_value_to_key_range, dom_string_from_name, evaluate_key_path_on_value, extract_key,
+-    index_keys, inject_key_into_value, injected_key_is_stored, is_valid_key_path,
+-    name_from_dom_string, sorted_name_list,
++    EvaluationResult, ExtractionResult, can_inject_key_into_value, clear_pending_exception,
++    convert_value_to_key, convert_value_to_key_range, dom_string_from_name,
++    evaluate_key_path_on_value, extract_key, index_keys, inject_key_into_value,
++    injected_key_is_stored, is_valid_key_path, name_from_dom_string, sorted_name_list,
+ };
+ 
+ #[derive(Clone, JSTraceable, MallocSizeOf)]
+@@ -315,6 +316,58 @@ impl IDBObjectStore {
+         })
+     }
+ 
++    /// The keys that the records `records` of this store get in `index`, which is being
++    /// populated: steps 5.1 and 5.2 of
++    /// <https://w3c.github.io/IndexedDB/#store-a-record-into-an-object-store> on each stored
++    /// value, with its generated key injected. Records without keys are left out. Stops early if
++    /// page code that computing the keys reached aborted the transaction.
++    pub(crate) fn index_keys_of_records(
++        &self,
++        cx: &mut JSContext,
++        index: &IndexedDBIndex,
++        records: Vec<IndexedDBValue>,
++    ) -> BackendResult<Vec<IndexedDBRecordIndexKeys>> {
++        let mut keys_of_records = Vec::with_capacity(records.len());
++        rooted!(&in(cx) let mut value = UndefinedValue());
++        for record in records {
++            if !self.transaction.is_usable() {
++                break;
++            }
++            if self
++                .deserialize_value(cx, &record.primary_key, &record.value, value.handle_mut())
++                .is_err()
++            {
++                clear_pending_exception(cx);
++                return Err(BackendError::DbErr(
++                    "Failed to read a stored value to populate an index".to_owned(),
++                ));
++            }
++            let keys =
++                self.with_transaction_inactive(|| index_keys(cx, value.handle(), index, None));
++            if !keys.is_empty() {
++                keys_of_records.push(IndexedDBRecordIndexKeys {
++                    primary_key: record.primary_key,
++                    keys,
++                });
++            }
++        }
++        Ok(keys_of_records)
++    }
++
++    /// Sends a step of populating the index `index_id` of this handle's store to the backend.
++    pub(crate) fn send_index_population_step(
++        &self,
++        index_id: IndexedDBIndexId,
++        step: IndexPopulationStep,
++    ) {
++        if self
++            .send_schema_operation(AsyncSchemaOperation::PopulateIndex { index_id, step })
++            .is_err()
++        {
++            error!("Failed to send a step of populating IndexedDB index {index_id}");
++        }
++    }
++
+     /// <https://www.w3.org/TR/IndexedDB-3/#object-store-in-line-keys>
+     pub(crate) fn uses_inline_keys(&self) -> bool {
+         self.key_path.is_some()
+@@ -449,6 +502,7 @@ impl IDBObjectStore {
+         // it: reading the value injects the key, see `deserialize_value`. The index keys that the
+         // operation's step 5 extracts from the clone are computed here.
+         let index_keys = self.index_keys(cx, cloned_js_value.handle(), serialized_key.is_none());
++        self.transaction.note_records_added(self.id);
+         // Step 13. Return the result (an IDBRequest) of running asynchronously execute a request
+         // with handle and operation.
+         IDBRequest::execute_async(
+@@ -994,14 +1048,23 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+             unique: options.unique,
+             multi_entry: options.multiEntry,
+         };
++        // NOTE: The index gets records for the store's records, which creating it "processed as
++        // an asynchronous request within the upgrade transaction" computes, and the backend holds
++        // the transaction's later requests back until then. A store that the transaction created
++        // and that no record was added to has none.
++        let populate = !self.transaction.is_new_empty_store(self.id);
+         self.send_schema_operation(AsyncSchemaOperation::CreateIndex {
+             index_id: index.id,
+             name: index.name.clone(),
+             key_path: index.key_path.clone(),
+             unique: index.unique,
+             multi_entry: index.multi_entry,
++            populate,
+         })?;
+         db.add_index(self.id, index.clone());
++        if populate {
++            self.transaction.start_index_population(self, index.clone());
++        }
+ 
+         // Step 12. Add index to this object store handle's index set.
+         let index = self.add_index(cx, &index);
+diff --git a/components/script/dom/indexeddb/idbtransaction.rs b/components/script/dom/indexeddb/idbtransaction.rs
+index 47fa0f041e5..32935afa41a 100644
+--- a/components/script/dom/indexeddb/idbtransaction.rs
++++ b/components/script/dom/indexeddb/idbtransaction.rs
+@@ -13,8 +13,9 @@ use script_bindings::reflector::reflect_dom_object;
+ use servo_base::generic_channel::{GenericSend, GenericSender};
+ use servo_base::id::ScriptEventLoopId;
+ use storage_traits::indexeddb::{
+-    BackendError, BackendResult, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg,
+-    IndexedDBTxnId, IndexedDBTxnMode, RequestOutput, SyncOperation, TransactionEvent, Utf16String,
++    BackendResult, IndexPopulationEvent, IndexPopulationStep, IndexedDBIndex, IndexedDBIndexId,
++    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBThreadMsg, IndexedDBTxnId,
++    IndexedDBTxnMode, RequestOutput, SyncOperation, TransactionEvent, Utf16String,
+ };
+ use stylo_atoms::Atom;
+ 
+@@ -37,14 +38,16 @@ use crate::dom::indexeddb::idbcursor::IterationParam;
+ use crate::dom::indexeddb::idbdatabase::IDBDatabase;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+ use crate::dom::indexeddb::idbrequest::IDBRequest;
+-use crate::dom::indexeddb::key::{map_backend_error_to_dom_error, name_from_dom_string};
++use crate::dom::indexeddb::key::{map_transaction_error_to_dom_error, name_from_dom_string};
+ use crate::realms::enter_auto_realm;
+ 
+ /// A request in a transaction's request list, and its result once the backend has reported it.
+ #[derive(JSTraceable, MallocSizeOf)]
+ #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+ struct PendingRequest {
+-    request: Dom<IDBRequest>,
++    /// The request, or `None` for the population of an index, which createIndex makes "an
++    /// asynchronous request within the upgrade transaction" without an IDBRequest.
++    request: Option<Dom<IDBRequest>>,
+     /// The id of this execution of the request, which a cursor's request has once per
+     /// iteration.
+     id: u64,
+@@ -55,6 +58,20 @@ struct PendingRequest {
+     result: Option<BackendResult<RequestOutput>>,
+ }
+ 
++/// The population of an index that createIndex created on an object store that may have
++/// records: script reads the store's records in batches, computes their keys in the index and
++/// sends them to the backend, which holds the transaction's later requests back meanwhile.
++#[derive(JSTraceable, MallocSizeOf)]
++#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
++struct IndexPopulation {
++    /// The handle that createIndex was called on.
++    store: Dom<IDBObjectStore>,
++    #[no_trace]
++    index: IndexedDBIndex,
++    /// The id of the request list entry that the population completes.
++    entry: u64,
++}
++
+ #[dom_struct]
+ pub struct IDBTransaction {
+     eventtarget: EventTarget,
+@@ -74,6 +91,11 @@ pub struct IDBTransaction {
+     /// task hasn't run, in the order they were made. Results are delivered from the front only,
+     /// so that they complete in request order.
+     requests: DomRefCell<VecDeque<PendingRequest>>,
++    /// The index populations of this upgrade transaction that haven't ended.
++    index_populations: DomRefCell<Vec<IndexPopulation>>,
++    /// The object stores that this upgrade transaction created and that no put or add has been
++    /// made on since, which have no records to populate an index from.
++    new_empty_stores: DomRefCell<Vec<IndexedDBObjectStoreId>>,
+     // https://www.w3.org/TR/IndexedDB-3/#transaction-active-flag
+     active: Cell<bool>,
+     // https://www.w3.org/TR/IndexedDB-3/#transaction-finish
+@@ -118,6 +140,8 @@ impl IDBTransaction {
+ 
+             store_handles: Default::default(),
+             requests: Default::default(),
++            index_populations: Default::default(),
++            new_empty_stores: Default::default(),
+             active: Cell::new(true),
+             finished: Cell::new(false),
+             abort_initiated: Cell::new(false),
+@@ -397,13 +421,128 @@ impl IDBTransaction {
+         iteration_param: Option<IterationParam>,
+     ) {
+         self.requests.borrow_mut().push_back(PendingRequest {
+-            request: Dom::from_ref(request),
++            request: Some(Dom::from_ref(request)),
+             id,
+             iteration_param,
+             result: None,
+         });
+     }
+ 
++    /// Notes that this upgrade transaction created the object store `store`, which has no
++    /// records.
++    pub(crate) fn note_new_empty_store(&self, store: IndexedDBObjectStoreId) {
++        self.new_empty_stores.borrow_mut().push(store);
++    }
++
++    /// Notes that a request that adds a record to the object store `store` was made.
++    pub(crate) fn note_records_added(&self, store: IndexedDBObjectStoreId) {
++        self.new_empty_stores.borrow_mut().retain(|id| *id != store);
++    }
++
++    /// Whether the object store `store` is one that this upgrade transaction created and that
++    /// no record was added to since.
++    pub(crate) fn is_new_empty_store(&self, store: IndexedDBObjectStoreId) -> bool {
++        self.new_empty_stores.borrow().contains(&store)
++    }
++
++    /// Populates the index `index`, which createIndex created on the store of `store`, the handle
++    /// it was called on: the backend reports the store's first records, see
++    /// [`Self::index_population_event`]. The population is a request list entry without an
++    /// IDBRequest, so that it ends in request order.
++    pub(crate) fn start_index_population(&self, store: &IDBObjectStore, index: IndexedDBIndex) {
++        let entry = self.allocate_request_id();
++        self.requests.borrow_mut().push_back(PendingRequest {
++            request: None,
++            id: entry,
++            iteration_param: None,
++            result: None,
++        });
++        self.index_populations.borrow_mut().push(IndexPopulation {
++            store: Dom::from_ref(store),
++            index,
++            entry,
++        });
++    }
++
++    /// Takes the next step of populating the index `index_id` after the backend reported
++    /// `event`: reads the next records and sends the index keys of those that arrived, or ends
++    /// the population's request list entry.
++    fn index_population_event(
++        &self,
++        cx: &mut JSContext,
++        index_id: IndexedDBIndexId,
++        event: IndexPopulationEvent,
++    ) {
++        if self.finished.get() || self.abort_initiated.get() {
++            return;
++        }
++        let Some((store, index, entry)) = self
++            .index_populations
++            .borrow()
++            .iter()
++            .find(|population| population.index.id == index_id)
++            .map(|population| {
++                (
++                    population.store.as_rooted(),
++                    population.index.clone(),
++                    population.entry,
++                )
++            })
++        else {
++            return;
++        };
++        let (records, last) = match event {
++            IndexPopulationEvent::Records { records, last } => (records, last),
++            IndexPopulationEvent::Done(result) => {
++                return self.end_index_population(cx, index_id, entry, result);
++            },
++        };
++        // An index or store deleted since is still populated: the requests made before the
++        // deletion see the whole index, and the backend runs the deletion after them.
++
++        // The next records are read while these are indexed.
++        if !last && let Some(record) = records.last() {
++            store.send_index_population_step(
++                index_id,
++                IndexPopulationStep::ReadRecords {
++                    after: record.primary_key.clone(),
++                },
++            );
++        }
++        let mut realm = enter_auto_realm(cx, &*store);
++        let cx: &mut JSContext = &mut realm;
++        let keys = store.index_keys_of_records(cx, &index, records);
++        // Page code that computing the keys reached may have aborted the transaction.
++        if self.finished.get() || self.abort_initiated.get() {
++            return;
++        }
++        match keys {
++            Ok(records) => store.send_index_population_step(
++                index_id,
++                IndexPopulationStep::SetIndexKeys {
++                    records,
++                    done: last,
++                },
++            ),
++            Err(error) => self.end_index_population(cx, index_id, entry, Err(error)),
++        }
++    }
++
++    /// Ends the population of the index `index_id`, whose request list entry is `entry`, with
++    /// `result`, and delivers the results that are next in request order.
++    fn end_index_population(
++        &self,
++        cx: &mut JSContext,
++        index_id: IndexedDBIndexId,
++        entry: u64,
++        result: BackendResult<()>,
++    ) {
++        self.index_populations
++            .safe_borrow_mut(cx.no_gc())
++            .retain(|population| population.index.id != index_id);
++        self.request_result_arrived(cx, entry, result.map(|()| RequestOutput::Done));
++    }
++
+     /// Handles what the backend reported about this transaction on the connection's result
+     /// channel.
+     pub(crate) fn handle_event(&self, cx: &mut JSContext, event: TransactionEvent) {
+@@ -412,7 +551,10 @@ impl IDBTransaction {
+                 self.request_result_arrived(cx, request_id, result)
+             },
+             TransactionEvent::SchemaChangeFailed(error) => {
+-                self.abort(cx, map_backend_error_to_dom_error(error))
++                self.abort(cx, map_transaction_error_to_dom_error(error))
++            },
++            TransactionEvent::IndexPopulation { index_id, event } => {
++                self.index_population_event(cx, index_id, event)
+             },
+             TransactionEvent::Committed(result) => self.commit_result_arrived(cx, result),
+         }
+@@ -459,7 +601,7 @@ impl IDBTransaction {
+                 return;
+             };
+             let first = (
+-                first.request.as_rooted(),
++                first.request.as_ref().map(|request| request.as_rooted()),
+                 first.id,
+                 first.iteration_param.take(),
+                 result,
+@@ -469,25 +611,49 @@ impl IDBTransaction {
+             first
+         };
+ 
+-        let mut realm = enter_auto_realm(cx, &*request);
+-        let cx: &mut JSContext = &mut realm;
+-        rooted!(&in(cx) let mut answer = UndefinedValue());
+-        match request.convert_result(cx, result, iteration_param.as_ref(), answer.handle_mut()) {
+-            // Step 5.3: If result is an error and transaction’s state is committing, then run
+-            // abort a transaction with transaction and result, and terminate these steps.
+-            // The request stays in the request list, so the abort fires its error event.
+-            Err(error) if self.committing.get() => {
+-                self.requests.borrow_mut().push_front(PendingRequest {
+-                    request: Dom::from_ref(&*request),
+-                    id,
+-                    iteration_param: None,
+-                    result: None,
+-                });
+-                self.abort(cx, error);
+-                return;
++        match request {
++            Some(request) => {
++                let mut realm = enter_auto_realm(cx, &*request);
++                let cx: &mut JSContext = &mut realm;
++                rooted!(&in(cx) let mut answer = UndefinedValue());
++                match request.convert_result(
++                    cx,
++                    result,
++                    iteration_param.as_ref(),
++                    answer.handle_mut(),
++                ) {
++                    // Step 5.3: If result is an error and transaction’s state is committing, then
++                    // run abort a transaction with transaction and result, and terminate these
++                    // steps.
++                    // The request stays in the request list, so the abort fires its error event.
++                    Err(error) if self.committing.get() => {
++                        self.requests.borrow_mut().push_front(PendingRequest {
++                            request: Some(Dom::from_ref(&*request)),
++                            id,
++                            iteration_param: None,
++                            result: None,
++                        });
++                        self.abort(cx, error);
++                        return;
++                    },
++                    Err(error) => request.finish_with_error(cx, self, error),
++                    Ok(()) => request.finish_with_success(cx, self, answer.handle()),
++                }
++            },
++            None => {
++                let mut realm = enter_auto_realm(cx, self);
++                let cx: &mut JSContext = &mut realm;
++                // https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex
++                // Once the implementation determines that creating the index has failed, it
++                // must run the steps to abort a transaction using an appropriate error. For
++                // example [...] if the index can't be created due to unique flag constraints, a
++                // "ConstraintError" DOMException must be used as error.
++                if let Err(error) = result {
++                    self.abort(cx, map_transaction_error_to_dom_error(error));
++                    return;
++                }
++                self.maybe_commit(cx);
+             },
+-            Err(error) => request.finish_with_error(cx, self, error),
+-            Ok(()) => request.finish_with_success(cx, self, answer.handle()),
+         }
+ 
+         if self
+@@ -523,13 +689,7 @@ impl IDBTransaction {
+                 // run abort a transaction with transaction and an appropriate type for the error,
+                 // for example a QuotaExceededError or an "UnknownError" DOMException, and
+                 // terminate these steps.
+-                let error = match err {
+-                    BackendError::DbErr(details) => {
+-                        Error::Operation(Some(format!("IndexedDB commit failed: {details}")))
+-                    },
+-                    other => map_backend_error_to_dom_error(other),
+-                };
+-                self.abort(cx, error);
++                self.abort(cx, map_transaction_error_to_dom_error(err));
+             },
+         }
+     }
+@@ -590,11 +750,12 @@ impl IDBTransaction {
+         let global = self.global();
+         let task_manager = global.task_manager();
+         let task_source = task_manager.database_access_task_source();
++        self.index_populations.safe_borrow_mut(cx.no_gc()).clear();
+         let requests: Vec<Trusted<IDBRequest>> = self
+             .requests
+             .safe_borrow_mut(cx.no_gc())
+             .drain(..)
+-            .map(|pending| Trusted::new(&*pending.request))
++            .filter_map(|pending| pending.request.as_deref().map(Trusted::new))
+             .collect();
+         for request in requests {
+             task_source.queue(task!(fire_indexeddb_request_abort_error: move |cx| {
+@@ -679,6 +840,7 @@ impl IDBTransaction {
+         }
+         self.finished.set(true);
+         self.requests.borrow_mut().clear();
++        self.index_populations.borrow_mut().clear();
+         self.send_abort_to_backend();
+         self.notify_backend_transaction_finished();
+         self.db.remove_transaction(self);
+diff --git a/components/script/dom/indexeddb/key.rs b/components/script/dom/indexeddb/key.rs
+index e97cb59ff7e..e5be4e7abc8 100644
+--- a/components/script/dom/indexeddb/key.rs
++++ b/components/script/dom/indexeddb/key.rs
+@@ -576,7 +576,7 @@ pub(crate) fn convert_value_to_multientry_key(
+ 
+ /// Clears the exception of a failed JavaScript operation whose failure is ignored.
+ #[expect(unsafe_code)]
+-fn clear_pending_exception(cx: &mut JSContext) {
++pub(crate) fn clear_pending_exception(cx: &mut JSContext) {
+     if JS_IsExceptionPending(cx) {
+         // SAFETY: `cx` is the context the exception is pending on.
+         unsafe { JS_ClearPendingException(cx) };
+@@ -634,6 +634,28 @@ pub(crate) fn map_backend_error_to_dom_error(error: BackendError) -> Error {
+     }
+ }
+ 
++/// The error that a transaction aborts with when the backend, or script on its behalf, failed
++/// it: a "QuotaExceededError" for a full disk, a "ConstraintError" for a unique index that got
++/// the same key for two records while it was populated, and otherwise an "UnknownError" with a
++/// neutral message, as <https://w3c.github.io/IndexedDB/#commit-a-transaction> step 2.4 suggests;
++/// the details only go to the log.
++pub(crate) fn map_transaction_error_to_dom_error(error: BackendError) -> Error {
++    match error {
++        BackendError::QuotaExceeded => Error::QuotaExceeded {
++            quota: None,
++            requested: None,
++        },
++        BackendError::Constraint => Error::Constraint(Some(
++            "A unique index has the same key for two records".to_owned(),
++        )),
++        BackendError::Abort => Error::Abort(Some("The transaction was aborted".to_owned())),
++        other => {
++            warn!("IndexedDB transaction failed: {other}");
++            Error::Unknown(Some("The IndexedDB transaction failed".to_owned()))
++        },
++    }
++}
++
+ /// The result of steps in
+ /// <https://www.w3.org/TR/IndexedDB-3/#evaluate-a-key-path-on-a-value>
+ pub(crate) enum EvaluationResult {
+diff --git a/components/script_bindings/error.rs b/components/script_bindings/error.rs
+index 9a4912b00ee..ab96c57e953 100644
+--- a/components/script_bindings/error.rs
++++ b/components/script_bindings/error.rs
+@@ -78,6 +78,8 @@ pub enum Error {
+     Encoding(Option<String>),
+     /// ConstraintError DOMException
+     Constraint(Option<String>),
++    /// UnknownError DOMException
++    Unknown(Option<String>),
+ 
+     /// TypeError JavaScript Error
+     Type(CString),
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 99578837bf2..a76acbbf45a 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -35,6 +35,9 @@ pub enum BackendError {
+     QuotaExceeded,
+     /// The transaction was aborted
+     Abort,
++    /// A unique index got the same key for two records while it was populated, which aborts the
++    /// upgrade transaction with a "ConstraintError" DOMException.
++    Constraint,
+ 
+     DbErr(DbError),
+ }
+@@ -52,6 +55,7 @@ impl Display for BackendError {
+             BackendError::StoreNotFound => write!(f, "StoreNotFound"),
+             BackendError::QuotaExceeded => write!(f, "QuotaExceeded"),
+             BackendError::Abort => write!(f, "Abort"),
++            BackendError::Constraint => write!(f, "Constraint"),
+             BackendError::DbErr(err) => write!(f, "{err}"),
+         }
+     }
+@@ -478,6 +482,14 @@ pub struct IndexedDBIndexKeys {
+     pub keys: Vec<IndexedDBIndexKey>,
+ }
+ 
++/// The keys that script computed for an index that it populates, from the value of the record
++/// with the key `primary_key`, as [`IndexedDBIndexKeys`] has them.
++#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
++pub struct IndexedDBRecordIndexKeys {
++    pub primary_key: IndexedDBKeyType,
++    pub keys: Vec<IndexedDBIndexKey>,
++}
++
+ #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+ pub enum PutItemResult {
+     Key(IndexedDBKeyType),
+@@ -552,13 +564,18 @@ pub enum AsyncSchemaOperation {
+     DeleteObjectStore,
+     /// Renames the object store, which keeps its records and indexes.
+     RenameObjectStore { new_name: Utf16String },
+-    /// Creates an index of the object store, with its id from script.
++    /// Creates an index of the object store, with its id from script. With `populate`, the store
++    /// may have records, and script populates the index from them: the backend reports the first
++    /// records as [`IndexPopulationEvent::Records`], script answers with
++    /// [`AsyncSchemaOperation::PopulateIndex`] steps, and the transaction's later requests and
++    /// schema operations wait until the population is done, so that they see the whole index.
+     CreateIndex {
+         index_id: IndexedDBIndexId,
+         name: Utf16String,
+         key_path: KeyPath,
+         unique: bool,
+         multi_entry: bool,
++        populate: bool,
+     },
+     /// Renames an index of the object store.
+     RenameIndex {
+@@ -567,6 +584,43 @@ pub enum AsyncSchemaOperation {
+     },
+     /// Deletes an index of the object store.
+     DeleteIndex { index_id: IndexedDBIndexId },
++    /// A step of populating the index `index_id` of the object store, which runs ahead of the
++    /// requests that wait for the population.
++    PopulateIndex {
++        index_id: IndexedDBIndexId,
++        step: IndexPopulationStep,
++    },
++}
++
++/// A step of populating an index that
++/// <https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex> created on an object store
++/// with records.
++#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
++pub enum IndexPopulationStep {
++    /// Reads the records after the one with the key `after`, reported as
++    /// [`IndexPopulationEvent::Records`].
++    ReadRecords { after: IndexedDBKeyType },
++    /// Stores the index records of `records`. With `done`, no records follow, and the backend
++    /// reports [`IndexPopulationEvent::Done`].
++    SetIndexKeys {
++        records: Vec<IndexedDBRecordIndexKeys>,
++        done: bool,
++    },
++}
++
++/// What the backend reports about the population of an index.
++#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
++pub enum IndexPopulationEvent {
++    /// The next records of the object store in key order, a batch of limited size, and whether
++    /// they are the last.
++    Records {
++        records: Vec<IndexedDBValue>,
++        last: bool,
++    },
++    /// The population ended: every record has its index records, or the population failed with
++    /// the error, which failed the transaction. [`BackendError::Constraint`] means that a unique
++    /// index got the same key for two records.
++    Done(BackendResult<()>),
+ }
+ 
+ /// Operations that are not executed instantly, but rather added to a
+@@ -609,6 +663,11 @@ pub enum TransactionEvent {
+     },
+     /// A schema operation failed, which fails the transaction.
+     SchemaChangeFailed(BackendError),
++    /// About the population of the index `index_id`.
++    IndexPopulation {
++        index_id: IndexedDBIndexId,
++        event: IndexPopulationEvent,
++    },
+     /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>: the changes of the transaction
+     /// were written, or writing them failed and they were rolled back.
+     Committed(BackendResult<()>),
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index 6b0621f42c0..652d226b08c 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -12,7 +12,8 @@ use rustc_hash::FxHashMap;
+ use servo_base::threadpool::ThreadPool;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+-    BackendError, BackendResult, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBTxnId,
++    BackendError, BackendResult, IndexPopulationEvent, IndexPopulationStep, IndexedDBIndexId,
++    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBTxnId,
+     IndexedDBTxnMode, RequestOutput, TransactionEvent,
+ };
+ 
+@@ -63,6 +64,7 @@ impl<X: SqlExecutor> SqlEngine<X> {
+                     versionchange: None,
+                     metadata: metadata.clone(),
+                     failed: FxHashMap::default(),
++                    population: None,
+                 })),
+             }),
+             metadata,
+@@ -285,10 +287,29 @@ pub(super) struct Database<X> {
+     /// Transactions whose changes were rolled back by a failure, with the error that their later
+     /// requests and their commit report, until the transaction aborts.
+     failed: FxHashMap<IndexedDBTxnId, BackendError>,
++    /// The index population of the upgrade transaction, while one runs or while the requests
++    /// that waited for it run.
++    population: Option<Population>,
++}
++
++/// The population of an index that an upgrade transaction created on an object store that may
++/// have records (<https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex>), which script
++/// drives with [`AsyncSchemaOperation::PopulateIndex`] steps. Its requests and schema operations
++/// that come after the index's creation wait, in order, while the steps run as they come, as in
++/// Chromium's preemptive task queue: so they see the whole index, and those that change the
++/// store or its indexes come after the population.
++struct Population {
++    transaction: IndexedDBTxnId,
++    /// The index being populated, or `None` while the waiting requests run, until one of them
++    /// starts populating another index.
++    index: Option<IndexedDBIndexId>,
++    waiting: VecDeque<KvsOperation>,
+ }
+ 
+ impl<X: SqlExecutor> Database<X> {
+     /// Runs the requests of a batch in order and sends each result to `results` as it has run.
++    /// Requests that come after the creation of an index that is being populated wait for the
++    /// population instead.
+     fn run_batch(
+         &mut self,
+         transaction: IndexedDBTxnId,
+@@ -297,26 +318,105 @@ impl<X: SqlExecutor> Database<X> {
+     ) {
+         let writes = batch.mode != IndexedDBTxnMode::Readonly;
+         for request in batch.requests {
+-            if let Some(error) = self.failed.get(&transaction) {
+-                results.send(request.failure_event(error.clone()));
++            let Some(population) = self
++                .population
++                .as_mut()
++                .filter(|population| population.transaction == transaction)
++            else {
++                self.run(transaction, writes, request, results);
+                 continue;
++            };
++            // The active population's own steps run at once, so none of them ever waits.
++            let failed = self.failed.contains_key(&transaction);
++            if !failed &&
++                population
++                    .index
++                    .is_some_and(|index| request.is_population_step_of(index))
++            {
++                self.run(transaction, true, request, results);
++            } else {
++                population.waiting.push_back(request);
+             }
+-            if writes && let Err(error) = self.begin(transaction) {
+-                results.send(request.failure_event(error));
+-                continue;
+-            }
+-            let (event, failure) = run_request(&mut self.executor, request);
+-            if let Some(event) = event {
+-                results.send(event);
+-            }
+-            self.notice_ended_transaction(|| {
+-                failure
+-                    .as_ref()
+-                    .map_or_else(ended_early, |failure| failure.error().clone())
+-            });
+-            if let Some(Failure::Write(error)) = failure {
+-                self.fail(transaction, error);
++            self.run_waiting(transaction, results);
++        }
++    }
++
++    /// Runs the waiting requests of `transaction` that can run now: once the index population is
++    /// done, or if the transaction has failed, all of them in order, until one of them starts
++    /// populating another index.
++    fn run_waiting(&mut self, transaction: IndexedDBTxnId, results: &TransactionResults) {
++        loop {
++            let failed = self.failed.contains_key(&transaction);
++            let Some(population) = self
++                .population
++                .as_mut()
++                .filter(|population| population.transaction == transaction)
++            else {
++                return;
++            };
++            if population.index.is_some() && !failed {
++                return;
+             }
++            let Some(request) = population.waiting.pop_front() else {
++                self.population = None;
++                return;
++            };
++            self.run(transaction, true, request, results);
++        }
++    }
++
++    /// Runs a request of `transaction` and sends what it reports to `results`.
++    fn run(
++        &mut self,
++        transaction: IndexedDBTxnId,
++        writes: bool,
++        request: KvsOperation,
++        results: &TransactionResults,
++    ) {
++        if let Some(error) = self.failed.get(&transaction) {
++            return results.send(request.failure_event(error.clone()));
++        }
++        if writes && let Err(error) = self.begin(transaction) {
++            return results.send(request.failure_event(error));
++        }
++        let populating = self
++            .population
++            .as_ref()
++            .filter(|population| population.transaction == transaction)
++            .and_then(|population| population.index);
++        let outcome = run_request(&mut self.executor, request, populating);
++        if let Some(event) = outcome.event {
++            results.send(event);
++        }
++        self.notice_ended_transaction(|| {
++            outcome
++                .failure
++                .as_ref()
++                .map_or_else(ended_early, |failure| failure.error().clone())
++        });
++        if let Some(Failure::Write(error)) = outcome.failure {
++            self.fail(transaction, error);
++        }
++        match outcome.population {
++            Some(PopulationChange::Starts(index)) => match self.population.as_mut() {
++                Some(population) if population.transaction == transaction => {
++                    population.index = Some(index);
++                },
++                _ => {
++                    debug_assert!(self.population.is_none(), "One upgrade at a time");
++                    self.population = Some(Population {
++                        transaction,
++                        index: Some(index),
++                        waiting: VecDeque::new(),
++                    });
++                },
++            },
++            Some(PopulationChange::Ends) => {
++                if let Some(population) = self.population.as_mut() {
++                    population.index = None;
++                }
++            },
++            None => {},
+         }
+     }
+ 
+@@ -376,9 +476,20 @@ impl<X: SqlExecutor> Database<X> {
+             .versionchange
+             .take_if(|versionchange| *versionchange == transaction)
+             .is_some();
++        let populating = self
++            .population
++            .take_if(|population| population.transaction == transaction)
++            .is_some();
+         if let Some(error) = self.failed.remove(&transaction) {
+             return Err(error);
+         }
++        if populating {
++            error!("IndexedDB transaction {transaction} committed while it populated an index");
++            self.roll_back(transaction);
++            return Err(BackendError::DbErr(
++                "The transaction committed before its index population ended".to_owned(),
++            ));
++        }
+         // An upgrade transaction without requests still sets the version.
+         if self
+             .upgrade
+@@ -420,6 +531,8 @@ impl<X: SqlExecutor> Database<X> {
+     /// <https://w3c.github.io/IndexedDB/#abort-a-transaction>
+     fn abort(&mut self, transaction: IndexedDBTxnId) {
+         self.failed.remove(&transaction);
++        self.population
++            .take_if(|population| population.transaction == transaction);
+         if self
+             .upgrade
+             .is_some_and(|(upgrade, _)| upgrade == transaction)
+@@ -564,14 +677,57 @@ fn outcome<T>(
+     }
+ }
+ 
+-/// Runs a request, and returns what to report about it, if anything, and how it failed if it
+-/// failed in the database. A request that fails before reading or writing anything, such as one
+-/// for a missing object store, fails only itself; a schema operation that fails fails its
+-/// transaction, and is the only kind of operation that reports nothing when it succeeds.
++/// How a request changes the index population of its transaction.
++enum PopulationChange {
++    /// The request created the index, which is populated now.
++    Starts(IndexedDBIndexId),
++    /// The population of the index ended.
++    Ends,
++}
++
++/// What running a request gives.
++#[derive(Default)]
++struct Outcome {
++    /// What to report about the request.
++    event: Option<TransactionEvent>,
++    /// How the request failed, if it failed in the database.
++    failure: Option<Failure>,
++    population: Option<PopulationChange>,
++}
++
++impl Outcome {
++    /// A failed schema operation, which fails its transaction.
++    fn schema_failure(error: BackendError) -> Self {
++        Self {
++            event: Some(TransactionEvent::SchemaChangeFailed(error.clone())),
++            failure: Some(Failure::Write(error)),
++            population: None,
++        }
++    }
++
++    /// A population of the index `index_id` that failed with `error`, which fails its
++    /// transaction.
++    fn population_failure(index_id: IndexedDBIndexId, error: BackendError) -> Self {
++        Self {
++            event: Some(TransactionEvent::IndexPopulation {
++                index_id,
++                event: IndexPopulationEvent::Done(Err(error.clone())),
++            }),
++            failure: Some(Failure::Write(error)),
++            population: None,
++        }
++    }
++}
++
++/// Runs a request. A request that fails before reading or writing anything, such as one for a
++/// missing object store, fails only itself; a schema operation that fails fails its transaction,
++/// and reports nothing when it succeeds, except for the steps of an index population.
++/// `populating` is the index that the request's transaction populates.
+ fn run_request<X: SqlExecutor>(
+     executor: &mut X,
+     request: KvsOperation,
+-) -> (Option<TransactionEvent>, Option<Failure>) {
++    populating: Option<IndexedDBIndexId>,
++) -> Outcome {
+     let KvsOperation {
+         store,
+         request_id,
+@@ -580,17 +736,13 @@ fn run_request<X: SqlExecutor>(
+ 
+     let operation = match operation {
+         AsyncOperation::Schema(operation) => {
+-            let failure = run_schema(executor, store, operation);
+-            let event = failure
+-                .as_ref()
+-                .map(|failure| TransactionEvent::SchemaChangeFailed(failure.error().clone()));
+-            return (event, failure);
++            return run_schema(executor, store, operation, populating);
+         },
+         operation => operation,
+     };
+     let Some(request_id) = request_id else {
+         error!("IndexedDB request without a request id");
+-        return (None, None);
++        return Outcome::default();
+     };
+ 
+     let (result, failure) = match queries::object_store(executor, store) {
+@@ -605,10 +757,11 @@ fn run_request<X: SqlExecutor>(
+             (Err(error.clone()), Some(Failure::Read(error)))
+         },
+     };
+-    (
+-        Some(TransactionEvent::Request { request_id, result }),
++    Outcome {
++        event: Some(TransactionEvent::Request { request_id, result }),
+         failure,
+-    )
++        population: None,
++    }
+ }
+ 
+ fn run_read_only<X: SqlExecutor>(
+@@ -689,12 +842,14 @@ fn run_read_write<X: SqlExecutor>(
+     }
+ }
+ 
+-/// Runs a schema operation, and returns how it failed if it failed.
++/// Runs a schema operation of the store `store`. `populating` is the index that the
++/// transaction populates.
+ fn run_schema<X: SqlExecutor>(
+     executor: &mut X,
+     store: IndexedDBObjectStoreId,
+     operation: AsyncSchemaOperation,
+-) -> Option<Failure> {
++    populating: Option<IndexedDBIndexId>,
++) -> Outcome {
+     let result = match operation {
+         AsyncSchemaOperation::CreateObjectStore {
+             name,
+@@ -713,21 +868,113 @@ fn run_schema<X: SqlExecutor>(
+             key_path,
+             unique,
+             multi_entry,
+-        } => queries::create_index(
+-            executor,
+-            store,
+-            index_id,
+-            &name,
+-            &key_path,
+-            unique,
+-            multi_entry,
+-        ),
++            populate,
++        } => {
++            let result = queries::create_index(
++                executor,
++                store,
++                index_id,
++                &name,
++                &key_path,
++                unique,
++                multi_entry,
++            );
++            match result {
++                Ok(()) if populate => {
++                    let mut outcome = read_population_records(executor, store, index_id, None);
++                    if outcome.failure.is_none() {
++                        outcome.population = Some(PopulationChange::Starts(index_id));
++                    }
++                    return outcome;
++                },
++                Err(error) if populate => {
++                    return Outcome::population_failure(index_id, error.to_backend_error());
++                },
++                result => result,
++            }
++        },
+         AsyncSchemaOperation::RenameIndex { index_id, new_name } => {
+             queries::rename_index(executor, store, index_id, &new_name)
+         },
+         AsyncSchemaOperation::DeleteIndex { index_id } => {
+             queries::delete_index(executor, store, index_id)
+         },
++        AsyncSchemaOperation::PopulateIndex { index_id, step } => {
++            if populating != Some(index_id) {
++                let error = SqlError::InvalidMetadata("a step of an index population that ended");
++                return Outcome::population_failure(index_id, error.to_backend_error());
++            }
++            return run_population_step(executor, store, index_id, step);
++        },
+     };
+-    Some(Failure::Write(result.err()?.to_backend_error()))
++    match result {
++        Ok(()) => Outcome::default(),
++        Err(error) => Outcome::schema_failure(error.to_backend_error()),
++    }
++}
++
++/// Reads the next records of the store `store` for populating its index `index_id`: those after
++/// the key `after`, or from the first one.
++fn read_population_records<X: SqlExecutor>(
++    executor: &mut X,
++    store: IndexedDBObjectStoreId,
++    index_id: IndexedDBIndexId,
++    after: Option<&IndexedDBKeyType>,
++) -> Outcome {
++    let result = queries::object_store(executor, store)
++        .and_then(|store| store.ok_or(SqlError::MissingRow("object store")))
++        .and_then(|store| queries::population_records(executor, &store, after));
++    match result {
++        Ok((records, last)) => Outcome {
++            event: Some(TransactionEvent::IndexPopulation {
++                index_id,
++                event: IndexPopulationEvent::Records { records, last },
++            }),
++            ..Outcome::default()
++        },
++        Err(error) => Outcome::population_failure(index_id, error.to_backend_error()),
++    }
++}
++
++/// Runs a step of populating the index `index_id` of the store `store`. A unique index that gets
++/// a key twice fails the transaction with [`BackendError::Constraint`].
++fn run_population_step<X: SqlExecutor>(
++    executor: &mut X,
++    store: IndexedDBObjectStoreId,
++    index_id: IndexedDBIndexId,
++    step: IndexPopulationStep,
++) -> Outcome {
++    let (records, done) = match step {
++        IndexPopulationStep::ReadRecords { after } => {
++            return read_population_records(executor, store, index_id, Some(&after));
++        },
++        IndexPopulationStep::SetIndexKeys { records, done } => (records, done),
++    };
++    let result = queries::object_store(executor, store)
++        .and_then(|store| store.ok_or(SqlError::MissingRow("object store")))
++        .and_then(|store| {
++            let index = store
++                .index(index_id)
++                .ok_or(SqlError::InvalidMetadata("population of a missing index"))?;
++            queries::set_index_keys(executor, &store, index, records)
++        });
++    match result {
++        Ok(true) if done => Outcome {
++            event: Some(TransactionEvent::IndexPopulation {
++                index_id,
++                event: IndexPopulationEvent::Done(Ok(())),
++            }),
++            failure: None,
++            population: Some(PopulationChange::Ends),
++        },
++        Ok(true) => Outcome::default(),
++        // https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex
++        // If the referenced object store already contains data which violates these
++        // constraints, this must not cause the implementation of createIndex() to throw an
++        // exception or affect what it returns. The implementation must still create and
++        // return an IDBIndex object, and the implementation must queue a database task to
++        // abort the upgrade transaction which was used for the createIndex() call.
++        Ok(false) => Outcome::population_failure(index_id, BackendError::Constraint),
++        Err(error) => Outcome::population_failure(index_id, error.to_backend_error()),
++    }
+ }
+diff --git a/components/storage/indexeddb/backend/queries.rs b/components/storage/indexeddb/backend/queries.rs
+index f8f9b58511a..975174a529c 100644
+--- a/components/storage/indexeddb/backend/queries.rs
++++ b/components/storage/indexeddb/backend/queries.rs
+@@ -5,11 +5,13 @@
+ //! The IndexedDB operations on the tables of `schema.rs`.
+ 
+ use std::collections::BTreeSet;
++use std::ops::ControlFlow;
+ 
++use rustc_hash::FxHashSet;
+ use storage_traits::indexeddb::{
+     IndexedDBIndex, IndexedDBIndexId, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
+-    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBValue, KeyPath,
+-    PutItemResult, Utf16String,
++    IndexedDBObjectStore, IndexedDBObjectStoreId, IndexedDBRecord, IndexedDBRecordIndexKeys,
++    IndexedDBValue, KeyPath, PutItemResult, Utf16String,
+ };
+ 
+ use super::executor::{SqlError, SqlExecutor, SqlParam, SqlRow, query_row, query_rows};
+@@ -52,7 +54,6 @@ impl StoreIndex {
+     /// the record in the store. `unique_index_data`'s primary key `(index_id, value)` allows one
+     /// record per key; `index_data`'s is `(index_id, value, object_data_key)`. Both read in
+     /// (key, primary key) order.
+-    #[cfg_attr(not(test), expect(dead_code))]
+     pub(crate) fn table(&self) -> &'static str {
+         if self.unique {
+             "unique_index_data"
+@@ -859,6 +860,113 @@ pub(crate) fn put_record<X: SqlExecutor>(
+     Ok(PutItemResult::Key(key))
+ }
+ 
++/// The most records that one step of populating an index reads.
++pub(crate) const POPULATION_BATCH_RECORDS: usize = 500;
++
++/// The size of the values above which a step of populating an index reads no more records.
++const POPULATION_BATCH_BYTES: usize = 1 << 20;
++
++/// The records of `store` after the key `after`, or from the first one, in key order, for
++/// populating an index: at most [`POPULATION_BATCH_RECORDS`], and no more once their values add
++/// up to [`POPULATION_BATCH_BYTES`]. Returns them, and whether no records follow them.
++pub(crate) fn population_records<X: SqlExecutor>(
++    executor: &mut X,
++    store: &ObjectStore,
++    after: Option<&IndexedDBKeyType>,
++) -> Result<(Vec<IndexedDBValue>, bool), SqlError> {
++    let after = after.map(encoding::serialize);
++    let mut sql = "SELECT key, data FROM object_data WHERE object_store_id = ?".to_owned();
++    let mut params = vec![SqlParam::Integer(store.id)];
++    if let Some(after) = &after {
++        sql.push_str(" AND key > ?");
++        params.push(SqlParam::Blob(after));
++    }
++    sql.push_str(" ORDER BY key LIMIT ?");
++    params.push(SqlParam::Integer(POPULATION_BATCH_RECORDS as i64));
++    let mut records = Vec::new();
++    let mut bytes = 0;
++    let mut full = false;
++    executor.query(&sql, &params, &mut |row| {
++        let record = value_of_row(row)?;
++        bytes += record.value.len();
++        records.push(record);
++        full = bytes >= POPULATION_BATCH_BYTES;
++        Ok(if full {
++            ControlFlow::Break(())
++        } else {
++            ControlFlow::Continue(())
++        })
++    })?;
++    let last = !full && records.len() < POPULATION_BATCH_RECORDS;
++    Ok((records, last))
++}
++
++/// The most keys that one statement of [`set_index_keys`] checks.
++const POPULATION_KEYS_PER_CHECK: usize = 500;
++
++/// The most index records that one statement of [`set_index_keys`] inserts, four parameters
++/// each, so that a statement stays below SQLite's oldest limit of 999 parameters.
++const POPULATION_RECORDS_PER_INSERT: usize = 200;
++
++/// Stores the records of `index`, which is being populated, for the records of `store` that
++/// `records` has the index keys of. Returns false, having stored none of them, if the index is
++/// unique and two of the records, or one of them and a record stored before, have the same key.
++/// The statements cover many records each, since on RDB each statement costs about 0.2 ms.
++pub(crate) fn set_index_keys<X: SqlExecutor>(
++    executor: &mut X,
++    store: &ObjectStore,
++    index: StoreIndex,
++    records: Vec<IndexedDBRecordIndexKeys>,
++) -> Result<bool, SqlError> {
++    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
++    for IndexedDBRecordIndexKeys { primary_key, keys } in records {
++        let encoded_key = encoding::serialize(&primary_key);
++        let keys: BTreeSet<Vec<u8>> = keys
++            .into_iter()
++            .map(|key| encoding::serialize(&key.with_primary_key(&primary_key)))
++            .collect();
++        rows.extend(keys.into_iter().map(|key| (key, encoded_key.clone())));
++    }
++    if index.unique {
++        let mut keys = FxHashSet::default();
++        if !rows.iter().all(|(key, _)| keys.insert(key.as_slice())) {
++            return Ok(false);
++        }
++        for chunk in rows.chunks(POPULATION_KEYS_PER_CHECK) {
++            let sql = format!(
++                "SELECT 1 FROM unique_index_data WHERE index_id = ? AND value IN ({}) LIMIT 1",
++                vec!["?"; chunk.len()].join(", ")
++            );
++            let params: Vec<_> = std::iter::once(SqlParam::Integer(index.id))
++                .chain(chunk.iter().map(|(key, _)| SqlParam::Blob(key)))
++                .collect();
++            if query_row(executor, &sql, &params, |_| Ok(()))?.is_some() {
++                return Ok(false);
++            }
++        }
++    }
++    for chunk in rows.chunks(POPULATION_RECORDS_PER_INSERT) {
++        let sql = format!(
++            "INSERT INTO {} (index_id, value, object_data_key, object_store_id) VALUES {}",
++            index.table(),
++            vec!["(?, ?, ?, ?)"; chunk.len()].join(", ")
++        );
++        let params: Vec<_> = chunk
++            .iter()
++            .flat_map(|(key, primary_key)| {
++                [
++                    SqlParam::Integer(index.id),
++                    SqlParam::Blob(key),
++                    SqlParam::Blob(primary_key),
++                    SqlParam::Integer(store.id),
++                ]
++            })
++            .collect();
++        executor.execute(&sql, &params)?;
++    }
++    Ok(true)
++}
++
+ /// <https://w3c.github.io/IndexedDB/#delete-records-from-an-object-store>
+ pub(crate) fn delete_records<X: SqlExecutor>(
+     executor: &mut X,
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index 5bd770cf50d..75b4ae48860 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -16,10 +16,11 @@ use servo_base::threadpool::ThreadPool;
+ use servo_url::ImmutableOrigin;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+-    BackendError, BackendResult, ConnectionEvent, IndexedDBIndex, IndexedDBIndexKey,
+-    IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord,
+-    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput,
+-    TransactionEvent, Utf16String,
++    BackendError, BackendResult, ConnectionEvent, IndexPopulationEvent, IndexPopulationStep,
++    IndexedDBIndex, IndexedDBIndexKey, IndexedDBIndexKeys, IndexedDBKeyRange, IndexedDBKeyType,
++    IndexedDBObjectStore, IndexedDBRecord, IndexedDBRecordIndexKeys, IndexedDBTxnId,
++    IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput, TransactionEvent,
++    Utf16String,
+ };
+ use tempfile::TempDir;
+ use url::Host;
+@@ -122,6 +123,17 @@ executor_tests!(
+     test_placeholders_become_the_record_key,
+     test_abort_reverts_index_records,
+     test_index_keys_for_other_indexes_fail_the_transaction,
++    test_population_gives_the_index_records_that_puts_give,
++    test_population_unique_conflict_fails_the_upgrade,
++    test_population_of_a_unique_multi_entry_index,
++    test_requests_after_create_index_wait_for_the_population,
++    test_waiting_put_sees_the_populated_unique_index,
++    test_indexes_created_one_after_another_populate_in_turn,
++    test_abort_during_population_leaves_nothing,
++    test_commit_of_a_transaction_that_failed_while_populating,
++    test_population_of_an_empty_store_and_a_step_out_of_turn,
++    test_population_batches_are_limited_in_size,
++    test_population_finds_unique_conflicts_in_every_check,
+ );
+ 
+ const TIMEOUT: Duration = Duration::from_secs(10);
+@@ -1239,8 +1251,23 @@ fn get_callback<T: TestReply>() -> Callback<T> {
+ fn routed_results(
+     transaction: u64,
+     schema_failures: mpsc::Sender<BackendError>,
++) -> TransactionResults {
++    routed_results_with_populations(transaction, schema_failures, None)
++}
++
++/// [`routed_results`], with the index population events to `populations`.
++fn routed_results_with_populations(
++    transaction: u64,
++    schema_failures: mpsc::Sender<BackendError>,
++    populations: Option<mpsc::Sender<(i64, IndexPopulationEvent)>>,
+ ) -> TransactionResults {
+     let channel = GenericCallback::new(move |event| match event.unwrap() {
++        ConnectionEvent::Transaction {
++            event: TransactionEvent::IndexPopulation { index_id, event },
++            ..
++        } if populations.is_some() => {
++            let _ = populations.as_ref().unwrap().send((index_id, event));
++        },
+         ConnectionEvent::Transaction {
+             event: TransactionEvent::Request { request_id, result },
+             ..
+@@ -2086,6 +2113,7 @@ fn test_abort_rolls_back_data_schema_and_version<X: SqlExecutor>() {
+                     key_path: KeyPath::String("b".to_owned()),
+                     unique: false,
+                     multi_entry: false,
++                    populate: false,
+                 },
+             ),
+             schema(
+@@ -2187,6 +2215,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
+                     key_path: KeyPath::String("a".to_owned()),
+                     unique: false,
+                     multi_entry: false,
++                    populate: false,
+                 },
+             ),
+             (
+@@ -2197,6 +2226,7 @@ fn test_invalid_schema_operation_fails_the_transaction<X: SqlExecutor>() {
+                     key_path: KeyPath::String("a".to_owned()),
+                     unique: false,
+                     multi_entry: false,
++                    populate: false,
+                 },
+             ),
+             (store, AsyncSchemaOperation::DeleteIndex { index_id: 1 }),
+@@ -3307,6 +3337,7 @@ fn test_deleted_indexes_take_their_records_along<X: SqlExecutor>() {
+                 key_path: key_path.clone(),
+                 unique: false,
+                 multi_entry: false,
++                populate: false,
+             },
+         )],
+     );
+@@ -3573,6 +3604,788 @@ fn test_index_keys_for_other_indexes_fail_the_transaction<X: SqlExecutor>() {
+     }
+ }
+ 
++/// The index population events of a batch.
++type PopulationEvents = Vec<(i64, IndexPopulationEvent)>;
++
++/// Runs a batch of the upgrade `transaction`, waits until it has run, and returns the index
++/// population events it gave.
++fn run_upgrade_batch<X: SqlExecutor>(
++    db: &SqlEngine<X>,
++    transaction: u64,
++    requests: Vec<KvsOperation>,
++) -> PopulationEvents {
++    let (done_sender, done_receiver) = mpsc::channel();
++    let (schema_failures, _) = mpsc::channel();
++    let (populations, events) = mpsc::channel();
++    db.process_transaction(
++        txn(transaction),
++        KvsTransaction {
++            mode: IndexedDBTxnMode::Versionchange,
++            requests: VecDeque::from(requests),
++        },
++        routed_results_with_populations(transaction, schema_failures, Some(populations)),
++        Box::new(move || {
++            let _ = done_sender.send(());
++        }),
++    );
++    done_receiver
++        .recv_timeout(TIMEOUT)
++        .expect("The batch should complete");
++    events.try_iter().collect()
++}
++
++/// Creates the index `index` of `store` on the key path `key_path`, populated from the store's
++/// records.
++fn create_populated_index(
++    store: i64,
++    index: i64,
++    key_path: &str,
++    unique: bool,
++    multi_entry: bool,
++) -> KvsOperation {
++    schema(
++        store,
++        AsyncSchemaOperation::CreateIndex {
++            index_id: index,
++            name: key_path.into(),
++            key_path: KeyPath::String(key_path.to_owned()),
++            unique,
++            multi_entry,
++            populate: true,
++        },
++    )
++}
++
++fn population_step(store: i64, index: i64, step: IndexPopulationStep) -> KvsOperation {
++    schema(
++        store,
++        AsyncSchemaOperation::PopulateIndex {
++            index_id: index,
++            step,
++        },
++    )
++}
++
++/// The steps that script takes after the batch of records `records` of the population of
++/// `index`: it reads the next records unless these are the last, and sends the keys that
++/// `keys` gives each record.
++fn population_steps(
++    store: i64,
++    index: i64,
++    records: &[IndexedDBValue],
++    last: bool,
++    keys: &impl Fn(&IndexedDBValue) -> Vec<IndexedDBKeyType>,
++) -> Vec<KvsOperation> {
++    let mut steps = Vec::new();
++    if !last {
++        let after = records.last().unwrap().primary_key.clone();
++        steps.push(population_step(
++            store,
++            index,
++            IndexPopulationStep::ReadRecords { after },
++        ));
++    }
++    let records = records
++        .iter()
++        .map(|record| IndexedDBRecordIndexKeys {
++            primary_key: record.primary_key.clone(),
++            keys: keys(record)
++                .into_iter()
++                .map(IndexedDBIndexKey::Key)
++                .collect(),
++        })
++        .collect();
++    steps.push(population_step(
++        store,
++        index,
++        IndexPopulationStep::SetIndexKeys {
++            records,
++            done: last,
++        },
++    ));
++    steps
++}
++
++/// Populates `index` of `store` in the upgrade `transaction` as script does, from `events`, the
++/// events of the batch that created it, with `keys` computing the index keys of a record.
++/// Returns how the population ended, the population events of the other indexes on the way, and
++/// the number of record batches.
++fn populate<X: SqlExecutor>(
++    db: &SqlEngine<X>,
++    transaction: u64,
++    store: i64,
++    index: i64,
++    mut events: PopulationEvents,
++    keys: impl Fn(&IndexedDBValue) -> Vec<IndexedDBKeyType>,
++) -> (BackendResult<()>, PopulationEvents, usize) {
++    let mut others = Vec::new();
++    let mut batches = 0;
++    loop {
++        let mut next = None;
++        let mut done = None;
++        for (index_id, event) in events {
++            match event {
++                _ if index_id != index || done.is_some() => others.push((index_id, event)),
++                IndexPopulationEvent::Done(result) => done = Some(result),
++                IndexPopulationEvent::Records { records, last } => {
++                    assert!(next.is_none(), "One batch of records at a time");
++                    next = Some((records, last));
++                },
++            }
++        }
++        if let Some(result) = done {
++            return (result, others, batches);
++        }
++        let (records, last) = next.expect("The population should go on");
++        batches += 1;
++        let steps = population_steps(store, index, &records, last, &keys);
++        events = run_upgrade_batch(db, transaction, steps);
++    }
++}
++
++/// The number that a test value is: its bytes, big-endian.
++fn value_number(record: &IndexedDBValue) -> u32 {
++    u32::from_be_bytes(record.value[..4].try_into().unwrap())
++}
++
++/// The index records that populating an index gives a store's records are those that puts give
++/// them in an index that exists already, with several batches of records, a multiEntry index, a
++/// unique index and records without keys.
++fn test_population_gives_the_index_records_that_puts_give<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    // The keys of the record `n` in the index `kind`: by parity, none for multiples of ten; by
++    // digit, multiEntry; by name, unique.
++    let keys = |kind: usize, n: u32| -> Vec<IndexedDBKeyType> {
++        match kind {
++            0 if n.is_multiple_of(10) => vec![],
++            0 => vec![number(f64::from(n % 2))],
++            1 => {
++                let mut digits: Vec<u8> = n.to_string().bytes().map(|digit| digit - b'0').collect();
++                digits.sort();
++                digits.dedup();
++                digits
++                    .into_iter()
++                    .map(|digit| number(digit.into()))
++                    .collect()
++            },
++            _ => vec![string(&format!("n{n}"))],
++        }
++    };
++    let options = [
++        ("parity", false, false),
++        ("digit", false, true),
++        ("name", true, false),
++    ];
++
++    let indexed = create_store(&db, "indexed", None, false).unwrap();
++    let indexes: Vec<i64> = options
++        .iter()
++        .map(|(name, unique, multi_entry)| {
++            let key_path = KeyPath::String((*name).to_owned());
++            create_index(
++                &db,
++                indexed,
++                (*name).to_owned(),
++                key_path,
++                *unique,
++                *multi_entry,
++            )
++            .unwrap()
++        })
++        .collect();
++    let populated = create_store(&db, "populated", None, false).unwrap();
++    let count = 2 * queries::POPULATION_BATCH_RECORDS as u32 + 234;
++    let puts: Vec<_> = (1..=count)
++        .map(|n| {
++            let index_keys = (0..)
++                .zip(&indexes)
++                .map(|(kind, index)| index_keys(*index, keys(kind, n)))
++                .collect();
++            (
++                Some(number(f64::from(n))),
++                n.to_be_bytes().to_vec(),
++                index_keys,
++            )
++        })
++        .collect();
++    let plain_puts = puts
++        .iter()
++        .map(|(key, value, _)| (key.clone(), value.clone()))
++        .collect();
++    assert!(
++        run_indexed_puts(&db, 1, indexed, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    assert!(
++        run_puts(&db, 1, populated, plain_puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    db.upgrade_version(txn(2), 2);
++    let mut new_indexes = Vec::new();
++    for (kind, (name, unique, multi_entry)) in options.iter().enumerate() {
++        let index = indexes[2] + 1 + kind as i64;
++        let events = run_upgrade_batch(
++            &db,
++            2,
++            vec![create_populated_index(
++                populated,
++                index,
++                name,
++                *unique,
++                *multi_entry,
++            )],
++        );
++        let (result, others, batches) = populate(&db, 2, populated, index, events, |record| {
++            keys(kind, value_number(record))
++        });
++        assert_eq!(result, Ok(()));
++        assert!(others.is_empty());
++        assert_eq!(batches, 3);
++        new_indexes.push(index);
++    }
++    assert_eq!(commit(&db, 2), Ok(()));
++    for (index, new_index) in indexes.iter().zip(&new_indexes) {
++        let records = index_records_of(&db, indexed, *index);
++        assert!(!records.is_empty());
++        assert_eq!(index_records_of(&db, populated, *new_index), records);
++    }
++    assert_eq!(dangling_index_records(&db), 0);
++}
++
++/// A unique index that gets a key twice while it is populated, here from records in different
++/// batches, fails the upgrade transaction with Constraint: the requests that waited for the
++/// population and later steps fail, the commit fails, and aborting it leaves the database as it
++/// was.
++fn test_population_unique_conflict_fails_the_upgrade<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let count = queries::POPULATION_BATCH_RECORDS as u32 + 150;
++    let puts = (1..=count)
++        .map(|n| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
++        .collect();
++    assert!(
++        run_puts(&db, 1, store, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++    let unique_key = |n: u32| string(&format!("k{}", if n == count - 1 { 3 } else { n }));
++
++    db.upgrade_version(txn(2), 2);
++    let (before, after) = (get_callback::<PutReply>(), get_callback::<PutReply>());
++    let index = 1;
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![
++            put_request(
++                store,
++                before.0,
++                number(0.0),
++                0u32.to_be_bytes().to_vec(),
++                false,
++            ),
++            create_populated_index(store, index, "k", true, false),
++            indexed_put_request(
++                store,
++                after.0,
++                Some(number(-1.0)),
++                vec![],
++                false,
++                vec![index_keys(index, [string("new")])],
++            ),
++        ],
++    );
++    assert_eq!(recv(&before.1), key_reply(0.0));
++    assert!(
++        after.1.try_recv().is_err(),
++        "The put waits for the population"
++    );
++    let (result, _, batches) = populate(&db, 2, store, index, events, |record| {
++        vec![unique_key(value_number(record))]
++    });
++    assert_eq!(result, Err(BackendError::Constraint));
++    assert_eq!(batches, 2);
++    assert_eq!(recv(&after.1), Err(BackendError::Constraint));
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![population_step(
++            store,
++            index,
++            IndexPopulationStep::ReadRecords { after: number(1.0) },
++        )],
++    );
++    assert!(matches!(
++        &events[..],
++        [(1, IndexPopulationEvent::Done(Err(BackendError::Constraint)))]
++    ));
++    assert_eq!(commit(&db, 2), Err(BackendError::Constraint));
++    abort(&db, 2);
++
++    assert!(db.object_stores()[0].indexes.is_empty());
++    assert_eq!(index_record_count(&db, index), 0);
++    assert_eq!(stored_keys(&db, store).len(), count as usize);
++    assert_eq!(stored_keys(&db, store)[0], number(1.0));
++}
++
++/// A unique multiEntry index gets each of a record's keys once and fails if two records share
++/// one.
++fn test_population_of_a_unique_multi_entry_index<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let puts = (1..=3)
++        .map(|n: u32| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
++        .collect();
++    assert!(
++        run_puts(&db, 1, store, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++    let tags = |third: &'static str| {
++        move |record: &IndexedDBValue| match value_number(record) {
++            1 => vec![string("a"), string("a"), string("b")],
++            2 => vec![string("c")],
++            _ => vec![string(third), string("d")],
++        }
++    };
++
++    db.upgrade_version(txn(2), 2);
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![create_populated_index(store, 1, "t", true, true)],
++    );
++    assert_eq!(populate(&db, 2, store, 1, events, tags("e")).0, Ok(()));
++    assert_eq!(
++        index_records_of(&db, store, 1),
++        string_records(&[("a", 1.0), ("b", 1.0), ("c", 2.0), ("d", 3.0), ("e", 3.0)])
++    );
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![create_populated_index(store, 2, "u", true, true)],
++    );
++    assert_eq!(
++        populate(&db, 2, store, 2, events, tags("b")).0,
++        Err(BackendError::Constraint)
++    );
++    abort(&db, 2);
++}
++
++/// The requests and schema operations that come after the creation of an index that is
++/// populated run once the population is done, in order, and see the whole index: a put whose
++/// unique key an existing record has fails, and one after the index's deletion doesn't.
++fn test_requests_after_create_index_wait_for_the_population<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let puts = (1..=3)
++        .map(|n: u32| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
++        .collect();
++    assert!(
++        run_puts(&db, 1, store, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    db.upgrade_version(txn(2), 2);
++    let index = 1;
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![create_populated_index(store, index, "k", true, false)],
++    );
++    let (order_sender, order) = mpsc::channel();
++    let put = |id, key: f64, index_key: Option<&str>| {
++        let index_keys = index_key.map(|key| vec![index_keys(index, [string(key)])]);
++        indexed_put_request(
++            store,
++            tagged(&order_sender, id),
++            Some(number(key)),
++            vec![],
++            false,
++            index_keys.unwrap_or_default(),
++        )
++    };
++    assert!(
++        run_upgrade_batch(
++            &db,
++            2,
++            vec![
++                put(4, 4.0, Some("k1")),
++                put(5, 5.0, Some("k5")),
++                schema(store, AsyncSchemaOperation::DeleteIndex { index_id: index }),
++                put(6, 6.0, None),
++            ],
++        )
++        .is_empty()
++    );
++    assert!(
++        order.try_recv().is_err(),
++        "The requests wait for the population"
++    );
++    let (result, _, _) = populate(&db, 2, store, index, events, |record| {
++        vec![string(&format!("k{}", value_number(record)))]
++    });
++    assert_eq!(result, Ok(()));
++    assert_eq!(order.try_iter().collect::<Vec<_>>(), vec![4, 5, 6]);
++    assert_eq!(commit(&db, 2), Ok(()));
++    assert_eq!(stored_keys(&db, store), number_keys([1, 2, 3, 5, 6]));
++    assert!(db.object_stores()[0].indexes.is_empty());
++    assert_eq!(index_record_count(&db, index), 0);
++}
++
++/// The results of the requests that waited, and the unique conflict of one of them with an
++/// existing record.
++fn test_waiting_put_sees_the_populated_unique_index<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let puts = vec![(Some(number(1.0)), 1u32.to_be_bytes().to_vec())];
++    assert!(
++        run_puts(&db, 1, store, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    db.upgrade_version(txn(2), 2);
++    let (conflict, other) = (get_callback::<PutReply>(), get_callback::<PutReply>());
++    let index = 1;
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![
++            create_populated_index(store, index, "k", true, false),
++            indexed_put_request(
++                store,
++                conflict.0,
++                Some(number(2.0)),
++                vec![],
++                false,
++                vec![index_keys(index, [string("k1")])],
++            ),
++            indexed_put_request(
++                store,
++                other.0,
++                Some(number(3.0)),
++                vec![],
++                false,
++                vec![index_keys(index, [string("k3")])],
++            ),
++        ],
++    );
++    let (result, _, _) = populate(&db, 2, store, index, events, |record| {
++        vec![string(&format!("k{}", value_number(record)))]
++    });
++    assert_eq!(result, Ok(()));
++    assert_eq!(
++        recv(&conflict.1),
++        Ok(PutItemResult::UniqueIndexKeyExists(index))
++    );
++    assert_eq!(recv(&other.1), key_reply(3.0));
++    assert_eq!(commit(&db, 2), Ok(()));
++    assert_eq!(
++        index_records_of(&db, store, index),
++        string_records(&[("k1", 1.0), ("k3", 3.0)])
++    );
++}
++
++/// Indexes created one after another are populated one after another, each after the requests
++/// that came before its creation, so the second sees a record put between the two.
++fn test_indexes_created_one_after_another_populate_in_turn<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let puts = (1..=3)
++        .map(|n: u32| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
++        .collect();
++    assert!(
++        run_puts(&db, 1, store, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    db.upgrade_version(txn(2), 2);
++    let (first, second) = (1, 2);
++    let put = get_callback::<PutReply>();
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![
++            create_populated_index(store, first, "a", false, false),
++            indexed_put_request(
++                store,
++                put.0,
++                Some(number(4.0)),
++                4u32.to_be_bytes().to_vec(),
++                false,
++                vec![index_keys(first, [number(4.0)])],
++            ),
++            create_populated_index(store, second, "b", false, false),
++        ],
++    );
++    assert!(events.iter().all(|(index, _)| *index == first));
++    let same = |record: &IndexedDBValue| vec![number(f64::from(value_number(record)))];
++    let (result, others, _) = populate(&db, 2, store, first, events, same);
++    assert_eq!(result, Ok(()));
++    assert_eq!(recv(&put.1), key_reply(4.0));
++    let [
++        (
++            _,
++            IndexPopulationEvent::Records {
++                records,
++                last: true,
++            },
++        ),
++    ] = &others[..]
++    else {
++        panic!("The second population should start: {others:?}");
++    };
++    assert_eq!(records.len(), 4);
++    let (result, _, _) = populate(&db, 2, store, second, others, same);
++    assert_eq!(result, Ok(()));
++    assert_eq!(commit(&db, 2), Ok(()));
++    let records: Vec<_> = (1..=4)
++        .map(|n| (number(f64::from(n)), number(f64::from(n))))
++        .collect();
++    assert_eq!(index_records_of(&db, store, first), records);
++    assert_eq!(index_records_of(&db, store, second), records);
++}
++
++/// Aborting the upgrade transaction during a population rolls it back and drops the requests
++/// that waited, and the database's next writer runs.
++fn test_abort_during_population_leaves_nothing<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let count = queries::POPULATION_BATCH_RECORDS as u32 + 10;
++    let puts = (1..=count)
++        .map(|n| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
++        .collect();
++    assert!(
++        run_puts(&db, 1, store, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    db.upgrade_version(txn(2), 2);
++    let index = 1;
++    let waiting = get_callback::<PutReply>();
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![
++            create_populated_index(store, index, "k", false, false),
++            put_request(store, waiting.0, number(0.0), vec![], false),
++        ],
++    );
++    let [
++        (
++            _,
++            IndexPopulationEvent::Records {
++                records,
++                last: false,
++            },
++        ),
++    ] = &events[..]
++    else {
++        panic!("The population should start: {events:?}");
++    };
++    let steps = population_steps(store, index, records, false, &|_| vec![number(1.0)]);
++    assert_eq!(run_upgrade_batch(&db, 2, steps).len(), 1);
++    assert!(index_record_count(&db, index) > 0);
++    abort(&db, 2);
++    assert!(waiting.1.recv_timeout(Duration::from_millis(100)).is_err());
++
++    assert_eq!(index_record_count(&db, index), 0);
++    assert!(db.object_stores()[0].indexes.is_empty());
++    let replies = run_puts(&db, 3, store, vec![(Some(number(0.0)), vec![])], false);
++    assert_eq!(replies, vec![key_reply(0.0)]);
++    assert_eq!(commit(&db, 3), Ok(()));
++    assert_eq!(stored_keys(&db, store).len(), count as usize + 1);
++}
++
++/// The commit of an upgrade transaction that failed while it populated an index fails and drops
++/// the population, so that the next upgrade can populate an index without an abort in between.
++fn test_commit_of_a_transaction_that_failed_while_populating<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_faulty_engine::<X>(&dir);
++    db.upgrade_version(txn(2), 2);
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![create_populated_index(TEST_STORE, 1, "k", false, false)],
++    );
++    assert!(
++        matches!(&events[..], [(1, IndexPopulationEvent::Records { .. })]),
++        "The population should start: {events:?}"
++    );
++    // A job outside the transaction's requests ends its SQL transaction; the fault clears
++    // itself when it fires.
++    faults_for(dir.path()).lock().unwrap().statement = Some(("FROM object_store", 0));
++    db.spawn_on_connection(|executor| {
++        let _ = queries::object_store(executor, TEST_STORE);
++    });
++    assert!(commit(&db, 2).is_err());
++
++    db.upgrade_version(txn(3), 2);
++    let events = run_upgrade_batch(
++        &db,
++        3,
++        vec![create_populated_index(TEST_STORE, 1, "k", false, false)],
++    );
++    let (result, _, batches) = populate(&db, 3, TEST_STORE, 1, events, |_| vec![number(1.0)]);
++    assert_eq!((result, batches), (Ok(()), 1));
++    assert_eq!(commit(&db, 3), Ok(()));
++    assert_eq!(index_record_count(&db, 1), 1);
++}
++
++/// An index of an empty store is populated in one step, and a step for an index that isn't
++/// being populated fails the transaction.
++fn test_population_of_an_empty_store_and_a_step_out_of_turn<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++
++    db.upgrade_version(txn(1), 1);
++    let events = run_upgrade_batch(
++        &db,
++        1,
++        vec![create_populated_index(store, 1, "a", false, false)],
++    );
++    let [
++        (
++            1,
++            IndexPopulationEvent::Records {
++                records,
++                last: true,
++            },
++        ),
++    ] = &events[..]
++    else {
++        panic!("The population should start with no records: {events:?}");
++    };
++    assert!(records.is_empty());
++    let (result, _, batches) = populate(&db, 1, store, 1, events, |_| vec![]);
++    assert_eq!((result, batches), (Ok(()), 1));
++
++    let put = get_callback::<PutReply>();
++    let events = run_upgrade_batch(
++        &db,
++        1,
++        vec![
++            population_step(
++                store,
++                1,
++                IndexPopulationStep::SetIndexKeys {
++                    records: vec![],
++                    done: true,
++                },
++            ),
++            put_request(store, put.0, number(1.0), vec![], false),
++        ],
++    );
++    assert!(matches!(
++        &events[..],
++        [(1, IndexPopulationEvent::Done(Err(BackendError::DbErr(_))))]
++    ));
++    assert!(recv(&put.1).is_err());
++    assert!(commit(&db, 1).is_err());
++}
++
++/// A unique index's keys in a batch of records are checked against the records of earlier
++/// batches in several statements, and a conflict in any of them fails the population.
++fn test_population_finds_unique_conflicts_in_every_check<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let count = queries::POPULATION_BATCH_RECORDS as u32 + 300;
++    let puts = (1..=count)
++        .map(|n| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
++        .collect();
++    assert!(
++        run_puts(&db, 1, store, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++    // Two keys per record; the last record's first key is the first record's, which the second
++    // batch's 600 keys only reach in their second check.
++    let keys = |last_conflicts: bool| {
++        move |record: &IndexedDBValue| {
++            let n = f64::from(value_number(record));
++            match n as u32 {
++                n if n == count && last_conflicts => vec![number(2.0), number(f64::from(2 * n))],
++                _ => vec![number(2.0 * n), number(2.0 * n + 1.0)],
++            }
++        }
++    };
++
++    db.upgrade_version(txn(2), 2);
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![create_populated_index(store, 1, "a", true, true)],
++    );
++    let (result, _, batches) = populate(&db, 2, store, 1, events, keys(false));
++    assert_eq!((result, batches), (Ok(()), 2));
++    assert_eq!(index_record_count(&db, 1), 2 * i64::from(count));
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![create_populated_index(store, 2, "b", true, true)],
++    );
++    let (result, _, _) = populate(&db, 2, store, 2, events, keys(true));
++    assert_eq!(result, Err(BackendError::Constraint));
++    abort(&db, 2);
++}
++
++/// A batch of records for a population stops early once their values reach the size limit.
++fn test_population_batches_are_limited_in_size<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let puts = (1..=10)
++        .map(|n| (Some(number(f64::from(n))), vec![n as u8; 300 * 1024]))
++        .collect();
++    assert!(
++        run_puts(&db, 1, store, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    let mut connection = db.connection();
++    let object_store = queries::object_store(&mut *connection, store)
++        .unwrap()
++        .unwrap();
++    let mut after = None;
++    let mut batches = Vec::new();
++    loop {
++        let (records, last) =
++            queries::population_records(&mut *connection, &object_store, after.as_ref()).unwrap();
++        batches.push((records.len(), last));
++        if last {
++            break;
++        }
++        after = Some(records.last().unwrap().primary_key.clone());
++    }
++    assert_eq!(batches, vec![(4, false), (4, false), (2, true)]);
++}
++
+ #[test]
+ fn has_enospc_detects_enospc_and_nothing_else() {
+     use crate::shared::has_enospc;
+diff --git a/components/storage/indexeddb/engines/mod.rs b/components/storage/indexeddb/engines/mod.rs
+index 61f6acf7c24..eb7a8805c2a 100644
+--- a/components/storage/indexeddb/engines/mod.rs
++++ b/components/storage/indexeddb/engines/mod.rs
+@@ -9,8 +9,9 @@ use malloc_size_of::MallocSizeOf;
+ use malloc_size_of_derive::MallocSizeOf;
+ use profile_traits::generic_callback::GenericCallback;
+ use storage_traits::indexeddb::{
+-    AsyncOperation, BackendError, BackendResult, ConnectionEvent, IndexedDBObjectStore,
+-    IndexedDBObjectStoreId, IndexedDBTxnId, IndexedDBTxnMode, TransactionEvent,
++    AsyncOperation, AsyncSchemaOperation, BackendError, BackendResult, ConnectionEvent,
++    IndexPopulationEvent, IndexedDBIndexId, IndexedDBObjectStore, IndexedDBObjectStoreId,
++    IndexedDBTxnId, IndexedDBTxnMode, TransactionEvent,
+ };
+ 
+ pub(crate) use crate::indexeddb::backend::ActiveKvsEngine;
+@@ -30,14 +31,44 @@ pub struct KvsOperation {
+ impl KvsOperation {
+     /// What to report when the operation fails with `error`.
+     pub fn failure_event(&self, error: BackendError) -> TransactionEvent {
+-        match self.request_id {
+-            Some(request_id) => TransactionEvent::Request {
++        if let Some(request_id) = self.request_id {
++            return TransactionEvent::Request {
+                 request_id,
+                 result: Err(error),
++            };
++        }
++        match self.populated_index() {
++            Some(index_id) => TransactionEvent::IndexPopulation {
++                index_id,
++                event: IndexPopulationEvent::Done(Err(error)),
+             },
+             None => TransactionEvent::SchemaChangeFailed(error),
+         }
+     }
++
++    /// The index that the operation populates or starts populating, if it does.
++    fn populated_index(&self) -> Option<IndexedDBIndexId> {
++        match &self.operation {
++            AsyncOperation::Schema(
++                AsyncSchemaOperation::CreateIndex {
++                    index_id,
++                    populate: true,
++                    ..
++                } |
++                AsyncSchemaOperation::PopulateIndex { index_id, .. },
++            ) => Some(*index_id),
++            _ => None,
++        }
++    }
++
++    /// Whether the operation is a step of populating the index `index`.
++    pub fn is_population_step_of(&self, index: IndexedDBIndexId) -> bool {
++        matches!(
++            &self.operation,
++            AsyncOperation::Schema(AsyncSchemaOperation::PopulateIndex { index_id, .. })
++                if *index_id == index
++        )
++    }
+ }
+ 
+ /// Where the results of a transaction go: the result channel of its connection, which keeps the
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 1ee0ab8eeac..e561a9a33e3 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -2449,6 +2449,7 @@ mod tests {
+                 key_path: KeyPath::String("author".to_string()),
+                 unique: false,
+                 multi_entry: false,
++                populate: false,
+             }),
+         );
+         assert_eq!(
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index 319c0412a6f..2f8915ee868 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -20,10 +20,11 @@ use storage::ClientStorageThreadFactory;
+ use storage_traits::StorageThreads;
+ use storage_traits::indexeddb::{
+     AsyncOperation, AsyncReadOnlyOperation, AsyncReadWriteOperation, AsyncSchemaOperation,
+-    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexedDBIndexKeys,
+-    IndexedDBKeyRange, IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBThreadMsg,
+-    IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult, RequestOutput,
+-    StorageBottleSource, SyncOperation, TransactionEvent,
++    BackendError, BackendResult, ConnectionEvent, ConnectionMsg, IndexPopulationEvent,
++    IndexPopulationStep, IndexedDBIndexKey, IndexedDBIndexKeys, IndexedDBKeyRange,
++    IndexedDBKeyType, IndexedDBObjectStore, IndexedDBRecord, IndexedDBRecordIndexKeys,
++    IndexedDBThreadMsg, IndexedDBTxnId, IndexedDBTxnMode, IndexedDBValue, KeyPath, PutItemResult,
++    RequestOutput, StorageBottleSource, SyncOperation, TransactionEvent,
+ };
+ use tempfile::TempDir;
+ use uuid::Uuid;
+@@ -80,6 +81,7 @@ backend_tests!(
+     test_indexeddb_transaction_of_a_dropped_connection_holds_back_no_one,
+     test_indexeddb_requests_outside_the_mode_or_scope_fail_the_transaction,
+     test_indexeddb_versionchange_follows_the_open_result_on_one_channel,
++    test_indexeddb_create_index_population_runs_before_later_requests,
+ );
+ 
+ static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+@@ -212,6 +214,8 @@ struct Routes {
+     requests: HashMap<(Uuid, u64, u64), RequestRoute>,
+     commits: HashMap<(Uuid, u64), mpsc::Sender<Option<BackendResult<()>>>>,
+     schema_failures: HashMap<(Uuid, u64), mpsc::Sender<Option<BackendError>>>,
++    /// The index population events, by (connection, transaction serial).
++    populations: HashMap<(Uuid, u64), mpsc::Sender<(i64, IndexPopulationEvent)>>,
+     /// The transaction events of each connection, in the order they arrived, as (transaction
+     /// serial, request id or `None` for a commit result).
+     log: HashMap<Uuid, Vec<(u64, Option<u64>)>>,
+@@ -260,6 +264,11 @@ fn route(connection: Uuid, event: ConnectionEvent) {
+                 let _ = sender.send(Some(error));
+             }
+         },
++        TransactionEvent::IndexPopulation { index_id, event } => {
++            if let Some(sender) = routes.populations.get(&(connection, serial)) {
++                let _ = sender.send((index_id, event));
++            }
++        },
+     }
+ }
+ 
+@@ -466,6 +475,7 @@ fn create_index(
+             key_path,
+             unique,
+             multi_entry,
++            populate: false,
+         },
+     )
+ }
+@@ -2478,3 +2488,134 @@ fn test_indexeddb_versionchange_follows_the_open_result_on_one_channel() {
+     close_database(&ctx, upgraded, db_name);
+     ctx.shutdown();
+ }
++
++/// An index that an upgrade transaction creates on a store with records is populated by script's
++/// steps, and the transaction's requests that came after its creation wait until it is done and
++/// see the whole index.
++fn test_indexeddb_create_index_population_runs_before_later_requests() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-create-index-population";
++    let receiver = open_database(&ctx, db_name, Some(1));
++    let ConnectionMsg::Upgrade { transaction, .. } =
++        recv_callback_timeout(&receiver, "upgrade message")
++    else {
++        panic!("expected an upgrade");
++    };
++    let (population_sender, populations) = mpsc::channel();
++    ROUTES.lock().unwrap().populations.insert(
++        (transaction.connection, transaction.serial),
++        population_sender,
++    );
++    let failures = create_object_store(&ctx, db_name, STORE, "store", transaction, None, false);
++    let before: Vec<_> = (1..=3)
++        .map(|key| {
++            indexed_put_request(
++                &ctx,
++                db_name,
++                STORE,
++                transaction,
++                key,
++                Some(IndexedDBKeyType::Number(key as f64)),
++                vec![key as u8],
++                false,
++                vec![],
++            )
++        })
++        .collect();
++    let index = 1;
++    send_schema_operation(
++        &ctx,
++        db_name,
++        STORE,
++        transaction,
++        AsyncSchemaOperation::CreateIndex {
++            index_id: index,
++            name: "unique".into(),
++            key_path: KeyPath::String("k".to_owned()),
++            unique: true,
++            multi_entry: false,
++            populate: true,
++        },
++    );
++    let string_key = |key: &str| IndexedDBIndexKeys {
++        index_id: index,
++        keys: vec![IndexedDBIndexKey::Key(IndexedDBKeyType::String(key.into()))],
++    };
++    let after = [(4, "d"), (5, "a")].map(|(key, index_key)| {
++        indexed_put_request(
++            &ctx,
++            db_name,
++            STORE,
++            transaction,
++            key,
++            Some(IndexedDBKeyType::Number(key as f64)),
++            vec![key as u8],
++            false,
++            vec![string_key(index_key)],
++        )
++    });
++    for (key, receiver) in (1..).zip(&before) {
++        assert_eq!(
++            recv_callback_timeout(receiver, "put before createIndex"),
++            Ok(PutItemResult::Key(IndexedDBKeyType::Number(key as f64)))
++        );
++    }
++
++    let (event_index, event) = populations.recv_timeout(TIMEOUT).unwrap();
++    assert_eq!(event_index, index);
++    let IndexPopulationEvent::Records { records, last } = event else {
++        panic!("expected the store's records: {event:?}");
++    };
++    assert!(last);
++    assert_eq!(records.len(), 3);
++    assert!(
++        after[0].recv_timeout(Duration::from_millis(200)).is_err(),
++        "the put after createIndex waits for the population"
++    );
++    let records = records
++        .into_iter()
++        .map(|record| IndexedDBRecordIndexKeys {
++            keys: vec![IndexedDBIndexKey::Key(IndexedDBKeyType::String(
++                ["a", "b", "c"][record.value[0] as usize - 1].into(),
++            ))],
++            primary_key: record.primary_key,
++        })
++        .collect();
++    send_schema_operation(
++        &ctx,
++        db_name,
++        STORE,
++        transaction,
++        AsyncSchemaOperation::PopulateIndex {
++            index_id: index,
++            step: IndexPopulationStep::SetIndexKeys {
++                records,
++                done: true,
++            },
++        },
++    );
++    assert!(matches!(
++        populations.recv_timeout(TIMEOUT).unwrap(),
++        (1, IndexPopulationEvent::Done(Ok(())))
++    ));
++    assert_eq!(
++        recv_callback_timeout(&after[0], "put after createIndex"),
++        Ok(PutItemResult::Key(IndexedDBKeyType::Number(4.0)))
++    );
++    assert_eq!(
++        recv_callback_timeout(&after[1], "conflicting put after createIndex"),
++        Ok(PutItemResult::UniqueIndexKeyExists(index))
++    );
++    assert!(failures.try_recv().is_err());
++
++    commit_upgrade_transaction(&ctx, db_name, transaction);
++    let ConnectionMsg::Connection {
++        id, object_stores, ..
++    } = recv_callback_timeout(&receiver, "connection message")
++    else {
++        panic!("expected the connection");
++    };
++    assert_eq!(object_stores[0].indexes.len(), 1);
++    close_database(&ctx, id, db_name);
++    ctx.shutdown();
++}
+diff --git a/python/tidy/error_message_exceptions.txt b/python/tidy/error_message_exceptions.txt
+index d4e8727a5c2..666c3be5d27 100644
+--- a/python/tidy/error_message_exceptions.txt
++++ b/python/tidy/error_message_exceptions.txt
+@@ -1,7 +1,7 @@
+ ./components/script/dom/abort/abortsignal.rs 3
+ ./components/script/dom/animations/keyframeeffect.rs 3
+ ./components/script/dom/bindings/constructor.rs 3
+-./components/script/dom/bindings/error.rs 29
++./components/script/dom/bindings/error.rs 30
+ ./components/script/dom/bindings/structuredclone.rs 2
+ ./components/script/dom/bluetooth/bluetooth.rs 6
+ ./components/script/dom/bluetooth/bluetoothremotegattserver.rs 1
+diff --git a/tests/wpt/meta/IndexedDB/idbfactory-open-request-error.any.js.ini b/tests/wpt/meta/IndexedDB/idbfactory-open-request-error.any.js.ini
+index 7885ce931ae..22f7495a6ec 100644
+--- a/tests/wpt/meta/IndexedDB/idbfactory-open-request-error.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbfactory-open-request-error.any.js.ini
+@@ -1,17 +1,8 @@
+ [idbfactory-open-request-error.any.html]
+-  [Properties of IDBOpenDBRequest during failed IDBFactory open()]
+-    expected: FAIL
+-
+ 
+ [idbfactory-open-request-error.any.sharedworker.html]
+-  [Properties of IDBOpenDBRequest during failed IDBFactory open()]
+-    expected: FAIL
+-
+ 
+ [idbfactory-open-request-error.any.worker.html]
+-  [Properties of IDBOpenDBRequest during failed IDBFactory open()]
+-    expected: FAIL
+-
+ 
+ [idbfactory-open-request-error.any.serviceworker.html]
+   expected: ERROR
+diff --git a/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini b/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini
+index 6cf9edddb39..c6d15a982b1 100644
+--- a/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini
+@@ -1,22 +1,10 @@
+ [idbobjectstore_createIndex.any.worker.html]
+-  [Attempt to create an index that requires unique values on an object store already contains duplicates]
+-    expected: FAIL
+-
+   [The index is usable right after being made]
+     expected: FAIL
+ 
+-  [Event ordering for a later deleted index]
+-    expected: FAIL
+-
+   [Empty keyPath]
+     expected: FAIL
+ 
+-  [Event order when unique constraint is triggered]
+-    expected: FAIL
+-
+-  [Event ordering for ConstraintError on request]
+-    expected: FAIL
+-
+   [Index can be valid keys]
+     expected: FAIL
+ 
+@@ -37,24 +25,12 @@
+   expected: ERROR
+ 
+ [idbobjectstore_createIndex.any.sharedworker.html]
+-  [Attempt to create an index that requires unique values on an object store already contains duplicates]
+-    expected: FAIL
+-
+   [The index is usable right after being made]
+     expected: FAIL
+ 
+-  [Event ordering for a later deleted index]
+-    expected: FAIL
+-
+   [Empty keyPath]
+     expected: FAIL
+ 
+-  [Event order when unique constraint is triggered]
+-    expected: FAIL
+-
+-  [Event ordering for ConstraintError on request]
+-    expected: FAIL
+-
+   [Index can be valid keys]
+     expected: FAIL
+ 
+@@ -72,24 +48,12 @@
+ 
+ 
+ [idbobjectstore_createIndex.any.html]
+-  [Attempt to create an index that requires unique values on an object store already contains duplicates]
+-    expected: FAIL
+-
+   [The index is usable right after being made]
+     expected: FAIL
+ 
+-  [Event ordering for a later deleted index]
+-    expected: FAIL
+-
+   [Empty keyPath]
+     expected: FAIL
+ 
+-  [Event order when unique constraint is triggered]
+-    expected: FAIL
+-
+-  [Event ordering for ConstraintError on request]
+-    expected: FAIL
+-
+   [Index can be valid keys]
+     expected: FAIL
+ 
+diff --git a/tests/wpt/meta/IndexedDB/idbtransaction_abort.any.js.ini b/tests/wpt/meta/IndexedDB/idbtransaction_abort.any.js.ini
+index c6e34fc4449..68d0e5a4c5e 100644
+--- a/tests/wpt/meta/IndexedDB/idbtransaction_abort.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbtransaction_abort.any.js.ini
+@@ -1,16 +1,8 @@
+ [idbtransaction_abort.any.worker.html]
+-  [Abort event should fire during transaction]
+-    expected: FAIL
+-
+ 
+ [idbtransaction_abort.any.sharedworker.html]
+-  [Abort event should fire during transaction]
+-    expected: FAIL
+-
+ 
+ [idbtransaction_abort.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbtransaction_abort.any.html]
+-  [Abort event should fire during transaction]
+-    expected: FAIL
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 1b0e2a69c7a..2faee6bd465 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11805,6 +11805,89 @@
+       }
+      ]
+     ],
++    "index-population.any.js": [
++     "f1f53e3ac16114d0d37f4c28593bba2d2ae6a70b",
++     [
++      "IndexedDB/index-population.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: an index created on an object store with records is populated from them"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ],
++     [
++      "IndexedDB/index-population.any.serviceworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: an index created on an object store with records is populated from them"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ],
++     [
++      "IndexedDB/index-population.any.sharedworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: an index created on an object store with records is populated from them"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ],
++     [
++      "IndexedDB/index-population.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: an index created on an object store with records is populated from them"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ]
++    ],
+     "removed-iframe-aborts-its-transactions.html": [
+      "4c72fe0190142520f2e483e292f0997bd6dc924b",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/index-population.any.js b/tests/wpt/mozilla/tests/IndexedDB/index-population.any.js
+new file mode 100644
+index 00000000000..f1f53e3ac16
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/index-population.any.js
+@@ -0,0 +1,385 @@
++// META: global=window,worker
++// META: title=IndexedDB: an index created on an object store with records is populated from them
++// META: timeout=long
++
++// https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex: creating an index is "processed
++// as an asynchronous request within the upgrade transaction", which gives the index the records
++// of the store's records; if a unique index would get a key twice, the upgrade transaction aborts
++// with a ConstraintError. Requests made after createIndex see the whole index. Index reads aren't
++// implemented yet, so these tests observe the index records through unique conflicts.
++
++'use strict';
++
++// Opens a new database at version 1, with `upgrade` as its upgradeneeded handler.
++function openDatabase(t, upgrade) {
++  const name = 'index-population-' + Math.random();
++  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
++  return reopen(name, 1, upgrade);
++}
++
++// Opens the database `name` at `version`, with `upgrade` as its upgradeneeded handler.
++function reopen(name, version, upgrade) {
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open(name, version);
++    request.onupgradeneeded = () => upgrade(request.result, request.transaction);
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++// Opens the database `name` at `version` and resolves with the names of the events of the upgrade
++// transaction's requests and of the transaction, and of the open request's error, once it fails.
++function failedUpgrade(name, version, upgrade) {
++  return new Promise((resolve, reject) => {
++    const events = [];
++    const log = label => event => {
++      const error = event.target.error;
++      events.push(label + (error ? ' ' + error.name : ''));
++    };
++    const request = indexedDB.open(name, version);
++    request.onupgradeneeded = () => {
++      request.transaction.onabort = log('abort');
++      request.transaction.oncomplete = log('complete');
++      upgrade(request.result, request.transaction, log);
++    };
++    request.onsuccess = () => {
++      request.result.close();
++      reject(new Error('The upgrade should fail'));
++    };
++    request.onerror = event => {
++      event.preventDefault();
++      log('open')(event);
++      resolve(events);
++    };
++  });
++}
++
++function result(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++// The name of the request's error, which is prevented, so that the transaction goes on.
++function failure(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => reject(new Error('The request should fail'));
++    request.onerror = event => {
++      event.preventDefault();
++      resolve(request.error.name);
++    };
++  });
++}
++
++function complete(transaction) {
++  return new Promise((resolve, reject) => {
++    transaction.oncomplete = resolve;
++    transaction.onabort = () => reject(transaction.error);
++  });
++}
++
++// More records than the backend reads in one step of a population.
++const MANY = 1234;
++
++// A database at version 1 with the store `items` holding `count` records `{k: 'k<i>', n: i}`
++// under the keys 0 to count - 1.
++async function databaseWithRecords(t, count) {
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('items');
++    for (let i = 0; i < count; i++) {
++      store.add({k: 'k' + i, n: i}, i);
++    }
++  });
++  db.close();
++  return db.name;
++}
++
++promise_test(async t => {
++  const name = await databaseWithRecords(t, MANY);
++  let conflict, added;
++  const db = await reopen(name, 2, (db, tx) => {
++    const store = tx.objectStore('items');
++    store.createIndex('k', 'k', {unique: true});
++    conflict = failure(store.add({k: 'k' + (MANY - 1)}, 'last'));
++    added = result(store.add({k: 'new'}, 'new'));
++  });
++  t.add_cleanup(() => { db.close(); });
++  assert_equals(await conflict, 'ConstraintError', 'the last record is in the index');
++  assert_equals(await added, 'new');
++
++  const tx = db.transaction('items', 'readwrite');
++  const store = tx.objectStore('items');
++  assert_equals(await failure(store.put({k: 'k0'}, 'first')), 'ConstraintError');
++  assert_equals(await failure(store.put({k: 'new'}, 'other')), 'ConstraintError');
++  assert_equals(await result(store.put({k: 'k0'}, 0)), 0, 'a record keeps its own key');
++  await complete(tx);
++}, 'An index created on a store with records has their keys for the requests that follow');
++
++promise_test(async t => {
++  let conflict;
++  const db = await openDatabase(t, (db, tx) => {
++    const store = db.createObjectStore('items');
++    store.add({k: 'a'}, 1);
++    store.createIndex('k', 'k', {unique: true});
++    conflict = failure(store.add({k: 'a'}, 2));
++  });
++  db.close();
++  assert_equals(await conflict, 'ConstraintError');
++}, 'An index created on a store that the upgrade created and added records to has their keys');
++
++promise_test(async t => {
++  const name = await databaseWithRecords(t, MANY);
++  const events = await failedUpgrade(name, 2, (db, tx, log) => {
++    const store = tx.objectStore('items');
++    store.put({k: 'k700'}, 3).onsuccess = log('put');
++    store.createIndex('k', 'k', {unique: true});
++    const after = store.add({k: 'new'}, 'new');
++    after.onsuccess = log('add');
++    after.onerror = log('add');
++  });
++  assert_array_equals(
++      events, ['put', 'add AbortError', 'abort ConstraintError', 'open AbortError']);
++
++  const db = await reopen(name, 1, () => assert_unreached('no upgrade'));
++  t.add_cleanup(() => { db.close(); });
++  const tx = db.transaction('items', 'readonly');
++  const store = tx.objectStore('items');
++  assert_array_equals([...store.indexNames], []);
++  assert_equals(await result(store.count()), MANY);
++  assert_equals((await result(store.get(3))).k, 'k3', 'the put is rolled back');
++}, 'Records that would give a new unique index a key twice abort the upgrade with ' +
++   'ConstraintError, after the events of earlier requests');
++
++promise_test(async t => {
++  let conflict, nested, plain, invalid;
++  const db = await openDatabase(t, (db, tx) => {
++    const store = db.createObjectStore('items');
++    store.add({tags: ['a', 'a', 'b']}, 1);
++    store.add({tags: ['c', null, {}, ['nested']]}, 2);
++    store.add({tags: 'd'}, 3);
++    store.add({tags: []}, 4);
++    store.add({}, 5);
++    store.createIndex('tags', 'tags', {unique: true, multiEntry: true});
++    conflict = failure(store.add({tags: ['x', 'c']}, 6));
++    nested = failure(store.add({tags: [['nested']]}, 7));
++    plain = failure(store.add({tags: 'd'}, 8));
++    invalid = result(store.add({tags: [null, 'e', {}]}, 9));
++  });
++  db.close();
++  assert_equals(await conflict, 'ConstraintError', 'a valid subkey of an array is indexed');
++  assert_equals(await nested, 'ConstraintError', 'an array in the array is a subkey');
++  assert_equals(await plain, 'ConstraintError', 'a key that is no array is indexed');
++  assert_equals(await invalid, 9, 'invalid subkeys are not indexed');
++
++  const events = await failedUpgrade(db.name, 2, (db, tx) => {
++    const store = tx.objectStore('items');
++    store.add({tags: ['y', 'b']}, 10);
++    store.createIndex('more', 'tags', {unique: true, multiEntry: true});
++  });
++  assert_array_equals(events, ['abort ConstraintError', 'open AbortError']);
++}, 'A multiEntry index gets each valid subkey of its records once, and a unique one aborts ' +
++   'the upgrade if two records share one');
++
++promise_test(async t => {
++  const name = await databaseWithRecords(t, 3);
++  let first, second;
++  const db = await reopen(name, 2, (db, tx) => {
++    const store = tx.objectStore('items');
++    store.createIndex('k', 'k', {unique: true});
++    first = failure(store.add({k: 'k1'}, 'first'));
++    store.deleteIndex('k');
++    store.createIndex('k', 'n', {unique: true});
++    second = failure(store.add({k: 'k1', n: 2}, 'second'));
++    store.deleteIndex('k');
++    store.add({k: 'k1', n: 2}, 'third');
++  });
++  t.add_cleanup(() => { db.close(); });
++  assert_equals(await first, 'ConstraintError');
++  assert_equals(await second, 'ConstraintError');
++  const tx = db.transaction('items', 'readonly');
++  assert_array_equals([...tx.objectStore('items').indexNames], []);
++  assert_equals(await result(tx.objectStore('items').count()), 4);
++}, 'Requests between the creation and the deletion of an index see the whole index');
++
++promise_test(async t => {
++  const name = await databaseWithRecords(t, MANY);
++  let conflict;
++  const db = await reopen(name, 2, (db, tx) => {
++    const store = tx.objectStore('items');
++    store.createIndex('k', 'k', {unique: true});
++    conflict = failure(store.add({k: 'k5'}, 'x'));
++    db.deleteObjectStore('items');
++    db.createObjectStore('items').createIndex('k', 'k', {unique: true});
++  });
++  t.add_cleanup(() => { db.close(); });
++  assert_equals(await conflict, 'ConstraintError');
++  const tx = db.transaction('items', 'readonly');
++  assert_equals(await result(tx.objectStore('items').count()), 0);
++}, 'Requests between the creation of an index and the deletion of its store see the whole index');
++
++promise_test(async t => {
++  const name = await databaseWithRecords(t, 3);
++  let conflict;
++  const db = await reopen(name, 2, (db, tx) => {
++    const store = tx.objectStore('items');
++    store.createIndex('k', 'k', {unique: true});
++    store.add({k: 'k3', n: 7}, 3);
++    store.createIndex('n', 'n', {unique: true});
++    conflict = failure(store.add({k: 'k4', n: 7}, 4));
++  });
++  db.close();
++  assert_equals(await conflict, 'ConstraintError', 'the second index has the added record');
++
++  const other = await databaseWithRecords(t, 3);
++  const events = await failedUpgrade(other, 2, (db, tx) => {
++    const store = tx.objectStore('items');
++    store.createIndex('k', 'k', {unique: true});
++    store.add({k: 'k9', n: 1}, 9);
++    store.createIndex('n', 'n', {unique: true});
++  });
++  assert_array_equals(events, ['abort ConstraintError', 'open AbortError'],
++                      'the second index gets the record added before its creation');
++}, 'Indexes created one after another are populated in turn, each after the requests before it');
++
++promise_test(async t => {
++  const name = await databaseWithRecords(t, MANY);
++  const events = await failedUpgrade(name, 2, (db, tx, log) => {
++    const store = tx.objectStore('items');
++    store.put({k: 'changed'}, 0).onsuccess = event => {
++      log('put')(event);
++      tx.abort();
++    };
++    store.createIndex('k', 'k', {unique: true});
++    const after = store.add({k: 'new'}, 'new');
++    after.onerror = log('add');
++  });
++  assert_array_equals(events, ['put', 'add AbortError', 'abort AbortError', 'open AbortError']);
++
++  const db = await reopen(name, 1, () => assert_unreached('no upgrade'));
++  t.add_cleanup(() => { db.close(); });
++  const tx = db.transaction('items', 'readwrite');
++  const store = tx.objectStore('items');
++  assert_array_equals([...store.indexNames], []);
++  assert_equals((await result(store.get(0))).k, 'k0');
++  assert_equals(await result(store.count()), MANY);
++  await result(store.put({k: 'k1'}, 'again'));
++  await complete(tx);
++}, 'Aborting the upgrade while an index is populated leaves the database as it was');
++
++promise_test(async t => {
++  let conflict, generated;
++  const db = await openDatabase(t, (db, tx) => {
++    const store = db.createObjectStore('items', {keyPath: 'id', autoIncrement: true});
++    store.add({x: 1});
++    store.add({x: 2});
++    store.add({id: 'explicit', x: 3});
++    store.createIndex('id', 'id', {unique: true});
++    store.createIndex('pair', ['x', 'id'], {unique: true});
++    store.createIndex('x', 'x', {unique: true});
++    conflict = failure(store.add({id: 'other', x: 2}));
++    generated = result(store.add({x: 4}));
++  });
++  db.close();
++  assert_equals(await conflict, 'ConstraintError');
++  assert_equals(await generated, 3);
++}, 'Records stored under generated keys are indexed with their values as they read back');
++
++// More records than one step of a population reads, whose `tags` arrays have a hole at index 1,
++// through which the multiEntry key conversion reaches Array.prototype[1].
++const WITH_HOLES = 600;
++
++// A database at version 1 with the store `items` holding `WITH_HOLES` records
++// `{tags: ['a<i>', , 'b<i>']}` under the keys 0 to WITH_HOLES - 1, whose arrays are marked with a
++// `hole` property, which cloning keeps.
++async function databaseWithHoles(t) {
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('items');
++    for (let i = 0; i < WITH_HOLES; i++) {
++      const tags = ['a' + i, , 'b' + i];
++      tags.hole = true;
++      store.add({tags}, i);
++    }
++  });
++  db.close();
++  return db.name;
++}
++
++// Defines `get` as the getter of Array.prototype[1] for the marked arrays until the returned
++// function removes it. Other arrays read undefined there, and assignments to index 1 create their
++// own property.
++function arrayGetter(t, get) {
++  Object.defineProperty(Array.prototype, 1, {
++    configurable: true,
++    get() {
++      return this.hole === true ? get() : undefined;
++    },
++    set(value) {
++      Object.defineProperty(this, 1, {value, writable: true, enumerable: true, configurable: true});
++    },
++  });
++  const remove = () => { delete Array.prototype[1]; };
++  t.add_cleanup(remove);
++  return remove;
++}
++
++promise_test(async t => {
++  const name = await databaseWithHoles(t);
++  let tx = null;
++  const errors = new Set();
++  const remove = arrayGetter(t, () => {
++    try {
++      tx.objectStore('items').put({tags: ['inner']}, 'inner');
++      errors.add('none');
++    } catch (e) {
++      errors.add(e.name);
++    }
++    throw new Error('getter');
++  });
++  let conflict, added;
++  const db = await reopen(name, 2, (db, transaction) => {
++    tx = transaction;
++    const store = transaction.objectStore('items');
++    store.createIndex('tags', 'tags', {multiEntry: true, unique: true});
++    conflict = failure(store.add({tags: ['b' + (WITH_HOLES - 1)]}, 'conflict'));
++    added = result(store.add({tags: ['new']}, 'new'));
++  });
++  remove();
++  t.add_cleanup(() => { db.close(); });
++  assert_array_equals([...errors], ['TransactionInactiveError']);
++  assert_equals(await conflict, 'ConstraintError', 'the subkeys around the hole are indexed');
++  assert_equals(await added, 'new');
++  const store = db.transaction('items').objectStore('items');
++  assert_equals(await result(store.count()), WITH_HOLES + 1);
++  assert_equals(await result(store.get('inner')), undefined);
++}, 'A getter that a population reaches and that throws skips its subkey, and its requests throw');
++
++promise_test(async t => {
++  const name = await databaseWithHoles(t);
++  let tx = null;
++  let calls = 0;
++  const remove = arrayGetter(t, () => {
++    calls++;
++    if (tx) {
++      const transaction = tx;
++      tx = null;
++      transaction.abort();
++    }
++    return undefined;
++  });
++  const events = await failedUpgrade(name, 2, (db, transaction) => {
++    tx = transaction;
++    transaction.objectStore('items').createIndex('tags', 'tags', {multiEntry: true});
++  });
++  remove();
++  assert_array_equals(events, ['abort AbortError', 'open AbortError']);
++  assert_less_than_equal(calls, 1, 'no more keys are computed after the abort');
++
++  const db = await reopen(name, 1, () => assert_unreached('no upgrade'));
++  t.add_cleanup(() => { db.close(); });
++  const tx2 = db.transaction('items', 'readwrite');
++  const store = tx2.objectStore('items');
++  assert_array_equals([...store.indexNames], []);
++  await result(store.put({tags: ['z']}, 'z'));
++  await complete(tx2);
++}, 'A getter that a population reaches and that aborts the upgrade leaves the database as it was');

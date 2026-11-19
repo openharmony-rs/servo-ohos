@@ -31,6 +31,7 @@ use js::rust::{
     HandleObject, HandleValue, MutableHandleObject, RealmOptions, define_methods,
     define_properties, get_object_class, is_dom_class, maybe_wrap_object,
 };
+use servo_config::pref;
 use servo_url::MutableOrigin;
 
 use crate::DomTypes;
@@ -147,7 +148,9 @@ pub(crate) unsafe fn create_global_object<D: DomTypes>(
 
     let mut options = RealmOptions::default();
     options.creationOptions_.traceGlobal_ = Some(trace);
-    options.creationOptions_.sharedMemoryAndAtomics_ = false;
+    let shared_memory = pref!(js_shared_memory_enabled_for_testing);
+    options.creationOptions_.sharedMemoryAndAtomics_ = shared_memory;
+    options.creationOptions_.defineSharedArrayBufferConstructor_ = shared_memory;
     if use_system_compartment {
         options.creationOptions_.compSpec_ = CompartmentSpecifier::NewCompartmentAndZone;
         options.creationOptions_.__bindgen_anon_1.comp_ = std::ptr::null_mut();

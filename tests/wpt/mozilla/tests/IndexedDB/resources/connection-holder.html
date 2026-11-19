@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<script>
+// Opens the database named in the query, without a versionchange handler, and reports 'opened' to
+// the parent.
+const request = indexedDB.open(decodeURIComponent(location.search.slice(1)));
+request.onsuccess = () => parent.postMessage('opened', '*');
+request.onerror = () => parent.postMessage(`error ${request.error.name}`, '*');
+</script>

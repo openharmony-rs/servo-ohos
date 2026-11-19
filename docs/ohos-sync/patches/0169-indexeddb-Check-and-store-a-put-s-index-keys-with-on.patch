@@ -1,0 +1,370 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 07:33:49 +0000
+Subject: [PATCH] indexeddb: Check and store a put's index keys with one
+ statement per table
+
+A put checked each key of a unique index with its own SELECT and
+inserted each index key with its own INSERT, so a record with ten
+multiEntry keys cost ten more statements; at 0.2-0.3 ms per RDB statement
+on the DAYU200 that made indexed puts slow (P3 review S1). A put now
+checks the keys of each unique index with one value IN (...) statement
+(500 keys per statement) and inserts the records of each index table
+with one multi-row INSERT (200 rows per statement), as the index
+population already did; set_index_keys shares the two helpers.
+
+A put with a generated key skips the check whether a record with its key
+exists: the key generator's current number is above every number key in
+the store, since storing a key possibly updates the generator, so no
+record can have it.
+
+Validation: `cargo nextest run -p servo-storage -p servo-storage-traits` (host SQLite): 143 passed, 1 skipped, with test_put_index_records_of_many_keys (700 keys of a unique multiEntry index and 300 of another per record, a taken key found in the second check, an overwrite with its own keys) and the unique-index and population tests; `./mach check --ohos -- -p servo-storage --all-targets --no-default-features --features ohos-rdb-backend` and `cargo clippy -p servo-storage --lib -- -D warnings`: no warnings. DAYU200 (QuickJS + RDB, checked-release), 2,000 puts each, this commit vs the previous one: 395 -> 579/s with a multiEntry index of 10 keys per record, 1,225 -> 1,876/s with generated keys and no index, 933 -> 953/s with one unique index, 1,805 -> 1,860/s without an index. The WPT runs of the series are in the last commit of the series (P4.2).
+AI-assisted: Yes (agent session; batched the statements, added the backend test, measured puts on the board)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../storage/indexeddb/backend/queries.rs      | 202 ++++++++++--------
+ components/storage/indexeddb/backend/tests.rs |  57 +++++
+ 2 files changed, 173 insertions(+), 86 deletions(-)
+
+diff --git a/components/storage/indexeddb/backend/queries.rs b/components/storage/indexeddb/backend/queries.rs
+index 4059045f3b9..94df21490e2 100644
+--- a/components/storage/indexeddb/backend/queries.rs
++++ b/components/storage/indexeddb/backend/queries.rs
+@@ -56,22 +56,90 @@ impl StoreIndex {
+     /// record per key; `index_data`'s is `(index_id, value, object_data_key)`. Both read in
+     /// (key, primary key) order.
+     pub(crate) fn table(&self) -> &'static str {
+-        if self.unique {
+-            "unique_index_data"
+-        } else {
+-            "index_data"
+-        }
++        index_table(self.unique)
++    }
++}
++
++/// The table of the records of unique indexes, or of the other indexes.
++fn index_table(unique: bool) -> &'static str {
++    if unique {
++        "unique_index_data"
++    } else {
++        "index_data"
+     }
++}
++
++/// The most keys that one statement checks for a unique index.
++const KEYS_PER_CHECK: usize = 500;
+ 
+-    fn insert_statement(&self) -> &'static str {
+-        if self.unique {
+-            "INSERT INTO unique_index_data (index_id, value, object_data_key, object_store_id) \
+-             VALUES (?, ?, ?, ?)"
++/// The most index records that one statement inserts, four parameters each, so that a statement
++/// stays below SQLite's oldest limit of 999 parameters.
++const RECORDS_PER_INSERT: usize = 200;
++
++/// `count` comma-separated placeholders.
++fn placeholders(count: usize) -> String {
++    vec!["?"; count].join(", ")
++}
++
++/// Whether the unique index `index` has a record with one of `keys`, the encoded index keys,
++/// for another record than the one with the encoded key `primary_key`, if given. Each statement
++/// checks many keys, since on RDB each statement costs about 0.2 ms.
++fn unique_keys_taken<X: SqlExecutor>(
++    executor: &mut X,
++    index: IndexedDBIndexId,
++    keys: &[&[u8]],
++    primary_key: Option<&[u8]>,
++) -> Result<bool, SqlError> {
++    for chunk in keys.chunks(KEYS_PER_CHECK) {
++        let other_record = if primary_key.is_some() {
++            " AND object_data_key != ?"
+         } else {
+-            "INSERT INTO index_data (index_id, value, object_data_key, object_store_id) \
+-             VALUES (?, ?, ?, ?)"
++            ""
++        };
++        let sql = format!(
++            "SELECT 1 FROM unique_index_data WHERE index_id = ? AND value IN ({}){other_record} \
++             LIMIT 1",
++            placeholders(chunk.len())
++        );
++        let params: Vec<_> = std::iter::once(SqlParam::Integer(index))
++            .chain(chunk.iter().map(|key| SqlParam::Blob(key)))
++            .chain(primary_key.map(SqlParam::Blob))
++            .collect();
++        if query_row(executor, &sql, &params, |_| Ok(()))?.is_some() {
++            return Ok(true);
+         }
+     }
++    Ok(false)
++}
++
++/// Inserts `rows`, each the id of an index, an encoded index key and the encoded primary key of
++/// the record of the store `store_id` that it refers to, into the index table `table`, with as
++/// few statements as SQLite's parameter limit allows.
++fn insert_index_rows<X: SqlExecutor>(
++    executor: &mut X,
++    table: &str,
++    store_id: IndexedDBObjectStoreId,
++    rows: &[(IndexedDBIndexId, &[u8], &[u8])],
++) -> Result<(), SqlError> {
++    for chunk in rows.chunks(RECORDS_PER_INSERT) {
++        let sql = format!(
++            "INSERT INTO {table} (index_id, value, object_data_key, object_store_id) VALUES {}",
++            vec!["(?, ?, ?, ?)"; chunk.len()].join(", ")
++        );
++        let params: Vec<_> = chunk
++            .iter()
++            .flat_map(|&(index, key, primary_key)| {
++                [
++                    SqlParam::Integer(index),
++                    SqlParam::Blob(key),
++                    SqlParam::Blob(primary_key),
++                    SqlParam::Integer(store_id),
++                ]
++            })
++            .collect();
++        executor.execute(&sql, &params)?;
++    }
++    Ok(())
+ }
+ 
+ pub(crate) fn encode_key_path(key_path: &KeyPath) -> Result<Vec<u8>, SqlError> {
+@@ -1121,49 +1189,36 @@ pub(crate) fn unique_index_conflict<X: SqlExecutor>(
+     primary_key: &[u8],
+ ) -> Result<Option<IndexedDBIndexId>, SqlError> {
+     for records in records.iter().filter(|records| records.index.unique) {
+-        for key in &records.keys {
+-            let taken = query_row(
+-                executor,
+-                "SELECT 1 FROM unique_index_data \
+-                 WHERE index_id = ? AND value = ? AND object_data_key != ?",
+-                &[
+-                    SqlParam::Integer(records.index.id),
+-                    SqlParam::Blob(key),
+-                    SqlParam::Blob(primary_key),
+-                ],
+-                |_| Ok(()),
+-            )?
+-            .is_some();
+-            if taken {
+-                return Ok(Some(records.index.id));
+-            }
++        let keys: Vec<&[u8]> = records.keys.iter().map(Vec::as_slice).collect();
++        if unique_keys_taken(executor, records.index.id, &keys, Some(primary_key))? {
++            return Ok(Some(records.index.id));
+         }
+     }
+     Ok(None)
+ }
+ 
+ /// Stores `records`, the index records of the record of `store` with the encoded key
+-/// `primary_key`. The record must be stored already. A unique index's primary key rejects a key
+-/// that another record has: callers check with [`unique_index_conflict`] first, and the failed
+-/// statement fails the transaction.
++/// `primary_key`, with one statement per index table. The record must be stored already. A
++/// unique index's primary key rejects a key that another record has: callers check with
++/// [`unique_index_conflict`] first, and the failed statement fails the transaction.
+ pub(crate) fn insert_index_records<X: SqlExecutor>(
+     executor: &mut X,
+     store: &ObjectStore,
+     primary_key: &[u8],
+     records: &[IndexRecords],
+ ) -> Result<(), SqlError> {
+-    for records in records {
+-        for key in &records.keys {
+-            executor.execute(
+-                records.index.insert_statement(),
+-                &[
+-                    SqlParam::Integer(records.index.id),
+-                    SqlParam::Blob(key),
+-                    SqlParam::Blob(primary_key),
+-                    SqlParam::Integer(store.id),
+-                ],
+-            )?;
+-        }
++    for unique in [false, true] {
++        let rows: Vec<_> = records
++            .iter()
++            .filter(|records| records.index.unique == unique)
++            .flat_map(|records| {
++                records
++                    .keys
++                    .iter()
++                    .map(|key| (records.index.id, key.as_slice(), primary_key))
++            })
++            .collect();
++        insert_index_rows(executor, index_table(unique), store.id, &rows)?;
+     }
+     Ok(())
+ }
+@@ -1200,6 +1255,7 @@ pub(crate) fn put_record<X: SqlExecutor>(
+ ) -> Result<PutItemResult, SqlError> {
+     let has_key_generator = store.auto_increment != 0;
+     debug_assert!(key.is_some() || has_key_generator);
++    let generated = key.is_none();
+     // Step 1. If store uses a key generator, then:
+     let (key, new_current_number) = match key {
+         // Step 1.1. If key is undefined, then:
+@@ -1228,13 +1284,16 @@ pub(crate) fn put_record<X: SqlExecutor>(
+     // exists in store with its key equal to key, then this operation failed with a
+     // "ConstraintError" DOMException. Abort this algorithm without taking any further steps.
+     let encoded_key = encoding::serialize(&key);
+-    let exists = query_row(
+-        executor,
+-        "SELECT 1 FROM object_data WHERE object_store_id = ? AND key = ?",
+-        &[SqlParam::Integer(store.id), SqlParam::Blob(&encoded_key)],
+-        |_| Ok(()),
+-    )?
+-    .is_some();
++    // NOTE: No record has a generated key yet: the current number is above every number key
++    // stored, as each stored key possibly updated the key generator.
++    let exists = !generated &&
++        query_row(
++            executor,
++            "SELECT 1 FROM object_data WHERE object_store_id = ? AND key = ?",
++            &[SqlParam::Integer(store.id), SqlParam::Blob(&encoded_key)],
++            |_| Ok(()),
++        )?
++        .is_some();
+     if exists && !overwrite {
+         return Ok(PutItemResult::CannotOverwrite);
+     }
+@@ -1354,13 +1413,6 @@ pub(crate) fn population_records<X: SqlExecutor>(
+     Ok((records, last))
+ }
+ 
+-/// The most keys that one statement of [`set_index_keys`] checks.
+-const POPULATION_KEYS_PER_CHECK: usize = 500;
+-
+-/// The most index records that one statement of [`set_index_keys`] inserts, four parameters
+-/// each, so that a statement stays below SQLite's oldest limit of 999 parameters.
+-const POPULATION_RECORDS_PER_INSERT: usize = 200;
+-
+ /// Stores the records of `index`, which is being populated, for the records of `store` that
+ /// `records` has the index keys of. Returns false, having stored none of them, if the index is
+ /// unique and two of the records, or one of them and a record stored before, have the same key.
+@@ -1385,38 +1437,16 @@ pub(crate) fn set_index_keys<X: SqlExecutor>(
+         if !rows.iter().all(|(key, _)| keys.insert(key.as_slice())) {
+             return Ok(false);
+         }
+-        for chunk in rows.chunks(POPULATION_KEYS_PER_CHECK) {
+-            let sql = format!(
+-                "SELECT 1 FROM unique_index_data WHERE index_id = ? AND value IN ({}) LIMIT 1",
+-                vec!["?"; chunk.len()].join(", ")
+-            );
+-            let params: Vec<_> = std::iter::once(SqlParam::Integer(index.id))
+-                .chain(chunk.iter().map(|(key, _)| SqlParam::Blob(key)))
+-                .collect();
+-            if query_row(executor, &sql, &params, |_| Ok(()))?.is_some() {
+-                return Ok(false);
+-            }
++        let keys: Vec<&[u8]> = rows.iter().map(|(key, _)| key.as_slice()).collect();
++        if unique_keys_taken(executor, index.id, &keys, None)? {
++            return Ok(false);
+         }
+     }
+-    for chunk in rows.chunks(POPULATION_RECORDS_PER_INSERT) {
+-        let sql = format!(
+-            "INSERT INTO {} (index_id, value, object_data_key, object_store_id) VALUES {}",
+-            index.table(),
+-            vec!["(?, ?, ?, ?)"; chunk.len()].join(", ")
+-        );
+-        let params: Vec<_> = chunk
+-            .iter()
+-            .flat_map(|(key, primary_key)| {
+-                [
+-                    SqlParam::Integer(index.id),
+-                    SqlParam::Blob(key),
+-                    SqlParam::Blob(primary_key),
+-                    SqlParam::Integer(store.id),
+-                ]
+-            })
+-            .collect();
+-        executor.execute(&sql, &params)?;
+-    }
++    let rows: Vec<_> = rows
++        .iter()
++        .map(|(key, primary_key)| (index.id, key.as_slice(), primary_key.as_slice()))
++        .collect();
++    insert_index_rows(executor, index.table(), store.id, &rows)?;
+     Ok(true)
+ }
+ 
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index 7497dd5a366..e96e99feb5f 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -121,6 +121,7 @@ executor_tests!(
+     test_deleted_records_take_their_index_records_along,
+     test_deleted_indexes_take_their_records_along,
+     test_unique_index_conflict_changes_nothing,
++    test_put_index_records_of_many_keys,
+     test_placeholders_become_the_record_key,
+     test_abort_reverts_index_records,
+     test_index_keys_for_other_indexes_fail_the_transaction,
+@@ -3523,6 +3524,62 @@ fn test_unique_index_conflict_changes_nothing<X: SqlExecutor>() {
+     assert_eq!(dangling_index_records(&db), 0);
+ }
+ 
++/// A put whose record has more index keys than one statement checks or inserts stores all of
++/// them, finds a unique key taken in a later check, and is checked against other records only.
++fn test_put_index_records_of_many_keys<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "posts", None, false).unwrap();
++    let tags = KeyPath::String("tags".to_owned());
++    let words = KeyPath::String("words".to_owned());
++    let by_tag = create_index(&db, store, "tags".to_owned(), tags, true, true).unwrap();
++    let by_word = create_index(&db, store, "words".to_owned(), words, false, true).unwrap();
++    let keys = |prefix: &str, count: usize| {
++        (0..count)
++            .map(|i| string(&format!("{prefix}{i:03}")))
++            .collect::<Vec<_>>()
++    };
++    let put = |key: f64, tags: Vec<IndexedDBKeyType>| {
++        let index_keys = vec![
++            index_keys(by_tag, tags),
++            index_keys(by_word, keys("w", 300)),
++        ];
++        (Some(number(key)), vec![key as u8], index_keys)
++    };
++    // The taken key "t699" sorts last of the second record's keys, so the second check finds it.
++    let mut taken_last = keys("s", 699);
++    taken_last.push(string("t699"));
++    let replies = run_indexed_puts(
++        &db,
++        1,
++        store,
++        vec![
++            put(1.0, keys("t", 700)),
++            put(2.0, taken_last),
++            put(3.0, keys("u", 700)),
++            put(1.0, keys("t", 700)),
++        ],
++        true,
++    );
++    assert_eq!(
++        replies,
++        vec![
++            key_reply(1.0),
++            Ok(PutItemResult::UniqueIndexKeyExists(by_tag)),
++            key_reply(3.0),
++            key_reply(1.0),
++        ]
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++    assert_eq!(stored_keys(&db, store), number_keys([1, 3]));
++    assert_eq!(index_record_count(&db, by_tag), 1400);
++    assert_eq!(index_record_count(&db, by_word), 600);
++    let records = index_records_of(&db, store, by_tag);
++    assert_eq!(records.first(), Some(&(string("t000"), number(1.0))));
++    assert_eq!(records.last(), Some(&(string("u699"), number(3.0))));
++    assert_eq!(dangling_index_records(&db), 0);
++}
++
+ /// The parts of index keys that come from a generated key become the record's key, as a whole
+ /// key and inside an array key.
+ fn test_placeholders_become_the_record_key<X: SqlExecutor>() {

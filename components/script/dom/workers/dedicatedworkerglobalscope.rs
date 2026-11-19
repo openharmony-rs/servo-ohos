@@ -68,7 +68,7 @@ use crate::dom::types::DebuggerGlobalScope;
 use crate::dom::webgpu::identityhub::IdentityHub;
 use crate::dom::worker::{TrustedWorkerAddress, Worker};
 use crate::dom::workerglobalscope::{
-    ScriptFetchContext, WorkerDevtoolsControlMsg, WorkerGlobalScope,
+    CloseIndexedDBConnections, ScriptFetchContext, WorkerDevtoolsControlMsg, WorkerGlobalScope,
 };
 use crate::messaging::{CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSender};
 use crate::realms::enter_auto_realm;
@@ -584,6 +584,7 @@ impl DedicatedWorkerGlobalScope {
                 }
                 let worker_global_scope =
                     dedicated_worker_global_scope.upcast::<WorkerGlobalScope>();
+                let close_indexeddb_connections = CloseIndexedDBConnections(worker_global_scope);
                 let global_scope = dedicated_worker_global_scope.upcast::<GlobalScope>();
 
                 // Step 12. Obtain script by switching on options["type"]:
@@ -645,6 +646,7 @@ impl DedicatedWorkerGlobalScope {
 
                 // Drop worker rAF state before destroying the JS runtime.
                 dedicated_worker_global_scope.clear_animation_frame_callbacks_and_unregister();
+                drop(close_indexeddb_connections);
                 global_scope.tear_down();
                 worker_global_scope.clear_js_runtime();
             })

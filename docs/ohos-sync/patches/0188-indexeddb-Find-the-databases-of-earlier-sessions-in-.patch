@@ -1,0 +1,1165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 16:17:09 +0000
+Subject: [PATCH] indexeddb: Find the databases of earlier sessions in the
+ client storage registry
+
+The IndexedDB manager only knew the databases it had opened since it
+started (`self.databases`). After a restart, databases() missed every
+database of an earlier session, and deleteDatabase of one reported an
+old version of 0 and left the database, files and registry entry, in
+place, so its next open found the old data. Upstream has the same code.
+Open already found such a database, since the registry's create looks an
+existing one up.
+
+Open and delete now look a database that the manager hasn't opened up in
+the client storage registry, at step 4, once the request is at the front
+of its connection queue (new OpenRequestState::Locating): an open with
+the registry's create (lookup or create, step 6), a delete with
+FindDatabase. This runs on the manager's client storage thread, like the
+storage proxy map, and comes back as
+IndexedDBThreadMsg::DatabaseLocated; only the front request of a queue
+gets there, and only it changes the database's registry entry, so the
+answer can't be stale. An open then opens the engine on the manager
+thread as before. A delete of a database found there has no connection
+to wait for: it reads the version the database committed last
+(SqlEngine::committed_version, without opening an engine, so a database
+of another schema version, which an open would reset, counts as 0),
+deletes the database and its registry entry, and reports the version. A
+database whose version can't be read, such as a corrupt one, is deleted
+all the same with version 0, as Gecko does.
+
+databases() sends a StorageBottleSource (GetDatabases has a third
+field). The manager lists the bottle's databases in the registry on that
+thread (IndexedDBThreadMsg::DatabasesListed), then reports the databases
+it has open with the version of their last committed upgrade, as before,
+and every other listed one with its committed version from its file;
+version 0 is left out.
+
+The manager now closes its databases before it acknowledges Exit, as the
+message's documentation says, so that a restarted manager doesn't meet
+the old connections.
+
+A stored database of version 0, which a session that ended during the
+database's first upgrade leaves behind, opens as a new one, as
+databases() already treats it: an open without a version upgrades it
+from 0 to 1. It returned a connection at version 0 without stores, so a
+page that creates its stores in upgradeneeded failed with that database
+for good (P5 review S1). Reading a stored database's version first
+checks that its file exists (SqlExecutor::exists), so databases() and a
+delete create no empty database file in a registry directory that has
+none (N2). A registry lookup or list that can't be handed to the client
+storage calls thread fails its request or databases() call (N4).
+
+Validation: host `cargo nextest run -p servo-storage -p servo-storage-traits`: 155 passed, 1 skipped (new: tests/indexeddb.rs test_indexeddb_databases_of_an_earlier_session_are_listed_deleted_and_opened and test_indexeddb_database_of_an_earlier_session_is_deleted_without_being_listed, which restart the storage threads on the same data, and backend committed_version_of_a_stored_database, each on every backend compiled in); DAYU200 unit tests: the two restart tests and committed_version_of_a_stored_database pass with RDB only (RDB registry and engine) and with both backends (both registry engines); host SM and QuickJS IndexedDB/ 4,484 of 4,511 and /_mozilla/IndexedDB/ 312 of 312 SM, 310 of 312 QuickJS (interface lists, as before), every result as expected (unchanged: WPT runs in one session); 10 back-to-back host runs per engine: SM every result as expected in 10 of 10, QuickJS in 9 of 10 (one transaction-inflight-worker-terminate subtest, also 2 of 10 with P5.2's binary); DAYU200 (QuickJS + RDB) IndexedDB/ 4,468 to 4,476 of 4,511 in 5 runs over 2 boots (P5.2: 4,464), unexpected only idb-partitioned-coverage and file_support, as before; after the P5 review fixes: 158 passed, 1 skipped at this commit, with the new restart test test_indexeddb_database_left_at_version_0_by_an_earlier_session_opens_as_new (it gets a connection at version 0 without the fix) and committed_version_of_a_stored_database checking that an empty directory stays empty; the P5 review's crash probe (kill -9 during a first upgrade, then a versionless open) gives upgradeneeded from 0 to 1 in 2 of 2 runs on the stack tip, where it gave a connection at version 0
+AI-assisted: Yes (agent session; the agent designed the registry lookups for open, delete and databases, implemented them and the restart tests, and measured the result; the P5 review fixes for version 0 databases, version probes and lookups that can't be handed over, with the restart test)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbfactory.rs |   6 +-
+ components/shared/storage/indexeddb.rs        |  19 +
+ .../storage/indexeddb/backend/engine.rs       |   8 +-
+ .../storage/indexeddb/backend/executor.rs     |   3 +
+ components/storage/indexeddb/backend/rdb.rs   |   4 +
+ .../storage/indexeddb/backend/schema.rs       |  16 +
+ .../storage/indexeddb/backend/sqlite.rs       |   4 +
+ components/storage/indexeddb/backend/tests.rs |  34 ++
+ components/storage/indexeddb/backend/twin.rs  |   8 +
+ components/storage/indexeddb/mod.rs           | 470 +++++++++++++-----
+ components/storage/tests/indexeddb.rs         | 218 +++++++-
+ 11 files changed, 667 insertions(+), 123 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbfactory.rs b/components/script/dom/indexeddb/idbfactory.rs
+index 95c35e6ff16..8943fe90c43 100644
+--- a/components/script/dom/indexeddb/idbfactory.rs
++++ b/components/script/dom/indexeddb/idbfactory.rs
+@@ -478,7 +478,11 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
+         })
+         .expect("Could not create databases callback");
+ 
+-        let get_operation = SyncOperation::GetDatabases(callback, storage_key);
++        let get_operation = SyncOperation::GetDatabases(
++            callback,
++            storage_key,
++            Self::storage_bottle_source(&global),
++        );
+         if global
+             .storage_threads()
+             .send(IndexedDBThreadMsg::Sync(get_operation))
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 4514df7617d..9a0c104cf21 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -6,6 +6,7 @@ use std::cmp::{Ordering, PartialEq, PartialOrd};
+ use std::collections::{HashMap, HashSet};
+ use std::error::Error;
+ use std::fmt::{Debug, Display, Formatter};
++use std::path::PathBuf;
+ 
+ use malloc_size_of_derive::MallocSizeOf;
+ use profile_traits::generic_callback::GenericCallback;
+@@ -848,6 +849,7 @@ pub enum SyncOperation {
+     GetDatabases(
+         GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
+         ImmutableOrigin,
++        StorageBottleSource,
+     ),
+     /// <https://w3c.github.io/IndexedDB/#commit-a-transaction>: commits the transaction once its
+     /// requests have run, and reports [`TransactionEvent::Committed`]. Script sends it once the
+@@ -972,6 +974,23 @@ pub enum IndexedDBThreadMsg {
+         request: Uuid,
+         result: BackendResult<StorageProxyMap>,
+     },
++    /// The open or delete request `request` at the front of its connection queue looked its
++    /// database up in the client storage registry, which the manager does in parallel: the
++    /// database's directory and, for an open, which creates a database that doesn't exist,
++    /// whether it was created; `None` if a delete found no database.
++    DatabaseLocated {
++        origin: ImmutableOrigin,
++        db_name: Utf16String,
++        request: Uuid,
++        result: BackendResult<Option<(PathBuf, bool)>>,
++    },
++    /// The databases in the storage bottle of `origin` were listed in the client storage
++    /// registry, each with its directory, for the databases() call that `sender` answers.
++    DatabasesListed {
++        origin: ImmutableOrigin,
++        sender: GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
++        result: BackendResult<Vec<(Utf16String, PathBuf)>>,
++    },
+ 
+     /// Measure memory used by this thread and send the report over the provided channel.
+     CollectMemoryReport(ReportsChan),
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index 4416e911c22..c861e496a3d 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -4,7 +4,7 @@
+ 
+ use std::collections::VecDeque;
+ use std::collections::hash_map::Entry;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+ 
+@@ -79,6 +79,12 @@ impl<X: SqlExecutor> SqlEngine<X> {
+         })
+     }
+ 
++    /// The version of the database stored in `path` as of its last commit, for a database that
++    /// no engine has open; see [`schema::committed_version`].
++    pub(crate) fn committed_version(path: &Path) -> Result<u64, SqlError> {
++        schema::committed_version::<X>(path)
++    }
++
+     /// Returns whether the physical db was created as part of `new`, which includes recreating
+     /// a database of another schema version.
+     pub(crate) fn created_db_path(&self) -> bool {
+diff --git a/components/storage/indexeddb/backend/executor.rs b/components/storage/indexeddb/backend/executor.rs
+index 5c72eedd3c7..6a54e50b81f 100644
+--- a/components/storage/indexeddb/backend/executor.rs
++++ b/components/storage/indexeddb/backend/executor.rs
+@@ -87,6 +87,9 @@ pub(crate) trait SqlExecutor: Send + Sized + 'static {
+     /// to the database may be open.
+     fn delete(self) -> Result<(), SqlError>;
+ 
++    /// Whether a database is stored in `directory`, which [`Self::open`] would otherwise create.
++    fn exists(directory: &Path) -> bool;
++
+     /// Runs a statement that returns no rows. Returns the number of rows an `UPDATE` or `DELETE`
+     /// changed; the value is unspecified for other statements.
+     ///
+diff --git a/components/storage/indexeddb/backend/rdb.rs b/components/storage/indexeddb/backend/rdb.rs
+index 84955106cae..6321b2f2850 100644
+--- a/components/storage/indexeddb/backend/rdb.rs
++++ b/components/storage/indexeddb/backend/rdb.rs
+@@ -196,6 +196,10 @@ impl SqlExecutor for RdbExecutor {
+         Ok(())
+     }
+ 
++    fn exists(directory: &Path) -> bool {
++        directory.join("rdb").join(DATABASE_FILE_NAME).exists()
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         let values = values(params)?;
+         // RDB returns the number of changed rows for UPDATE and DELETE, and the row id or -1 for
+diff --git a/components/storage/indexeddb/backend/schema.rs b/components/storage/indexeddb/backend/schema.rs
+index 2b187ee7232..2c2ac237456 100644
+--- a/components/storage/indexeddb/backend/schema.rs
++++ b/components/storage/indexeddb/backend/schema.rs
+@@ -9,6 +9,7 @@ use log::info;
+ use super::executor::{
+     SqlError, SqlExecutor, SqlParam, TransactionBehavior, query_row, with_transaction,
+ };
++use super::queries;
+ use crate::indexeddb::IndexedDBDescription;
+ use crate::shared::DB_INIT_PRAGMAS;
+ 
+@@ -120,6 +121,21 @@ pub(crate) fn open_database<X: SqlExecutor>(
+     Ok((executor, created))
+ }
+ 
++/// The version of the database in `directory` as of its last commit, read without opening the
++/// database as [`open_database`] does: 0 for a database without tables or of another
++/// [`SCHEMA_VERSION`], which that would create anew, and for a directory without one, where
++/// nothing is created. Nothing else may have the database open.
++pub(crate) fn committed_version<X: SqlExecutor>(directory: &Path) -> Result<u64, SqlError> {
++    if !X::exists(directory) {
++        return Ok(0);
++    }
++    let mut executor = X::open(directory)?;
++    if stored_schema_version(&mut executor)? != SCHEMA_VERSION {
++        return Ok(0);
++    }
++    queries::version(&mut executor)
++}
++
+ /// The schema version a database was stored with, 0 if it has none.
+ pub(crate) fn stored_schema_version<X: SqlExecutor>(executor: &mut X) -> Result<i64, SqlError> {
+     Ok(query_row(executor, "PRAGMA user_version", &[], |row| row.integer(0))?.unwrap_or(0))
+diff --git a/components/storage/indexeddb/backend/sqlite.rs b/components/storage/indexeddb/backend/sqlite.rs
+index 224db2d6bdb..5585fbe7287 100644
+--- a/components/storage/indexeddb/backend/sqlite.rs
++++ b/components/storage/indexeddb/backend/sqlite.rs
+@@ -168,6 +168,10 @@ impl SqlExecutor for SqliteExecutor {
+         Ok(())
+     }
+ 
++    fn exists(directory: &Path) -> bool {
++        directory.join(DATABASE_FILE_NAME).exists()
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         let result = match self.connection.prepare_cached(sql) {
+             Ok(mut statement) => {
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index b01fdb4e10f..db89a922418 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -84,6 +84,7 @@ executor_tests!(
+     schema_version_mismatch_resets_the_database,
+     indexeddb_version_is_independent_of_the_schema_version,
+     schema_reset_that_keeps_the_old_database_fails,
++    committed_version_of_a_stored_database,
+     test_cycle,
+     test_create_store,
+     test_create_store_empty_name,
+@@ -698,6 +699,35 @@ fn schema_version_mismatch_resets_the_database<X: SqlExecutor>() {
+     }
+ }
+ 
++/// The version of a stored database that no engine has open is the one its last commit wrote,
++/// and 0 for a new database and for one of another schema version, which is left as it is.
++fn committed_version_of_a_stored_database<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    assert_eq!(SqlEngine::<X>::committed_version(dir.path()).unwrap(), 0);
++    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
++    assert!(!X::exists(dir.path()));
++    let db = open_engine_in::<X>(dir.path(), true);
++    assert!(X::exists(dir.path()));
++    create_store(&db, "store", None, false).unwrap();
++    set_version(&db, 3).unwrap();
++    drop(db);
++    assert_eq!(SqlEngine::<X>::committed_version(dir.path()).unwrap(), 3);
++
++    let set_schema_version = |version: i64| {
++        let mut executor = X::open(dir.path()).unwrap();
++        executor
++            .execute(&format!("PRAGMA user_version = {version}"), &[])
++            .unwrap();
++        queries::version(&mut executor).unwrap()
++    };
++    assert_eq!(set_schema_version(SCHEMA_VERSION + 1), 3);
++    assert_eq!(SqlEngine::<X>::committed_version(dir.path()).unwrap(), 0);
++    assert_eq!(set_schema_version(SCHEMA_VERSION), 3);
++    let db = open_engine_in::<X>(dir.path(), false);
++    assert_eq!(db.version().unwrap(), 3);
++    assert_eq!(store_names(&db), vec!["store".to_owned()]);
++}
++
+ fn indexeddb_version_is_independent_of_the_schema_version<X: SqlExecutor>() {
+     let dir = tempfile::tempdir().unwrap();
+     let db = open_engine_in::<X>(dir.path(), true);
+@@ -2720,6 +2750,10 @@ impl<X: SqlExecutor> SqlExecutor for Faulty<X> {
+         self.inner.delete()
+     }
+ 
++    fn exists(directory: &Path) -> bool {
++        X::exists(directory)
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         self.inject(sql)?;
+         self.inner.execute(sql, params)
+diff --git a/components/storage/indexeddb/backend/twin.rs b/components/storage/indexeddb/backend/twin.rs
+index ce42cb1e681..91df97a5ad2 100644
+--- a/components/storage/indexeddb/backend/twin.rs
++++ b/components/storage/indexeddb/backend/twin.rs
+@@ -56,6 +56,14 @@ impl SqlExecutor for TwinExecutor {
+         delegate!(self, |executor| executor.delete())
+     }
+ 
++    fn exists(directory: &Path) -> bool {
++        if use_ohos_rdb_backend() {
++            RdbExecutor::exists(directory)
++        } else {
++            SqliteExecutor::exists(directory)
++        }
++    }
++
+     fn execute(&mut self, sql: &str, params: &[SqlParam<'_>]) -> Result<u64, SqlError> {
+         delegate!(self, |executor| executor.execute(sql, params))
+     }
+diff --git a/components/storage/indexeddb/mod.rs b/components/storage/indexeddb/mod.rs
+index 5e3222d9557..20577c289a7 100644
+--- a/components/storage/indexeddb/mod.rs
++++ b/components/storage/indexeddb/mod.rs
+@@ -8,6 +8,7 @@ mod engines;
+ use std::borrow::ToOwned;
+ use std::collections::hash_map::Entry;
+ use std::collections::{HashMap, HashSet, VecDeque};
++use std::path::{Path, PathBuf};
+ use std::sync::{Arc, mpsc};
+ use std::thread;
+ 
+@@ -609,22 +610,85 @@ fn backend_error_from_storage_error<E: BackendErrorMapper>(err: E) -> BackendErr
+     err.into_backend_error()
+ }
+ 
++/// What the client storage thread answers on `receiver`.
++fn client_storage_result<T>(receiver: GenericReceiver<Result<T, String>>) -> BackendResult<T>
++where
++    T: for<'de> serde::Deserialize<'de> + serde::Serialize,
++{
++    receiver
++        .recv()
++        .map_err(|_| BackendError::DbErr("Failed to communicate with client storage.".to_owned()))?
++        .map_err(|error| BackendError::DbErr(format!("Client storage error: {error}")))
++}
++
+ /// <https://storage.spec.whatwg.org/#obtain-a-local-storage-bottle-map>
+ fn obtain_a_local_storage_bottle_map(
+     source: &StorageBottleSource,
+     origin: &ImmutableOrigin,
+ ) -> BackendResult<StorageProxyMap> {
+-    source
+-        .client_storage
+-        .obtain_a_storage_bottle_map(
+-            StorageType::Local,
+-            source.webview,
+-            StorageIdentifier::IndexedDB,
+-            origin.clone(),
+-        )
+-        .recv()
+-        .map_err(|_| BackendError::DbErr("Failed to communicate with client storage.".to_owned()))?
+-        .map_err(|error| BackendError::DbErr(format!("Client storage error: {error}")))
++    client_storage_result(source.client_storage.obtain_a_storage_bottle_map(
++        StorageType::Local,
++        source.webview,
++        StorageIdentifier::IndexedDB,
++        origin.clone(),
++    ))
++}
++
++/// The directory of the database `name` in the storage bottle of `proxy_map`, which creates the
++/// database there if it doesn't exist, and whether it did.
++fn create_database_in_bottle(
++    proxy_map: &StorageProxyMap,
++    name: &Utf16String,
++) -> BackendResult<(PathBuf, bool)> {
++    client_storage_result(
++        proxy_map
++            .handle
++            .create_database(proxy_map.bottle_id, name.clone()),
++    )
++}
++
++/// The directory of the database `name` in the storage bottle of `proxy_map`, if it exists.
++fn find_database_in_bottle(
++    proxy_map: &StorageProxyMap,
++    name: &Utf16String,
++) -> BackendResult<Option<PathBuf>> {
++    client_storage_result(
++        proxy_map
++            .handle
++            .find_database(proxy_map.bottle_id, name.clone()),
++    )
++}
++
++/// Deletes the database `name` from the storage bottle of `proxy_map`, with its files.
++fn delete_database_in_bottle(proxy_map: &StorageProxyMap, name: &Utf16String) -> BackendResult<()> {
++    client_storage_result(
++        proxy_map
++            .handle
++            .delete_database(proxy_map.bottle_id, name.clone()),
++    )
++}
++
++/// <https://w3c.github.io/IndexedDB/#delete-a-database>, steps 10 and 11, for the database `key`
++/// stored in `path` that the manager hasn't opened since it started, so that no connection to it
++/// is open: deletes it and returns the version it had. A database whose version can't be read,
++/// such as a corrupt one, is deleted all the same, and its version counts as 0.
++fn delete_stored_database(
++    key: &IndexedDBDescription,
++    path: &Path,
++    proxy_map: &StorageProxyMap,
++) -> BackendResult<u64> {
++    // Step 10: Let version be db’s version.
++    let version = ActiveKvsEngine::committed_version(path).unwrap_or_else(|error| {
++        warn!(
++            "Deleting IndexedDB database {:?}, whose version can't be read: {error:?}",
++            key.name
++        );
++        0
++    });
++    // Step 11: Delete db. If this fails for any reason, return an appropriate error (e.g. a
++    // QuotaExceededError, or an "UnknownError" DOMException).
++    delete_database_in_bottle(proxy_map, &key.name)?;
++    Ok(version)
+ }
+ 
+ /// <https://w3c.github.io/IndexedDB/#request-open-request> in a
+@@ -639,6 +703,9 @@ struct OpenRequest {
+     /// parallel once the request is queued; `None` until it has arrived.
+     proxy_map: Option<BackendResult<StorageProxyMap>>,
+     state: OpenRequestState,
++    /// Whether the open request created its database, which then opens at version 1 if no
++    /// version is asked for.
++    created: bool,
+ }
+ 
+ #[derive(MallocSizeOf)]
+@@ -664,6 +731,10 @@ enum OpenRequestState {
+     /// Step 3: waiting for the requests before it to be processed, and for its storage proxy
+     /// map.
+     Queued,
++    /// Step 4: waiting for the client storage registry to find the database, which the manager
++    /// asks in parallel, for a database that it hasn't opened since it started. An open request
++    /// also creates the database there if it doesn't exist (open step 6).
++    Locating,
+     /// Waiting for the other connections to the database to close: steps 10.2 to 10.5 of open a
+     /// database connection, steps 6 to 9 of delete a database.
+     WaitingForConnections(ConnectionsToClose),
+@@ -694,6 +765,7 @@ impl OpenRequest {
+             kind,
+             proxy_map: None,
+             state: OpenRequestState::Queued,
++            created: false,
+         }
+     }
+ 
+@@ -877,6 +949,8 @@ impl IndexedDBManager {
+             };
+             match message {
+                 IndexedDBThreadMsg::Sync(SyncOperation::Exit(sender)) => {
++                    // Close the databases first, so that nothing uses their files any more.
++                    self.databases.clear();
+                     let _ = sender.send(());
+                     break;
+                 },
+@@ -945,6 +1019,25 @@ impl IndexedDBManager {
+                     };
+                     self.storage_proxy_map_obtained(key, request, result);
+                 },
++                IndexedDBThreadMsg::DatabaseLocated {
++                    origin,
++                    db_name,
++                    request,
++                    result,
++                } => {
++                    let key = IndexedDBDescription {
++                        origin,
++                        name: db_name,
++                    };
++                    self.database_located(key, request, result);
++                },
++                IndexedDBThreadMsg::DatabasesListed {
++                    origin,
++                    sender,
++                    result,
++                } => {
++                    self.databases_listed(origin, sender, result);
++                },
+                 IndexedDBThreadMsg::AsyncSchemaOperation {
+                     origin,
+                     database_name,
+@@ -1199,9 +1292,8 @@ impl IndexedDBManager {
+                 return;
+             };
+             let next = match (&request.state, &request.proxy_map, &request.kind) {
+-                (OpenRequestState::Queued, None, _) | (OpenRequestState::Upgrading(_), ..) => {
+-                    Next::Wait
+-                },
++                (OpenRequestState::Queued, None, _) |
++                (OpenRequestState::Locating | OpenRequestState::Upgrading(_), ..) => Next::Wait,
+                 (OpenRequestState::Queued, Some(Err(error)), _) => Next::Fail(error.clone()),
+                 (OpenRequestState::Queued, Some(Ok(_)), OpenRequestKind::Open { .. }) => Next::Open,
+                 (OpenRequestState::Queued, Some(Ok(_)), OpenRequestKind::Delete { .. }) => {
+@@ -1698,29 +1790,124 @@ impl IndexedDBManager {
+         self.advance_connection_queue(key);
+     }
+ 
+-    /// Creates the database `key` in the storage bottle of `proxy_map`
+-    /// (<https://w3c.github.io/IndexedDB/#open-a-database-connection> step 6) or opens it if it
+-    /// exists there, and returns whether it was created.
+-    fn create_database(
++    /// Looks the database `key`, which the manager hasn't opened since it started, up in the
++    /// client storage registry for the request at the front of its connection queue. An open
++    /// request creates it there if it doesn't exist. This runs on the manager's client storage
++    /// thread, and the result comes back as [`IndexedDBThreadMsg::DatabaseLocated`]. Returns
++    /// whether the request has ended, as it failed because the lookup couldn't be handed over.
++    fn locate_database(&mut self, key: &IndexedDBDescription) -> bool {
++        let Some(request) = self.front_request_mut(key) else {
++            debug_assert!(false, "A request should be in the queue.");
++            return false;
++        };
++        let Some(proxy_map) = request.proxy_map().cloned() else {
++            debug_assert!(false, "The request's storage proxy map should be there.");
++            return false;
++        };
++        request.state = OpenRequestState::Locating;
++        let id = request.id;
++        let create = matches!(request.kind, OpenRequestKind::Open { .. });
++        let manager_sender = self.manager_sender.clone();
++        let IndexedDBDescription { origin, name } = key.clone();
++        let handed_over = self.client_storage_calls.run(move || {
++            let result = if create {
++                create_database_in_bottle(&proxy_map, &name).map(Some)
++            } else {
++                find_database_in_bottle(&proxy_map, &name)
++                    .map(|path| path.map(|path| (path, false)))
++            };
++            if manager_sender
++                .send(IndexedDBThreadMsg::DatabaseLocated {
++                    origin,
++                    db_name: name,
++                    request: id,
++                    result,
++                })
++                .is_err()
++            {
++                debug!("IndexedDB manager went away while looking up a database");
++            }
++        });
++        let Err(error) = handed_over else {
++            return false;
++        };
++        if let Some(request) = self.front_request(key) {
++            request.fail(&key.name, error);
++        }
++        true
++    }
++
++    /// Continues the request `request` at the front of the connection queue for `key`, which
++    /// looked its database up in the client storage registry and found it in the directory that
++    /// `result` holds, or found none.
++    fn database_located(
+         &mut self,
+-        key: &IndexedDBDescription,
+-        proxy_map: &StorageProxyMap,
+-    ) -> BackendResult<bool> {
+-        let response = proxy_map
+-            .handle
+-            .create_database(proxy_map.bottle_id, key.name.clone())
+-            .recv()
+-            .map_err(|_| {
+-                BackendError::DbErr("Failed to communicate with client storage.".to_string())
+-            })?;
+-        let (path, created) =
+-            response.map_err(|error| BackendError::DbErr(format!("{error:?}")))?;
+-        let engine = ActiveKvsEngine::new(path, created, key, self.thread_pool.clone())
+-            .map_err(backend_error_from_storage_error)?;
+-        let created = engine.created_db_path();
+-        let db = IndexedDBEnvironment::new(engine, self.manager_sender.clone());
+-        self.databases.insert(key.clone(), db);
+-        Ok(created)
++        key: IndexedDBDescription,
++        request: Uuid,
++        result: BackendResult<Option<(PathBuf, bool)>>,
++    ) {
++        let Some(front) = self.front_request(&key).filter(|front| {
++            front.id == request && matches!(front.state, OpenRequestState::Locating)
++        }) else {
++            return debug!("IndexedDB request {request} went away");
++        };
++        let opens = matches!(front.kind, OpenRequestKind::Open { .. });
++        let ended = match result {
++            Err(error) => {
++                front.fail(&key.name, error);
++                true
++            },
++            Ok(Some((path, created))) if opens => {
++                // <https://w3c.github.io/IndexedDB/#open-a-database-connection>
++                // Step 6: If db is null, let db be a new database with name name, version 0
++                // (zero), and with no object stores. If this fails for any reason, return an
++                // appropriate error (e.g. a "QuotaExceededError" or "UnknownError" DOMException).
++                match ActiveKvsEngine::new(path, created, &key, self.thread_pool.clone()) {
++                    Ok(engine) => {
++                        let created = engine.created_db_path();
++                        let db = IndexedDBEnvironment::new(engine, self.manager_sender.clone());
++                        self.databases.insert(key.clone(), db);
++                        let front = self.front_request_mut(&key).expect("Checked above");
++                        front.created = created;
++                        front.state = OpenRequestState::Queued;
++                        false
++                    },
++                    Err(error) => {
++                        front.fail(&key.name, backend_error_from_storage_error(error));
++                        true
++                    },
++                }
++            },
++            Ok(None) if opens => {
++                debug_assert!(
++                    false,
++                    "The registry creates the database of an open request"
++                );
++                front.fail(&key.name, BackendError::DbNotFound);
++                true
++            },
++            // <https://w3c.github.io/IndexedDB/#delete-a-database>
++            // Step 4: Let db be the database named name in storageKey, if one exists. Otherwise,
++            // return 0 (zero).
++            Ok(None) => {
++                front.send_delete_result(Ok(0));
++                true
++            },
++            // Steps 5 to 9 have nothing to wait for: no connection to db is open.
++            Ok(Some((path, _))) => {
++                let result = match front.proxy_map() {
++                    Some(proxy_map) => delete_stored_database(&key, &path, proxy_map),
++                    None => Err(BackendError::DbNotFound),
++                };
++                // Step 12: Return version.
++                front.send_delete_result(result);
++                true
++            },
++        };
++        if ended {
++            self.pop_front_request(&key);
++        }
++        self.advance_connection_queue(key);
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>, steps 4 to 11, for the
+@@ -1742,11 +1929,12 @@ impl IndexedDBManager {
+             );
+             return false;
+         };
+-        let (id, requested_version, results) = (request.id, *requested_version, results.clone());
+-        let Some(proxy_map) = request.proxy_map().cloned() else {
+-            debug_assert!(false, "The request's storage proxy map should be there.");
+-            return false;
+-        };
++        let (id, requested_version, results, created) = (
++            request.id,
++            *requested_version,
++            results.clone(),
++            request.created,
++        );
+ 
+         // A database that a failure showed to be unusable is opened again, once its connections
+         // are closed.
+@@ -1762,22 +1950,11 @@ impl IndexedDBManager {
+         }
+ 
+         // Step 4: Let db be the database named name in storageKey, or null otherwise.
+-        let created = if self.databases.contains_key(key) {
+-            false
+-        } else {
+-            // Step 6: If db is null, let db be a new database with name name, version 0
+-            // (zero), and with no object stores. If this fails for any reason, return an
+-            // appropriate error (e.g. a "QuotaExceededError" or "UnknownError" DOMException).
+-            match self.create_database(key, &proxy_map) {
+-                Ok(created) => created,
+-                Err(error) => {
+-                    self.front_request(key)
+-                        .expect("Checked above")
+-                        .fail(&key.name, error);
+-                    return true;
+-                },
+-            }
+-        };
++        // Note: a database that the manager hasn't opened since it started is looked up in the
++        // client storage registry first, in parallel, which also does step 6.
++        if !self.databases.contains_key(key) {
++            return self.locate_database(key);
++        }
+         let db_version = match self.databases.get(key).map(|db| db.version()) {
+             Some(Ok(version)) => version,
+             Some(Err(error)) => {
+@@ -1795,7 +1972,13 @@ impl IndexedDBManager {
+ 
+         // Step 5: If version is undefined, let version be 1 if db is null, or db’s version
+         // otherwise.
+-        let version = requested_version.unwrap_or(if created { 1 } else { db_version });
++        // Note: a stored database of version 0 counts as null, as databases() skips it: it was
++        // created by an earlier session that ended before its first upgrade committed.
++        let version = requested_version.unwrap_or(if created || db_version == 0 {
++            1
++        } else {
++            db_version
++        });
+ 
+         // Step 7: If db’s version is greater than version, return a newly created
+         // "VersionError" DOMException and abort these steps.
+@@ -1888,10 +2071,11 @@ impl IndexedDBManager {
+ 
+         // Step 4: Let db be the database named name in storageKey, if one exists. Otherwise,
+         // return 0 (zero).
++        // Note: a database that the manager hasn't opened since it started is looked up in the
++        // client storage registry, in parallel.
+         let old_version = match self.databases.get(key).map(|db| db.version()) {
+             None => {
+-                request.send_delete_result(Ok(0));
+-                return true;
++                return self.locate_database(key);
+             },
+             Some(Ok(version)) => version,
+             Some(Err(error)) => {
+@@ -1960,17 +2144,117 @@ impl IndexedDBManager {
+ 
+         // Step 11: Delete db. If this fails for any reason, return an appropriate error (e.g. a
+         // QuotaExceededError, or an "UnknownError" DOMException).
+-        proxy_map
+-            .handle
+-            .delete_database(proxy_map.bottle_id, key.name.clone())
+-            .recv()
+-            .map_err(|_| {
+-                BackendError::DbErr("Failed to communicate with client storage.".to_string())
+-            })?
+-            .map_err(|error| BackendError::DbErr(format!("Client storage error: {error:?}")))?;
++        delete_database_in_bottle(proxy_map, &key.name)?;
+         Ok(version)
+     }
+ 
++    /// The in-parallel steps of <https://w3c.github.io/IndexedDB/#dom-idbfactory-databases>,
++    /// which start by listing the databases in the storage bottle of `origin` in the client
++    /// storage registry, on the manager's client storage thread; the list comes back as
++    /// [`IndexedDBThreadMsg::DatabasesListed`].
++    fn list_databases(
++        &self,
++        sender: GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
++        origin: ImmutableOrigin,
++        bottle_source: StorageBottleSource,
++    ) {
++        let manager_sender = self.manager_sender.clone();
++        let reply = sender.clone();
++        let handed_over = self.client_storage_calls.run(move || {
++            let result =
++                obtain_a_local_storage_bottle_map(&bottle_source, &origin).and_then(|proxy_map| {
++                    client_storage_result(proxy_map.handle.list_databases(proxy_map.bottle_id))
++                });
++            if manager_sender
++                .send(IndexedDBThreadMsg::DatabasesListed {
++                    origin,
++                    sender,
++                    result,
++                })
++                .is_err()
++            {
++                debug!("IndexedDB manager went away while listing databases");
++            }
++        });
++        if let Err(error) = handed_over &&
++            reply.send(Err(error)).is_err()
++        {
++            debug!("Couldn't send SyncOperation::GetDatabases reply.");
++        }
++    }
++
++    /// The in-parallel steps of <https://w3c.github.io/IndexedDB/#dom-idbfactory-databases> for
++    /// the databases of `origin` that the client storage registry lists in `listed`, with their
++    /// directories, answered to `sender`.
++    fn databases_listed(
++        &self,
++        origin: ImmutableOrigin,
++        sender: GenericCallback<BackendResult<Vec<DatabaseInfo>>>,
++        listed: BackendResult<Vec<(Utf16String, PathBuf)>>,
++    ) {
++        // Step 4.1 Let databases be the set of databases in storageKey.
++        // If this cannot be determined for any reason,
++        // then queue a database task to reject p with an appropriate error
++        // (e.g. an "UnknownError" DOMException) and terminate these steps.
++        // Note: the databases that the manager has opened since it started, each with the
++        // version of its last committed upgrade (a running upgrade's version doesn't count yet,
++        // and a database counts until its delete request deletes it), and the other databases
++        // in the registry, with the version stored in their files.
++        let listed = match listed {
++            Ok(listed) => listed,
++            Err(error) => {
++                if sender.send(Err(error)).is_err() {
++                    debug!("Couldn't send SyncOperation::GetDatabases reply.");
++                }
++                return;
++            },
++        };
++        let mut databases: Vec<(Utf16String, u64)> = self
++            .databases
++            .iter()
++            .filter(|(description, _)| description.origin == origin)
++            .filter_map(|(description, db)| {
++                db.version()
++                    .ok()
++                    .map(|version| (description.name.clone(), version))
++            })
++            .collect();
++        for (name, path) in listed {
++            let key = IndexedDBDescription {
++                origin: origin.clone(),
++                name,
++            };
++            if self.databases.contains_key(&key) {
++                continue;
++            }
++            match ActiveKvsEngine::committed_version(&path) {
++                Ok(version) => databases.push((key.name, version)),
++                Err(error) => warn!(
++                    "Couldn't read the version of IndexedDB database {:?}: {error:?}",
++                    key.name
++                ),
++            }
++        }
++
++        // Step 4.2: Let result be a new list.
++        let info_list: Vec<DatabaseInfo> = databases
++            .into_iter()
++            // Step 4.3: For each db of databases:
++            // Step 4.3.4: If db’s version is 0, then continue.
++            .filter(|(_, version)| *version != 0)
++            // Step 4.3.5: Let info be a new IDBDatabaseInfo dictionary.
++            // Step 4.3.6: Set info’s name dictionary member to db’s name.
++            // Step 4.3.7: Set info’s version dictionary member to db’s version.
++            // Step 4.3.8: Append info to result.
++            .map(|(name, version)| DatabaseInfo { name, version })
++            .collect();
++
++        // Step 4.4: Queue a database task to resolve p with result.
++        if sender.send(Ok(info_list)).is_err() {
++            debug!("Couldn't send SyncOperation::GetDatabases reply.");
++        }
++    }
++
+     /// <https://w3c.github.io/IndexedDB/#close-a-database-connection>
+     fn close_database(&mut self, origin: ImmutableOrigin, id: Uuid, name: Utf16String) {
+         let key = IndexedDBDescription { origin, name };
+@@ -2008,54 +2292,8 @@ impl IndexedDBManager {
+ 
+     fn handle_sync_operation(&mut self, operation: SyncOperation) {
+         match operation {
+-            SyncOperation::GetDatabases(sender, origin) => {
+-                // The in-parallel steps of https://www.w3.org/TR/IndexedDB/#dom-idbfactory-databases
+-
+-                // Step 4.1 Let databases be the set of databases in storageKey.
+-                // If this cannot be determined for any reason,
+-                // then queue a database task to reject p with an appropriate error
+-                // (e.g. an "UnknownError" DOMException) and terminate these steps.
+-                // Note: the databases that were opened since the manager started, each with the
+-                // version of its last committed upgrade; a running upgrade's version doesn't
+-                // count yet, and a database counts until its delete request deletes it.
+-                // TODO: databases in storage that weren't opened since are missing.
+-
+-                // Step 4.2: Let result be a new list.
+-                let info_list: Vec<DatabaseInfo> = self
+-                    .databases
+-                    .iter()
+-                    .filter(|(description, _)| description.origin == origin)
+-                    .filter_map(|(description, info)| {
+-                        // Step 4.3: For each db of databases:
+-                        if let Ok(version) = info.version() {
+-                            // Step 4.3.4: If db’s version is 0, then continue.
+-                            if version == 0 {
+-                                None
+-                            } else {
+-                                // Step 4.3.5: Let info be a new IDBDatabaseInfo dictionary.
+-                                // Step 4.3.6: Set info’s name dictionary member to db’s name.
+-                                // Step 4.3.7: Set info’s version dictionary member to db’s version.
+-                                // Step 4.3.8: Append info to result.
+-                                Some(DatabaseInfo {
+-                                    name: description.name.clone(),
+-                                    version,
+-                                })
+-                            }
+-                        } else {
+-                            None
+-                        }
+-                    })
+-                    .collect();
+-
+-                // IndexedDB `databases()` / "get a list of databases" returns the visible list;
+-                // filtering out non-user-visible entries must not turn success into an internal error.
+-                // https://w3c.github.io/IndexedDB/#dom-idbfactory-databases
+-                let result = Ok(info_list);
+-
+-                // Step 4.4: Queue a database task to resolve p with result.
+-                if sender.send(result).is_err() {
+-                    debug!("Couldn't send SyncOperation::GetDatabases reply.");
+-                }
++            SyncOperation::GetDatabases(sender, origin, bottle_source) => {
++                self.list_databases(sender, origin, bottle_source);
+             },
+             SyncOperation::CloseDatabase(origin, id, db_name) => {
+                 self.close_database(origin, id, db_name);
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index 81bbd22511e..162d2cb0b9f 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -90,6 +90,9 @@ backend_tests!(
+     test_indexeddb_close_during_the_upgrade_fails_the_open,
+     test_indexeddb_connection_of_a_gone_global_counts_as_closed,
+     test_indexeddb_upgrade_committed_before_its_global_went_away_stays,
++    test_indexeddb_databases_of_an_earlier_session_are_listed_deleted_and_opened,
++    test_indexeddb_database_of_an_earlier_session_is_deleted_without_being_listed,
++    test_indexeddb_database_left_at_version_0_by_an_earlier_session_opens_as_new,
+ );
+ 
+ static INDEXEDDB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+@@ -149,8 +152,9 @@ fn shutdown_storage_group(threads: &StorageThreads) {
+ }
+ 
+ struct IndexedDbTestContext {
+-    _client_handle: storage_traits::client_storage::ClientStorageThreadHandle,
+-    _temp_dir: TempDir,
++    client_handle: storage_traits::client_storage::ClientStorageThreadHandle,
++    /// The config directory, which [`Self::restart`] hands on.
++    temp_dir: Option<TempDir>,
+     private_threads: StorageThreads,
+     public_threads: StorageThreads,
+     bottle_source: StorageBottleSource,
+@@ -163,8 +167,12 @@ struct IndexedDbTestContext {
+ 
+ impl IndexedDbTestContext {
+     fn new() -> Self {
++        Self::in_dir(tempfile::tempdir().unwrap())
++    }
++
++    /// A context whose storage threads keep their data in `temp_dir`.
++    fn in_dir(temp_dir: TempDir) -> Self {
+         install_test_namespace();
+-        let temp_dir = tempfile::tempdir().unwrap();
+         let config_dir = temp_dir.path().to_path_buf();
+         let client_handle: storage_traits::client_storage::ClientStorageThreadHandle =
+             ClientStorageThreadFactory::new(Some(config_dir.clone()), false);
+@@ -178,8 +186,8 @@ impl IndexedDbTestContext {
+         };
+ 
+         Self {
+-            _client_handle: client_handle,
+-            _temp_dir: temp_dir,
++            client_handle,
++            temp_dir: Some(temp_dir),
+             private_threads,
+             public_threads,
+             bottle_source,
+@@ -196,6 +204,22 @@ impl IndexedDbTestContext {
+ 
+         shutdown_storage_group(&self.private_threads);
+         shutdown_storage_group(&self.public_threads);
++        let (sender, receiver) = generic_channel::channel().unwrap();
++        self.client_handle
++            .send(storage_traits::client_storage::ClientStorageThreadMessage::Exit(sender))
++            .expect("failed to send client storage exit");
++        receiver
++            .recv()
++            .expect("failed to receive client storage exit ack");
++    }
++
++    /// Shuts the storage threads down and starts new ones on the same data, as a restart of the
++    /// browser does.
++    fn restart(mut self) -> Self {
++        self.shutdown();
++        let restarted = Self::in_dir(self.temp_dir.take().expect("The data is still there"));
++        restarted.indexes.replace(self.indexes.take());
++        restarted
+     }
+ }
+ 
+@@ -3058,3 +3082,187 @@ fn test_indexeddb_upgrade_committed_before_its_global_went_away_stays() {
+     close_database(&ctx, reopened, db_name);
+     ctx.shutdown();
+ }
++
++/// What databases() lists, as (name, version), by name.
++fn databases(ctx: &IndexedDbTestContext) -> Vec<(String, u64)> {
++    let (sender, receiver) = mpsc::channel();
++    let callback = ProfileGenericCallback::new(move |result| {
++        let _ = sender.send(result.ok());
++    })
++    .unwrap();
++    GenericSend::send(
++        &ctx.private_threads,
++        IndexedDBThreadMsg::Sync(SyncOperation::GetDatabases(
++            callback,
++            ctx.origin.clone(),
++            ctx.bottle_source.clone(),
++        )),
++    )
++    .unwrap();
++    let mut databases: Vec<(String, u64)> = recv_callback_timeout(&receiver, "databases")
++        .expect("databases() failed")
++        .into_iter()
++        .map(|info| (info.name.to_string(), info.version))
++        .collect();
++    databases.sort();
++    databases
++}
++
++/// The directory of `db_name` in the client storage registry, if it has one.
++fn database_directory(ctx: &IndexedDbTestContext, db_name: &str) -> Option<std::path::PathBuf> {
++    let proxy_map = ctx
++        .client_handle
++        .obtain_a_storage_bottle_map(
++            storage_traits::client_storage::StorageType::Local,
++            ctx.bottle_source.webview,
++            storage_traits::client_storage::StorageIdentifier::IndexedDB,
++            ctx.origin.clone(),
++        )
++        .recv()
++        .unwrap()
++        .unwrap();
++    proxy_map
++        .handle
++        .find_database(proxy_map.bottle_id, db_name)
++        .recv()
++        .unwrap()
++        .unwrap()
++}
++
++fn delete_result(ctx: &IndexedDbTestContext, db_name: &str) -> BackendResult<u64> {
++    match recv_callback_timeout(&delete_database(ctx, db_name).1, "delete result") {
++        DeleteDatabaseEvent::Done(result) => result,
++        other => panic!("unexpected delete event: {other:?}"),
++    }
++}
++
++/// Opens `db_name` at `version`, which must upgrade it from `old_version` to `version`, without
++/// changes, and closes the connection.
++fn upgrade_and_close(ctx: &IndexedDbTestContext, db_name: &str, version: u64, old_version: u64) {
++    let receiver = open_database(ctx, db_name, Some(version));
++    let (connection, upgraded_from) = upgrade_without_changes(ctx, db_name, &receiver, version);
++    assert_eq!(upgraded_from, old_version);
++    close_database(ctx, connection, db_name);
++}
++
++/// The databases in storage that the manager hasn't opened since it started, such as those of an
++/// earlier session, are found in the client storage registry: databases() lists them with their
++/// committed versions, deleteDatabase reports the version and deletes the database with its
++/// files and registry entry, and open opens one with its data.
++fn test_indexeddb_databases_of_an_earlier_session_are_listed_deleted_and_opened() {
++    let ctx = IndexedDbTestContext::new();
++    let connection =
++        expect_upgrade_and_initialize_database(&ctx, "kept", "books", "by_author", None);
++    let txn = create_transaction(
++        &ctx,
++        "kept",
++        connection,
++        IndexedDBTxnMode::Readwrite,
++        vec![STORE],
++    );
++    let put = put_item(
++        &ctx,
++        "kept",
++        STORE,
++        txn,
++        IndexedDBKeyType::String("book-1".into()),
++        b"Moby Dick".to_vec(),
++    );
++    let commit = commit_transaction(&ctx, "kept", txn);
++    assert!(recv_callback_timeout(&put, "put reply").is_ok());
++    assert!(recv_callback_timeout(&commit, "commit reply").is_ok());
++    finish_transaction(&ctx, "kept", txn);
++    close_database(&ctx, connection, "kept");
++    upgrade_and_close(&ctx, "deleted", 3, 0);
++    upgrade_and_close(&ctx, "upgraded", 2, 0);
++    let deleted_directory = database_directory(&ctx, "deleted").expect("A registry entry");
++    assert!(deleted_directory.is_dir());
++
++    let ctx = ctx.restart();
++    assert_eq!(
++        databases(&ctx),
++        vec![
++            ("deleted".to_owned(), 3),
++            ("kept".to_owned(), 1),
++            ("upgraded".to_owned(), 2)
++        ]
++    );
++    assert_eq!(delete_result(&ctx, "deleted"), Ok(3));
++    assert!(!deleted_directory.exists());
++    assert_eq!(database_directory(&ctx, "deleted"), None);
++    assert_eq!(delete_result(&ctx, "deleted"), Ok(0));
++    assert_eq!(delete_result(&ctx, "never-created"), Ok(0));
++    upgrade_and_close(&ctx, "upgraded", 4, 2);
++    assert_eq!(
++        databases(&ctx),
++        vec![("kept".to_owned(), 1), ("upgraded".to_owned(), 4)]
++    );
++
++    let connection = reopen_database(&ctx, "kept", "books");
++    assert_eq!(
++        get_item_in_new_readonly_transaction(
++            &ctx,
++            "kept",
++            connection,
++            STORE,
++            IndexedDBKeyType::String("book-1".into())
++        ),
++        Some(b"Moby Dick".to_vec())
++    );
++    close_database(&ctx, connection, "kept");
++    upgrade_and_close(&ctx, "deleted", 1, 0);
++    assert_eq!(
++        databases(&ctx),
++        vec![
++            ("deleted".to_owned(), 1),
++            ("kept".to_owned(), 1),
++            ("upgraded".to_owned(), 4)
++        ]
++    );
++    ctx.shutdown();
++}
++
++/// A delete of a database of an earlier session finds it in the client storage registry also
++/// when it is the first request after the restart, and an open after it, queued behind it,
++/// creates the database anew.
++fn test_indexeddb_database_of_an_earlier_session_is_deleted_without_being_listed() {
++    let ctx = IndexedDbTestContext::new();
++    upgrade_and_close(&ctx, "earlier", 5, 0);
++
++    let ctx = ctx.restart();
++    let (_, delete) = delete_database(&ctx, "earlier");
++    let open = open_database(&ctx, "earlier", None);
++    match recv_callback_timeout(&delete, "delete result") {
++        DeleteDatabaseEvent::Done(result) => assert_eq!(result, Ok(5)),
++        other => panic!("unexpected delete event: {other:?}"),
++    }
++    let (connection, old_version) = upgrade_without_changes(&ctx, "earlier", &open, 1);
++    assert_eq!(old_version, 0);
++    close_database(&ctx, connection, "earlier");
++    assert_eq!(databases(&ctx), vec![("earlier".to_owned(), 1)]);
++    ctx.shutdown();
++}
++
++/// A database whose first upgrade an earlier session never committed, as the browser stopped
++/// during it, is stored with version 0. databases() skips it, and an open without a version
++/// upgrades it from 0 to 1, as it does a new database.
++fn test_indexeddb_database_left_at_version_0_by_an_earlier_session_opens_as_new() {
++    let ctx = IndexedDbTestContext::new();
++    let db_name = "indexeddb-left-at-version-0";
++    let open = open_database(&ctx, db_name, Some(1));
++    let transaction = match recv_callback_timeout(&open, "upgrade") {
++        ConnectionMsg::Upgrade { transaction, .. } => transaction,
++        other => panic!("unexpected open message: {other:?}"),
++    };
++    create_object_store(&ctx, db_name, A, "a", transaction, None, false);
++
++    let ctx = ctx.restart();
++    assert!(database_directory(&ctx, db_name).is_some());
++    assert_eq!(databases(&ctx), vec![]);
++    let open = open_database(&ctx, db_name, None);
++    let (connection, old_version) = upgrade_without_changes(&ctx, db_name, &open, 1);
++    assert_eq!(old_version, 0);
++    close_database(&ctx, connection, db_name);
++    assert_eq!(databases(&ctx), vec![(db_name.to_owned(), 1)]);
++    ctx.shutdown();
++}

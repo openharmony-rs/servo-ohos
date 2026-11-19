@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Terminating an idle worker stops it, including its nested workers</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+// An idle worker waits for its next message, so it only notices that it was terminated if
+// termination wakes it up. Its nested worker keeps sending messages for as long as the
+// terminated worker is still running.
+promise_test(async t => {
+  const channel = new MessageChannel();
+  let ticks = 0;
+  channel.port1.onmessage = () => ticks++;
+
+  const worker = new Worker("resources/worker-terminate-idle-outer.js");
+  await new Promise(resolve => {
+    worker.onmessage = resolve;
+    worker.postMessage(channel.port2, [channel.port2]);
+  });
+  await new Promise(resolve => t.step_timeout(resolve, 200));
+  assert_greater_than(ticks, 0, "the nested worker is running");
+
+  worker.terminate();
+  await new Promise(resolve => t.step_timeout(resolve, 500));
+  const ticksAfterTerminate = ticks;
+  await new Promise(resolve => t.step_timeout(resolve, 500));
+  assert_equals(ticks, ticksAfterTerminate, "the nested worker stopped");
+}, "Terminating an idle worker stops its nested worker");
+</script>

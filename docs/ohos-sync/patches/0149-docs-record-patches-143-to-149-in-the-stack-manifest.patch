@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 17 Nov 2026 20:53:29 +0000
+Subject: [PATCH] docs: record patches 143 to 149 in the stack manifest
+
+Phase P1 of the IndexedDB redesign: the database actor, each IndexedDB
+transaction as one SQL transaction, the abort of a transaction whose
+commit failed, the key generator in the backend with the key injected
+when a value is read, the abort of a global's unfinished transactions
+when it goes away, and the manager's metadata reads from the committed
+metadata. The actor only changes fork files and is tier A; the other
+five edit upstream files and are tier C; this bookkeeping entry is B,
+like the earlier ones. The key generator entry no longer watches
+key.rs, which it now changes, but the structured clone code that its
+read-time injection relies on.
+
+Validation: `uv run docs/ohos-sync/check_stack.py base/2026-11-09` passes.
+AI-assisted: Yes (agent session; written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index a5443457049..b0130f29ad8 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -166,6 +166,13 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 140. `indexeddb: End the executor's transaction after errors that may roll it back` — A · CI+device · watch: -
+ 141. `storage: Test the transaction and statement behaviour the executors rely on` — A · CI+device · watch: -
+ 142. `docs: record patches 136 to 142 in the stack manifest` — B · none · watch: -
++143. `indexeddb: Run each database's work on its one connection, in order` — A · CI+device · watch: components/storage/indexeddb/mod.rs components/storage/indexeddb/engines/mod.rs
++144. `indexeddb: Make each IndexedDB transaction one SQL transaction` — C · CI+device · watch: components/shared/storage/indexeddb.rs components/script/dom/indexeddb/idbtransaction.rs
++145. `indexeddb: Abort a transaction whose commit failed with the backend's error` — C · CI+device · watch: components/script/dom/indexeddb/key.rs
++146. `indexeddb: Move the key generator into the backend` — C · CI+device · watch: components/script/dom/bindings/structuredclone.rs tests/wpt/tests/IndexedDB
++147. `indexeddb: Abort a global's unfinished transactions when it goes away` — C · CI+device · watch: components/script/dom/window/window.rs components/script/dom/workers/workerglobalscope.rs components/shared/storage/indexeddb.rs
++148. `indexeddb: Answer the manager's metadata reads from the committed metadata` — C · CI+device · watch: components/script/dom/indexeddb/idbtransaction.rs components/script/dom/indexeddb/idbdatabase.rs
++149. `docs: record patches 143 to 149 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 

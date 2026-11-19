@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use storage_traits::indexeddb::IndexedDBKeyType;
+use storage_traits::indexeddb::{IndexedDBKeyType, Utf16String};
 
 // Implementation is a port of:
 // https://searchfox.org/firefox-main/rev/55ec080e4a37b7ae1f89267063eccd361cdd232d/dom/indexedDB/Key.cpp#109-187
@@ -106,7 +106,7 @@ fn internal_serialize(key: &IndexedDBKeyType, type_offset: u8, buffer: &mut Vec<
         },
         IndexedDBKeyType::String(s) => {
             encode_stringy(
-                s.encode_utf16(),
+                s.units().iter().copied(),
                 KeyType::String as u8 + type_offset,
                 buffer,
             );
@@ -205,7 +205,7 @@ fn internal_deserialize(
     } else if key_type == KeyType::String as u8 + type_offset {
         *pos += 1;
         let u16s = decode_stringy(buffer, pos)?;
-        Some(IndexedDBKeyType::String(String::from_utf16(&u16s).ok()?))
+        Some(IndexedDBKeyType::String(Utf16String::from_units(u16s)))
     } else if key_type == KeyType::Binary as u8 + type_offset {
         *pos += 1;
         let u16s = decode_stringy(buffer, pos)?;
@@ -233,21 +233,15 @@ pub fn deserialize(data: &[u8]) -> Option<IndexedDBKeyType> {
     internal_deserialize(data, &mut pos, 0)
 }
 
-// Signature pin: on host builds this file is compiled twice (once as
-// engines::encoding, once as sqlite's submodule); the pin keeps whichever
-// instance goes unused from tripping dead code detection.
-const _: () = {
-    let _ = serialize_number as fn(f64) -> [u8; 8];
-    let _ = deserialize_number as fn(&[u8]) -> Option<f64>;
-    let _ = serialize as fn(&IndexedDBKeyType) -> Vec<u8>;
-    let _ = deserialize as fn(&[u8]) -> Option<IndexedDBKeyType>;
-};
-
 #[cfg(test)]
 mod tests {
-    use storage_traits::indexeddb::IndexedDBKeyType;
+    use storage_traits::indexeddb::{IndexedDBKeyType, Utf16String};
 
     use super::{deserialize, deserialize_number, serialize, serialize_number};
+
+    fn units(units: &[u16]) -> IndexedDBKeyType {
+        IndexedDBKeyType::String(Utf16String::from_units(units.to_vec()))
+    }
 
     #[test]
     fn test_number_roundtrip() {
@@ -281,12 +275,15 @@ mod tests {
         let keys = vec![
             IndexedDBKeyType::Number(42.0),
             IndexedDBKeyType::Date(1625077765.0),
-            IndexedDBKeyType::String("hello".to_string()),
+            IndexedDBKeyType::String("hello".into()),
             IndexedDBKeyType::Binary(vec![1, 2, 3, 4]),
             IndexedDBKeyType::Array(vec![
                 IndexedDBKeyType::Number(1.0),
-                IndexedDBKeyType::String("nested".to_string()),
+                IndexedDBKeyType::String("nested".into()),
             ]),
+            units(&[0xDC00, 0xD800]),
+            units(&[0x61, 0xD800]),
+            IndexedDBKeyType::Array(vec![units(&[0xDFFF]), units(&[0xD834, 0xDD1E])]),
         ];
         for key in &keys {
             let serialized = serialize(key);
@@ -312,14 +309,20 @@ mod tests {
             IndexedDBKeyType::Date(0.0),
             IndexedDBKeyType::Date(100.0),
             // String sorting
-            IndexedDBKeyType::String(String::new()),
-            IndexedDBKeyType::String("\0".to_string()),
-            IndexedDBKeyType::String("a".to_string()),
-            IndexedDBKeyType::String("aa".to_string()),
-            IndexedDBKeyType::String("b".to_string()),
-            IndexedDBKeyType::String("ba".to_string()),
-            IndexedDBKeyType::String("c".to_string()),
-            IndexedDBKeyType::String("~".to_string()),
+            IndexedDBKeyType::String("".into()),
+            IndexedDBKeyType::String("\0".into()),
+            IndexedDBKeyType::String("a".into()),
+            IndexedDBKeyType::String("aa".into()),
+            IndexedDBKeyType::String("b".into()),
+            IndexedDBKeyType::String("ba".into()),
+            IndexedDBKeyType::String("c".into()),
+            IndexedDBKeyType::String("~".into()),
+            // By code unit: unpaired surrogates and pairs sort among the units around them.
+            units(&[0xD800]),
+            units(&[0xD834, 0xDD1E]),
+            units(&[0xDC00]),
+            units(&[0xDC00, 0xD800]),
+            IndexedDBKeyType::String("\u{FFFD}".into()),
             // Binary sorting
             IndexedDBKeyType::Binary(vec![]),
             IndexedDBKeyType::Binary(vec![0]),
@@ -336,7 +339,7 @@ mod tests {
                 IndexedDBKeyType::Number(1.0),
                 IndexedDBKeyType::Number(2.0),
             ]),
-            IndexedDBKeyType::Array(vec![IndexedDBKeyType::String("a".to_string())]),
+            IndexedDBKeyType::Array(vec![IndexedDBKeyType::String("a".into())]),
         ];
 
         let serialized: Vec<Vec<u8>> = keys.iter().map(serialize).collect();
@@ -345,5 +348,6 @@ mod tests {
 
         // The bytes should be byte-wise sortable mirroring the original sort order
         assert_eq!(serialized, sorted_serialized);
+        assert!(keys.is_sorted_by(|a, b| a <= b));
     }
 }

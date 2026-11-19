@@ -1,0 +1,3644 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 16 Nov 2026 01:31:30 +0000
+Subject: [PATCH] indexeddb: Read the records of an index
+
+IDBIndex gets get(), getKey(), getAll(), getAllKeys() and count()
+(https://w3c.github.io/IndexedDB/#index-interface), so the index records
+that P3.1 and P3.2 store become readable. The methods follow their spec
+steps: the index or its store has been deleted (InvalidStateError) is
+checked before an inactive transaction (TransactionInactiveError), and
+that before the key range conversion (DataError); the requests have the
+index as their source.
+
+Protocol: the store's read operations (GetKey, GetItem, GetAllKeys,
+GetAllItems, Count) get an `index: Option<IndexedDBIndexId>`, the way
+Chromium passes an index id to the same calls, instead of new variants.
+GetKey of an index is "retrieve a value from an index", the primary key
+of the first record; GetItem "retrieve a referenced value", the store's
+value with its primary key, so that script injects a generated key
+through IDBObjectStore::deserialize_value as for store reads.
+
+Backend: the engine resolves the index id against the request's store
+(a missing index fails only that request) and reads through one SQL
+builder, `queries::RecordSource`, an object store or an index. An index
+is read from its table (unique_index_data or index_data, P3.1) in
+(index key, primary key) order, joined with object_data only when the
+values are read; ranges apply to the index key, counts and limits as
+for stores. The cursor read goes through the same builder with the store
+as source, so index cursors (P3.4) and getAll's direction and records
+(P4.1) only add columns and orderings. Reads queued behind a createIndex
+population wait for it like any request (P3.2).
+
+Script: getAll() and getAllKeys() of stores and indexes share
+IDBRequest::retrieve_multiple_items, the spec's "create a request to
+retrieve multiple items", with the query form only; P4.1 adds the
+IDBGetAllOptions branch, the direction and the "record" kind there, and
+the IDL keeps the spec's queryOrOptions and getAllRecords forms
+commented. A count of 0 now gets every record, as the spec's "If count
+is not given or is 0 (zero), let count be infinity" asks, also for
+stores, which returned none.
+
+The fork test index-reads.any.js also reads index keys that come from a
+generated key back through the indexes (P3.1's placeholders): items of
+a sequence key path and a multiEntry key path that are the store's key
+path, a key path below it, which gives no key, and a nested store key
+path whose key goes into the value's object or into one created for it.
+
+Validation: `cargo nextest run -p servo-storage -p servo-storage-traits` (host SQLite): 137 passed, 1 skipped (P3.2 134/1), with index read tests on every executor (keys of every type in (index key, primary key) order, unique and multiEntry indexes, ranges, counts and a count of 0, a missing index failing alone; reads after puts, overwrites, deletes, clears and an abort; reads queued behind a three-batch createIndex population). Host WPT tests/wpt/tests/IndexedDB (4,511 subtests), 8 processes: SpiderMonkey 3,796, QuickJS 3,797 (previous commit 3,418 / 3,398, P3.2 tip 3,392 / 3,389); the 378 new passes over the previous commit, the same on both engines, are idbindex_get, _getKey, _getAll, _getAllKeys and _count, idbindex-query-exception-order, the method subtests of idbindex-request-source, idbindex-cross-realm-methods, idlharness's IDBIndex operations, reading-autoincrement-indexes, key-conversion-exceptions, idbindex-rename, -rename-errors and -rename-abort, idbindex-multientry, idbobjectstore_createIndex's index read subtests, idbobjectstore-rename-store, transaction-abort-index- and -multiple-metadata-revert, idb-partitioned-coverage, request-abort-ordering, idbfactory_open, idbdatabase_createObjectStore and the invalid-key subtests of idbindex_getAll(Keys)-options; expectations updated with `./mach update-wpt` from both engines' runs, after which SM ran 819 of 820 tests as expected (idbfactory-origin-isolation, a known flip) and QuickJS 820 of 820. tests/wpt/mozilla/tests/IndexedDB/ 200 of 200 on SM, QuickJS and SM --multiprocess, with the new index-reads.any.js (7 subtests in 4 globals; the P3.2 binary passes none). DAYU200 (QuickJS + RDB, 2 processes): WPT IndexedDB/ 3,773 (P3.2 3,381), the host's new passes except 10 of idb-partitioned-coverage, which now times out as a whole on the board (17 subtests): its iframe runs the index getAll tests, which takes 17 to 24 s on the board inside an iframe (4.7 s top-level, 0.65 s on the host), past the iframe harness's own 10 s timeout, and with that timeout disabled it completes in 24 s with only the two expected index cursor failures (RDB); the SQLite backend on the board times out the same way; the other unexpected results are the known board set (interleaved-cursors-large, idbfactory-origin-isolation, lone-surrogate rename subtests of worker/sharedworker variants, file_support's send_keys); /_mozilla/IndexedDB/ 200 of 200; `./mach test-unit --ohos -p servo-storage` RDB only 138 passed / 3 skipped, SQLite and RDB 245 / 4. `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`, `./mach check --ohos -- -p servo-storage --all-targets` with SQLite, RDB and both, and test-tidy (except the known libsqlite3-sys advisory) pass. With the P3 review fixes folded in: `./mach check` without warnings and nextest 138 passed, 1 skipped at this commit; index-reads.any.js gets the generated-key subtest (8 subtests in 4 globals), which passes at the branch tip on SM, QuickJS and the DAYU200, and also with the P3.3 binary, as a regression test.
+AI-assisted: Yes (agent session; implemented the index read protocol, queries and IDBIndex methods, wrote the unit and fork WPT tests, ran the host and board checks and updated the expectations; added the generated-key read-back subtest after the P3 review)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/indexeddb/idbindex.rs   | 147 +++++-
+ .../script/dom/indexeddb/idbobjectstore.rs    |  89 ++--
+ components/script/dom/indexeddb/idbrequest.rs |  93 +++-
+ .../script_bindings/codegen/Bindings.conf     |   2 +-
+ .../script_bindings/webidls/IDBIndex.webidl   |  10 +-
+ components/shared/storage/indexeddb.rs        |  23 +-
+ .../storage/indexeddb/backend/engine.rs       |  76 +--
+ .../storage/indexeddb/backend/queries.rs      | 222 ++++++--
+ components/storage/indexeddb/backend/tests.rs | 495 +++++++++++++++++-
+ components/storage/tests/indexeddb.rs         |   3 +
+ .../idb-partitioned-coverage.sub.html.ini     |  57 --
+ .../idbdatabase_createObjectStore.any.js.ini  |   9 -
+ .../meta/IndexedDB/idbfactory_open.any.js.ini |   8 -
+ .../idbindex-cross-realm-methods.html.ini     |  15 -
+ .../IndexedDB/idbindex-multientry.any.js.ini  |  17 -
+ .../idbindex-query-exception-order.any.js.ini |  71 ---
+ .../idbindex-rename-abort.any.js.ini          |   8 -
+ .../idbindex-rename-errors.any.js.ini         |  17 -
+ .../meta/IndexedDB/idbindex-rename.any.js.ini |  72 ---
+ .../idbindex-request-source.any.js.ini        |  44 --
+ .../meta/IndexedDB/idbindex_count.any.js.ini  |  35 --
+ .../meta/IndexedDB/idbindex_get.any.js.ini    |  72 ---
+ .../idbindex_getAll-options.any.js.ini        |   9 -
+ .../meta/IndexedDB/idbindex_getAll.any.js.ini | 170 ------
+ .../idbindex_getAllKeys-options.any.js.ini    |   9 -
+ .../IndexedDB/idbindex_getAllKeys.any.js.ini  | 161 ------
+ .../meta/IndexedDB/idbindex_getKey.any.js.ini |  71 ---
+ .../idbobjectstore-rename-store.any.js.ini    |   9 -
+ .../idbobjectstore_createIndex.any.js.ini     |  54 --
+ .../wpt/meta/IndexedDB/idlharness.any.js.ini  |  48 --
+ .../key-conversion-exceptions.any.js.ini      |  29 -
+ .../reading-autoincrement-indexes.any.js.ini  |  53 --
+ .../request-abort-ordering.any.js.ini         |   8 -
+ ...ion-abort-index-metadata-revert.any.js.ini |  53 --
+ ...-abort-multiple-metadata-revert.any.js.ini |  26 -
+ tests/wpt/mozilla/meta/MANIFEST.json          |  85 ++-
+ .../tests/IndexedDB/index-population.any.js   |   4 +-
+ .../tests/IndexedDB/index-reads.any.js        | 330 ++++++++++++
+ 38 files changed, 1424 insertions(+), 1280 deletions(-)
+ delete mode 100644 tests/wpt/meta/IndexedDB/idbindex-cross-realm-methods.html.ini
+ create mode 100644 tests/wpt/mozilla/tests/IndexedDB/index-reads.any.js
+
+diff --git a/components/script/dom/indexeddb/idbindex.rs b/components/script/dom/indexeddb/idbindex.rs
+index 5f12b77b631..aec15d05a69 100644
+--- a/components/script/dom/indexeddb/idbindex.rs
++++ b/components/script/dom/indexeddb/idbindex.rs
+@@ -12,7 +12,9 @@ use script_bindings::codegen::GenericBindings::IDBTransactionBinding::IDBTransac
+ use script_bindings::error::{Error, ErrorResult, Fallible};
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use script_bindings::str::DOMString;
+-use storage_traits::indexeddb::{IndexedDBIndexId, Utf16String};
++use storage_traits::indexeddb::{
++    AsyncOperation, AsyncReadOnlyOperation, IndexedDBIndexId, Utf16String,
++};
+ 
+ use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
+ use crate::dom::bindings::refcounted::Trusted;
+@@ -23,7 +25,7 @@ use crate::dom::idbobjectstore::KeyPath;
+ use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
+ use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+-use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource};
++use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource, RetrievalKind};
+ use crate::dom::indexeddb::key::{
+     convert_value_to_key_range, dom_string_from_name, name_from_dom_string,
+ };
+@@ -118,6 +120,59 @@ impl IDBIndex {
+         Ok(())
+     }
+ 
++    fn check_transaction_active(&self) -> ErrorResult {
++        let transaction = self.object_store.transaction();
++        if !transaction.is_active() || !transaction.is_usable() {
++            return Err(Error::TransactionInactive(Some(
++                "Transaction is not active".to_owned(),
++            )));
++        }
++        Ok(())
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-get> and
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-getkey>, which differ in their operation.
++    fn get(
++        &self,
++        cx: &mut JSContext,
++        query: HandleValue,
++        key_only: bool,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        // Step 1. Let transaction be this’s transaction.
++        // Step 2. Let index be this’s index.
++        // Step 3. If index or index’s object store has been deleted, throw an
++        // "InvalidStateError" DOMException.
++        self.verify_not_deleted()?;
++
++        // Step 4. If transaction’s state is not active, then throw a "TransactionInactiveError"
++        // DOMException.
++        self.check_transaction_active()?;
++
++        // Step 5. Let range be the result of converting a value to a key range with query and
++        // true. Rethrow any exceptions.
++        let key_range = convert_value_to_key_range(cx, query, Some(true))?;
++
++        // Step 6. Let operation be an algorithm to run retrieve a referenced value from an index
++        // with the current Realm record, index, and range (get), or retrieve a value from an
++        // index with index and range (getKey).
++        let index = Some(self.id);
++        let operation = if key_only {
++            AsyncReadOnlyOperation::GetKey { index, key_range }
++        } else {
++            AsyncReadOnlyOperation::GetItem { index, key_range }
++        };
++
++        // Step 7. Return the result (an IDBRequest) of running asynchronously execute a request
++        // with this and operation.
++        IDBRequest::execute_async(
++            cx,
++            RequestSource::Index(self),
++            AsyncOperation::ReadOnly(operation),
++            None,
++            None,
++        )
++    }
++
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbindex-opencursor>
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbindex-openkeycursor>
+     fn open_cursor(
+@@ -134,11 +189,7 @@ impl IDBIndex {
+         self.verify_not_deleted()?;
+ 
+         // Step 3. If transaction is not active, throw a "TransactionInactiveError" DOMException.
+-        if !transaction.is_active() || !transaction.is_usable() {
+-            return Err(Error::TransactionInactive(Some(
+-                "Transaction is not active".to_owned(),
+-            )));
+-        }
++        self.check_transaction_active()?;
+ 
+         // Step 4. Let range be the result of running the steps to convert a value to a key range with query.
+         let range = convert_value_to_key_range(cx, query, Some(false))?;
+@@ -268,6 +319,88 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+         }
+     }
+ 
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-get>
++    fn Get(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
++        self.get(cx, query, false)
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-getkey>
++    fn GetKey(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
++        self.get(cx, query, true)
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-getall>
++    fn GetAll(
++        &self,
++        cx: &mut JSContext,
++        query: HandleValue,
++        count: Option<u32>,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        // Step 1. Return the result of creating a request to retrieve multiple items with the
++        // current Realm record, this, "value", queryOrOptions, and count if given. Rethrow any
++        // exceptions.
++        IDBRequest::retrieve_multiple_items(
++            cx,
++            RequestSource::Index(self),
++            RetrievalKind::Value,
++            query,
++            count,
++        )
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-getallkeys>
++    fn GetAllKeys(
++        &self,
++        cx: &mut JSContext,
++        query: HandleValue,
++        count: Option<u32>,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        // Step 1. Return the result of creating a request to retrieve multiple items with the
++        // current Realm record, this, "key", queryOrOptions, and count if given. Rethrow any
++        // exceptions.
++        IDBRequest::retrieve_multiple_items(
++            cx,
++            RequestSource::Index(self),
++            RetrievalKind::Key,
++            query,
++            count,
++        )
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-count>
++    fn Count(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
++        // Step 1. Let transaction be this’s transaction.
++        // Step 2. Let index be this’s index.
++        // Step 3. If index or index’s object store has been deleted, throw an
++        // "InvalidStateError" DOMException.
++        self.verify_not_deleted()?;
++
++        // Step 4. If transaction’s state is not active, then throw a "TransactionInactiveError"
++        // DOMException.
++        self.check_transaction_active()?;
++
++        // Step 5. Let range be the result of converting a value to a key range with query.
++        // Rethrow any exceptions.
++        let key_range = convert_value_to_key_range(cx, query, None)?;
++
++        // Step 6. Let operation be an algorithm to run count the records in a range with index
++        // and range.
++        let operation = AsyncReadOnlyOperation::Count {
++            index: Some(self.id),
++            key_range,
++        };
++
++        // Step 7. Return the result (an IDBRequest) of running asynchronously execute a request
++        // with this and operation.
++        IDBRequest::execute_async(
++            cx,
++            RequestSource::Index(self),
++            AsyncOperation::ReadOnly(operation),
++            None,
++            None,
++        )
++    }
++
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbindex-opencursor>
+     fn OpenCursor(
+         &self,
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index 5c045b2ca4b..083bb65f047 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -39,7 +39,7 @@ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
+ use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
+ use crate::dom::indexeddb::idbindex::IDBIndex;
+-use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource};
++use crate::dom::indexeddb::idbrequest::{IDBRequest, RequestSource, RetrievalKind};
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::key::{
+     EvaluationResult, ExtractionResult, can_inject_key_into_value, clear_pending_exception,
+@@ -767,7 +767,10 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+             IDBRequest::execute_async(
+                 cx,
+                 RequestSource::ObjectStore(self),
+-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem { key_range: q }),
++                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
++                    index: None,
++                    key_range: q,
++                }),
+                 None,
+                 None,
+             )
+@@ -794,7 +797,10 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+             IDBRequest::execute_async(
+                 cx,
+                 RequestSource::ObjectStore(self),
+-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey { key_range: q }),
++                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey {
++                    index: None,
++                    key_range: q,
++                }),
+                 None,
+                 None,
+             )
+@@ -808,32 +814,16 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         query: HandleValue,
+         count: Option<u32>,
+     ) -> Fallible<DomRoot<IDBRequest>> {
+-        // Step 1. Let transaction be this’s transaction.
+-        // Step 2. Let store be this's object store.
+-        // Step 3. If store has been deleted, throw an "InvalidStateError" DOMException.
+-        self.verify_not_deleted()?;
+-
+-        // Step 4. If transaction’s state is not active, then throw a "TransactionInactiveError" DOMException.
+-        self.check_transaction_active()?;
+-
+-        // Step 5. Let range be the result of converting a value to a key range with query and true. Rethrow any exceptions.
+-        let serialized_query = convert_value_to_key_range(cx, query, None);
+-
+-        // Step 6. Run the steps to asynchronously execute a request and return the IDBRequest created by these steps.
+-        // The steps are run with this object store handle as source and the steps to retrieve a key from an object
+-        // store as operation, using store and range.
+-        serialized_query.and_then(|q| {
+-            IDBRequest::execute_async(
+-                cx,
+-                RequestSource::ObjectStore(self),
+-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
+-                    key_range: q,
+-                    count,
+-                }),
+-                None,
+-                None,
+-            )
+-        })
++        // Step 1. Return the result of creating a request to retrieve multiple items with the
++        // current Realm record, this, "value", queryOrOptions, and count if given. Rethrow any
++        // exceptions.
++        IDBRequest::retrieve_multiple_items(
++            cx,
++            RequestSource::ObjectStore(self),
++            RetrievalKind::Value,
++            query,
++            count,
++        )
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-getallkeys>
+@@ -843,32 +833,16 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+         query: HandleValue,
+         count: Option<u32>,
+     ) -> Fallible<DomRoot<IDBRequest>> {
+-        // Step 1. Let transaction be this’s transaction.
+-        // Step 2. Let store be this's object store.
+-        // Step 3. If store has been deleted, throw an "InvalidStateError" DOMException.
+-        self.verify_not_deleted()?;
+-
+-        // Step 4. If transaction’s state is not active, then throw a "TransactionInactiveError" DOMException.
+-        self.check_transaction_active()?;
+-
+-        // Step 5. Let range be the result of converting a value to a key range with query and true. Rethrow any exceptions.
+-        let serialized_query = convert_value_to_key_range(cx, query, None);
+-
+-        // Step 6. Run the steps to asynchronously execute a request and return the IDBRequest created by these steps.
+-        // The steps are run with this object store handle as source and the steps to retrieve a key from an object
+-        // store as operation, using store and range.
+-        serialized_query.and_then(|q| {
+-            IDBRequest::execute_async(
+-                cx,
+-                RequestSource::ObjectStore(self),
+-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
+-                    key_range: q,
+-                    count,
+-                }),
+-                None,
+-                None,
+-            )
+-        })
++        // Step 1. Return the result of creating a request to retrieve multiple items with the
++        // current Realm record, this, "key", queryOrOptions, and count if given. Rethrow any
++        // exceptions.
++        IDBRequest::retrieve_multiple_items(
++            cx,
++            RequestSource::ObjectStore(self),
++            RetrievalKind::Key,
++            query,
++            count,
++        )
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbobjectstore-count>
+@@ -890,7 +864,10 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+             IDBRequest::execute_async(
+                 cx,
+                 RequestSource::ObjectStore(self),
+-                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count { key_range: q }),
++                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
++                    index: None,
++                    key_range: q,
++                }),
+                 None,
+                 None,
+             )
+diff --git a/components/script/dom/indexeddb/idbrequest.rs b/components/script/dom/indexeddb/idbrequest.rs
+index 563fb2a55fa..c562dfeb4f5 100644
+--- a/components/script/dom/indexeddb/idbrequest.rs
++++ b/components/script/dom/indexeddb/idbrequest.rs
+@@ -27,7 +27,7 @@ use crate::dom::bindings::codegen::Bindings::IDBRequestBinding::{
+ };
+ use crate::dom::bindings::codegen::Bindings::IDBTransactionBinding::IDBTransactionMode;
+ use crate::dom::bindings::codegen::UnionTypes::IDBObjectStoreOrIDBIndexOrIDBCursor;
+-use crate::dom::bindings::error::{Error, Fallible, create_dom_exception};
++use crate::dom::bindings::error::{Error, ErrorResult, Fallible, create_dom_exception};
+ use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+@@ -40,7 +40,7 @@ use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
+ use crate::dom::indexeddb::idbindex::IDBIndex;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+-use crate::dom::indexeddb::key::key_type_to_jsval;
++use crate::dom::indexeddb::key::{convert_value_to_key_range, key_type_to_jsval};
+ 
+ pub enum IdbResult {
+     Key(IndexedDBKeyType),
+@@ -155,6 +155,14 @@ impl RequestSource<'_> {
+             Self::Cursor(cursor) => cursor.effective_object_store(),
+         }
+     }
++
++    fn verify_not_deleted(&self) -> ErrorResult {
++        match self {
++            Self::ObjectStore(store) => store.verify_not_deleted(),
++            Self::Index(index) => index.verify_not_deleted(),
++            Self::Cursor(cursor) => cursor.verify_not_deleted(),
++        }
++    }
+ }
+ 
+ /// A [`RequestSource`] that a request keeps.
+@@ -166,6 +174,14 @@ enum SourceHandle {
+     Cursor(Dom<IDBCursor>),
+ }
+ 
++/// <https://w3c.github.io/IndexedDB/#create-a-request-to-retrieve-multiple-items>: what the
++/// request retrieves of each record.
++#[derive(Clone, Copy)]
++pub(crate) enum RetrievalKind {
++    Key,
++    Value,
++}
++
+ #[dom_struct]
+ pub struct IDBRequest {
+     eventtarget: EventTarget,
+@@ -323,6 +339,79 @@ impl IDBRequest {
+         Ok(request)
+     }
+ 
++    /// <https://w3c.github.io/IndexedDB/#create-a-request-to-retrieve-multiple-items>, for a
++    /// `queryOrOptions` that is a query: from an object store or an index `source_handle`.
++    pub(crate) fn retrieve_multiple_items(
++        cx: &mut JSContext,
++        source_handle: RequestSource,
++        kind: RetrievalKind,
++        query: HandleValue,
++        count: Option<u32>,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        // Step 1. Let source be an index or an object store from sourceHandle. If sourceHandle
++        // is an index handle, then source is the index handle’s associated index. Otherwise,
++        // source is the object store handle’s associated object store.
++        let index = match source_handle {
++            RequestSource::ObjectStore(_) => None,
++            RequestSource::Index(index) => Some(index.id()),
++            RequestSource::Cursor(_) => unreachable!("Only object stores and indexes get all"),
++        };
++
++        // Step 2. If source has been deleted, throw an "InvalidStateError" DOMException.
++        // Step 3. If source is an index and source’s object store has been deleted, throw an
++        // "InvalidStateError" DOMException.
++        source_handle.verify_not_deleted()?;
++
++        // Step 4. Let transaction be sourceHandle’s transaction.
++        let transaction = source_handle.object_store().transaction();
++
++        // Step 5. If transaction’s state is not active, then throw a "TransactionInactiveError"
++        // DOMException.
++        if !transaction.is_active() || !transaction.is_usable() {
++            return Err(Error::TransactionInactive(Some(
++                "Transaction is not active".to_owned(),
++            )));
++        }
++
++        // Step 6. Let range be a key range.
++        // Step 7. Let direction be a cursor direction.
++        // Step 8. If running is a potentially valid key range with queryOrOptions is true, then:
++        // Step 8.1. Set range to the result of converting a value to a key range with
++        // queryOrOptions. Rethrow any exceptions.
++        // Step 8.2. Set direction to "next".
++        // NOTE: IDBGetAllOptions isn't supported yet, so queryOrOptions is a query, and step 9
++        // doesn't apply.
++        let key_range = convert_value_to_key_range(cx, query, None)?;
++
++        // Step 10. Let operation be an algorithm to run.
++        // Step 11. If source is an index, set operation to retrieve multiple items from an index
++        // with targetRealm, source, range, kind, direction, and count if given.
++        // Step 12. Else set operation to retrieve multiple items from an object store with
++        // targetRealm, source, range, kind, direction, and count if given.
++        let operation = match kind {
++            RetrievalKind::Key => AsyncReadOnlyOperation::GetAllKeys {
++                index,
++                key_range,
++                count,
++            },
++            RetrievalKind::Value => AsyncReadOnlyOperation::GetAllItems {
++                index,
++                key_range,
++                count,
++            },
++        };
++
++        // Step 13. Return the result (an IDBRequest) of running asynchronously execute a request
++        // with sourceHandle and operation.
++        Self::execute_async(
++            cx,
++            source_handle,
++            AsyncOperation::ReadOnly(operation),
++            None,
++            None,
++        )
++    }
++
+     /// Converts the result of this request, as the backend reported it, into `answer`, or
+     /// returns the error that is the request's result.
+     pub(crate) fn convert_result(
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index ba4d52c1abd..dd95f6e0ad3 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -872,7 +872,7 @@ DOMInterfaces = {
+ },
+ 
+ 'IDBIndex': {
+-    'cx': ['KeyPath', 'OpenCursor', 'OpenKeyCursor'],
++    'cx': ['Count', 'Get', 'GetAll', 'GetAllKeys', 'GetKey', 'KeyPath', 'OpenCursor', 'OpenKeyCursor'],
+ },
+ 
+ 'IDBKeyRange': {
+diff --git a/components/script_bindings/webidls/IDBIndex.webidl b/components/script_bindings/webidls/IDBIndex.webidl
+index 8767269f006..9db6ba966f0 100644
+--- a/components/script_bindings/webidls/IDBIndex.webidl
++++ b/components/script_bindings/webidls/IDBIndex.webidl
+@@ -15,14 +15,18 @@ interface IDBIndex {
+   readonly attribute boolean multiEntry;
+   readonly attribute boolean unique;
+ 
+-  // [NewObject] IDBRequest get(any query);
+-  // [NewObject] IDBRequest getKey(any query);
++  [NewObject, Throws] IDBRequest get(any query);
++  [NewObject, Throws] IDBRequest getKey(any query);
+   // [NewObject] IDBRequest getAll(optional any queryOrOptions,
+   //                               optional [EnforceRange] unsigned long count);
++  [NewObject, Throws] IDBRequest getAll(optional any query,
++                                optional [EnforceRange] unsigned long count);
+   // [NewObject] IDBRequest getAllKeys(optional any queryOrOptions,
+   //                                   optional [EnforceRange] unsigned long count);
++  [NewObject, Throws] IDBRequest getAllKeys(optional any query,
++                                    optional [EnforceRange] unsigned long count);
+   // [NewObject] IDBRequest getAllRecords(optional IDBGetAllOptions options = {});
+-  // [NewObject] IDBRequest count(optional any query);
++  [NewObject, Throws] IDBRequest count(optional any query);
+ 
+   [NewObject, Throws] IDBRequest openCursor(optional any query,
+                                     optional IDBCursorDirection direction = "next");
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index a76acbbf45a..9b320e8dca8 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -500,26 +500,47 @@ pub enum PutItemResult {
+     UniqueIndexKeyExists(IndexedDBIndexId),
+ }
+ 
++/// The reads of the records of the object store that [`IndexedDBThreadMsg::Async`] names, or,
++/// with `index`, of the records of that index of the store: in (index key, primary key) order,
++/// with the index key as the key of each record and the primary key as its value, which refers
++/// to the store's record and its value.
+ #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+ pub enum AsyncReadOnlyOperation {
+-    /// Gets the value associated with the given key in the associated idb data
++    /// The primary key of the first record in `key_range`:
++    /// <https://w3c.github.io/IndexedDB/#retrieve-a-key-from-an-object-store> and
++    /// <https://w3c.github.io/IndexedDB/#retrieve-a-value-from-an-index>.
+     GetKey {
++        index: Option<IndexedDBIndexId>,
+         key_range: IndexedDBKeyRange,
+     },
++    /// The (referenced) value of the first record in `key_range`:
++    /// <https://w3c.github.io/IndexedDB/#retrieve-a-value-from-an-object-store> and
++    /// <https://w3c.github.io/IndexedDB/#retrieve-a-referenced-value-from-an-index>.
+     GetItem {
++        index: Option<IndexedDBIndexId>,
+         key_range: IndexedDBKeyRange,
+     },
+ 
++    /// The primary keys of the first `count` records in `key_range`, or of all of them if
++    /// `count` is `None` or 0: <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-object-store>
++    /// and <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-index> with kind
++    /// "key" and direction "next".
+     GetAllKeys {
++        index: Option<IndexedDBIndexId>,
+         key_range: IndexedDBKeyRange,
+         count: Option<u32>,
+     },
++    /// The (referenced) values of the records that [`AsyncReadOnlyOperation::GetAllKeys`] gets
++    /// the keys of: kind "value".
+     GetAllItems {
++        index: Option<IndexedDBIndexId>,
+         key_range: IndexedDBKeyRange,
+         count: Option<u32>,
+     },
+ 
++    /// <https://w3c.github.io/IndexedDB/#count-the-records-in-a-range>
+     Count {
++        index: Option<IndexedDBIndexId>,
+         key_range: IndexedDBKeyRange,
+     },
+     /// Gets the records in `key_range` in ascending key order: the first `count` of them, or the
+diff --git a/components/storage/indexeddb/backend/engine.rs b/components/storage/indexeddb/backend/engine.rs
+index 652d226b08c..3b0ddaee0a9 100644
+--- a/components/storage/indexeddb/backend/engine.rs
++++ b/components/storage/indexeddb/backend/engine.rs
+@@ -18,7 +18,7 @@ use storage_traits::indexeddb::{
+ };
+ 
+ use super::executor::{SqlError, SqlExecutor, TransactionBehavior};
+-use super::queries::{self, ObjectStore};
++use super::queries::{self, ObjectStore, RecordSource};
+ use super::schema;
+ use crate::indexeddb::IndexedDBDescription;
+ use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction, TransactionResults};
+@@ -769,41 +769,53 @@ fn run_read_only<X: SqlExecutor>(
+     store: &ObjectStore,
+     operation: AsyncReadOnlyOperation,
+ ) -> (BackendResult<RequestOutput>, Option<Failure>) {
+-    match operation {
+-        AsyncReadOnlyOperation::GetKey { key_range } => outcome(
+-            queries::get_key(executor, store, &key_range),
+-            RequestOutput::Key,
+-            Failure::Read,
+-        ),
+-        AsyncReadOnlyOperation::GetItem { key_range } => outcome(
+-            queries::get_value(executor, store, &key_range),
+-            RequestOutput::Value,
+-            Failure::Read,
+-        ),
+-        AsyncReadOnlyOperation::GetAllKeys { key_range, count } => outcome(
+-            queries::get_all_keys(executor, store, &key_range, count),
+-            RequestOutput::Keys,
+-            Failure::Read,
+-        ),
+-        AsyncReadOnlyOperation::GetAllItems { key_range, count } => outcome(
+-            queries::get_all_values(executor, store, &key_range, count),
+-            RequestOutput::Values,
+-            Failure::Read,
+-        ),
+-        AsyncReadOnlyOperation::Count { key_range } => outcome(
+-            queries::count(executor, store, &key_range),
+-            RequestOutput::Count,
+-            Failure::Read,
+-        ),
++    // The records the request reads: the store's, or those of one of its indexes, which must
++    // exist, since script and the backend agree on the indexes of the store.
++    let source = |index: Option<IndexedDBIndexId>| match index {
++        None => Ok(RecordSource::ObjectStore(store)),
++        Some(index) => store
++            .index(index)
++            .map(RecordSource::Index)
++            .ok_or_else(|| BackendError::DbErr(format!("The object store has no index {index}"))),
++    };
++    let result = match operation {
++        AsyncReadOnlyOperation::GetKey { index, key_range } => source(index)
++            .map(|source| queries::get_key(executor, source, &key_range).map(RequestOutput::Key)),
++        AsyncReadOnlyOperation::GetItem { index, key_range } => source(index).map(|source| {
++            queries::get_value(executor, source, &key_range).map(RequestOutput::Value)
++        }),
++        AsyncReadOnlyOperation::GetAllKeys {
++            index,
++            key_range,
++            count,
++        } => source(index).map(|source| {
++            queries::get_all_keys(executor, source, &key_range, count).map(RequestOutput::Keys)
++        }),
++        AsyncReadOnlyOperation::GetAllItems {
++            index,
++            key_range,
++            count,
++        } => source(index).map(|source| {
++            queries::get_all_values(executor, source, &key_range, count).map(RequestOutput::Values)
++        }),
++        AsyncReadOnlyOperation::Count { index, key_range } => source(index)
++            .map(|source| queries::count(executor, source, &key_range).map(RequestOutput::Count)),
+         AsyncReadOnlyOperation::Iterate {
+             key_range,
+             count,
+             reverse,
+-        } => outcome(
+-            queries::get_records(executor, store, &key_range, count, reverse),
+-            RequestOutput::Records,
+-            Failure::Read,
+-        ),
++        } => Ok(queries::get_records(
++            executor,
++            RecordSource::ObjectStore(store),
++            &key_range,
++            count,
++            reverse,
++        )
++        .map(RequestOutput::Records)),
++    };
++    match result {
++        Ok(result) => outcome(result, |output| output, Failure::Read),
++        Err(error) => (Err(error), None),
+     }
+ }
+ 
+diff --git a/components/storage/indexeddb/backend/queries.rs b/components/storage/indexeddb/backend/queries.rs
+index 975174a529c..7119a403e20 100644
+--- a/components/storage/indexeddb/backend/queries.rs
++++ b/components/storage/indexeddb/backend/queries.rs
+@@ -431,9 +431,9 @@ impl RangeCondition {
+         self.sql.replace("{}", column)
+     }
+ 
+-    /// The parameters for `object_store_id = ?` followed by this condition.
+-    fn params(&self, store: &ObjectStore) -> Vec<SqlParam<'_>> {
+-        std::iter::once(SqlParam::Integer(store.id))
++    /// The parameters for an `id = ?` condition with `id` followed by this condition.
++    fn params(&self, id: i64) -> Vec<SqlParam<'_>> {
++        std::iter::once(SqlParam::Integer(id))
+             .chain(self.bounds.iter().map(|bound| SqlParam::Blob(bound)))
+             .collect()
+     }
+@@ -464,24 +464,108 @@ fn range_condition(range: &IndexedDBKeyRange) -> RangeCondition {
+     condition
+ }
+ 
+-/// Selects `columns` of the records of `store` in `range`, in ascending key order or descending
++/// The records that a read reads: those of an object store, or those of an index, whose keys are
++/// index keys and whose values are the keys of the records of the index's store, which hold the
++/// referenced values. Both are in key order, and an index's secondarily in value order.
++#[derive(Clone, Copy, Debug)]
++pub(crate) enum RecordSource<'a> {
++    ObjectStore(&'a ObjectStore),
++    Index(StoreIndex),
++}
++
++/// What a read selects of each record, in this order.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) enum RecordColumns {
++    /// The primary key: the key of a store's record, the value of an index's record.
++    PrimaryKey,
++    /// The primary key and the (referenced) value.
++    Value,
++    /// The key, the primary key and the (referenced) value.
++    Record,
++}
++
++impl RecordSource<'_> {
++    /// The `FROM` and `WHERE` clause of a read of `columns` of the records whose keys meet
++    /// `condition`, which needs [`RecordSource::id`] and the condition's bounds as parameters,
++    /// and the selected columns.
++    fn table_and_condition(
++        &self,
++        columns: RecordColumns,
++        condition: &RangeCondition,
++    ) -> (String, String) {
++        let (from, key, primary_key, value) = match self {
++            Self::ObjectStore(_) => (
++                "object_data AS o WHERE o.object_store_id = ?".to_owned(),
++                "o.key",
++                "o.key",
++                "o.data",
++            ),
++            Self::Index(index) if columns == RecordColumns::PrimaryKey => (
++                format!("{} AS i WHERE i.index_id = ?", index.table()),
++                "i.value",
++                "i.object_data_key",
++                "",
++            ),
++            Self::Index(index) => (
++                format!(
++                    "{} AS i JOIN object_data AS o \
++                     ON o.object_store_id = i.object_store_id AND o.key = i.object_data_key \
++                     WHERE i.index_id = ?",
++                    index.table()
++                ),
++                "i.value",
++                "i.object_data_key",
++                "o.data",
++            ),
++        };
++        let selected = match columns {
++            RecordColumns::PrimaryKey => primary_key.to_owned(),
++            RecordColumns::Value => format!("{primary_key}, {value}"),
++            RecordColumns::Record => format!("{key}, {primary_key}, {value}"),
++        };
++        (format!("{from}{}", condition.on(key)), selected)
++    }
++
++    /// The `ORDER BY` terms of the records in key order, or in reverse order.
++    fn order(&self, reverse: bool) -> &'static str {
++        match (self, reverse) {
++            (Self::ObjectStore(_), false) => "o.key ASC",
++            (Self::ObjectStore(_), true) => "o.key DESC",
++            // A unique index has one record per key.
++            (Self::Index(StoreIndex { unique: true, .. }), false) => "i.value ASC",
++            (Self::Index(StoreIndex { unique: true, .. }), true) => "i.value DESC",
++            (Self::Index(_), false) => "i.value ASC, i.object_data_key ASC",
++            (Self::Index(_), true) => "i.value DESC, i.object_data_key DESC",
++        }
++    }
++
++    /// The id that the `WHERE` clause of [`RecordSource::table_and_condition`] compares.
++    fn id(&self) -> i64 {
++        match self {
++            Self::ObjectStore(store) => store.id,
++            Self::Index(index) => index.id,
++        }
++    }
++}
++
++/// Selects `columns` of the records of `source` in `range`, in ascending key order or descending
+ /// if `reverse` is set, at most `count` of them.
+ fn select_records<X: SqlExecutor, T>(
+     executor: &mut X,
+-    columns: &str,
+-    store: &ObjectStore,
++    source: RecordSource,
++    columns: RecordColumns,
+     range: &IndexedDBKeyRange,
+     count: Option<u32>,
+     reverse: bool,
+     map_row: impl Fn(&dyn SqlRow) -> Result<T, SqlError>,
+ ) -> Result<Vec<T>, SqlError> {
+     let condition = range_condition(range);
++    let (table_and_condition, selected) = source.table_and_condition(columns, &condition);
+     let mut sql = format!(
+-        "SELECT {columns} FROM object_data WHERE object_store_id = ?{} ORDER BY key {}",
+-        condition.on("key"),
+-        if reverse { "DESC" } else { "ASC" }
++        "SELECT {selected} FROM {table_and_condition} ORDER BY {}",
++        source.order(reverse)
+     );
+-    let mut params = condition.params(store);
++    let mut params = condition.params(source.id());
+     if let Some(count) = count {
+         sql.push_str(" LIMIT ?");
+         params.push(SqlParam::Integer(count.into()));
+@@ -489,6 +573,10 @@ fn select_records<X: SqlExecutor, T>(
+     query_rows(executor, &sql, &params, map_row)
+ }
+ 
++fn primary_key_of_row(row: &dyn SqlRow) -> Result<IndexedDBKeyType, SqlError> {
++    decode_key(&row.blob(0)?)
++}
++
+ fn value_of_row(row: &dyn SqlRow) -> Result<IndexedDBValue, SqlError> {
+     Ok(IndexedDBValue {
+         primary_key: decode_key(&row.blob(0)?)?,
+@@ -496,15 +584,23 @@ fn value_of_row(row: &dyn SqlRow) -> Result<IndexedDBValue, SqlError> {
+     })
+ }
+ 
++/// <https://w3c.github.io/IndexedDB/#retrieve-a-value-from-an-object-store> and
++/// <https://w3c.github.io/IndexedDB/#retrieve-a-referenced-value-from-an-index>, with the
++/// primary key of the record, which script needs to inject a generated key.
+ pub(crate) fn get_value<X: SqlExecutor>(
+     executor: &mut X,
+-    store: &ObjectStore,
++    source: RecordSource,
+     range: &IndexedDBKeyRange,
+ ) -> Result<Option<IndexedDBValue>, SqlError> {
++    // Step 1. Let record be the first record in source’s list of records whose key is in range,
++    // if any.
++    // Step 2. If record was not found, return undefined.
++    // Step 3. Let serialized be record’s (referenced) value.
++    // NOTE: Script deserializes it.
+     Ok(select_records(
+         executor,
+-        "key, data",
+-        store,
++        source,
++        RecordColumns::Value,
+         range,
+         Some(1),
+         false,
+@@ -513,82 +609,116 @@ pub(crate) fn get_value<X: SqlExecutor>(
+     .pop())
+ }
+ 
++/// <https://w3c.github.io/IndexedDB/#retrieve-a-key-from-an-object-store> and
++/// <https://w3c.github.io/IndexedDB/#retrieve-a-value-from-an-index>: the primary key of the
++/// first record in `range`.
+ pub(crate) fn get_key<X: SqlExecutor>(
+     executor: &mut X,
+-    store: &ObjectStore,
++    source: RecordSource,
+     range: &IndexedDBKeyRange,
+ ) -> Result<Option<IndexedDBKeyType>, SqlError> {
+-    Ok(
+-        select_records(executor, "key", store, range, Some(1), false, |row| {
+-            decode_key(&row.blob(0)?)
+-        })?
+-        .pop(),
+-    )
++    Ok(select_records(
++        executor,
++        source,
++        RecordColumns::PrimaryKey,
++        range,
++        Some(1),
++        false,
++        primary_key_of_row,
++    )?
++    .pop())
++}
++
++/// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-object-store> and
++/// <https://w3c.github.io/IndexedDB/#retrieve-multiple-items-from-an-index>, step 1: a count
++/// that is not given or 0 means every record.
++fn retrieved_count(count: Option<u32>) -> Option<u32> {
++    count.filter(|count| *count != 0)
+ }
+ 
++/// The primary keys of the first `count` records of `source` in `range`: retrieve multiple
++/// items with kind "key" and direction "next".
+ pub(crate) fn get_all_keys<X: SqlExecutor>(
+     executor: &mut X,
+-    store: &ObjectStore,
++    source: RecordSource,
+     range: &IndexedDBKeyRange,
+     count: Option<u32>,
+ ) -> Result<Vec<IndexedDBKeyType>, SqlError> {
+-    select_records(executor, "key", store, range, count, false, |row| {
+-        decode_key(&row.blob(0)?)
+-    })
++    select_records(
++        executor,
++        source,
++        RecordColumns::PrimaryKey,
++        range,
++        retrieved_count(count),
++        false,
++        primary_key_of_row,
++    )
+ }
+ 
++/// The (referenced) values of the first `count` records of `source` in `range`, with their
++/// primary keys: retrieve multiple items with kind "value" and direction "next".
+ pub(crate) fn get_all_values<X: SqlExecutor>(
+     executor: &mut X,
+-    store: &ObjectStore,
++    source: RecordSource,
+     range: &IndexedDBKeyRange,
+     count: Option<u32>,
+ ) -> Result<Vec<IndexedDBValue>, SqlError> {
+     select_records(
+         executor,
+-        "key, data",
+-        store,
++        source,
++        RecordColumns::Value,
+         range,
+-        count,
++        retrieved_count(count),
+         false,
+         value_of_row,
+     )
+ }
+ 
+-/// The records of `store` in `range` in ascending key order: the first `count` of them, or the
++/// The records of `source` in `range` in ascending key order: the first `count` of them, or the
+ /// last `count` if `reverse` is set.
+ pub(crate) fn get_records<X: SqlExecutor>(
+     executor: &mut X,
+-    store: &ObjectStore,
++    source: RecordSource,
+     range: &IndexedDBKeyRange,
+     count: Option<u32>,
+     reverse: bool,
+ ) -> Result<Vec<IndexedDBRecord>, SqlError> {
+-    let mut records = select_records(executor, "key, data", store, range, count, reverse, |row| {
+-        let key = decode_key(&row.blob(0)?)?;
+-        Ok(IndexedDBRecord {
+-            key: key.clone(),
+-            primary_key: key,
+-            value: row.blob(1)?,
+-        })
+-    })?;
++    let mut records = select_records(
++        executor,
++        source,
++        RecordColumns::Record,
++        range,
++        count,
++        reverse,
++        |row| {
++            Ok(IndexedDBRecord {
++                key: decode_key(&row.blob(0)?)?,
++                primary_key: decode_key(&row.blob(1)?)?,
++                value: row.blob(2)?,
++            })
++        },
++    )?;
+     if reverse {
+         records.reverse();
+     }
+     Ok(records)
+ }
+ 
++/// <https://w3c.github.io/IndexedDB/#count-the-records-in-a-range>
+ pub(crate) fn count<X: SqlExecutor>(
+     executor: &mut X,
+-    store: &ObjectStore,
++    source: RecordSource,
+     range: &IndexedDBKeyRange,
+ ) -> Result<u64, SqlError> {
++    // Step 1. Let count be the number of records, if any, in source’s list of records with key
++    // in range.
+     let condition = range_condition(range);
+-    let sql = format!(
+-        "SELECT COUNT(*) FROM object_data WHERE object_store_id = ?{}",
+-        condition.on("key")
+-    );
+-    let params = condition.params(store);
++    let (table_and_condition, _) =
++        source.table_and_condition(RecordColumns::PrimaryKey, &condition);
++    let sql = format!("SELECT COUNT(*) FROM {table_and_condition}");
++    let params = condition.params(source.id());
+     let count = query_row(executor, &sql, &params, |row| row.integer(0))?.unwrap_or_default();
++    // Step 2. Return count.
+     Ok(count as u64)
+ }
+ 
+@@ -723,7 +853,7 @@ fn delete_index_records<X: SqlExecutor>(
+     store: &ObjectStore,
+     condition: &RangeCondition,
+ ) -> Result<(), SqlError> {
+-    let params = condition.params(store);
++    let params = condition.params(store.id);
+     for table in store.index_tables() {
+         let sql = format!(
+             "DELETE FROM {table} WHERE object_store_id = ?{}",
+@@ -983,7 +1113,7 @@ pub(crate) fn delete_records<X: SqlExecutor>(
+         "DELETE FROM object_data WHERE object_store_id = ?{}",
+         condition.on("key")
+     );
+-    executor.execute(&sql, &condition.params(store))?;
++    executor.execute(&sql, &condition.params(store.id))?;
+     // Step 3. Return undefined.
+     Ok(())
+ }
+diff --git a/components/storage/indexeddb/backend/tests.rs b/components/storage/indexeddb/backend/tests.rs
+index 75b4ae48860..307fff1805a 100644
+--- a/components/storage/indexeddb/backend/tests.rs
++++ b/components/storage/indexeddb/backend/tests.rs
+@@ -31,7 +31,7 @@ use super::executor::{
+     Connector, OnRow, SqlError, SqlExecutor, SqlParam, TransactionBehavior, query_row, query_rows,
+     with_transaction,
+ };
+-use super::queries;
++use super::queries::{self, RecordSource};
+ use super::schema::{self, SCHEMA_VERSION};
+ use crate::indexeddb::engines::{
+     KvsEngine, KvsOperation, KvsTransaction, TransactionResults, encoding,
+@@ -134,6 +134,9 @@ executor_tests!(
+     test_population_of_an_empty_store_and_a_step_out_of_turn,
+     test_population_batches_are_limited_in_size,
+     test_population_finds_unique_conflicts_in_every_check,
++    test_index_reads_go_in_key_then_primary_key_order,
++    test_index_reads_see_the_writes_before_them,
++    test_index_reads_after_create_index_see_the_whole_index,
+ );
+ 
+ const TIMEOUT: Duration = Duration::from_secs(10);
+@@ -901,7 +904,13 @@ fn test_unpaired_surrogates_in_names_and_keys<X: SqlExecutor>() {
+     let mut connection = db.connection();
+     let store = queries::object_store(&mut *connection, 1).unwrap().unwrap();
+     assert_eq!(
+-        queries::get_all_keys(&mut *connection, &store, &range, None).unwrap(),
++        queries::get_all_keys(
++            &mut *connection,
++            RecordSource::ObjectStore(&store),
++            &range,
++            None
++        )
++        .unwrap(),
+         vec![
+             IndexedDBKeyType::String(units(&[0xD834, 0xDD1E])),
+             IndexedDBKeyType::String(trail),
+@@ -1467,7 +1476,13 @@ fn abort<X: SqlExecutor>(db: &SqlEngine<X>, transaction: u64) {
+ /// The keys of the store `store`, read on `executor`.
+ fn keys_of<X: SqlExecutor>(executor: &mut X, store: i64) -> Vec<IndexedDBKeyType> {
+     let store = queries::object_store(executor, store).unwrap().unwrap();
+-    queries::get_all_keys(executor, &store, &IndexedDBKeyRange::default(), None).unwrap()
++    queries::get_all_keys(
++        executor,
++        RecordSource::ObjectStore(&store),
++        &IndexedDBKeyRange::default(),
++        None,
++    )
++    .unwrap()
+ }
+ 
+ fn number_keys(keys: impl IntoIterator<Item = i32>) -> Vec<IndexedDBKeyType> {
+@@ -1559,6 +1574,7 @@ fn test_async_operations<X: SqlExecutor>() {
+                 store_id,
+                 get_item_some.0,
+                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
++                    index: None,
+                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
+                 }),
+             ),
+@@ -1566,6 +1582,7 @@ fn test_async_operations<X: SqlExecutor>() {
+                 store_id,
+                 get_item_none.0,
+                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
++                    index: None,
+                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(5.0)),
+                 }),
+             ),
+@@ -1573,6 +1590,7 @@ fn test_async_operations<X: SqlExecutor>() {
+                 store_id,
+                 get_all_items.0,
+                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
++                    index: None,
+                     key_range: IndexedDBKeyRange::lower_bound(IndexedDBKeyType::Number(0.0), false),
+                     count: None,
+                 }),
+@@ -1581,6 +1599,7 @@ fn test_async_operations<X: SqlExecutor>() {
+                 store_id,
+                 count.0,
+                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
++                    index: None,
+                     key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
+                 }),
+             ),
+@@ -1676,7 +1695,7 @@ fn test_delete_item_range_respects_open_bounds<X: SqlExecutor>() {
+ 
+         queries::get_all_keys(
+             &mut *connection,
+-            &store,
++            RecordSource::ObjectStore(&store),
+             &IndexedDBKeyRange::default(),
+             None,
+         )
+@@ -2374,6 +2393,7 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
+             read,
+             tagged::<BackendResult<u64>>(&order_sender, id),
+             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
++                index: None,
+                 key_range: IndexedDBKeyRange::default(),
+             }),
+         )
+@@ -2428,6 +2448,7 @@ fn test_requests_run_in_order<X: SqlExecutor>() {
+             written,
+             value.0,
+             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
++                index: None,
+                 key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
+             }),
+         )],
+@@ -2674,6 +2695,7 @@ fn get_request(request_id: ReplyId<GetReply>, key: f64) -> KvsOperation {
+         TEST_STORE,
+         request_id,
+         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
++            index: None,
+             key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(key)),
+         }),
+     )
+@@ -2784,6 +2806,7 @@ fn test_readonly_failure_that_ends_the_sql_transaction_fails_the_writer<X: SqlEx
+             other,
+             get.0,
+             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
++                index: None,
+                 key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
+             }),
+         )],
+@@ -3413,6 +3436,7 @@ fn test_unique_index_conflict_changes_nothing<X: SqlExecutor>() {
+             store,
+             get.0,
+             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
++                index: None,
+                 key_range: IndexedDBKeyRange::only(number(1.0)),
+             }),
+         )],
+@@ -4386,6 +4410,469 @@ fn test_population_batches_are_limited_in_size<X: SqlExecutor>() {
+     assert_eq!(batches, vec![(4, false), (4, false), (2, true)]);
+ }
+ 
++fn read_request<T>(
++    store: i64,
++    request_id: ReplyId<T>,
++    operation: AsyncReadOnlyOperation,
++) -> KvsOperation {
++    request(store, request_id, AsyncOperation::ReadOnly(operation))
++}
++
++/// Runs `operation`, which reads `store` or one of its indexes, as the only request of a batch
++/// of the readonly `transaction`, and returns its result.
++fn read<X: SqlExecutor, T: TestReply>(
++    db: &SqlEngine<X>,
++    transaction: u64,
++    store: i64,
++    operation: AsyncReadOnlyOperation,
++) -> T {
++    let (id, receiver) = get_callback::<T>();
++    let read = read_request(store, id, operation);
++    run_batch(db, transaction, IndexedDBTxnMode::Readonly, vec![read]);
++    recv(&receiver)
++}
++
++fn date(time: f64) -> IndexedDBKeyType {
++    IndexedDBKeyType::Date(time)
++}
++
++/// The values of `values`, each with its number key, as the test stores them.
++fn number_values(values: &[(f64, u8)]) -> Vec<IndexedDBValue> {
++    values
++        .iter()
++        .map(|(key, value)| stored_value(*key, vec![*value]))
++        .collect()
++}
++
++/// Reads of an index see its records in (index key, primary key) order, whatever the order of
++/// the puts and the types of the keys, and stop at a count; a unique index's and a multiEntry
++/// index's reads too, and a read of an index the store doesn't have fails alone.
++fn test_index_reads_go_in_key_then_primary_key_order<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let index = |name: &str, unique, multi_entry| {
++        let key_path = KeyPath::String(name.to_owned());
++        create_index(&db, store, name.to_owned(), key_path, unique, multi_entry).unwrap()
++    };
++    let (by_kind, by_id, by_tag) = (
++        index("kind", false, false),
++        index("id", true, false),
++        index("tag", false, true),
++    );
++    // Index keys of every type, in key order: numbers, dates, strings (by code unit), binary and
++    // arrays; each kind has two records, put with the larger primary key first.
++    let kinds = [
++        number(f64::NEG_INFINITY),
++        number(-1.5),
++        number(0.0),
++        number(f64::INFINITY),
++        date(-1.0),
++        date(0.0),
++        string(""),
++        string("A"),
++        IndexedDBKeyType::String(units(&[0xD800])),
++        IndexedDBKeyType::String(units(&[0xFFFF])),
++        IndexedDBKeyType::Binary(vec![]),
++        IndexedDBKeyType::Binary(vec![0, 255]),
++        IndexedDBKeyType::Array(vec![]),
++        IndexedDBKeyType::Array(vec![number(1.0), IndexedDBKeyType::Array(vec![])]),
++    ];
++    let mut puts = Vec::new();
++    for (n, kind) in kinds.iter().enumerate().rev() {
++        for primary_key in [2 * n + 1, 2 * n] {
++            let tags = [
++                string("all"),
++                string(if n % 2 == 0 { "even" } else { "odd" }),
++            ];
++            puts.push((
++                Some(number(primary_key as f64)),
++                vec![primary_key as u8],
++                vec![
++                    index_keys(by_kind, [kind.clone()]),
++                    index_keys(by_id, [number(-(primary_key as f64) - 1.0)]),
++                    index_keys(by_tag, tags),
++                ],
++            ));
++        }
++    }
++    let record_count = 2 * kinds.len();
++    let replies = run_indexed_puts(&db, 1, store, puts, false);
++    assert!(replies.iter().all(Result::is_ok), "{replies:?}");
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    let all = IndexedDBKeyRange::default();
++    let get_all_keys = |index, key_range, count| -> Vec<IndexedDBKeyType> {
++        read::<X, BackendResult<Vec<IndexedDBKeyType>>>(
++            &db,
++            2,
++            store,
++            AsyncReadOnlyOperation::GetAllKeys {
++                index: Some(index),
++                key_range,
++                count,
++            },
++        )
++        .unwrap()
++    };
++    let count = |index, key_range| -> u64 {
++        read::<X, BackendResult<u64>>(
++            &db,
++            2,
++            store,
++            AsyncReadOnlyOperation::Count { index, key_range },
++        )
++        .unwrap()
++    };
++    let primary_keys = |keys: std::ops::Range<usize>| -> Vec<IndexedDBKeyType> {
++        keys.map(|key| number(key as f64)).collect()
++    };
++
++    // The primary keys in (index key, primary key) order, also with a count of 0 (every record).
++    assert_eq!(
++        get_all_keys(by_kind, all.clone(), None),
++        primary_keys(0..record_count)
++    );
++    assert_eq!(
++        get_all_keys(by_kind, all.clone(), Some(0)),
++        primary_keys(0..record_count)
++    );
++    assert_eq!(
++        get_all_keys(by_kind, all.clone(), Some(3)),
++        primary_keys(0..3)
++    );
++    // A range across key types: from the first date up to the strings, without "A".
++    let range = IndexedDBKeyRange::new(Some(date(-1.0)), Some(string("A")), false, true);
++    assert_eq!(
++        get_all_keys(by_kind, range.clone(), None),
++        primary_keys(8..14)
++    );
++    assert_eq!(count(Some(by_kind), range.clone()), 6);
++    assert_eq!(
++        get_all_keys(
++            by_kind,
++            IndexedDBKeyRange::only(IndexedDBKeyType::Array(vec![])),
++            None
++        ),
++        primary_keys(24..26)
++    );
++    // The values, with their primary keys, of the first records in the range.
++    assert_eq!(
++        read::<X, BackendResult<Vec<IndexedDBValue>>>(
++            &db,
++            2,
++            store,
++            AsyncReadOnlyOperation::GetAllItems {
++                index: Some(by_kind),
++                key_range: range.clone(),
++                count: Some(3),
++            },
++        ),
++        Ok(number_values(&[(8.0, 8), (9.0, 9), (10.0, 10)]))
++    );
++    // get and getKey take the first record: the lowest primary key of the lowest index key.
++    assert_eq!(
++        read::<X, GetReply>(
++            &db,
++            2,
++            store,
++            AsyncReadOnlyOperation::GetItem {
++                index: Some(by_kind),
++                key_range: range.clone(),
++            },
++        ),
++        Ok(Some(stored_value(8.0, vec![8])))
++    );
++    assert_eq!(
++        read::<X, BackendResult<Option<IndexedDBKeyType>>>(
++            &db,
++            2,
++            store,
++            AsyncReadOnlyOperation::GetKey {
++                index: Some(by_kind),
++                key_range: IndexedDBKeyRange::only(string("A")),
++            },
++        ),
++        Ok(Some(number(14.0)))
++    );
++    assert_eq!(
++        read::<X, BackendResult<Option<IndexedDBKeyType>>>(
++            &db,
++            2,
++            store,
++            AsyncReadOnlyOperation::GetKey {
++                index: Some(by_kind),
++                key_range: IndexedDBKeyRange::only(string("none")),
++            },
++        ),
++        Ok(None)
++    );
++
++    // The unique index's keys are the negated primary keys, minus one.
++    let descending: Vec<_> = primary_keys(0..record_count).into_iter().rev().collect();
++    assert_eq!(get_all_keys(by_id, all.clone(), None), descending);
++    assert_eq!(
++        get_all_keys(
++            by_id,
++            IndexedDBKeyRange::new(Some(number(-4.0)), Some(number(0.0)), true, false),
++            None
++        ),
++        primary_keys(0..3).into_iter().rev().collect::<Vec<_>>()
++    );
++    assert_eq!(count(Some(by_id), all.clone()), record_count as u64);
++
++    // A record has one record per subkey in a multiEntry index.
++    assert_eq!(count(Some(by_tag), all.clone()), 2 * record_count as u64);
++    assert_eq!(
++        count(Some(by_tag), IndexedDBKeyRange::only(string("all"))),
++        record_count as u64
++    );
++    let even: Vec<_> = (0..kinds.len())
++        .step_by(2)
++        .flat_map(|n| [2 * n, 2 * n + 1])
++        .map(|key| number(key as f64))
++        .collect();
++    assert_eq!(
++        get_all_keys(by_tag, IndexedDBKeyRange::only(string("even")), None),
++        even
++    );
++    assert_eq!(count(None, all.clone()), record_count as u64);
++
++    // A read of an index that the store doesn't have fails, and the reads after it run.
++    let (missing, missing_reply) = get_callback::<BackendResult<u64>>();
++    let (after, after_reply) = get_callback::<BackendResult<u64>>();
++    let count_request = |id, index| {
++        request(
++            store,
++            id,
++            AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
++                index,
++                key_range: IndexedDBKeyRange::default(),
++            }),
++        )
++    };
++    run_batch(
++        &db,
++        2,
++        IndexedDBTxnMode::Readonly,
++        vec![
++            count_request(missing, Some(by_tag + 1)),
++            count_request(after, Some(by_kind)),
++        ],
++    );
++    assert!(matches!(recv(&missing_reply), Err(BackendError::DbErr(_))));
++    assert_eq!(recv(&after_reply), Ok(record_count as u64));
++}
++
++/// Index reads in a readwrite transaction see the puts, overwrites, deletes and clears before
++/// them, and an aborted transaction's writes are gone from the index afterwards.
++fn test_index_reads_see_the_writes_before_them<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let index = create_index(
++        &db,
++        store,
++        "name".to_owned(),
++        KeyPath::String("name".to_owned()),
++        false,
++        false,
++    )
++    .unwrap();
++    let (order_sender, order) = mpsc::channel();
++    let put = |id, key: f64, name: &str| {
++        indexed_put_request(
++            store,
++            tagged(&order_sender, id),
++            Some(number(key)),
++            vec![key as u8],
++            true,
++            vec![index_keys(index, [string(name)])],
++        )
++    };
++    let (names, names_reply) = get_callback::<BackendResult<Vec<IndexedDBKeyType>>>();
++    let (moved, moved_reply) = get_callback::<BackendResult<Vec<IndexedDBValue>>>();
++    let (deleted, deleted_reply) = get_callback::<BackendResult<u64>>();
++    let (cleared, cleared_reply) = get_callback::<BackendResult<u64>>();
++    let (remove_id, _remove) = get_callback::<BackendResult<()>>();
++    let (clear_id, _clear) = get_callback::<BackendResult<()>>();
++    let ann = || IndexedDBKeyRange::only(string("ann"));
++    run_batch(
++        &db,
++        1,
++        IndexedDBTxnMode::Readwrite,
++        vec![
++            put(1, 1.0, "ann"),
++            put(2, 2.0, "bob"),
++            put(3, 3.0, "ann"),
++            read_request(
++                store,
++                names,
++                AsyncReadOnlyOperation::GetAllKeys {
++                    index: Some(index),
++                    key_range: ann(),
++                    count: None,
++                },
++            ),
++            put(4, 1.0, "cid"),
++            read_request(
++                store,
++                moved,
++                AsyncReadOnlyOperation::GetAllItems {
++                    index: Some(index),
++                    key_range: IndexedDBKeyRange::default(),
++                    count: None,
++                },
++            ),
++            remove_request(store, remove_id, IndexedDBKeyRange::only(number(3.0))),
++            read_request(
++                store,
++                deleted,
++                AsyncReadOnlyOperation::Count {
++                    index: Some(index),
++                    key_range: ann(),
++                },
++            ),
++            request(
++                store,
++                clear_id,
++                AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear),
++            ),
++            read_request(
++                store,
++                cleared,
++                AsyncReadOnlyOperation::Count {
++                    index: Some(index),
++                    key_range: IndexedDBKeyRange::default(),
++                },
++            ),
++        ],
++    );
++    assert_eq!(order.try_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
++    assert_eq!(recv(&names_reply), Ok(number_keys([1, 3])));
++    assert_eq!(
++        recv(&moved_reply),
++        Ok(number_values(&[(3.0, 3), (2.0, 2), (1.0, 1)]))
++    );
++    assert_eq!(recv(&deleted_reply), Ok(0));
++    assert_eq!(recv(&cleared_reply), Ok(0));
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    assert!(
++        run_batch(
++            &db,
++            2,
++            IndexedDBTxnMode::Readwrite,
++            vec![put(5, 5.0, "ann")]
++        )
++        .is_empty()
++    );
++    abort(&db, 2);
++    let count: BackendResult<u64> = read_count(&db, 3, store, index);
++    assert_eq!(count, Ok(0));
++}
++
++fn read_count<X: SqlExecutor>(
++    db: &SqlEngine<X>,
++    transaction: u64,
++    store: i64,
++    index: i64,
++) -> BackendResult<u64> {
++    read(
++        db,
++        transaction,
++        store,
++        AsyncReadOnlyOperation::Count {
++            index: Some(index),
++            key_range: IndexedDBKeyRange::default(),
++        },
++    )
++}
++
++/// Index reads made after a createIndex that populates the index wait until every batch of the
++/// population is stored, and then see the whole index.
++fn test_index_reads_after_create_index_see_the_whole_index<X: SqlExecutor>() {
++    let dir = tempfile::tempdir().unwrap();
++    let db = open_engine::<X>(&dir);
++    let store = create_store(&db, "store", None, false).unwrap();
++    let records = queries::POPULATION_BATCH_RECORDS as u32 * 2 + 1;
++    let puts = (0..records)
++        .map(|n| (Some(number(f64::from(n))), n.to_be_bytes().to_vec()))
++        .collect();
++    assert!(
++        run_puts(&db, 1, store, puts, false)
++            .iter()
++            .all(Result::is_ok)
++    );
++    assert_eq!(commit(&db, 1), Ok(()));
++
++    db.upgrade_version(txn(2), 2);
++    let index = 1;
++    let events = run_upgrade_batch(
++        &db,
++        2,
++        vec![create_populated_index(store, index, "parity", false, false)],
++    );
++    let (keys, keys_reply) = get_callback::<BackendResult<Vec<IndexedDBKeyType>>>();
++    let (count, count_reply) = get_callback::<BackendResult<u64>>();
++    let (first, first_reply) = get_callback::<GetReply>();
++    let odd = || IndexedDBKeyRange::only(number(1.0));
++    assert!(
++        run_upgrade_batch(
++            &db,
++            2,
++            vec![
++                read_request(
++                    store,
++                    keys,
++                    AsyncReadOnlyOperation::GetAllKeys {
++                        index: Some(index),
++                        key_range: odd(),
++                        count: None,
++                    },
++                ),
++                read_request(
++                    store,
++                    count,
++                    AsyncReadOnlyOperation::Count {
++                        index: Some(index),
++                        key_range: IndexedDBKeyRange::default(),
++                    },
++                ),
++                read_request(
++                    store,
++                    first,
++                    AsyncReadOnlyOperation::GetItem {
++                        index: Some(index),
++                        key_range: odd(),
++                    },
++                ),
++            ],
++        )
++        .is_empty()
++    );
++    assert!(
++        keys_reply.try_recv().is_err(),
++        "The reads wait for the population"
++    );
++    let (result, _, batches) = populate(&db, 2, store, index, events, |record| {
++        vec![number(f64::from(value_number(record) % 2))]
++    });
++    assert_eq!(result, Ok(()));
++    assert_eq!(batches, 3);
++    let odd_keys: Vec<_> = (1..records)
++        .step_by(2)
++        .map(|n| number(f64::from(n)))
++        .collect();
++    assert_eq!(recv(&keys_reply), Ok(odd_keys));
++    assert_eq!(recv(&count_reply), Ok(u64::from(records)));
++    assert_eq!(
++        recv(&first_reply),
++        Ok(Some(stored_value(1.0, 1u32.to_be_bytes().to_vec())))
++    );
++    assert_eq!(commit(&db, 2), Ok(()));
++}
++
+ #[test]
+ fn has_enospc_detects_enospc_and_nothing_else() {
+     use crate::shared::has_enospc;
+diff --git a/components/storage/tests/indexeddb.rs b/components/storage/tests/indexeddb.rs
+index ed1d5e18176..343d445f81b 100644
+--- a/components/storage/tests/indexeddb.rs
++++ b/components/storage/tests/indexeddb.rs
+@@ -719,6 +719,7 @@ fn get_all_keys_request(
+         request_id,
+         IndexedDBTxnMode::Readonly,
+         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
++            index: None,
+             key_range,
+             count: None,
+         }),
+@@ -766,6 +767,7 @@ fn get_item(
+         1,
+         IndexedDBTxnMode::Readonly,
+         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
++            index: None,
+             key_range: IndexedDBKeyRange::only(key),
+         }),
+     )
+@@ -2158,6 +2160,7 @@ fn test_indexeddb_results_reach_the_connection_in_request_order() {
+         0,
+         IndexedDBTxnMode::Readonly,
+         AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
++            index: None,
+             key_range: IndexedDBKeyRange::default(),
+             count: None,
+         }),
+diff --git a/tests/wpt/meta/IndexedDB/idb-partitioned-coverage.sub.html.ini b/tests/wpt/meta/IndexedDB/idb-partitioned-coverage.sub.html.ini
+index d68d39ebc01..75a4d16f15b 100644
+--- a/tests/wpt/meta/IndexedDB/idb-partitioned-coverage.sub.html.ini
++++ b/tests/wpt/meta/IndexedDB/idb-partitioned-coverage.sub.html.ini
+@@ -4,60 +4,3 @@
+ 
+   [ - fresh advance still async]
+     expected: FAIL
+-
+-  [Single item get]
+-    expected: FAIL
+-
+-  [Empty object store]
+-    expected: FAIL
+-
+-  [Get all]
+-    expected: FAIL
+-
+-  [Get all with generated keys]
+-    expected: FAIL
+-
+-  [Get all with large values]
+-    expected: FAIL
+-
+-  [maxCount=10]
+-    expected: FAIL
+-
+-  [Get bound range]
+-    expected: FAIL
+-
+-  [Get bound range with maxCount]
+-    expected: FAIL
+-
+-  [Get upper excluded]
+-    expected: FAIL
+-
+-  [Get lower excluded]
+-    expected: FAIL
+-
+-  [Get bound range (generated) with maxCount]
+-    expected: FAIL
+-
+-  [Non existent key]
+-    expected: FAIL
+-
+-  [maxCount=0]
+-    expected: FAIL
+-
+-  [Max value count]
+-    expected: FAIL
+-
+-  [Query with empty range where  first key < upperBound]
+-    expected: FAIL
+-
+-  [Query with empty range where lowerBound < last key]
+-    expected: FAIL
+-
+-  [Retrieve multiEntry key]
+-    expected: FAIL
+-
+-  [Retrieve one key multiple values]
+-    expected: FAIL
+-
+-  [Get all values with invalid query keys]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbdatabase_createObjectStore.any.js.ini b/tests/wpt/meta/IndexedDB/idbdatabase_createObjectStore.any.js.ini
+index d90d06b7e23..ff1ac2a55d2 100644
+--- a/tests/wpt/meta/IndexedDB/idbdatabase_createObjectStore.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbdatabase_createObjectStore.any.js.ini
+@@ -1,17 +1,8 @@
+ [idbdatabase_createObjectStore.any.sharedworker.html]
+-  [Both with empty name]
+-    expected: FAIL
+-
+ 
+ [idbdatabase_createObjectStore.any.html]
+-  [Both with empty name]
+-    expected: FAIL
+-
+ 
+ [idbdatabase_createObjectStore.any.worker.html]
+-  [Both with empty name]
+-    expected: FAIL
+-
+ 
+ [idbdatabase_createObjectStore.any.serviceworker.html]
+   expected: ERROR
+diff --git a/tests/wpt/meta/IndexedDB/idbfactory_open.any.js.ini b/tests/wpt/meta/IndexedDB/idbfactory_open.any.js.ini
+index 15f18ec0526..da5762bd6d4 100644
+--- a/tests/wpt/meta/IndexedDB/idbfactory_open.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbfactory_open.any.js.ini
+@@ -1,16 +1,8 @@
+ [idbfactory_open.any.worker.html]
+-  [IDBFactory.open() - error in upgradeneeded resets db]
+-    expected: FAIL
+-
+ 
+ [idbfactory_open.any.sharedworker.html]
+-  [IDBFactory.open() - error in upgradeneeded resets db]
+-    expected: FAIL
+-
+ 
+ [idbfactory_open.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbfactory_open.any.html]
+-  [IDBFactory.open() - error in upgradeneeded resets db]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex-cross-realm-methods.html.ini b/tests/wpt/meta/IndexedDB/idbindex-cross-realm-methods.html.ini
+deleted file mode 100644
+index 62f7bf1ffce..00000000000
+--- a/tests/wpt/meta/IndexedDB/idbindex-cross-realm-methods.html.ini
++++ /dev/null
+@@ -1,15 +0,0 @@
+-[idbindex-cross-realm-methods.html]
+-  [Cross-realm IDBIndex::get() method from detached <iframe> works as expected]
+-    expected: FAIL
+-
+-  [Cross-realm IDBIndex::getKey() method from detached <iframe> works as expected]
+-    expected: FAIL
+-
+-  [Cross-realm IDBIndex::getAll() method from detached <iframe> works as expected]
+-    expected: FAIL
+-
+-  [Cross-realm IDBIndex::getAllKeys() method from detached <iframe> works as expected]
+-    expected: FAIL
+-
+-  [Cross-realm IDBIndex::count() method from detached <iframe> works as expected]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex-multientry.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex-multientry.any.js.ini
+index 8355df6feef..57966fd999c 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex-multientry.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex-multientry.any.js.ini
+@@ -2,24 +2,7 @@
+   expected: ERROR
+ 
+ [idbindex-multientry.any.worker.html]
+-  [A 1000 entry multiEntry array]
+-    expected: FAIL
+-
+-  [Adding keys]
+-    expected: FAIL
+-
+ 
+ [idbindex-multientry.any.html]
+-  [A 1000 entry multiEntry array]
+-    expected: FAIL
+-
+-  [Adding keys]
+-    expected: FAIL
+-
+ 
+ [idbindex-multientry.any.sharedworker.html]
+-  [A 1000 entry multiEntry array]
+-    expected: FAIL
+-
+-  [Adding keys]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex-query-exception-order.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex-query-exception-order.any.js.ini
+index 9d308f4dd10..bc3a82ef3ce 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex-query-exception-order.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex-query-exception-order.any.js.ini
+@@ -1,79 +1,8 @@
+ [idbindex-query-exception-order.any.sharedworker.html]
+-  [IDBIndex.get exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.get exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAll exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAll exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+-
+-  [IDBIndex.count exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.count exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+-
+ 
+ [idbindex-query-exception-order.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbindex-query-exception-order.any.html]
+-  [IDBIndex.get exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.get exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAll exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAll exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+-
+-  [IDBIndex.count exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.count exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+-
+ 
+ [idbindex-query-exception-order.any.worker.html]
+-  [IDBIndex.get exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.get exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAll exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAll exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+-
+-  [IDBIndex.count exception order: InvalidStateError vs. TransactionInactiveError]
+-    expected: FAIL
+-
+-  [IDBIndex.count exception order: TransactionInactiveError vs. DataError]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex-rename-abort.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex-rename-abort.any.js.ini
+index e3fd7ffd98a..2b187c1d593 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex-rename-abort.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex-rename-abort.any.js.ini
+@@ -2,15 +2,7 @@
+   expected: ERROR
+ 
+ [idbindex-rename-abort.any.html]
+-  [IndexedDB index rename in aborted transaction]
+-    expected: FAIL
+-
+ 
+ [idbindex-rename-abort.any.worker.html]
+-  [IndexedDB index rename in aborted transaction]
+-    expected: FAIL
+-
+ 
+ [idbindex-rename-abort.any.sharedworker.html]
+-  [IndexedDB index rename in aborted transaction]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex-rename-errors.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex-rename-errors.any.js.ini
+index ad3e874af37..cafc17098ab 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex-rename-errors.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex-rename-errors.any.js.ini
+@@ -1,25 +1,8 @@
+ [idbindex-rename-errors.any.html]
+-  [IndexedDB index rename to the name of another index throws]
+-    expected: FAIL
+-
+-  [IndexedDB index rename handles exceptions when stringifying names]
+-    expected: FAIL
+-
+ 
+ [idbindex-rename-errors.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbindex-rename-errors.any.worker.html]
+-  [IndexedDB index rename to the name of another index throws]
+-    expected: FAIL
+-
+-  [IndexedDB index rename handles exceptions when stringifying names]
+-    expected: FAIL
+-
+ 
+ [idbindex-rename-errors.any.sharedworker.html]
+-  [IndexedDB index rename to the name of another index throws]
+-    expected: FAIL
+-
+-  [IndexedDB index rename handles exceptions when stringifying names]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex-rename.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex-rename.any.js.ini
+index 4d171fd1bc8..844aaa7da41 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex-rename.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex-rename.any.js.ini
+@@ -1,28 +1,4 @@
+ [idbindex-rename.any.html]
+-  [IndexedDB index rename in new transaction]
+-    expected: FAIL
+-
+-  [IndexedDB index rename in the transaction where it is created]
+-    expected: FAIL
+-
+-  [IndexedDB index rename to the same name succeeds]
+-    expected: FAIL
+-
+-  [IndexedDB index rename to the name of a deleted index succeeds]
+-    expected: FAIL
+-
+-  [IndexedDB index swapping via renames succeeds]
+-    expected: FAIL
+-
+-  [IndexedDB index rename stringifies non-string names]
+-    expected: FAIL
+-
+-  [IndexedDB index can be renamed to ""]
+-    expected: FAIL
+-
+-  [IndexedDB index can be renamed to "\\u0000"]
+-    expected: FAIL
+-
+   [IndexedDB index can be renamed to "\\uDC00\\uD800"]
+     expected: FAIL
+ 
+@@ -31,58 +7,10 @@
+   expected: ERROR
+ 
+ [idbindex-rename.any.worker.html]
+-  [IndexedDB index rename in new transaction]
+-    expected: FAIL
+-
+-  [IndexedDB index rename in the transaction where it is created]
+-    expected: FAIL
+-
+-  [IndexedDB index rename to the same name succeeds]
+-    expected: FAIL
+-
+-  [IndexedDB index rename to the name of a deleted index succeeds]
+-    expected: FAIL
+-
+-  [IndexedDB index swapping via renames succeeds]
+-    expected: FAIL
+-
+-  [IndexedDB index rename stringifies non-string names]
+-    expected: FAIL
+-
+-  [IndexedDB index can be renamed to ""]
+-    expected: FAIL
+-
+-  [IndexedDB index can be renamed to "\\u0000"]
+-    expected: FAIL
+-
+   [IndexedDB index can be renamed to "\\uDC00\\uD800"]
+     expected: FAIL
+ 
+ 
+ [idbindex-rename.any.sharedworker.html]
+-  [IndexedDB index rename in new transaction]
+-    expected: FAIL
+-
+-  [IndexedDB index rename in the transaction where it is created]
+-    expected: FAIL
+-
+-  [IndexedDB index rename to the same name succeeds]
+-    expected: FAIL
+-
+-  [IndexedDB index rename to the name of a deleted index succeeds]
+-    expected: FAIL
+-
+-  [IndexedDB index swapping via renames succeeds]
+-    expected: FAIL
+-
+-  [IndexedDB index rename stringifies non-string names]
+-    expected: FAIL
+-
+-  [IndexedDB index can be renamed to ""]
+-    expected: FAIL
+-
+-  [IndexedDB index can be renamed to "\\u0000"]
+-    expected: FAIL
+-
+   [IndexedDB index can be renamed to "\\uDC00\\uD800"]
+     expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex-request-source.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex-request-source.any.js.ini
+index 45c2329a058..32677a10792 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex-request-source.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex-request-source.any.js.ini
+@@ -1,52 +1,8 @@
+ [idbindex-request-source.any.html]
+-  [The source of the request from index => index.get(0) is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.getKey(0) is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.getAll() is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.getAllKeys() is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.count() is the index itself]
+-    expected: FAIL
+-
+ 
+ [idbindex-request-source.any.worker.html]
+-  [The source of the request from index => index.get(0) is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.getKey(0) is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.getAll() is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.getAllKeys() is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.count() is the index itself]
+-    expected: FAIL
+-
+ 
+ [idbindex-request-source.any.serviceworker.html]
+   expected: ERROR
+ 
+ [idbindex-request-source.any.sharedworker.html]
+-  [The source of the request from index => index.get(0) is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.getKey(0) is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.getAll() is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.getAllKeys() is the index itself]
+-    expected: FAIL
+-
+-  [The source of the request from index => index.count() is the index itself]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex_count.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex_count.any.js.ini
+index 2d152ab697a..d0bb71b18f1 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex_count.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex_count.any.js.ini
+@@ -2,42 +2,7 @@
+   expected: ERROR
+ 
+ [idbindex_count.any.sharedworker.html]
+-  [count() returns the number of records in the index]
+-    expected: FAIL
+-
+-  [count() returns the number of records that have keys within the range]
+-    expected: FAIL
+-
+-  [count() returns the number of records that have keys with the key]
+-    expected: FAIL
+-
+-  [count() throws DataError when using invalid key]
+-    expected: FAIL
+-
+ 
+ [idbindex_count.any.worker.html]
+-  [count() returns the number of records in the index]
+-    expected: FAIL
+-
+-  [count() returns the number of records that have keys within the range]
+-    expected: FAIL
+-
+-  [count() returns the number of records that have keys with the key]
+-    expected: FAIL
+-
+-  [count() throws DataError when using invalid key]
+-    expected: FAIL
+-
+ 
+ [idbindex_count.any.html]
+-  [count() returns the number of records in the index]
+-    expected: FAIL
+-
+-  [count() returns the number of records that have keys within the range]
+-    expected: FAIL
+-
+-  [count() returns the number of records that have keys with the key]
+-    expected: FAIL
+-
+-  [count() throws DataError when using invalid key]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex_get.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex_get.any.js.ini
+index 51787f05952..f53d20bb78e 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex_get.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex_get.any.js.ini
+@@ -1,80 +1,8 @@
+ [idbindex_get.any.html]
+-  [get() returns the record]
+-    expected: FAIL
+-
+-  [get() returns the record where the index contains duplicate values]
+-    expected: FAIL
+-
+-  [get() attempts to retrieve a record that does not exist]
+-    expected: FAIL
+-
+-  [get() returns the record with the first key in the range]
+-    expected: FAIL
+-
+-  [get() throws DataError when using invalid key]
+-    expected: FAIL
+-
+-  [get() throws InvalidStateError when the index is deleted]
+-    expected: FAIL
+-
+-  [get() throws TransactionInactiveError on aborted transaction]
+-    expected: FAIL
+-
+-  [get() throws InvalidStateError on index deleted by aborted upgrade]
+-    expected: FAIL
+-
+ 
+ [idbindex_get.any.worker.html]
+-  [get() returns the record]
+-    expected: FAIL
+-
+-  [get() returns the record where the index contains duplicate values]
+-    expected: FAIL
+-
+-  [get() attempts to retrieve a record that does not exist]
+-    expected: FAIL
+-
+-  [get() returns the record with the first key in the range]
+-    expected: FAIL
+-
+-  [get() throws DataError when using invalid key]
+-    expected: FAIL
+-
+-  [get() throws InvalidStateError when the index is deleted]
+-    expected: FAIL
+-
+-  [get() throws TransactionInactiveError on aborted transaction]
+-    expected: FAIL
+-
+-  [get() throws InvalidStateError on index deleted by aborted upgrade]
+-    expected: FAIL
+-
+ 
+ [idbindex_get.any.sharedworker.html]
+-  [get() returns the record]
+-    expected: FAIL
+-
+-  [get() returns the record where the index contains duplicate values]
+-    expected: FAIL
+-
+-  [get() attempts to retrieve a record that does not exist]
+-    expected: FAIL
+-
+-  [get() returns the record with the first key in the range]
+-    expected: FAIL
+-
+-  [get() throws DataError when using invalid key]
+-    expected: FAIL
+-
+-  [get() throws InvalidStateError when the index is deleted]
+-    expected: FAIL
+-
+-  [get() throws TransactionInactiveError on aborted transaction]
+-    expected: FAIL
+-
+-  [get() throws InvalidStateError on index deleted by aborted upgrade]
+-    expected: FAIL
+-
+ 
+ [idbindex_get.any.serviceworker.html]
+   expected: ERROR
+diff --git a/tests/wpt/meta/IndexedDB/idbindex_getAll-options.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex_getAll-options.any.js.ini
+index 370823ce070..ed36490857b 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex_getAll-options.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex_getAll-options.any.js.ini
+@@ -74,9 +74,6 @@
+   [Get all values with both options and count]
+     expected: FAIL
+ 
+-  [Get all values with invalid query keys]
+-    expected: FAIL
+-
+   [Direction: nextunique with multi-entry index]
+     expected: FAIL
+ 
+@@ -166,9 +163,6 @@
+   [Get all values with both options and count]
+     expected: FAIL
+ 
+-  [Get all values with invalid query keys]
+-    expected: FAIL
+-
+   [Direction: nextunique with multi-entry index]
+     expected: FAIL
+ 
+@@ -272,6 +266,3 @@
+ 
+   [Get all values with both options and count]
+     expected: FAIL
+-
+-  [Get all values with invalid query keys]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex_getAll.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex_getAll.any.js.ini
+index f0279104470..01bf8e9b8b8 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex_getAll.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex_getAll.any.js.ini
+@@ -2,177 +2,7 @@
+   expected: ERROR
+ 
+ [idbindex_getAll.any.html]
+-  [Single item get]
+-    expected: FAIL
+-
+-  [Empty object store]
+-    expected: FAIL
+-
+-  [Get all]
+-    expected: FAIL
+-
+-  [Get all with generated keys]
+-    expected: FAIL
+-
+-  [Get all with large values]
+-    expected: FAIL
+-
+-  [maxCount=10]
+-    expected: FAIL
+-
+-  [Get bound range]
+-    expected: FAIL
+-
+-  [Get bound range with maxCount]
+-    expected: FAIL
+-
+-  [Get upper excluded]
+-    expected: FAIL
+-
+-  [Get lower excluded]
+-    expected: FAIL
+-
+-  [Get bound range (generated) with maxCount]
+-    expected: FAIL
+-
+-  [Non existent key]
+-    expected: FAIL
+-
+-  [maxCount=0]
+-    expected: FAIL
+-
+-  [Max value count]
+-    expected: FAIL
+-
+-  [Query with empty range where  first key < upperBound]
+-    expected: FAIL
+-
+-  [Query with empty range where lowerBound < last key]
+-    expected: FAIL
+-
+-  [Retrieve multiEntry key]
+-    expected: FAIL
+-
+-  [Retrieve one key multiple values]
+-    expected: FAIL
+-
+-  [Get all values with invalid query keys]
+-    expected: FAIL
+-
+ 
+ [idbindex_getAll.any.sharedworker.html]
+-  [Single item get]
+-    expected: FAIL
+-
+-  [Empty object store]
+-    expected: FAIL
+-
+-  [Get all]
+-    expected: FAIL
+-
+-  [Get all with generated keys]
+-    expected: FAIL
+-
+-  [Get all with large values]
+-    expected: FAIL
+-
+-  [maxCount=10]
+-    expected: FAIL
+-
+-  [Get bound range]
+-    expected: FAIL
+-
+-  [Get bound range with maxCount]
+-    expected: FAIL
+-
+-  [Get upper excluded]
+-    expected: FAIL
+-
+-  [Get lower excluded]
+-    expected: FAIL
+-
+-  [Get bound range (generated) with maxCount]
+-    expected: FAIL
+-
+-  [Non existent key]
+-    expected: FAIL
+-
+-  [maxCount=0]
+-    expected: FAIL
+-
+-  [Max value count]
+-    expected: FAIL
+-
+-  [Query with empty range where  first key < upperBound]
+-    expected: FAIL
+-
+-  [Query with empty range where lowerBound < last key]
+-    expected: FAIL
+-
+-  [Retrieve multiEntry key]
+-    expected: FAIL
+-
+-  [Retrieve one key multiple values]
+-    expected: FAIL
+-
+-  [Get all values with invalid query keys]
+-    expected: FAIL
+-
+ 
+ [idbindex_getAll.any.worker.html]
+-  [Single item get]
+-    expected: FAIL
+-
+-  [Empty object store]
+-    expected: FAIL
+-
+-  [Get all]
+-    expected: FAIL
+-
+-  [Get all with generated keys]
+-    expected: FAIL
+-
+-  [Get all with large values]
+-    expected: FAIL
+-
+-  [maxCount=10]
+-    expected: FAIL
+-
+-  [Get bound range]
+-    expected: FAIL
+-
+-  [Get bound range with maxCount]
+-    expected: FAIL
+-
+-  [Get upper excluded]
+-    expected: FAIL
+-
+-  [Get lower excluded]
+-    expected: FAIL
+-
+-  [Get bound range (generated) with maxCount]
+-    expected: FAIL
+-
+-  [Non existent key]
+-    expected: FAIL
+-
+-  [maxCount=0]
+-    expected: FAIL
+-
+-  [Max value count]
+-    expected: FAIL
+-
+-  [Query with empty range where  first key < upperBound]
+-    expected: FAIL
+-
+-  [Query with empty range where lowerBound < last key]
+-    expected: FAIL
+-
+-  [Retrieve multiEntry key]
+-    expected: FAIL
+-
+-  [Retrieve one key multiple values]
+-    expected: FAIL
+-
+-  [Get all values with invalid query keys]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex_getAllKeys-options.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex_getAllKeys-options.any.js.ini
+index 5676865d826..4887f6207f9 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex_getAllKeys-options.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex_getAllKeys-options.any.js.ini
+@@ -71,9 +71,6 @@
+   [Get all keys with both options and count]
+     expected: FAIL
+ 
+-  [Get all keys with invalid query keys]
+-    expected: FAIL
+-
+   [Direction: nextunique with multi-entry index]
+     expected: FAIL
+ 
+@@ -160,9 +157,6 @@
+   [Get all keys with both options and count]
+     expected: FAIL
+ 
+-  [Get all keys with invalid query keys]
+-    expected: FAIL
+-
+   [Direction: nextunique with multi-entry index]
+     expected: FAIL
+ 
+@@ -263,6 +257,3 @@
+ 
+   [Get all keys with both options and count]
+     expected: FAIL
+-
+-  [Get all keys with invalid query keys]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex_getAllKeys.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex_getAllKeys.any.js.ini
+index 626689f2dcc..5e056899003 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex_getAllKeys.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex_getAllKeys.any.js.ini
+@@ -2,168 +2,7 @@
+   expected: ERROR
+ 
+ [idbindex_getAllKeys.any.html]
+-  [Single item get]
+-    expected: FAIL
+-
+-  [Empty object store]
+-    expected: FAIL
+-
+-  [Get all keys]
+-    expected: FAIL
+-
+-  [Get all generated keys]
+-    expected: FAIL
+-
+-  [maxCount=10]
+-    expected: FAIL
+-
+-  [Get bound range]
+-    expected: FAIL
+-
+-  [Get bound range with maxCount]
+-    expected: FAIL
+-
+-  [Get upper excluded]
+-    expected: FAIL
+-
+-  [Get lower excluded]
+-    expected: FAIL
+-
+-  [Get bound range (generated) with maxCount]
+-    expected: FAIL
+-
+-  [Non existent key]
+-    expected: FAIL
+-
+-  [maxCount=0]
+-    expected: FAIL
+-
+-  [Max value count]
+-    expected: FAIL
+-
+-  [Query with empty range where  first key < upperBound]
+-    expected: FAIL
+-
+-  [Query with empty range where lowerBound < last key]
+-    expected: FAIL
+-
+-  [Retrieve multiEntry key]
+-    expected: FAIL
+-
+-  [Retrieve one key multiple values]
+-    expected: FAIL
+-
+-  [Get all keys with invalid query keys]
+-    expected: FAIL
+-
+ 
+ [idbindex_getAllKeys.any.worker.html]
+-  [Single item get]
+-    expected: FAIL
+-
+-  [Empty object store]
+-    expected: FAIL
+-
+-  [Get all keys]
+-    expected: FAIL
+-
+-  [Get all generated keys]
+-    expected: FAIL
+-
+-  [maxCount=10]
+-    expected: FAIL
+-
+-  [Get bound range]
+-    expected: FAIL
+-
+-  [Get bound range with maxCount]
+-    expected: FAIL
+-
+-  [Get upper excluded]
+-    expected: FAIL
+-
+-  [Get lower excluded]
+-    expected: FAIL
+-
+-  [Get bound range (generated) with maxCount]
+-    expected: FAIL
+-
+-  [Non existent key]
+-    expected: FAIL
+-
+-  [maxCount=0]
+-    expected: FAIL
+-
+-  [Max value count]
+-    expected: FAIL
+-
+-  [Query with empty range where  first key < upperBound]
+-    expected: FAIL
+-
+-  [Query with empty range where lowerBound < last key]
+-    expected: FAIL
+-
+-  [Retrieve multiEntry key]
+-    expected: FAIL
+-
+-  [Retrieve one key multiple values]
+-    expected: FAIL
+-
+-  [Get all keys with invalid query keys]
+-    expected: FAIL
+-
+ 
+ [idbindex_getAllKeys.any.sharedworker.html]
+-  [Single item get]
+-    expected: FAIL
+-
+-  [Empty object store]
+-    expected: FAIL
+-
+-  [Get all keys]
+-    expected: FAIL
+-
+-  [Get all generated keys]
+-    expected: FAIL
+-
+-  [maxCount=10]
+-    expected: FAIL
+-
+-  [Get bound range]
+-    expected: FAIL
+-
+-  [Get bound range with maxCount]
+-    expected: FAIL
+-
+-  [Get upper excluded]
+-    expected: FAIL
+-
+-  [Get lower excluded]
+-    expected: FAIL
+-
+-  [Get bound range (generated) with maxCount]
+-    expected: FAIL
+-
+-  [Non existent key]
+-    expected: FAIL
+-
+-  [maxCount=0]
+-    expected: FAIL
+-
+-  [Max value count]
+-    expected: FAIL
+-
+-  [Query with empty range where  first key < upperBound]
+-    expected: FAIL
+-
+-  [Query with empty range where lowerBound < last key]
+-    expected: FAIL
+-
+-  [Retrieve multiEntry key]
+-    expected: FAIL
+-
+-  [Retrieve one key multiple values]
+-    expected: FAIL
+-
+-  [Get all keys with invalid query keys]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbindex_getKey.any.js.ini b/tests/wpt/meta/IndexedDB/idbindex_getKey.any.js.ini
+index a41f51737be..f785e971aef 100644
+--- a/tests/wpt/meta/IndexedDB/idbindex_getKey.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbindex_getKey.any.js.ini
+@@ -2,78 +2,7 @@
+   expected: ERROR
+ 
+ [idbindex_getKey.any.html]
+-  [getKey() returns the record's primary key]
+-    expected: FAIL
+-
+-  [getKey() returns the record's primary key where the index contains duplicate values]
+-    expected: FAIL
+-
+-  [getKey() attempt to retrieve the primary key of a record that doesn't exist]
+-    expected: FAIL
+-
+-  [getKey() returns the key of the first record within the range]
+-    expected: FAIL
+-
+-  [getKey() throws DataError when using invalid key]
+-    expected: FAIL
+-
+-  [getKey() throws InvalidStateError when the index is deleted]
+-    expected: FAIL
+-
+-  [getKey() throws TransactionInactiveError on aborted transaction]
+-    expected: FAIL
+-
+-  [getKey() throws InvalidStateError on index deleted by aborted upgrade]
+-    expected: FAIL
+-
+ 
+ [idbindex_getKey.any.sharedworker.html]
+-  [getKey() returns the record's primary key]
+-    expected: FAIL
+-
+-  [getKey() returns the record's primary key where the index contains duplicate values]
+-    expected: FAIL
+-
+-  [getKey() attempt to retrieve the primary key of a record that doesn't exist]
+-    expected: FAIL
+-
+-  [getKey() returns the key of the first record within the range]
+-    expected: FAIL
+-
+-  [getKey() throws DataError when using invalid key]
+-    expected: FAIL
+-
+-  [getKey() throws InvalidStateError when the index is deleted]
+-    expected: FAIL
+-
+-  [getKey() throws TransactionInactiveError on aborted transaction]
+-    expected: FAIL
+-
+-  [getKey() throws InvalidStateError on index deleted by aborted upgrade]
+-    expected: FAIL
+-
+ 
+ [idbindex_getKey.any.worker.html]
+-  [getKey() returns the record's primary key]
+-    expected: FAIL
+-
+-  [getKey() returns the record's primary key where the index contains duplicate values]
+-    expected: FAIL
+-
+-  [getKey() attempt to retrieve the primary key of a record that doesn't exist]
+-    expected: FAIL
+-
+-  [getKey() returns the key of the first record within the range]
+-    expected: FAIL
+-
+-  [getKey() throws DataError when using invalid key]
+-    expected: FAIL
+-
+-  [getKey() throws InvalidStateError when the index is deleted]
+-    expected: FAIL
+-
+-  [getKey() throws TransactionInactiveError on aborted transaction]
+-    expected: FAIL
+-
+-  [getKey() throws InvalidStateError on index deleted by aborted upgrade]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbobjectstore-rename-store.any.js.ini b/tests/wpt/meta/IndexedDB/idbobjectstore-rename-store.any.js.ini
+index a4333638c2b..900becf6ee0 100644
+--- a/tests/wpt/meta/IndexedDB/idbobjectstore-rename-store.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbobjectstore-rename-store.any.js.ini
+@@ -2,24 +2,15 @@
+   expected: ERROR
+ 
+ [idbobjectstore-rename-store.any.worker.html]
+-  [IndexedDB object store rename covers index]
+-    expected: FAIL
+-
+   [IndexedDB object store can be renamed to "\\uDC00\\uD800"]
+     expected: FAIL
+ 
+ 
+ [idbobjectstore-rename-store.any.sharedworker.html]
+-  [IndexedDB object store rename covers index]
+-    expected: FAIL
+-
+   [IndexedDB object store can be renamed to "\\uDC00\\uD800"]
+     expected: FAIL
+ 
+ 
+ [idbobjectstore-rename-store.any.html]
+-  [IndexedDB object store rename covers index]
+-    expected: FAIL
+-
+   [IndexedDB object store can be renamed to "\\uDC00\\uD800"]
+     expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini b/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini
+index c6d15a982b1..4d5cca719c6 100644
+--- a/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idbobjectstore_createIndex.any.js.ini
+@@ -1,22 +1,4 @@
+ [idbobjectstore_createIndex.any.worker.html]
+-  [The index is usable right after being made]
+-    expected: FAIL
+-
+-  [Empty keyPath]
+-    expected: FAIL
+-
+-  [Index can be valid keys]
+-    expected: FAIL
+-
+-  [IDBObjectStore.createIndex() - empty name]
+-    expected: FAIL
+-
+-  [Explicit Primary Key]
+-    expected: FAIL
+-
+-  [Auto-Increment Primary Key]
+-    expected: FAIL
+-
+   [Auto-Increment Primary Key - invalid key values elsewhere]
+     expected: FAIL
+ 
+@@ -25,46 +7,10 @@
+   expected: ERROR
+ 
+ [idbobjectstore_createIndex.any.sharedworker.html]
+-  [The index is usable right after being made]
+-    expected: FAIL
+-
+-  [Empty keyPath]
+-    expected: FAIL
+-
+-  [Index can be valid keys]
+-    expected: FAIL
+-
+-  [IDBObjectStore.createIndex() - empty name]
+-    expected: FAIL
+-
+-  [Explicit Primary Key]
+-    expected: FAIL
+-
+-  [Auto-Increment Primary Key]
+-    expected: FAIL
+-
+   [Auto-Increment Primary Key - invalid key values elsewhere]
+     expected: FAIL
+ 
+ 
+ [idbobjectstore_createIndex.any.html]
+-  [The index is usable right after being made]
+-    expected: FAIL
+-
+-  [Empty keyPath]
+-    expected: FAIL
+-
+-  [Index can be valid keys]
+-    expected: FAIL
+-
+-  [IDBObjectStore.createIndex() - empty name]
+-    expected: FAIL
+-
+-  [Explicit Primary Key]
+-    expected: FAIL
+-
+-  [Auto-Increment Primary Key]
+-    expected: FAIL
+-
+   [Auto-Increment Primary Key - invalid key values elsewhere]
+     expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/idlharness.any.js.ini b/tests/wpt/meta/IndexedDB/idlharness.any.js.ini
+index a8fe4b25c4e..0ae8602b480 100644
+--- a/tests/wpt/meta/IndexedDB/idlharness.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/idlharness.any.js.ini
+@@ -2,24 +2,9 @@
+   [IDBObjectStore interface: operation getAllRecords(optional IDBGetAllOptions)]
+     expected: FAIL
+ 
+-  [IDBIndex interface: operation get(any)]
+-    expected: FAIL
+-
+-  [IDBIndex interface: operation getKey(any)]
+-    expected: FAIL
+-
+-  [IDBIndex interface: operation getAll(optional any, optional unsigned long)]
+-    expected: FAIL
+-
+-  [IDBIndex interface: operation getAllKeys(optional any, optional unsigned long)]
+-    expected: FAIL
+-
+   [IDBIndex interface: operation getAllRecords(optional IDBGetAllOptions)]
+     expected: FAIL
+ 
+-  [IDBIndex interface: operation count(optional any)]
+-    expected: FAIL
+-
+   [IDBRecord interface: existence and properties of interface object]
+     expected: FAIL
+ 
+@@ -48,24 +33,7 @@
+     expected: FAIL
+ 
+ 
+-
+ [idlharness.any.html]
+-  [IDBIndex interface: operation get(any)]
+-    expected: FAIL
+-
+-  [IDBIndex interface: operation getKey(any)]
+-    expected: FAIL
+-
+-  [IDBIndex interface: operation getAll(optional any, optional unsigned long)]
+-    expected: FAIL
+-
+-  [IDBIndex interface: operation getAllKeys(optional any, optional unsigned long)]
+-    expected: FAIL
+-
+-  [IDBIndex interface: operation count(optional any)]
+-    expected: FAIL
+-
+-
+   [IDBObjectStore interface: operation getAllRecords(optional IDBGetAllOptions)]
+     expected: FAIL
+ 
+@@ -104,22 +72,6 @@
+   expected: ERROR
+ 
+ [idlharness.any.worker.html]
+-  [IDBIndex interface: operation get(any)]
+-    expected: FAIL
+-
+-  [IDBIndex interface: operation getKey(any)]
+-    expected: FAIL
+-
+-  [IDBIndex interface: operation getAll(optional any, optional unsigned long)]
+-    expected: FAIL
+-
+-  [IDBIndex interface: operation getAllKeys(optional any, optional unsigned long)]
+-    expected: FAIL
+-
+-  [IDBIndex interface: operation count(optional any)]
+-    expected: FAIL
+-
+-
+   [IDBObjectStore interface: operation getAllRecords(optional IDBGetAllOptions)]
+     expected: FAIL
+ 
+diff --git a/tests/wpt/meta/IndexedDB/key-conversion-exceptions.any.js.ini b/tests/wpt/meta/IndexedDB/key-conversion-exceptions.any.js.ini
+index 705175217a9..701bb7c549f 100644
+--- a/tests/wpt/meta/IndexedDB/key-conversion-exceptions.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/key-conversion-exceptions.any.js.ini
+@@ -2,36 +2,7 @@
+   expected: ERROR
+ 
+ [key-conversion-exceptions.any.worker.html]
+-  [IDBIndex get() method with throwing/invalid keys]
+-    expected: FAIL
+-
+-  [IDBIndex getKey() method with throwing/invalid keys]
+-    expected: FAIL
+-
+-  [IDBIndex count() method with throwing/invalid keys]
+-    expected: FAIL
+-
+-
+ 
+ [key-conversion-exceptions.any.html]
+-  [IDBIndex get() method with throwing/invalid keys]
+-    expected: FAIL
+-
+-  [IDBIndex getKey() method with throwing/invalid keys]
+-    expected: FAIL
+-
+-  [IDBIndex count() method with throwing/invalid keys]
+-    expected: FAIL
+-
+-
+ 
+ [key-conversion-exceptions.any.sharedworker.html]
+-
+-  [IDBIndex get() method with throwing/invalid keys]
+-    expected: FAIL
+-
+-  [IDBIndex getKey() method with throwing/invalid keys]
+-    expected: FAIL
+-
+-  [IDBIndex count() method with throwing/invalid keys]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/reading-autoincrement-indexes.any.js.ini b/tests/wpt/meta/IndexedDB/reading-autoincrement-indexes.any.js.ini
+index d2a0465441b..e9efa2f0c76 100644
+--- a/tests/wpt/meta/IndexedDB/reading-autoincrement-indexes.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/reading-autoincrement-indexes.any.js.ini
+@@ -1,61 +1,8 @@
+ [reading-autoincrement-indexes.any.html]
+-  [IDBIndex.getAll() for an index on the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys() for an index on the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.get() for an index on the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.getAll() for an index not covering the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys() returns correct result for an index not covering the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.get() for an index not covering the autoincrement key]
+-    expected: FAIL
+-
+ 
+ [reading-autoincrement-indexes.any.sharedworker.html]
+-  [IDBIndex.getAll() for an index on the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys() for an index on the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.get() for an index on the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.getAll() for an index not covering the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys() returns correct result for an index not covering the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.get() for an index not covering the autoincrement key]
+-    expected: FAIL
+-
+ 
+ [reading-autoincrement-indexes.any.serviceworker.html]
+   expected: ERROR
+ 
+ [reading-autoincrement-indexes.any.worker.html]
+-  [IDBIndex.getAll() for an index on the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys() for an index on the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.get() for an index on the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.getAll() for an index not covering the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.getAllKeys() returns correct result for an index not covering the autoincrement key]
+-    expected: FAIL
+-
+-  [IDBIndex.get() for an index not covering the autoincrement key]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/request-abort-ordering.any.js.ini b/tests/wpt/meta/IndexedDB/request-abort-ordering.any.js.ini
+index 4f1744828c0..3d7fe85f455 100644
+--- a/tests/wpt/meta/IndexedDB/request-abort-ordering.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/request-abort-ordering.any.js.ini
+@@ -1,16 +1,8 @@
+ [request-abort-ordering.any.html]
+-  [IndexedDB: request abort events are delivered in order]
+-    expected: FAIL
+-
+ 
+ [request-abort-ordering.any.worker.html]
+-  [IndexedDB: request abort events are delivered in order]
+-    expected: FAIL
+-
+ 
+ [request-abort-ordering.any.serviceworker.html]
+   expected: ERROR
+ 
+ [request-abort-ordering.any.sharedworker.html]
+-  [IndexedDB: request abort events are delivered in order]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/transaction-abort-index-metadata-revert.any.js.ini b/tests/wpt/meta/IndexedDB/transaction-abort-index-metadata-revert.any.js.ini
+index ba2dcc950aa..37d5df0944b 100644
+--- a/tests/wpt/meta/IndexedDB/transaction-abort-index-metadata-revert.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/transaction-abort-index-metadata-revert.any.js.ini
+@@ -1,61 +1,8 @@
+ [transaction-abort-index-metadata-revert.any.html]
+-  [Created stores get their indexes marked as deleted after the transaction that created them aborts]
+-    expected: FAIL
+-
+-  [Deleted stores get their indexes marked as not-deleted after the transaction that deleted them aborts]
+-    expected: FAIL
+-
+-  [Created+deleted stores still have their indexes marked as deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Created indexes get marked as deleted after their transaction aborts]
+-    expected: FAIL
+-
+-  [Deleted indexes get marked as not-deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Created+deleted indexes are still marked as deleted after their transaction aborts]
+-    expected: FAIL
+-
+ 
+ [transaction-abort-index-metadata-revert.any.serviceworker.html]
+   expected: ERROR
+ 
+ [transaction-abort-index-metadata-revert.any.worker.html]
+-  [Created stores get their indexes marked as deleted after the transaction that created them aborts]
+-    expected: FAIL
+-
+-  [Deleted stores get their indexes marked as not-deleted after the transaction that deleted them aborts]
+-    expected: FAIL
+-
+-  [Created+deleted stores still have their indexes marked as deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Created indexes get marked as deleted after their transaction aborts]
+-    expected: FAIL
+-
+-  [Deleted indexes get marked as not-deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Created+deleted indexes are still marked as deleted after their transaction aborts]
+-    expected: FAIL
+-
+ 
+ [transaction-abort-index-metadata-revert.any.sharedworker.html]
+-  [Created stores get their indexes marked as deleted after the transaction that created them aborts]
+-    expected: FAIL
+-
+-  [Deleted stores get their indexes marked as not-deleted after the transaction that deleted them aborts]
+-    expected: FAIL
+-
+-  [Created+deleted stores still have their indexes marked as deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Created indexes get marked as deleted after their transaction aborts]
+-    expected: FAIL
+-
+-  [Deleted indexes get marked as not-deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Created+deleted indexes are still marked as deleted after their transaction aborts]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/IndexedDB/transaction-abort-multiple-metadata-revert.any.js.ini b/tests/wpt/meta/IndexedDB/transaction-abort-multiple-metadata-revert.any.js.ini
+index d387464f98d..d53065d16a2 100644
+--- a/tests/wpt/meta/IndexedDB/transaction-abort-multiple-metadata-revert.any.js.ini
++++ b/tests/wpt/meta/IndexedDB/transaction-abort-multiple-metadata-revert.any.js.ini
+@@ -2,33 +2,7 @@
+   expected: ERROR
+ 
+ [transaction-abort-multiple-metadata-revert.any.sharedworker.html]
+-  [Deleted indexes in newly created stores are still marked as deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Deleted indexes in deleted stores are still marked as not-deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Deleted indexes in created+deleted stores are still marked as deleted after their transaction aborts]
+-    expected: FAIL
+-
+ 
+ [transaction-abort-multiple-metadata-revert.any.worker.html]
+-  [Deleted indexes in newly created stores are still marked as deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Deleted indexes in deleted stores are still marked as not-deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Deleted indexes in created+deleted stores are still marked as deleted after their transaction aborts]
+-    expected: FAIL
+-
+ 
+ [transaction-abort-multiple-metadata-revert.any.html]
+-  [Deleted indexes in newly created stores are still marked as deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Deleted indexes in deleted stores are still marked as not-deleted after the transaction aborts]
+-    expected: FAIL
+-
+-  [Deleted indexes in created+deleted stores are still marked as deleted after their transaction aborts]
+-    expected: FAIL
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index c06485ee9c4..3fa7d28a049 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11810,7 +11810,7 @@
+      ]
+     ],
+     "index-population.any.js": [
+-     "f1f53e3ac16114d0d37f4c28593bba2d2ae6a70b",
++     "669e877733e3cbeaa740d646ce2916b1a3b1831b",
+      [
+       "IndexedDB/index-population.any.html",
+       {
+@@ -11892,6 +11892,89 @@
+       }
+      ]
+     ],
++    "index-reads.any.js": [
++     "4696a5efe9e4378fdb089143407ff7c8100172cd",
++     [
++      "IndexedDB/index-reads.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: reading the records of an index"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ],
++     [
++      "IndexedDB/index-reads.any.serviceworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: reading the records of an index"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ],
++     [
++      "IndexedDB/index-reads.any.sharedworker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: reading the records of an index"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ],
++     [
++      "IndexedDB/index-reads.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,worker"
++        ],
++        [
++         "title",
++         "IndexedDB: reading the records of an index"
++        ],
++        [
++         "timeout",
++         "long"
++        ]
++       ],
++       "timeout": "long"
++      }
++     ]
++    ],
+     "removed-iframe-aborts-its-transactions.html": [
+      "4c72fe0190142520f2e483e292f0997bd6dc924b",
+      [
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/index-population.any.js b/tests/wpt/mozilla/tests/IndexedDB/index-population.any.js
+index f1f53e3ac16..669e877733e 100644
+--- a/tests/wpt/mozilla/tests/IndexedDB/index-population.any.js
++++ b/tests/wpt/mozilla/tests/IndexedDB/index-population.any.js
+@@ -5,8 +5,8 @@
+ // https://w3c.github.io/IndexedDB/#dom-idbobjectstore-createindex: creating an index is "processed
+ // as an asynchronous request within the upgrade transaction", which gives the index the records
+ // of the store's records; if a unique index would get a key twice, the upgrade transaction aborts
+-// with a ConstraintError. Requests made after createIndex see the whole index. Index reads aren't
+-// implemented yet, so these tests observe the index records through unique conflicts.
++// with a ConstraintError. Requests made after createIndex see the whole index. These tests observe
++// the index records through unique conflicts; index-reads.any.js reads them.
+ 
+ 'use strict';
+ 
+diff --git a/tests/wpt/mozilla/tests/IndexedDB/index-reads.any.js b/tests/wpt/mozilla/tests/IndexedDB/index-reads.any.js
+new file mode 100644
+index 00000000000..4696a5efe9e
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/IndexedDB/index-reads.any.js
+@@ -0,0 +1,330 @@
++// META: global=window,worker
++// META: title=IndexedDB: reading the records of an index
++// META: timeout=long
++
++// https://w3c.github.io/IndexedDB/#index-interface: get(), getKey(), getAll(), getAllKeys() and
++// count() read an index's records, which are sorted by key and then by value, the primary key of
++// the referenced record (https://w3c.github.io/IndexedDB/#index-retrieval-operation). These tests
++// cover what the IndexedDB WPT tests leave out: keys of every type, reads right after
++// createIndex, generated keys in the values read, and writes earlier in the same transaction.
++
++'use strict';
++
++// Opens a new database at version 1, with `upgrade` as its upgradeneeded handler.
++function openDatabase(t, upgrade) {
++  const name = 'index-reads-' + Math.random();
++  t.add_cleanup(() => { indexedDB.deleteDatabase(name); });
++  return reopen(name, 1, upgrade);
++}
++
++// Opens the database `name` at `version`, with `upgrade` as its upgradeneeded handler.
++function reopen(name, version, upgrade) {
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open(name, version);
++    request.onupgradeneeded = () => upgrade(request.result, request.transaction);
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++function result(request) {
++  return new Promise((resolve, reject) => {
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++function complete(transaction) {
++  return new Promise((resolve, reject) => {
++    transaction.oncomplete = resolve;
++    transaction.onabort = () => reject(transaction.error);
++  });
++}
++
++// More records than the backend reads in one step of a population.
++const MANY = 1234;
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('items');
++    for (let i = 0; i < MANY; i++) {
++      store.add({n: i, parity: i % 2}, i);
++    }
++  });
++  db.close();
++
++  let reads;
++  const upgraded = await reopen(db.name, 2, (db, tx) => {
++    const store = tx.objectStore('items');
++    const index = store.createIndex('parity', 'parity');
++    reads = Promise.all([
++      result(index.count()),
++      result(index.count(1)),
++      result(index.getAllKeys(1, 3)),
++      result(index.getAll(0)),
++      result(index.get(1)),
++      result(index.getKey(0)),
++      result(store.add({n: -1, parity: 1}, -1)).then(() => result(index.getKey(1))),
++    ]);
++  });
++  t.add_cleanup(() => { upgraded.close(); });
++  const [count, odd, firstOdd, even, get, getKey, added] = await reads;
++  assert_equals(count, MANY, 'every record is in the index');
++  assert_equals(odd, MANY / 2);
++  assert_array_equals(firstOdd, [1, 3, 5]);
++  assert_equals(even.length, MANY / 2);
++  assert_array_equals(even.map(value => value.n), [...Array(MANY / 2).keys()].map(i => 2 * i));
++  assert_equals(get.n, 1);
++  assert_equals(getKey, 0);
++  assert_equals(added, -1, 'a put after createIndex is in the index');
++}, 'Reads of an index right after createIndex see the records of the whole store');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('items', {keyPath: 'id', autoIncrement: true});
++    store.createIndex('x', 'x');
++    store.createIndex('id', 'id');
++    store.put({x: 'b'});
++    store.put({x: 'a'});
++    store.put({x: 'a', id: 10});
++    store.put({x: 'a'});
++    const nested = db.createObjectStore('nested', {keyPath: 'a.id', autoIncrement: true});
++    nested.createIndex('x', 'x');
++    nested.put({a: {}, x: 1});
++    db.createObjectStore('later', {keyPath: 'id', autoIncrement: true}).put({y: 'z'});
++  });
++  t.add_cleanup(() => { db.close(); });
++  const tx = db.transaction(['items', 'nested'], 'readonly');
++  const index = tx.objectStore('items').index('x');
++  const byId = tx.objectStore('items').index('id');
++  const [first, all, keys, byIdValue, byIdKeys, nested] = await Promise.all([
++    result(index.get('a')),
++    result(index.getAll()),
++    result(index.getAllKeys()),
++    result(byId.get(11)),
++    result(byId.getAllKeys()),
++    result(tx.objectStore('nested').index('x').get(1)),
++  ]);
++  assert_object_equals(first, {x: 'a', id: 2}, 'the generated key is in the value');
++  assert_array_equals(all.map(value => value.id), [2, 10, 11, 1]);
++  assert_array_equals(keys, [2, 10, 11, 1]);
++  assert_object_equals(byIdValue, {x: 'a', id: 11}, 'an index on the key path has the key');
++  assert_array_equals(byIdKeys, [1, 2, 10, 11]);
++  assert_object_equals(nested, {a: {id: 1}, x: 1}, 'the key is injected below the top');
++  db.close();
++
++  let later;
++  const upgraded = await reopen(db.name, 2, (db, tx) => {
++    const index = tx.objectStore('later').createIndex('id', 'id');
++    later = Promise.all([result(index.get(1)), result(index.getAllKeys())]);
++  });
++  t.add_cleanup(() => { upgraded.close(); });
++  const [value, laterKeys] = await later;
++  assert_object_equals(value, {y: 'z', id: 1}, 'a populated index has the generated key');
++  assert_array_equals(laterKeys, [1]);
++}, 'Values read through an index have their generated keys');
++
++// Index keys of every type, in key order, each of them the key of two records.
++const KEYS = [
++  -Infinity, -1.5, 0, Infinity,
++  new Date(-1), new Date(0),
++  '', 'A', '\uD800', '￿',
++  new ArrayBuffer(0), new Uint8Array([0, 255]),
++  [], [1, []],
++];
++
++promise_test(async t => {
++  // Primary keys sort like the records' positions in the index: 'p00a', 'p00b', 'p01a', ...
++  const label = (i, copy) => 'p' + String(i).padStart(2, '0') + copy;
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('items');
++    store.createIndex('k', 'k');
++    store.createIndex('unique', 'u', {unique: true});
++    for (let i = KEYS.length - 1; i >= 0; i--) {
++      store.put({k: KEYS[i], u: i, i}, label(i, 'b'));
++      store.put({k: KEYS[i], i}, label(i, 'a'));
++    }
++  });
++  t.add_cleanup(() => { db.close(); });
++  const tx = db.transaction('items', 'readonly');
++  const index = tx.objectStore('items').index('k');
++  const unique = tx.objectStore('items').index('unique');
++  const labels = (from, to) =>
++      KEYS.slice(from, to).flatMap((_, i) => [label(from + i, 'a'), label(from + i, 'b')]);
++  const range = IDBKeyRange.bound(new Date(-1), 'A', false, true);
++  const [keys, values, inRange, inRangeCount, first, firstKey, limited, arrays, uniqueKeys] =
++      await Promise.all([
++        result(index.getAllKeys()),
++        result(index.getAll()),
++        result(index.getAllKeys(range)),
++        result(index.count(range)),
++        result(index.get(range)),
++        result(index.getKey('\uD800')),
++        result(index.getAllKeys(IDBKeyRange.lowerBound(new ArrayBuffer(0)), 3)),
++        result(index.getAllKeys([])),
++        result(unique.getAllKeys(IDBKeyRange.bound(1, 3))),
++      ]);
++  assert_array_equals(keys, labels(0, KEYS.length));
++  assert_array_equals(values.map(value => value.i), KEYS.flatMap((_, i) => [i, i]));
++  assert_array_equals(inRange, labels(4, 7), 'a range from dates to strings');
++  assert_equals(inRangeCount, 6);
++  assert_equals(first.i, 4);
++  assert_equals(firstKey, label(8, 'a'), 'a lone surrogate is a key of its own');
++  assert_array_equals(limited, [label(10, 'a'), label(10, 'b'), label(11, 'a')]);
++  assert_array_equals(arrays, labels(12, 13));
++  assert_array_equals(uniqueKeys, [label(1, 'b'), label(2, 'b'), label(3, 'b')]);
++}, 'Index keys of every type are read in key order, and records with the same index key in ' +
++   'primary key order');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('items');
++    store.createIndex('tags', 'tags', {multiEntry: true});
++    store.put({tags: ['b', 'a', 'a', ['c']]}, 2);
++    store.put({tags: ['a', null]}, 1);
++    store.put({tags: 'b'}, 3);
++  });
++  t.add_cleanup(() => { db.close(); });
++  const tx = db.transaction('items', 'readonly');
++  const index = tx.objectStore('items').index('tags');
++  const [all, count, a, nested, firstB] = await Promise.all([
++    result(index.getAllKeys()),
++    result(index.count()),
++    result(index.getAllKeys('a')),
++    result(index.getKey(['c'])),
++    result(index.get('b')),
++  ]);
++  assert_array_equals(all, [1, 2, 2, 3, 2], 'a, b and then the array key');
++  assert_equals(count, 5);
++  assert_array_equals(a, [1, 2], 'a subkey that appears twice gives one record');
++  assert_equals(nested, 2);
++  assert_equals(JSON.stringify(firstB.tags), '["b","a","a",["c"]]', 'the first record of b');
++}, 'A multiEntry index has a record per distinct subkey');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    db.createObjectStore('items').createIndex('name', 'name');
++  });
++  t.add_cleanup(() => { db.close(); });
++  let tx = db.transaction('items', 'readwrite');
++  let store = tx.objectStore('items');
++  let index = store.index('name');
++  store.put({name: 'ann'}, 1);
++  store.put({name: 'bob'}, 2);
++  store.put({name: 'ann'}, 3);
++  const afterPuts = result(index.getAllKeys('ann'));
++  store.put({name: 'cid'}, 1);
++  const afterOverwrite = result(index.getAll());
++  store.delete(3);
++  const afterDelete = result(index.get('ann'));
++  const deletedCount = result(index.count('ann'));
++  store.clear();
++  const afterClear = result(index.count());
++  store.put({name: 'dan'}, 4);
++  await complete(tx);
++  assert_array_equals(await afterPuts, [1, 3]);
++  assert_array_equals((await afterOverwrite).map(value => value.name), ['ann', 'bob', 'cid']);
++  assert_equals(await afterDelete, undefined);
++  assert_equals(await deletedCount, 0);
++  assert_equals(await afterClear, 0);
++
++  tx = db.transaction('items', 'readwrite');
++  store = tx.objectStore('items');
++  store.put({name: 'eve'}, 5);
++  tx.abort();
++  await new Promise(resolve => { tx.onabort = resolve; });
++  tx = db.transaction('items', 'readonly');
++  index = tx.objectStore('items').index('name');
++  assert_array_equals(await result(index.getAllKeys()), [4], 'the aborted put is not there');
++}, 'Index reads see the writes before them in their transaction, and no aborted writes');
++
++promise_test(async t => {
++  let old, reads;
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('items');
++    store.put({a: 'x', b: 'y'}, 1);
++    old = store.createIndex('i', 'a');
++    store.deleteIndex('i');
++    const index = store.createIndex('i', 'b');
++    reads = Promise.all([result(index.getAllKeys('y')), result(index.count('x'))]);
++  });
++  t.add_cleanup(() => { db.close(); });
++  const [keys, oldKeys] = await reads;
++  assert_array_equals(keys, [1]);
++  assert_equals(oldKeys, 0, 'the index has no records of the deleted one');
++  for (const method of ['get', 'getKey', 'getAll', 'getAllKeys', 'count']) {
++    assert_throws_dom('InvalidStateError', () => old[method](1), method);
++  }
++}, 'An index deleted and created again with its name in one upgrade starts afresh');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    const store = db.createObjectStore('items');
++    store.createIndex('n', 'n');
++    for (let i = 0; i < 5; i++) {
++      store.put({n: i}, i);
++    }
++  });
++  t.add_cleanup(() => { db.close(); });
++  const tx = db.transaction('items', 'readonly');
++  const store = tx.objectStore('items');
++  const index = store.index('n');
++  const counts = await Promise.all([
++    result(store.getAll(undefined, 0)),
++    result(store.getAllKeys(null, 0)),
++    result(index.getAll(undefined, 0)),
++    result(index.getAllKeys(null, 0)),
++    result(index.getAllKeys(null, 2)),
++  ]);
++  assert_array_equals(counts.map(values => values.length), [5, 5, 5, 5, 2]);
++}, 'getAll() and getAllKeys() with a count of 0 get every record');
++
++promise_test(async t => {
++  const db = await openDatabase(t, db => {
++    const s = db.createObjectStore('s', {keyPath: 'id', autoIncrement: true});
++    s.createIndex('pair', ['x', 'id']);
++    s.createIndex('ids', 'id', {multiEntry: true});
++    s.createIndex('below', 'id.sub');
++    const n = db.createObjectStore('n', {keyPath: 'a.id', autoIncrement: true});
++    n.createIndex('a', 'a');
++    n.createIndex('pair', ['a.id', 'x']);
++    n.createIndex('aid', 'a.id');
++    n.createIndex('alen', 'a.length');
++  });
++  t.add_cleanup(() => { db.close(); });
++  const writes = db.transaction(['s', 'n'], 'readwrite');
++  writes.objectStore('s').put({x: 'b'});
++  writes.objectStore('s').put({x: 'a'});
++  writes.objectStore('s').put({x: 'a', id: 10});
++  writes.objectStore('n').put({x: 1});
++  writes.objectStore('n').put({a: {}, x: 2});
++  writes.objectStore('n').put({a: [7], x: 3});
++  await complete(writes);
++
++  const tx = db.transaction(['s', 'n']);
++  const s = tx.objectStore('s');
++  const n = tx.objectStore('n');
++  // An item of a sequence key path that is the store's key path gets the generated key.
++  assert_array_equals(await result(s.index('pair').getAllKeys()), [2, 10, 1]);
++  assert_equals(await result(s.index('pair').getKey(['a', 2])), 2);
++  assert_equals(await result(s.index('pair').getKey(['b', 1])), 1);
++  // A multiEntry index on the store's key path has the generated key; below it, there is none.
++  assert_array_equals(await result(s.index('ids').getAllKeys()), [1, 2, 10]);
++  assert_equals(await result(s.index('below').count()), 0);
++  // With a nested store key path, the key is injected into the object on the path, or into one
++  // created for it.
++  assert_array_equals(await result(n.index('aid').getAllKeys()), [1, 2, 3]);
++  assert_equals(await result(n.index('pair').getKey([1, 1])), 1);
++  assert_equals(await result(n.index('pair').getKey([2, 2])), 2);
++  assert_equals(await result(n.index('pair').getKey([3, 3])), 3);
++  // `a` is an invalid key when it is an object, and an array key when it is the array [7].
++  assert_equals(await result(n.index('a').count()), 1);
++  assert_equals(await result(n.index('a').getKey([7])), 3);
++  assert_array_equals(await result(n.index('alen').getAllKeys(1)), [3]);
++  assert_equals(await result(n.index('alen').count()), 1);
++  const values = await result(n.getAll());
++  assert_object_equals(values[0], {x: 1, a: {id: 1}});
++  assert_object_equals(values[1], {a: {id: 2}, x: 2});
++  assert_true(Array.isArray(values[2].a));
++  assert_equals(values[2].a.id, 3);
++}, 'Index keys that come from a generated key, read back through the indexes');

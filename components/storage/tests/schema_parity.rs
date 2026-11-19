@@ -2,10 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-// The OHOS RDB backend keeps its own copy of the SQLite schemas, which only
-// compiles for OHOS. These tests build both copies in SQLite on the host and
-// compare the resulting schemas, so an upstream schema change that the RDB copy
-// does not mirror fails here instead of silently diverging on devices.
+// The OHOS RDB backend of client storage keeps its own copy of the SQLite
+// schema, which only compiles for OHOS. These tests build both copies in SQLite
+// on the host and compare the resulting schemas, so an upstream schema change
+// that the RDB copy does not mirror fails here instead of silently diverging on
+// devices. IndexedDB has a single schema for both backends.
 // The webstorage `data` tables differ on purpose (the RDB one enforces unique,
 // non-null keys) and are not compared.
 #![cfg(feature = "sqlite-backend")]
@@ -136,15 +137,6 @@ fn schema_of(statements: &[&str]) -> Vec<String> {
             .unwrap_or_else(|error| panic!("{error}: {statement}"));
     }
     describe_schema(&conn)
-}
-
-#[test]
-fn indexeddb_rdb_schema_matches_sqlite_schema() {
-    let sqlite = create_statements(include_str!("../indexeddb/engines/sqlite/create.rs"));
-    let rdb = create_statements(include_str!("../indexeddb/engines/shared.rs"));
-    assert_eq!(sqlite.len(), 6, "{sqlite:#?}");
-    assert_eq!(rdb.len(), sqlite.len(), "{rdb:#?}");
-    assert_same_schema(&rdb, &sqlite);
 }
 
 #[test]
