@@ -5,18 +5,36 @@
 #![cfg_attr(crown, allow(crown::jscontext_first_arg))]
 
 use std::cell::Cell;
+#[cfg(feature = "js-quickjs")]
+use std::ffi::c_void;
 use std::rc::Rc;
 
 use js::context::JSContext;
-use js::jsapi::{AddAssociatedMemory, Heap, JSObject, MemoryUse, RemoveAssociatedMemory};
-use js::rust::HandleObject;
+use js::jsapi::{AddAssociatedMemory, Heap, JSClass, JSObject, MemoryUse, RemoveAssociatedMemory};
+#[cfg(feature = "js-quickjs")]
+use js::jsapi::JS_SetReservedSlot;
+#[cfg(feature = "js-quickjs")]
+use js::jsval::{PrivateValue, UndefinedValue};
+use js::rust::{HandleObject, MutableHandleObject};
+#[cfg(feature = "js-quickjs")]
+use js::rust::wrappers2::{
+    EnterRealm, JS_GetDomStubInfo, JS_GetDomStubRefCount,
+    JS_InitializePropertiesFromCompatibleNativeObject, JS_IsDomStub, JS_NewObjectWithGivenProto,
+    JS_UnbindDomStub, LeaveRealm,
+};
 use malloc_size_of_derive::MallocSizeOf;
 
+#[cfg(feature = "js-quickjs")]
+use crate::conversions::{DOM_OBJECT_SLOT, private_from_object};
 use crate::conversions::DerivedFrom;
+#[cfg(feature = "js-quickjs")]
+use crate::import::module::JS_GetReservedSlot;
 use crate::interfaces::GlobalScopeHelpers;
 use crate::iterable::{Iterable, IterableIterator};
 use crate::realms::enter_auto_realm;
 use crate::root::{Dom, DomRoot, Root};
+#[cfg(feature = "js-quickjs")]
+use crate::utils::DOM_PROTO_UNFORGEABLE_HOLDER_SLOT;
 use crate::{DomTypes, JSTraceable};
 
 pub trait AssociatedMemorySize: Default {
@@ -38,6 +56,25 @@ impl AssociatedMemorySize for AssociatedMemory {
     }
 }
 
+/// The generated `GetProtoObject` of an interface: returns its prototype in the realm of
+/// `global`, creating the prototype, its interface object and its unforgeable holder if needed.
+pub(crate) type ProtoObjectFn =
+    fn(&mut js::context::JSContext, HandleObject<'_>, MutableHandleObject<'_>);
+
+/// What a reflector records at wrap time, until its `JSDomStub` is materialized. Everything
+/// else materialization needs (class, realm, global, shim context) is read back from the stub's
+/// `ObjectData`.
+#[cfg(feature = "js-quickjs")]
+struct MaterializeCache {
+    /// The prototype the caller passed to `wrap`, already wrapped into the object's realm; null
+    /// if it did not pass one (the canonical prototype is used then).
+    given_proto: Cell<*mut JSObject>,
+    /// Creates the canonical prototype lazily, when the object is first handed to JS.
+    proto_object_fn: ProtoObjectFn,
+    /// Whether that interface has `[LegacyUnforgeable]` members to copy into the object.
+    has_legacy_unforgeable_members: bool,
+}
+
 /// A struct to store a reference to the reflector of a DOM object.
 #[derive(MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
@@ -54,6 +91,12 @@ pub struct Reflector<T = ()> {
     /// QuickJS: whether `object` holds a count, see `hold_object`.
     #[cfg(feature = "js-quickjs")]
     counted: Cell<bool>,
+    /// QuickJS: state recorded at wrap time for materialization. `Some` while `object` is a
+    /// `JSDomStub` that has not been materialized into a real `JSObject` yet; cleared once the
+    /// object is bound to a real `JSObject` (see [`Self::materialize_if_needed`]).
+    #[cfg(feature = "js-quickjs")]
+    #[ignore_malloc_size_of = "raw JS object pointers, owned by the JS engine"]
+    materialize_cache: Cell<Option<MaterializeCache>>,
 }
 
 unsafe impl<T> js::gc::Traceable for Reflector<T> {
@@ -89,11 +132,37 @@ impl<T> PartialEq for Reflector<T> {
 }
 
 impl<T> Reflector<T> {
-    /// Get the reflector.
+    /// Get the object the reflector points at, materializing it first if it is still a lazy
+    /// `JSDomStub`, so that it can be handed to the engine, which reads it as a regular
+    /// `JSObject`. Paths that must not allocate, or that must see the object as it currently is
+    /// (GC tracing, finalization, reference counting — a stub's count carries over to the
+    /// materialized object), read the pointer through [`Self::rootable`] instead.
     #[inline]
     pub fn get_jsobject(&self) -> HandleObject<'_> {
+        // A `JSDomStub` is not a `JSObject`: handing it out as one makes QuickJS read the stub's
+        // fields as `JSObject` fields. Materialize before calling this.
+        #[cfg(feature = "js-quickjs")]
+        unsafe {
+            if JS_IsDomStub(self.object.get()) {
+                panic!("get_jsobject() called on a reflector whose object is a JSDomStub");
+            }
+        }
         // We're rooted, so it's safe to hand out a handle to object in Heap
         unsafe { HandleObject::from_raw(self.object.handle()) }
+    }
+
+    /// Return a raw pointer to the DOM object that owns this `Reflector`.
+    ///
+    /// By Servo convention, every DOM struct has its `Reflector` as its first field, so the
+    /// address of the `Reflector` is also the address of the surrounding DOM struct. This is the
+    /// pointer stored in `DOM_OBJECT_SLOT` of the corresponding JS object.
+    ///
+    /// Unlike [`Self::get_jsobject`], this does not change when a `JSDomStub` is materialized into
+    /// a real `JSObject`, so it can be used as a stable node identity (e.g. for `OpaqueNode`).
+    #[cfg(feature = "js-quickjs")]
+    #[inline]
+    pub fn get_dom_obj_ptr(&self) -> *mut c_void {
+        self as *const Reflector<T> as *mut c_void
     }
 
     /// Get the cached prototype ID.
@@ -145,11 +214,198 @@ impl<T> Reflector<T> {
         unsafe { *self.object.get_unsafe() = std::ptr::null_mut() };
     }
 
+    /// QuickJS: replaces the object the reflector points at, e.g. when a `JSDomStub` is
+    /// materialized into a real `JSObject`. The old object must already have been freed or
+    /// otherwise made unreachable.
+    ///
+    /// # Safety
+    ///
+    /// The provided [`JSObject`] pointer must point to a valid [`JSObject`].
+    #[cfg(feature = "js-quickjs")]
+    pub(crate) unsafe fn rebind_jsobject(&self, object: *mut JSObject) {
+        assert!(!self.object.get().is_null(), "Reflector not initialized");
+        assert!(!object.is_null());
+        assert!(!self.counted.get(), "Cannot rebind a counted reflector");
+        unsafe {
+            *self.object.get_unsafe() = object;
+            crate::root::quickjs_refs::register(self as *const Self as *const Reflector, object);
+        }
+    }
+
     /// Return a pointer to the memory location at which the JS reflector
     /// object is stored. Used to root the reflector, as
     /// required by the JSAPI rooting APIs.
     pub fn rootable(&self) -> &Heap<*mut JSObject> {
         &self.object
+    }
+
+    /// Whether the object is backed by a real `JSObject`.
+    ///
+    /// QuickJS: this is true once the materialize cache has been cleared, i.e. after
+    /// materializing a `JSDomStub`; proxies never populate the cache.
+    pub fn is_js_binded(&self) -> bool {
+        #[cfg(feature = "js-quickjs")]
+        {
+            unsafe { (*self.materialize_cache.as_ptr()).is_none() }
+        }
+        #[cfg(not(feature = "js-quickjs"))]
+        {
+            true
+        }
+    }
+
+    /// Record what materialization needs that cannot be read back from the stub: the prototype
+    /// the caller asked for and the interface's `GetProtoObject`. The class, realm, global and
+    /// shim context are read from the stub's `ObjectData` when it is materialized.
+    pub fn set_materialize_cache(
+        &self,
+        given_proto: *mut JSObject,
+        proto_object_fn: ProtoObjectFn,
+        has_legacy_unforgeable_members: bool,
+    ) {
+        #[cfg(feature = "js-quickjs")]
+        {
+            self.materialize_cache.set(Some(MaterializeCache {
+                given_proto: Cell::new(given_proto),
+                proto_object_fn,
+                has_legacy_unforgeable_members,
+            }));
+        }
+        #[cfg(not(feature = "js-quickjs"))]
+        {
+            let _ = (given_proto, proto_object_fn, has_legacy_unforgeable_members);
+        }
+    }
+
+    /// QuickJS: drops the materialize cache once `object` is a real `JSObject`.
+    #[cfg(feature = "js-quickjs")]
+    pub(crate) fn clear_materialize_cache(&self) {
+        self.materialize_cache.set(None);
+    }
+
+    /// Materialize the object the reflector points at, if it is still a `JSDomStub`.
+    ///
+    /// The reflector's old `JSDomStub` is unbound from the DOM node: it stays allocated until the
+    /// pool drops the references it holds, but no longer finalizes the node. The stub's reference
+    /// count is carried over to the new `JSObject`. Only the object's initial reference is owned by
+    /// the pool; the rest are duplicated without corresponding pool entries and leak for now.
+    /// Afterwards the reflector points at the new `JSObject` and the materialize cache is dropped.
+    ///
+    /// The new object is created with the class and realm recorded on the stub (the object's
+    /// actual interface), not with those of the static type it is currently handled as. E.g.
+    /// `document.getElementById` returns `Element`, but the object may be an `HTMLDivElement`:
+    /// using `Element` would fail `this` checks for members declared on subinterfaces and would
+    /// finalize the object through the wrong Rust type. For the same reason the DOM node is read
+    /// from the stub's reserved slot rather than taken from a typed reference.
+    ///
+    /// The interface's canonical prototype is created here, lazily: an object that is never handed
+    /// to JS does not create its interface's prototype or interface object.
+    ///
+    /// This must run before the object is handed to JS: QuickJS inspects the value as a regular
+    /// object in some conversions (e.g. `ResolvePromise` reads its `then` property), which a
+    /// `JSDomStub` cannot support.
+    #[cfg(feature = "js-quickjs")]
+    pub unsafe fn materialize_if_needed(&self) {
+        let (given_proto, proto_object_fn, has_legacy_unforgeable_members) = {
+            let Some(cache) = (unsafe { (*self.materialize_cache.as_ptr()).as_ref() }) else {
+                // Already materialized, or a proxy: proxies never populate the cache.
+                return;
+            };
+            (
+                cache.given_proto.get(),
+                cache.proto_object_fn,
+                cache.has_legacy_unforgeable_members,
+            )
+        };
+
+        unsafe {
+            let stub = self.object.get();
+            let dom_ptr = private_from_object(stub);
+            assert!(!dom_ptr.is_null(), "JSDomStub without a DOM object");
+
+            // Read what wrap recorded on the stub before unbinding it: `JS_UnbindDomStub` frees
+            // its `ObjectData`, which holds the class, the realm and the realm's global.
+            let mut class: *const JSClass = std::ptr::null();
+            let mut scope: *mut JSObject = std::ptr::null_mut();
+            let mut raw_cx: *mut js::jsapi::JSContext = std::ptr::null_mut();
+            JS_GetDomStubInfo(stub, &mut class, &mut scope, &mut raw_cx);
+            assert!(!class.is_null());
+            assert!(!scope.is_null());
+            assert!(!raw_cx.is_null(), "JSDomStub without a live runtime");
+
+            // Recover the shim context from the stub's realm, which the stub's `ObjectData` keeps
+            // alive, rather than from the thread-local one.
+            let mut cx = JSContext::from_ptr(std::ptr::NonNull::new_unchecked(raw_cx));
+            let cx = &mut cx;
+
+            rooted!(&in(cx) let mut rval = std::ptr::null_mut::<JSObject>());
+
+            // The stub was created inside the realm of its global: create the canonical prototype
+            // and the real object there, not in whatever realm triggered materialization.
+            let old_realm = EnterRealm(cx, scope);
+
+            // Create the interface's canonical prototype (and its unforgeable holder), lazily.
+            // The global is kept alive by its realm, so a handle into this stack slot is valid
+            // for the duration of the call.
+            rooted!(&in(cx) let mut canonical_proto = std::ptr::null_mut::<JSObject>());
+            proto_object_fn(
+                cx,
+                HandleObject::from_marked_location(&scope),
+                canonical_proto.handle_mut(),
+            );
+            assert!(!canonical_proto.is_null());
+
+            let proto = if given_proto.is_null() {
+                canonical_proto.get()
+            } else {
+                given_proto
+            };
+
+            // Detach the DOM node from the old JSDomStub: the stub may still be referenced from
+            // the pool, so it is freed when the pool drains; by then it must not finalize the
+            // node. The pointer is read through the `object` field directly, not `get_jsobject`:
+            // this function is what `get_jsobject` calls to materialize, so reading through it
+            // would recurse.
+            let ref_count = JS_GetDomStubRefCount(stub);
+            JS_UnbindDomStub(cx, stub);
+
+            // Bind to a real JSObject, carrying over the stub's reference count.
+            // `JS_NewObjectWithGivenProto` creates the object with a count of 1, and the pool
+            // holds a reference for it, so duplicate it `ref_count - 1` times to match the stub's
+            // count. These extra references are not backed by pool entries, so they leak for now.
+            rval.set(JS_NewObjectWithGivenProto(
+                cx,
+                class,
+                HandleObject::from_marked_location(&proto),
+            ));
+            assert!(!rval.is_null());
+            for _ in 0..ref_count {
+                js::quickjs::retain_object(rval.get());
+            }
+            JS_SetReservedSlot(rval.get(), DOM_OBJECT_SLOT, &PrivateValue(dom_ptr));
+
+            // Copy the legacy unforgeable properties, which the interface defines on its holder,
+            // onto the instance.
+            if has_legacy_unforgeable_members {
+                let mut slot = UndefinedValue();
+                JS_GetReservedSlot(
+                    canonical_proto.get(),
+                    DOM_PROTO_UNFORGEABLE_HOLDER_SLOT,
+                    &mut slot,
+                );
+                rooted!(&in(cx) let mut unforgeable_holder = std::ptr::null_mut::<JSObject>());
+                unforgeable_holder.handle_mut().set(slot.to_object());
+                assert!(JS_InitializePropertiesFromCompatibleNativeObject(
+                    cx,
+                    rval.handle(),
+                    unforgeable_holder.handle(),
+                ));
+            }
+
+            LeaveRealm(cx, old_realm);
+            self.rebind_jsobject(rval.get());
+            self.clear_materialize_cache();
+        }
     }
 }
 
@@ -164,6 +420,8 @@ impl<T: AssociatedMemorySize> Reflector<T> {
             size: T::default(),
             #[cfg(feature = "js-quickjs")]
             counted: Cell::new(false),
+            #[cfg(feature = "js-quickjs")]
+            materialize_cache: Cell::new(None),
         }
     }
 

@@ -11,20 +11,18 @@ use js::glue::SetProxyReservedSlot;
 use js::jsapi::{JS_SetReservedSlot, JSAutoRealm, JSClass, JSObject};
 use js::jsval::{PrivateValue, UndefinedValue};
 use js::rust::wrappers2::{
-    JS_InitializePropertiesFromCompatibleNativeObject, JS_WrapObject, NewProxyObject,
+    JS_InitializePropertiesFromCompatibleNativeObject, JS_NewDomStub, JS_WrapObject, NewProxyObject,
 };
 use js::rust::{Handle, get_context_realm, get_object_class, get_object_realm};
 
 use crate::codegen::PrototypeList;
 use crate::conversions::DOM_OBJECT_SLOT;
 use crate::import::module::JS_GetReservedSlot;
-use crate::js::JS_NewObjectWithGivenProto;
 use crate::proxyhandler::ensure_expando_object;
+use crate::reflector::ProtoObjectFn;
 use crate::root::{DomRoot, MaybeUnreflectedDom, Root};
 use crate::utils::DOM_PROTO_UNFORGEABLE_HOLDER_SLOT;
 use crate::{DomObject, DomTypes, MutDomObject};
-
-type ProtoObjectFn = fn(&mut js::context::JSContext, HandleObject, MutableHandleObject);
 
 /// TODO: unforgeable is missing
 pub(crate) struct WrapConfig {
@@ -48,11 +46,11 @@ pub(crate) unsafe fn wrap<T: MutDomObject, D: DomTypes>(
 ) -> DomRoot<T> {
     unsafe {
         rooted!(&in(cx) let mut obj = ptr::null_mut::<JSObject>());
-        wrap_object(
+        wrap_object::<T>(
             cx,
             &scope.reflector().get_jsobject(),
             given_proto,
-            raw.as_ptr() as *const c_void,
+            &raw,
             &config,
             obj.handle_mut(),
         );
@@ -63,11 +61,11 @@ pub(crate) unsafe fn wrap<T: MutDomObject, D: DomTypes>(
 }
 
 // `wrap` is instantiated many times, so we move most of the code into this non-generic helper.
-unsafe fn wrap_object(
+unsafe fn wrap_object<T: MutDomObject>(
     cx: &mut JSContext,
     scope: &HandleObject,
     given_proto: Option<js::rust::Handle<*mut JSObject>>,
-    raw: *const c_void,
+    raw: &Root<MaybeUnreflectedDom<T>>,
     config: &WrapConfig,
     mut rval: MutableHandleObject,
 ) {
@@ -76,11 +74,47 @@ unsafe fn wrap_object(
         assert!(((*get_object_class(scope.get())).flags & JSCLASS_IS_GLOBAL) != 0);
         let _ac = JSAutoRealm::new(cx.raw_cx(), scope.get());
 
+        // Not a proxy object: create a `JSDomStub` and record what materialization needs.
+        if !config.is_proxy {
+            // Only the caller's prototype is recorded now. The canonical prototype, and this
+            // interface's unforgeable holder with it, is created lazily the first time the object
+            // is handed to JS (see `Reflector::materialize_if_needed`): an object that is never
+            // exposed does not create its interface's prototype.
+            let given = match given_proto {
+                Some(given) => {
+                    rooted!(&in(cx) let mut proto = *given);
+                    if get_context_realm(cx.raw_cx()) != get_object_realm(proto.get()) {
+                        assert!(JS_WrapObject(cx, proto.handle_mut()));
+                    }
+                    proto.get()
+                },
+                None => ptr::null_mut(),
+            };
+            (*raw.as_ptr()).reflector().set_materialize_cache(
+                given,
+                config.proto_object_fn,
+                config.has_legacy_unforgeable_members,
+            );
+
+            // The stub owns `ObjectData` (allocated by `JS_NewDomStub`) and, through it, the DOM
+            // node until it is replaced by a real `JSObject`. Like a materialized object, the
+            // stub keeps the node in `DOM_OBJECT_SLOT`.
+            rval.set(JS_NewDomStub(cx, config.class.unwrap()));
+            assert!(!rval.is_null());
+            JS_SetReservedSlot(
+                rval.get(),
+                DOM_OBJECT_SLOT,
+                &PrivateValue(raw.as_ptr() as *const c_void),
+            );
+            return;
+        }
+
+        // Proxies are real objects from the start and need the canonical prototype now.
         rooted!(&in(cx) let mut canonical_proto = ptr::null_mut::<JSObject>());
         (config.proto_object_fn)(cx, *scope, canonical_proto.handle_mut());
         assert!(!canonical_proto.is_null());
 
-        if config.is_proxy {
+        {
             let handler: *const libc::c_void = config.proxy_handler.unwrap();
 
             if config.is_maybe_cross_origin_object {
@@ -104,25 +138,8 @@ unsafe fn wrap_object(
             };
 
             assert!(!rval.is_null());
-            SetProxyReservedSlot(rval.get(), 0, &PrivateValue(raw));
-        } else {
-            rooted!(&in(cx) let mut proto = ptr::null_mut::<JSObject>());
-            if let Some(given) = given_proto {
-                proto.set(*given);
-                if get_context_realm(cx.raw_cx()) != get_object_realm(*given) {
-                    assert!(JS_WrapObject(cx, proto.handle_mut()));
-                }
-            } else {
-                proto.set(*canonical_proto);
-            }
-            rval.set(JS_NewObjectWithGivenProto(
-                cx,
-                Some(config.class.unwrap()),
-                proto.handle(),
-            ));
-            assert!(!rval.is_null());
-            JS_SetReservedSlot(rval.get(), DOM_OBJECT_SLOT, &PrivateValue(raw));
-        };
+            SetProxyReservedSlot(rval.get(), 0, &PrivateValue(raw.as_ptr() as *const c_void));
+        }
 
         // From here on we copy the legacy unforgeable properties to instance which was originally in a different function.
         if config.has_legacy_unforgeable_members {
