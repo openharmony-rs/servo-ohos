@@ -1,0 +1,21 @@
+[package]
+name = "engine_contract_tests"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "engine_contract_tests"
+path = "lib.rs"
+
+[features]
+# Select the QuickJS shim for the shared contract suite. The tests still treat SpiderMonkey
+# semantics as the contract; this feature only lets them record a shim divergence.
+js-quickjs = []
+
+[dependencies]
+js = { workspace = true }
+serde_json = { workspace = true }
