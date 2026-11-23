@@ -1570,9 +1570,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "time",
  "version_check",
@@ -7997,7 +7997,7 @@ dependencies = [
  "arboard",
  "bitflags 2.13.1",
  "content-security-policy",
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "crossbeam-channel",
  "dpi",
  "env_logger",
@@ -8412,7 +8412,7 @@ dependencies = [
  "accesskit",
  "bitflags 2.13.1",
  "content-security-policy",
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "crossbeam-channel",
  "euclid",
  "http",
@@ -8537,7 +8537,7 @@ dependencies = [
 name = "servo-hyper-serde"
 version = "0.6.0"
 dependencies = [
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "headers",
  "http",
  "hyper",
@@ -8661,7 +8661,7 @@ dependencies = [
  "atomic_refcell",
  "bytes",
  "content-security-policy",
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "crossbeam-channel",
  "data-url",
  "encoding_rs",
@@ -8948,7 +8948,7 @@ dependencies = [
  "bytes",
  "chrono",
  "content-security-policy",
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "crossbeam-channel",
  "data-url",
  "flate2",
@@ -9022,7 +9022,7 @@ version = "0.6.0"
 dependencies = [
  "bytes",
  "content-security-policy",
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "crossbeam-channel",
  "data-url",
  "headers",
@@ -9205,7 +9205,7 @@ dependencies = [
  "chardetng",
  "chrono",
  "content-security-policy",
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "crossbeam-channel",
  "crypto-bigint",
  "cshake",
@@ -9518,7 +9518,7 @@ version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "crossbeam-channel",
  "euclid",
  "http",
