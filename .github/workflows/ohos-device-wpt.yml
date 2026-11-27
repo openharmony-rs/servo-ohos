@@ -4,9 +4,10 @@
 # expectations for OpenHarmony yet, so the tests never fail the run.
 #
 # Every night, unless servo-ohos-wpt has a run of the ohos-main commit already, it runs the
-# nightly subset of WPT and stores the results in openharmony-rs/servo-ohos-wpt as
-# `ohos-dayu200-quickjs`. All of WPT would take a board about 14 hours. Otherwise it runs on
-# request only: pull requests must not reach the boards.
+# nightly subset of WPT on ohos-main. GitHub runs schedules only on the default branch, so on
+# ohos-v0.6 the nightly subset runs when dispatched with `store`, and is stored in
+# openharmony-rs/servo-ohos-wpt as `ohos-v06-dayu200-quickjs`. All of WPT would take a board about
+# 14 hours. Otherwise it runs on request only: pull requests must not reach the boards.
 name: OpenHarmony device WPT
 on:
   schedule:
@@ -23,7 +24,7 @@ on:
         options: ["checked-release", "release"]
         default: "checked-release"
       store:
-        description: "Store the results in servo-ohos-wpt (only the nightly subset with checked-release, on ohos-main)"
+        description: "Store the results in servo-ohos-wpt (only the nightly subset with checked-release, on ohos-v0.6)"
         type: boolean
         default: false
 
@@ -37,7 +38,7 @@ env:
   SHELL: /bin/bash
   CARGO_INCREMENTAL: 0
   # The configuration of the stored runs, as in the results job.
-  RESULTS_CONFIG: ohos-dayu200-quickjs
+  RESULTS_CONFIG: ohos-v06-dayu200-quickjs
   # About 36,000 tests of what generated UI uses: layout, text and fonts, rendering, SVG and canvas
   # (for charts), animations, images, forms, touch input, storage, markup parsing, scripts and
   # timers, and the network with streamed responses. They take one board about six hours. The
@@ -240,7 +241,7 @@ jobs:
           pattern: wpt-full-logs-ohos-dayu200-*
 
   # The called workflow takes its token from the `servo-ohos-wpt` environment, which only ohos-main
-  # can use.
+  # and ohos-v0.6 can use.
   results:
     name: Results
     needs: [setup, wpt, merge]
@@ -253,7 +254,7 @@ jobs:
       SERVO_OHOS_WPT_TOKEN: ${{ secrets.SERVO_OHOS_WPT_TOKEN }}
     with:
       # RESULTS_CONFIG; `with` can't read env.
-      artifacts: '{"ohos-dayu200-quickjs": "wpt-full-logs-ohos-dayu200"}'
+      artifacts: '{"ohos-v06-dayu200-quickjs": "wpt-full-logs-ohos-dayu200"}'
       chunks: 2
       upstream: false
     permissions: {}
