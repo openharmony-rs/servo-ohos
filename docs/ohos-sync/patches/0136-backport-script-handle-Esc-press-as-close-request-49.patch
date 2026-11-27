@@ -1,0 +1,954 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Glenn Skrzypczak <glenn.skrzypczak@gmail.com>
+Date: Fri, 6 Nov 2026 13:28:25 +0000
+Subject: [PATCH] backport: script: handle Esc press as close request (#49640)
+
+This intercepts `esc` presses and runs the close request steps in order
+to close the fullscreen and elements controlled by close watchers (only
+dialogs for now, later popovers aswell).
+
+Testing: Passes new web platform tests.
+Fixes: #47236
+
+Signed-off-by: Glenn Skrzypczak <glenn.skrzypczak@gmail.com>
+
+Fork note: upstream 3e7d8ed44d7, which came after Servo 0.8.0, backported with expectation adjustments. On 0.8.0 the light-dismiss subtests of dialog-closedby, the cross-origin close-watcher iframe cases and the SpiderMonkey testdriver issue in dialog-cancel-events and dialog-cancel-preventDefault still fail, so their expectations are kept or added. Drop this patch at the first sync onto a release that contains #49640, where the source applies unchanged and the expectations are upstream's.
+
+Validation: release builds on the host with SpiderMonkey (666 WPT files from the affected directories, all as expected) and with QuickJS on a local servo-quickjs branch carrying the unmerged WebAssembly and await-realm fixes (the focused 229-test set, all as expected; the full set's remaining unexpected results are origin-keyed expectations that the WebAssembly shim changes).
+AI-assisted: Yes (agent session; backported from upstream #49640, expectations updated from the two-engine runs)
+Signed-off-by: daodaoliehuo <352812717@qq.com>
+---
+ .../dom/closewatcher/closewatchermanager.rs   |  5 ++
+ components/script/dom/document/document.rs    |  2 +-
+ .../dom/document/document_event_handler.rs    | 66 +++++++++++++++-
+ components/script/dom/window/window.rs        | 38 ++++++++++
+ .../meta/close-watcher/abortsignal.html.ini   |  3 -
+ tests/wpt/meta/close-watcher/basic.html.ini   |  3 -
+ .../close-watcher/esc-key/keypress.html.ini   |  3 -
+ .../meta/close-watcher/esc-key/keyup.html.ini |  3 -
+ .../esc-key/not-user-activation.html.ini      |  3 -
+ .../iframes/dialog-cross-origin-ynn.html.ini  |  3 +
+ .../iframes/dialog-cross-origin-ynyn.html.ini |  3 +
+ .../iframes/dialog-same-origin-nn.html.ini    |  3 -
+ .../iframes/dialog-same-origin-ynn.html.ini   |  3 -
+ .../iframes/dialog-same-origin-ynyn.html.ini  |  3 -
+ .../n-activate-preventDefault.html.ini        |  8 --
+ .../user-activation/n-activate.html.ini       |  8 --
+ .../user-activation/n-closerequest-n.html.ini |  8 --
+ .../user-activation/n-destroy-n.html.ini      |  8 --
+ .../close-watcher/user-activation/n.html.ini  |  8 --
+ .../user-activation/nn-CloseWatcher.html.ini  |  3 -
+ .../nn-activate-CloseWatcher.html.ini         |  3 -
+ .../nn-activate-dialog.html.ini               |  3 -
+ .../user-activation/nn-dialog.html.ini        |  3 -
+ .../user-activation/nnn-CloseWatcher.html.ini |  3 -
+ .../user-activation/nnn-dialog.html.ini       |  3 -
+ .../ny-activate-preventDefault.html.ini       |  8 --
+ .../close-watcher/user-activation/ny.html.ini |  8 --
+ .../user-activation/nyn.html.ini              |  8 --
+ .../user-activation/nynn-destroy.html.ini     |  8 --
+ .../user-activation/nynn.html.ini             |  8 --
+ .../nyyn-CloseWatcher.html.ini                |  3 -
+ .../user-activation/nyyn-dialog.html.ini      |  3 -
+ .../nyyyn-CloseWatcher.html.ini               |  3 -
+ .../user-activation/nyyyn-dialog.html.ini     |  3 -
+ .../y-dialog-disconnected.html.ini            |  3 -
+ .../close-watcher/user-activation/y.html.ini  |  8 --
+ .../user-activation/yn-activate.html.ini      |  8 --
+ .../close-watcher/user-activation/yn.html.ini |  8 --
+ .../user-activation/ynn-CloseWatcher.html.ini |  3 -
+ .../user-activation/ynn-dialog.html.ini       |  3 -
+ .../close-watcher/user-activation/yy.html.ini |  8 --
+ .../user-activation/yyn.html.ini              |  8 --
+ .../user-activation/yyy.html.ini              |  8 --
+ ...lscreen-keyboard-lock-escape.window.js.ini | 11 +--
+ .../dialog-cancel-events.html.ini             |  5 +-
+ .../dialog-cancel-preventDefault.html.ini     |  5 +-
+ .../dialog-cancel-with-input.html.ini         |  4 -
+ .../dialog-cancel-with-select.html.ini        |  4 -
+ .../dialog-canceling.html.ini                 |  3 -
+ .../dialog-closedby-corner-cases.html.ini     |  9 +--
+ .../dialog-closedby-show-stacked.html.ini     |  5 +-
+ .../dialog-closedby-start-open.html.ini       |  6 --
+ .../dialog-closedby.html.ini                  | 76 ++-----------------
+ .../dialog-open-movebefore-setup.html.ini     |  3 -
+ .../non-modal-canceling.html.ini              |  3 -
+ 55 files changed, 129 insertions(+), 313 deletions(-)
+ delete mode 100644 tests/wpt/meta/close-watcher/abortsignal.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/basic.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/esc-key/keypress.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/esc-key/keyup.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/esc-key/not-user-activation.html.ini
+ create mode 100644 tests/wpt/meta/close-watcher/iframes/dialog-cross-origin-ynn.html.ini
+ create mode 100644 tests/wpt/meta/close-watcher/iframes/dialog-cross-origin-ynyn.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/iframes/dialog-same-origin-nn.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/iframes/dialog-same-origin-ynn.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/iframes/dialog-same-origin-ynyn.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/n-activate-preventDefault.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/n-activate.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/n-closerequest-n.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/n-destroy-n.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/n.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nn-CloseWatcher.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nn-activate-CloseWatcher.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nn-activate-dialog.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nn-dialog.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nnn-CloseWatcher.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nnn-dialog.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/ny-activate-preventDefault.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/ny.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nyn.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nynn-destroy.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nynn.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nyyn-CloseWatcher.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nyyn-dialog.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nyyyn-CloseWatcher.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/nyyyn-dialog.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/y-dialog-disconnected.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/y.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/yn-activate.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/yn.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/ynn-CloseWatcher.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/ynn-dialog.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/yy.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/yyn.html.ini
+ delete mode 100644 tests/wpt/meta/close-watcher/user-activation/yyy.html.ini
+ delete mode 100644 tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-with-input.html.ini
+ delete mode 100644 tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-with-select.html.ini
+ delete mode 100644 tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-canceling.html.ini
+ delete mode 100644 tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-start-open.html.ini
+ delete mode 100644 tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-open-movebefore-setup.html.ini
+ delete mode 100644 tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/non-modal-canceling.html.ini
+
+diff --git a/components/script/dom/closewatcher/closewatchermanager.rs b/components/script/dom/closewatcher/closewatchermanager.rs
+index 5bf4dee9cfa..beff52357c1 100644
+--- a/components/script/dom/closewatcher/closewatchermanager.rs
++++ b/components/script/dom/closewatcher/closewatchermanager.rs
+@@ -51,6 +51,11 @@ impl CloseWatcherManager {
+             .update(|allowed_number_of_groups| allowed_number_of_groups + 1);
+     }
+ 
++    pub(crate) fn decrement_allowed_number_of_groups(&self) {
++        self.allowed_number_of_groups
++            .update(|allowed_number_of_groups| allowed_number_of_groups - 1);
++    }
++
+     pub(crate) fn next_user_interaction_allows_a_new_group(&self) -> bool {
+         self.next_user_interaction_allows_a_new_group.get()
+     }
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 1465cd070e3..6a5aca53f9d 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -859,7 +859,7 @@ impl Document {
+     }
+ 
+     /// <https://fullscreen.spec.whatwg.org/#fully-exit-fullscreen>
+-    fn fully_exit_fullscreen(&self, cx: &mut JSContext) {
++    pub(crate) fn fully_exit_fullscreen(&self, cx: &mut JSContext) {
+         // Step 1. If document’s fullscreen element is null, terminate these
+         // steps.
+         if self.fullscreen_element().is_none() {
+diff --git a/components/script/dom/document/document_event_handler.rs b/components/script/dom/document/document_event_handler.rs
+index 8184a50a527..a5ba33331a4 100644
+--- a/components/script/dom/document/document_event_handler.rs
++++ b/components/script/dom/document/document_event_handler.rs
+@@ -1786,7 +1786,20 @@ impl DocumentEventHandler {
+ 
+         let event = keyevent.upcast::<Event>();
+         event.set_composed(true);
+-        event.fire(cx, target);
++        // <https://html.spec.whatwg.org/multipage/#close-requests>
++        // > Some example close requests are:
++        // > - The Esc key on desktop platforms.
++        // > On platforms where pressing the Esc key is interpreted as a close request, the user agent
++        // > must interpret the key being pressed down as the close request, instead of the key being
++        // > released. Thus, in the above algorithm, the "relevant events" that are fired must be the
++        // > single keydown event.
++        if keyboard_event.event.state == KeyState::Down &&
++            keyboard_event.event.key == Key::Named(NamedKey::Escape)
++        {
++            self.close_request_steps(cx, Some((event, target)));
++        } else {
++            event.fire(cx, target);
++        }
+ 
+         // From https://w3c.github.io/uievents/#keys-cancelable-keys:
+         // > Canceling the default action of a keydown event MUST NOT affect its
+@@ -1823,6 +1836,57 @@ impl DocumentEventHandler {
+         self.run_default_keydown_handler(cx, target, &keyboard_event, flags.into())
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#close-request-steps>
++    ///
++    /// `event` is the event to fire for this close request, along with its target, if any.
++    pub(crate) fn close_request_steps(
++        &self,
++        cx: &mut JSContext,
++        event: Option<(&Event, &EventTarget)>,
++    ) {
++        // Step 1. If document's fullscreen element is not null:
++        let document = self.window.Document();
++        if document.fullscreen_element().is_some() {
++            // Step 1.1. Fully exit fullscreen given document's node navigable's top-level traversable's active document.
++            // TODO: node navigable's top-level traversable's active document
++            document.fully_exit_fullscreen(cx);
++
++            // Step 1.2. Return.
++            return;
++        }
++
++        // Step 2. Optionally, skip to the step labeled alternative processing.
++
++        // Step 3. Fire any relevant events, per UI Events or other relevant specifications. [UIEVENTS]
++        if let Some((event, target)) = event {
++            event.fire(cx, target);
++        }
++
++        // Step 4. Let event be null if no such events are fired, or the Event object representing one of
++        // the fired events otherwise. If multiple events are fired, which one is chosen is
++        // implementation-defined.
++        let event = event.map(|(event, _)| event);
++
++        // Step 5. If event is not null, and its canceled flag is set, then return.
++        if event.is_some_and(|event| event.flags().contains(EventFlags::Canceled)) {
++            return;
++        }
++
++        // Step 6. If document is not fully active, then return.
++        if !document.is_fully_active() {
++            return;
++        }
++
++        // Step 7. Let closedSomething be the result of processing close watchers on document's
++        // relevant global object.
++        self.window.process_close_watchers(cx);
++
++        // Step 8. If closedSomething is true, then return.
++        // Step 9. Alternative processing: Otherwise, there was nothing watching for a close request.
++        // The user agent may instead interpret this interaction as some other action, instead of
++        // interpreting it as a close request.
++    }
++
+     fn handle_ime_event(&self, cx: &mut JSContext, event: ImeEvent) -> InputEventResult {
+         let document = self.window.Document();
+         let composition_event = match event {
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 839a8d71c83..eedcb24896a 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -1124,6 +1124,44 @@ impl Window {
+         let document = self.Document();
+         f(document.timers())
+     }
++
++    /// <https://html.spec.whatwg.org/multipage/#process-close-watchers>
++    pub(crate) fn process_close_watchers(&self, cx: &mut JSContext) -> bool {
++        // Step 1. Let processedACloseWatcher be false.
++        let mut processed_a_close_watcher = false;
++
++        // Step 2. If window's close watcher manager's groups is not empty:
++        // Step 2.1. Let group be the last item in window's close watcher manager's groups.
++        //
++        // We need to clone the group as request_to_close can modify the groups.
++        let close_watcher_manager = self.close_watcher_manager();
++        let group = close_watcher_manager.groups().last().cloned();
++        if let Some(group) = group {
++            // Step 2.2. For each closeWatcher of group, in reverse order:
++            for close_watcher in group.iter().rev() {
++                // Step 2.2.1. If the result of running closeWatcher's get enabled state is true, set processedACloseWatcher to true.
++                if close_watcher.get_enabled_state() {
++                    processed_a_close_watcher = true;
++                }
++
++                // Step 2.2.2. Let shouldProceed be the result of requesting to close closeWatcher with true.
++                let should_proceed = close_watcher.request_to_close(cx, true);
++
++                // Step 2.2.3. If shouldProceed is false, then break.
++                if !should_proceed {
++                    break;
++                }
++            }
++        }
++
++        // Step 3. If window's close watcher manager's allowed number of groups is greater than 1, decrement it by 1.
++        if close_watcher_manager.allowed_number_of_groups() > 1 {
++            close_watcher_manager.decrement_allowed_number_of_groups();
++        }
++
++        // Step 4. Return processedACloseWatcher.
++        processed_a_close_watcher
++    }
+ }
+ 
+ #[derive(Debug, MallocSizeOf)]
+diff --git a/tests/wpt/meta/close-watcher/abortsignal.html.ini b/tests/wpt/meta/close-watcher/abortsignal.html.ini
+deleted file mode 100644
+index 23509da8b5b..00000000000
+--- a/tests/wpt/meta/close-watcher/abortsignal.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[abortsignal.html]
+-  [Esc key then abortController.abort() fires only one close event]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/basic.html.ini b/tests/wpt/meta/close-watcher/basic.html.ini
+deleted file mode 100644
+index 0222bf29013..00000000000
+--- a/tests/wpt/meta/close-watcher/basic.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[basic.html]
+-  [Close request then destroy()]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/esc-key/keypress.html.ini b/tests/wpt/meta/close-watcher/esc-key/keypress.html.ini
+deleted file mode 100644
+index a54d3888240..00000000000
+--- a/tests/wpt/meta/close-watcher/esc-key/keypress.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[keypress.html]
+-  [A keypress listener can NOT prevent the Esc keypress from being interpreted as a close request]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/esc-key/keyup.html.ini b/tests/wpt/meta/close-watcher/esc-key/keyup.html.ini
+deleted file mode 100644
+index 7e702bd125a..00000000000
+--- a/tests/wpt/meta/close-watcher/esc-key/keyup.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[keyup.html]
+-  [A keyup listener can NOT prevent the Esc keypress from being interpreted as a close request]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/esc-key/not-user-activation.html.ini b/tests/wpt/meta/close-watcher/esc-key/not-user-activation.html.ini
+deleted file mode 100644
+index a462b70c87f..00000000000
+--- a/tests/wpt/meta/close-watcher/esc-key/not-user-activation.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[not-user-activation.html]
+-  [Esc key does not count as user activation, so if it is the sole user interaction, cancel is cancelable=false]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/iframes/dialog-cross-origin-ynn.html.ini b/tests/wpt/meta/close-watcher/iframes/dialog-cross-origin-ynn.html.ini
+new file mode 100644
+index 00000000000..0f115e574fb
+--- /dev/null
++++ b/tests/wpt/meta/close-watcher/iframes/dialog-cross-origin-ynn.html.ini
+@@ -0,0 +1,3 @@
++[dialog-cross-origin-ynn.html]
++  [dialog-cross-origin-ynn]
++    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/iframes/dialog-cross-origin-ynyn.html.ini b/tests/wpt/meta/close-watcher/iframes/dialog-cross-origin-ynyn.html.ini
+new file mode 100644
+index 00000000000..fce2640739a
+--- /dev/null
++++ b/tests/wpt/meta/close-watcher/iframes/dialog-cross-origin-ynyn.html.ini
+@@ -0,0 +1,3 @@
++[dialog-cross-origin-ynyn.html]
++  [dialog-cross-origin-ynyn]
++    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/iframes/dialog-same-origin-nn.html.ini b/tests/wpt/meta/close-watcher/iframes/dialog-same-origin-nn.html.ini
+deleted file mode 100644
+index f51eb087ea4..00000000000
+--- a/tests/wpt/meta/close-watcher/iframes/dialog-same-origin-nn.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[dialog-same-origin-nn.html]
+-  [dialog-same-origin-nn]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/iframes/dialog-same-origin-ynn.html.ini b/tests/wpt/meta/close-watcher/iframes/dialog-same-origin-ynn.html.ini
+deleted file mode 100644
+index ef26ec9d342..00000000000
+--- a/tests/wpt/meta/close-watcher/iframes/dialog-same-origin-ynn.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[dialog-same-origin-ynn.html]
+-  [dialog-same-origin-ynn]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/iframes/dialog-same-origin-ynyn.html.ini b/tests/wpt/meta/close-watcher/iframes/dialog-same-origin-ynyn.html.ini
+deleted file mode 100644
+index fe1e3ea1c77..00000000000
+--- a/tests/wpt/meta/close-watcher/iframes/dialog-same-origin-ynyn.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[dialog-same-origin-ynyn.html]
+-  [dialog-same-origin-ynyn]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/n-activate-preventDefault.html.ini b/tests/wpt/meta/close-watcher/user-activation/n-activate-preventDefault.html.ini
+deleted file mode 100644
+index d1e425cef05..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/n-activate-preventDefault.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[n-activate-preventDefault.html?dialog]
+-  [Create a close watcher without user activation that preventDefault()s cancel; send user activation]
+-    expected: FAIL
+-
+-
+-[n-activate-preventDefault.html?CloseWatcher]
+-  [Create a close watcher without user activation that preventDefault()s cancel; send user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/n-activate.html.ini b/tests/wpt/meta/close-watcher/user-activation/n-activate.html.ini
+deleted file mode 100644
+index c574a5b92b3..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/n-activate.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[n-activate.html?dialog]
+-  [Create a close watcher without user activation; send user activation]
+-    expected: FAIL
+-
+-
+-[n-activate.html?CloseWatcher]
+-  [Create a close watcher without user activation; send user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/n-closerequest-n.html.ini b/tests/wpt/meta/close-watcher/user-activation/n-closerequest-n.html.ini
+deleted file mode 100644
+index ff0b7e4fbc1..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/n-closerequest-n.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[n-closerequest-n.html?dialog]
+-  [Create a close watcher without user activation; send a close request; create a close watcher without user activation]
+-    expected: FAIL
+-
+-
+-[n-closerequest-n.html?CloseWatcher]
+-  [Create a close watcher without user activation; send a close request; create a close watcher without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/n-destroy-n.html.ini b/tests/wpt/meta/close-watcher/user-activation/n-destroy-n.html.ini
+deleted file mode 100644
+index ee79b98add2..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/n-destroy-n.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[n-destroy-n.html?dialog]
+-  [Create a close watcher without user activation; destroy the close watcher; create a close watcher without user activation]
+-    expected: FAIL
+-
+-
+-[n-destroy-n.html?CloseWatcher]
+-  [Create a close watcher without user activation; destroy the close watcher; create a close watcher without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/n.html.ini b/tests/wpt/meta/close-watcher/user-activation/n.html.ini
+deleted file mode 100644
+index 548e4e63cca..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/n.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[n.html?CloseWatcher]
+-  [Create a close watcher without user activation]
+-    expected: FAIL
+-
+-
+-[n.html?dialog]
+-  [Create a close watcher without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nn-CloseWatcher.html.ini b/tests/wpt/meta/close-watcher/user-activation/nn-CloseWatcher.html.ini
+deleted file mode 100644
+index 641e1bdfac4..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nn-CloseWatcher.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[nn-CloseWatcher.html]
+-  [Create two close watchers without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nn-activate-CloseWatcher.html.ini b/tests/wpt/meta/close-watcher/user-activation/nn-activate-CloseWatcher.html.ini
+deleted file mode 100644
+index b657be85b78..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nn-activate-CloseWatcher.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[nn-activate-CloseWatcher.html]
+-  [Create two CloseWatchers without user activation; send user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nn-activate-dialog.html.ini b/tests/wpt/meta/close-watcher/user-activation/nn-activate-dialog.html.ini
+deleted file mode 100644
+index 33e9ec9ad4e..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nn-activate-dialog.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[nn-activate-dialog.html]
+-  [Create two dialogs without user activation; send user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nn-dialog.html.ini b/tests/wpt/meta/close-watcher/user-activation/nn-dialog.html.ini
+deleted file mode 100644
+index d28174586e4..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nn-dialog.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[nn-dialog.html]
+-  [Create two close watchers without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nnn-CloseWatcher.html.ini b/tests/wpt/meta/close-watcher/user-activation/nnn-CloseWatcher.html.ini
+deleted file mode 100644
+index e107454db7e..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nnn-CloseWatcher.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[nnn-CloseWatcher.html]
+-  [Create three close watchers without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nnn-dialog.html.ini b/tests/wpt/meta/close-watcher/user-activation/nnn-dialog.html.ini
+deleted file mode 100644
+index 11b9e678994..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nnn-dialog.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[nnn-dialog.html]
+-  [Create three close watchers without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/ny-activate-preventDefault.html.ini b/tests/wpt/meta/close-watcher/user-activation/ny-activate-preventDefault.html.ini
+deleted file mode 100644
+index 6d6263081b3..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/ny-activate-preventDefault.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[ny-activate-preventDefault.html?CloseWatcher]
+-  [Create a close watcher without user activation; create a close watcher with user activation that preventDefault()s cancel; send user activation]
+-    expected: FAIL
+-
+-
+-[ny-activate-preventDefault.html?dialog]
+-  [Create a close watcher without user activation; create a close watcher with user activation that preventDefault()s cancel; send user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/ny.html.ini b/tests/wpt/meta/close-watcher/user-activation/ny.html.ini
+deleted file mode 100644
+index 5aee115bdcf..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/ny.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[ny.html?CloseWatcher]
+-  [Create a close watcher without user activation; create a close watcher with user activation]
+-    expected: FAIL
+-
+-
+-[ny.html?dialog]
+-  [Create a close watcher without user activation; create a close watcher with user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nyn.html.ini b/tests/wpt/meta/close-watcher/user-activation/nyn.html.ini
+deleted file mode 100644
+index 030c7da6037..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nyn.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[nyn.html?dialog]
+-  [Create a close watcher without user activation; create a close watcher with user activation; create a close watcher without user activation]
+-    expected: FAIL
+-
+-
+-[nyn.html?CloseWatcher]
+-  [Create a close watcher without user activation; create a close watcher with user activation; create a close watcher without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nynn-destroy.html.ini b/tests/wpt/meta/close-watcher/user-activation/nynn-destroy.html.ini
+deleted file mode 100644
+index fa7d136bc23..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nynn-destroy.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[nynn-destroy.html?CloseWatcher]
+-  [Create a close watcher without user activation; create a close watcher with user activation; create two close watchers without user activation; remove the second close watcher]
+-    expected: FAIL
+-
+-
+-[nynn-destroy.html?dialog]
+-  [Create a close watcher without user activation; create a close watcher with user activation; create two close watchers without user activation; remove the second close watcher]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nynn.html.ini b/tests/wpt/meta/close-watcher/user-activation/nynn.html.ini
+deleted file mode 100644
+index c20b5607cc7..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nynn.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[nynn.html?dialog]
+-  [Create a close watcher without user activation; create a close watcher with user activation; create two close watchers without user activation]
+-    expected: FAIL
+-
+-
+-[nynn.html?CloseWatcher]
+-  [Create a close watcher without user activation; create a close watcher with user activation; create two close watchers without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nyyn-CloseWatcher.html.ini b/tests/wpt/meta/close-watcher/user-activation/nyyn-CloseWatcher.html.ini
+deleted file mode 100644
+index 48cd6657306..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nyyn-CloseWatcher.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[nyyn-CloseWatcher.html]
+-  [Create a close watcher without user activation; create two close watchers with user activation; create a close watcher without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nyyn-dialog.html.ini b/tests/wpt/meta/close-watcher/user-activation/nyyn-dialog.html.ini
+deleted file mode 100644
+index a59d416371e..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nyyn-dialog.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[nyyn-dialog.html]
+-  [Create a close watcher without user activation; create two close watchers with user activation; create a close watcher without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nyyyn-CloseWatcher.html.ini b/tests/wpt/meta/close-watcher/user-activation/nyyyn-CloseWatcher.html.ini
+deleted file mode 100644
+index 75985eeeb24..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nyyyn-CloseWatcher.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[nyyyn-CloseWatcher.html]
+-  [Create a close watcher without user activation; create three close watchers with user activation; create a close watcher without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/nyyyn-dialog.html.ini b/tests/wpt/meta/close-watcher/user-activation/nyyyn-dialog.html.ini
+deleted file mode 100644
+index d63a1f96174..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/nyyyn-dialog.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[nyyyn-dialog.html]
+-  [Create a close watcher without user activation; create three close watchers with user activation; create a close watcher without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/y-dialog-disconnected.html.ini b/tests/wpt/meta/close-watcher/user-activation/y-dialog-disconnected.html.ini
+deleted file mode 100644
+index 5bb33b0c07e..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/y-dialog-disconnected.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[y-dialog-disconnected.html]
+-  [Disconnect dialog with close request]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/y.html.ini b/tests/wpt/meta/close-watcher/user-activation/y.html.ini
+deleted file mode 100644
+index 36c23843b85..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/y.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[y.html?dialog]
+-  [Create a close watcher with user activation]
+-    expected: FAIL
+-
+-
+-[y.html?CloseWatcher]
+-  [Create a close watcher with user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/yn-activate.html.ini b/tests/wpt/meta/close-watcher/user-activation/yn-activate.html.ini
+deleted file mode 100644
+index a16e0962e75..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/yn-activate.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[yn-activate.html?dialog]
+-  [Create a close watcher with user activation; create a close watcher without user activation; send user activation]
+-    expected: FAIL
+-
+-
+-[yn-activate.html?CloseWatcher]
+-  [Create a close watcher with user activation; create a close watcher without user activation; send user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/yn.html.ini b/tests/wpt/meta/close-watcher/user-activation/yn.html.ini
+deleted file mode 100644
+index a6e37ea4cf4..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/yn.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[yn.html?dialog]
+-  [Create a close watcher with user activation; create a close watcher without user activation]
+-    expected: FAIL
+-
+-
+-[yn.html?CloseWatcher]
+-  [Create a close watcher with user activation; create a close watcher without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/ynn-CloseWatcher.html.ini b/tests/wpt/meta/close-watcher/user-activation/ynn-CloseWatcher.html.ini
+deleted file mode 100644
+index df2246e1d4f..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/ynn-CloseWatcher.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[ynn-CloseWatcher.html]
+-  [Create a close watcher with user activation; create two close watchers without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/ynn-dialog.html.ini b/tests/wpt/meta/close-watcher/user-activation/ynn-dialog.html.ini
+deleted file mode 100644
+index 8e3273e2964..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/ynn-dialog.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[ynn-dialog.html]
+-  [Create a close watcher with user activation; create two close watchers without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/yy.html.ini b/tests/wpt/meta/close-watcher/user-activation/yy.html.ini
+deleted file mode 100644
+index 5dea5050b8b..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/yy.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[yy.html?dialog]
+-  [Create two close watchers with user activation]
+-    expected: FAIL
+-
+-
+-[yy.html?CloseWatcher]
+-  [Create two close watchers with user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/yyn.html.ini b/tests/wpt/meta/close-watcher/user-activation/yyn.html.ini
+deleted file mode 100644
+index cbddcd60b4c..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/yyn.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[yyn.html?CloseWatcher]
+-  [Create two close watchers with user activation; create a close watcher without user activation]
+-    expected: FAIL
+-
+-
+-[yyn.html?dialog]
+-  [Create two close watchers with user activation; create a close watcher without user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/close-watcher/user-activation/yyy.html.ini b/tests/wpt/meta/close-watcher/user-activation/yyy.html.ini
+deleted file mode 100644
+index 51fbed1c06e..00000000000
+--- a/tests/wpt/meta/close-watcher/user-activation/yyy.html.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[yyy.html?dialog]
+-  [Create three close watchers with user activation]
+-    expected: FAIL
+-
+-
+-[yyy.html?CloseWatcher]
+-  [Create three close watchers with user activation]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/fullscreen/api/document-fullscreen-keyboard-lock-escape.window.js.ini b/tests/wpt/meta/fullscreen/api/document-fullscreen-keyboard-lock-escape.window.js.ini
+index 186f9d7ae12..bdaf7f6d272 100644
+--- a/tests/wpt/meta/fullscreen/api/document-fullscreen-keyboard-lock-escape.window.js.ini
++++ b/tests/wpt/meta/fullscreen/api/document-fullscreen-keyboard-lock-escape.window.js.ini
+@@ -1,13 +1,6 @@
+ [document-fullscreen-keyboard-lock-escape.window.html]
+-  expected: TIMEOUT
+-  [Holding Escape with event.preventDefault() should cause fullscreen exit]
+-    expected: TIMEOUT
+-
+   [Tapping Escape with event.preventDefault() should not cause fullscreen exit]
+-    expected: NOTRUN
+-
+-  [Holding Escape without event.preventDefault() should cause fullscreen exit]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [Tapping Escape without event.preventDefault() should not cause fullscreen exit]
+-    expected: NOTRUN
++    expected: FAIL
+diff --git a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-events.html.ini b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-events.html.ini
+index f6e93a98d4e..5544cbd7ecc 100644
+--- a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-events.html.ini
++++ b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-events.html.ini
+@@ -1,7 +1,4 @@
+ [dialog-cancel-events.html]
+-  expected:
+-    if js_engine == "quickjs": TIMEOUT
+   [Test cancel event is fired when the dialog is closed by user close requests]
+     expected:
+-      if js_engine == "quickjs": NOTRUN
+-      FAIL
++      if js_engine == "spidermonkey": FAIL
+diff --git a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-preventDefault.html.ini b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-preventDefault.html.ini
+index 428e8270fe0..2d3bdb53c2c 100644
+--- a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-preventDefault.html.ini
++++ b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-preventDefault.html.ini
+@@ -1,7 +1,4 @@
+ [dialog-cancel-preventDefault.html]
+-  expected:
+-    if js_engine == "quickjs": TIMEOUT
+   [Test cancel event with preventDefault on cancel event for dialog element]
+     expected:
+-      if js_engine == "quickjs": NOTRUN
+-      FAIL
++      if js_engine == "spidermonkey": FAIL
+diff --git a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-with-input.html.ini b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-with-input.html.ini
+deleted file mode 100644
+index 9c85edd91fc..00000000000
+--- a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-with-input.html.ini
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[dialog-cancel-with-input.html]
+-  expected: TIMEOUT
+-  [Test dialog modal is closed by escape key with input focused]
+-    expected: NOTRUN
+diff --git a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-with-select.html.ini b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-with-select.html.ini
+deleted file mode 100644
+index 7ecb9f03e55..00000000000
+--- a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-cancel-with-select.html.ini
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[dialog-cancel-with-select.html]
+-  expected: TIMEOUT
+-  [Test dialog modal is closed by escape key with select focused]
+-    expected: NOTRUN
+diff --git a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-canceling.html.ini b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-canceling.html.ini
+deleted file mode 100644
+index 105c5305a71..00000000000
+--- a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-canceling.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[dialog-canceling.html]
+-  [Modal dialogs should close when the escape key is pressed.]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-corner-cases.html.ini b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-corner-cases.html.ini
+index 64683611904..9689e6bce7f 100644
+--- a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-corner-cases.html.ini
++++ b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-corner-cases.html.ini
+@@ -1,10 +1,10 @@
+ [dialog-closedby-corner-cases.html]
+   expected: TIMEOUT
+-  [Pressing escape, when focusin removes and reinserts, modeless]
+-    expected: TIMEOUT
++  [Pressing escape, when focusin calls showModal, modeless]
++    expected: NOTRUN
+ 
+   [Clicking outside, when focusin removes and reinserts, modeless]
+-    expected: NOTRUN
++    expected: TIMEOUT
+ 
+   [Pressing escape, when focusin closes dialog, modeless]
+     expected: NOTRUN
+@@ -12,9 +12,6 @@
+   [Clicking outside, when focusin closes dialog, modeless]
+     expected: NOTRUN
+ 
+-  [Pressing escape, when focusin calls showModal, modeless]
+-    expected: NOTRUN
+-
+   [Clicking outside, when focusin calls showModal, modeless]
+     expected: NOTRUN
+ 
+diff --git a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-show-stacked.html.ini b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-show-stacked.html.ini
+index 5367a8c755d..bb881979dfc 100644
+--- a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-show-stacked.html.ini
++++ b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-show-stacked.html.ini
+@@ -1,7 +1,4 @@
+ [dialog-closedby-show-stacked.html]
+   expected: TIMEOUT
+-  [With an inner closedby=any, the outer dialog stays open but the inner dialogs should close, when Esc is pressed]
+-    expected: TIMEOUT
+-
+   [With an inner closedby=any, the outer dialog stays open but the inner dialogs should close, when clicked outside]
+-    expected: NOTRUN
++    expected: TIMEOUT
+diff --git a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-start-open.html.ini b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-start-open.html.ini
+deleted file mode 100644
+index 19a0905d532..00000000000
+--- a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby-start-open.html.ini
++++ /dev/null
+@@ -1,6 +0,0 @@
+-[dialog-closedby-start-open.html]
+-  [Dialogs that start open and have closedby should still function]
+-    expected: FAIL
+-
+-  [Opening and closing a dialog during the dialog focus fixup should still leave closedby functional]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby.html.ini b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby.html.ini
+index 39998e5ae5e..7e6cae66dfc 100644
+--- a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby.html.ini
++++ b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-closedby.html.ini
+@@ -1,82 +1,18 @@
+ [dialog-closedby.html]
+-  expected: TIMEOUT
+   [closedby=any, modeless]
+-    expected: TIMEOUT
++    expected: FAIL
+ 
+   [closedby=any, modal]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [closedby=any, open]
+-    expected: NOTRUN
+-
+-  [closedby=closerequest, modeless]
+-    expected: NOTRUN
+-
+-  [closedby=closerequest, modal]
+-    expected: NOTRUN
+-
+-  [closedby=closerequest, open]
+-    expected: NOTRUN
+-
+-  [closedby=none, modeless]
+-    expected: NOTRUN
+-
+-  [closedby=none, modal]
+-    expected: NOTRUN
+-
+-  [closedby=none, open]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [closedby=AnY, modeless]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [closedby=AnY, modal]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [closedby=AnY, open]
+-    expected: NOTRUN
+-
+-  [closedby=ClOsErEqUeSt, modeless]
+-    expected: NOTRUN
+-
+-  [closedby=ClOsErEqUeSt, modal]
+-    expected: NOTRUN
+-
+-  [closedby=ClOsErEqUeSt, open]
+-    expected: NOTRUN
+-
+-  [closedby=NoNe, modeless]
+-    expected: NOTRUN
+-
+-  [closedby=NoNe, modal]
+-    expected: NOTRUN
+-
+-  [closedby=NoNe, open]
+-    expected: NOTRUN
+-
+-  [closedby=invalid, modeless]
+-    expected: NOTRUN
+-
+-  [closedby=invalid, modal]
+-    expected: NOTRUN
+-
+-  [closedby=invalid, open]
+-    expected: NOTRUN
+-
+-  [closedby=, modeless]
+-    expected: NOTRUN
+-
+-  [closedby=, modal]
+-    expected: NOTRUN
+-
+-  [closedby=, open]
+-    expected: NOTRUN
+-
+-  [closedby=null, modeless]
+-    expected: NOTRUN
+-
+-  [closedby=null, modal]
+-    expected: NOTRUN
+-
+-  [closedby=null, open]
+-    expected: NOTRUN
++    expected: FAIL
+diff --git a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-open-movebefore-setup.html.ini b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-open-movebefore-setup.html.ini
+deleted file mode 100644
+index e7424b2c31a..00000000000
+--- a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/dialog-open-movebefore-setup.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[dialog-open-movebefore-setup.html]
+-  [reparenting a dialog should not cause it to move in the open dialogs list]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/non-modal-canceling.html.ini b/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/non-modal-canceling.html.ini
+deleted file mode 100644
+index 3b4e364ec5f..00000000000
+--- a/tests/wpt/meta/html/semantics/interactive-elements/the-dialog-element/non-modal-canceling.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[non-modal-canceling.html]
+-  [Non-modal dialogs should not be cancelable via ESC]
+-    expected: FAIL

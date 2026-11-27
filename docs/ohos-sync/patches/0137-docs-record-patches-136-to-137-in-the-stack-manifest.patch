@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: daodaoliehuo <352812717@qq.com>
+Date: Fri, 27 Nov 2026 10:24:51 +0000
+Subject: [PATCH] docs: record patches 136 to 137 in the stack manifest
+
+Patch 136 is the backport of upstream servo/servo#49640, which turns Esc into a close request, with the expectations that still fail on Servo 0.8.0 kept or added. This entry is the bookkeeping one.
+
+Validation: `uv run docs/ohos-sync/check_stack.py base/2026-11-09` passes: the manifest and trailer checks, `git am` of the patch set reproduces the head tree, and the vendored-code checks pass.
+AI-assisted: Yes (agent session; written by the agent)
+Signed-off-by: daodaoliehuo <352812717@qq.com>
+---
+ docs/ohos-sync/STACK.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index 753cf7695a5..8323c2f972e 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -159,6 +159,8 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 133. `backport: deny: Allow chrono in cargo deny (#50002)` — B · CI · watch: -
+ 134. `wpt: Let fetch-cannot-overwhelm-system wait for its requests to a small file` — B · CI · watch: -
+ 135. `docs: record patches 131 to 135 in the stack manifest` — B · none · watch: -
++136. `backport: script: handle Esc press as close request (#49640)` — B · CI · watch: components/script/dom/closewatcher components/script/dom/document components/script/dom/window tests/wpt/meta
++137. `docs: record patches 136 to 137 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 

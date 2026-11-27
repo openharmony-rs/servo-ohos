@@ -159,6 +159,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 133. `backport: deny: Allow chrono in cargo deny (#50002)` — B · CI · watch: -
 134. `wpt: Let fetch-cannot-overwhelm-system wait for its requests to a small file` — B · CI · watch: -
 135. `docs: record patches 131 to 135 in the stack manifest` — B · none · watch: -
+136. `backport: script: handle Esc press as close request (#49640)` — B · CI · watch: components/script/dom/closewatcher components/script/dom/document components/script/dom/window tests/wpt/meta
+137. `docs: record patches 136 to 137 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
