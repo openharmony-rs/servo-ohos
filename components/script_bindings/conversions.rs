@@ -175,6 +175,11 @@ impl FromJSValConvertible for ByteString {
 
 impl<T> ToJSValConvertible for Reflector<T> {
     fn to_jsval(&self, cx: &mut JSContext, mut rval: MutableHandleValue) {
+        // QuickJS: the DOM object is still a `JSDomStub` until it is first handed to JS.
+        // Materialize it before the value leaves the embedder, as QuickJS treats it as a regular
+        // object (e.g. `ResolvePromise` reads its `then` property).
+        #[cfg(feature = "js-quickjs")]
+        self.materialize_if_needed();
         let obj = self.get_jsobject().get();
         assert!(!obj.is_null());
         rval.set(ObjectValue(obj));
@@ -246,11 +251,33 @@ pub unsafe fn is_dom_proxy(obj: *mut JSObject) -> bool {
 // globals and non-globals.
 pub const DOM_OBJECT_SLOT: u32 = 0;
 
+/// Whether `obj` is a `JSDomStub`, i.e. not yet materialized into a real `JSObject`.
+///
+/// Always false when not building with QuickJS.
+#[inline]
+pub fn is_dom_stub(obj: *mut JSObject) -> bool {
+    #[cfg(feature = "js-quickjs")]
+    {
+        unsafe { js::rust::wrappers2::JS_IsDomStub(obj) }
+    }
+    #[cfg(not(feature = "js-quickjs"))]
+    {
+        let _ = obj;
+        false
+    }
+}
+
 /// Get the private pointer of a DOM object from a given reflector.
 ///
 /// # Safety
 /// obj must point to a valid non-null JS object.
 pub unsafe fn private_from_object(obj: *mut JSObject) -> *const libc::c_void {
+    #[cfg(feature = "js-quickjs")]
+    if is_dom_stub(obj) {
+        // A `JSDomStub` is not a `JSObject`: it stores the DOM node directly.
+        return unsafe { js::rust::wrappers2::JS_GetDomStubDomPtr(obj) };
+    }
+
     let mut value = UndefinedValue();
     unsafe {
         if is_dom_object(obj) {

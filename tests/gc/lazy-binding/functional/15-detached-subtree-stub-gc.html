@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="host"></div>
+<script src="lb.js"></script>
+<script>
+  // The parser creates a chain of `total` nested divs and JS never touches any of them, so no
+  // stub materializes. Each div is only reachable through its parent, so the chain lives or dies
+  // as a whole: a leaked child stub would keep every ancestor alive too. The chain is detached
+  // without handing a node to JS; once layout recomputes, a single drain + GC should reclaim all
+  // `total` stubs at once.
+  var runtime = window.runtime;
+  var doc = document;
+  var total = 50;
+
+  // `getElementById` materializes the host's own stub before counting starts.
+  var host = doc.getElementById("host");
+
+  var html = "";
+  for (var i = 0; i < total; i++) {
+    html += "<div>";
+  }
+  for (var i = 0; i < total; i++) {
+    html += "</div>";
+  }
+
+  var before = runtime.dom_stub_count();
+  // `insertAdjacentHTML` hands no node to JS, unlike `createElement`.
+  host.insertAdjacentHTML("beforeend", html);
+  var attached = runtime.dom_stub_count();
+  console.log("JSDomStubs added by the parser:", attached - before);
+  LB.expectTrue(
+    "the parser creates at least one JSDomStub per never-accessed element",
+    attached - before >= total
+  );
+
+  // Detach without handing a node to JS: `replaceChildren()` returns `undefined`.
+  host.replaceChildren();
+  LB.expect("replaceChildren() leaves the host empty", 0, host.childNodes.length);
+
+  // Layout keeps the detached nodes alive until it recomputes, so give it a chance first.
+  window.setTimeout(() => {
+    runtime.drain_pool_gc();
+    var after = runtime.dom_stub_count();
+    console.log("stubs: insert=" + attached + " after gc=" + after);
+
+    var collected = attached - after;
+    LB.expectTrue(
+      "QuickJS GC reclaims the stubs of the detached, never-accessed subtree. [" + total + ", " + total +" + 5) stubs are reclaimed",
+      collected >= total && collected < total + 5
+    );
+    LB.finish("15-detached-subtree-stub-gc");
+  }, 100)
+</script>
+</body>
+</html>

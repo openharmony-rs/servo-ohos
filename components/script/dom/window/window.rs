@@ -2386,7 +2386,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     /// <https://dom.spec.whatwg.org/#dom-window-event>
     fn Event(&self, cx: &mut JSContext, rval: MutableHandleValue) {
         if let Some(ref event) = self.current_event.get() {
-            event.reflector().get_jsobject().to_jsval(cx, rval);
+            event.to_jsval(cx, rval);
         }
     }
 
@@ -4358,7 +4358,17 @@ impl Window {
             close_watcher_manager: CloseWatcherManager::new(),
         });
 
-        WindowBinding::Wrap::<crate::DomTypeHolder>(cx, &origin, win)
+        let window = WindowBinding::Wrap::<crate::DomTypeHolder>(cx, &origin, win);
+        #[cfg(feature = "js-quickjs")]
+        {
+            if pref!(dom_testutils_enabled) {
+                script_bindings::quickjs_runtime_helper::init_runtime_helper(
+                    cx,
+                    window.reflector().get_jsobject(),
+                );
+            }
+        }
+        window
     }
 
     pub(crate) fn task_manager(&self) -> Rc<TaskManager> {
